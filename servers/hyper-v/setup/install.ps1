@@ -123,12 +123,23 @@ elseif ($ProjectsFile) {
   $current = Join-Path $state 'policy.json'
   if (Test-Path -LiteralPath $current) { try { $projects = @((Get-Content -Raw -LiteralPath $current | ConvertFrom-Json).projects | Where-Object { $_ }) } catch { $projects = @() } }
 }
+# The pool's VM limit, worked out here (read-only) so the projects' reservations are checked against it before anything
+# changes: -MaxVms, or a quarter of the host's logical CPUs (1-4). Step 7 writes this same value.
+$poolMaxVms = $(if ($MaxVms) { $MaxVms } else { [Math]::Max(1, [Math]::Min(4, [Math]::Floor(([int](Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors) / 4))) })
+# A project's cap or reservation for the report: a number (Windows), or one per OS, never cast.
+function Format-Share($v) {
+  if ($null -eq $v) { return 'none' }
+  if ($v -is [ValueType]) { return "$v" }
+  return (@($v.PSObject.Properties) | ForEach-Object { "$($_.Name) $($_.Value)" }) -join ', '
+}
+$projectsLine = 'none (one shared pool, first come first served)'
 if ($projects.Count) {
   $nodeCheck = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
   if (-not $nodeCheck) { throw 'Node (18 or later) is not on PATH.' }
-  $why = (ConvertTo-Json -InputObject @($projects) -Depth 6 -Compress) | & $nodeCheck -e "const p = require(process.argv[1]); let t = ''; process.stdin.on('data', d => t += d).on('end', () => { const w = p.projectProblems(JSON.parse(t)); process.stdout.write(w.join('; ')) })" (Join-Path $src 'helper\policy.js')
+  $why = (ConvertTo-Json -InputObject @($projects) -Depth 6 -Compress) | & $nodeCheck -e "const p = require(process.argv[1]); let t = ''; process.stdin.on('data', d => t += d).on('end', () => { const w = p.projectProblems(JSON.parse(t), Number(process.argv[2])); process.stdout.write(w.join('; ')) })" (Join-Path $src 'helper\policy.js') $poolMaxVms
   if ($LASTEXITCODE) { throw 'The projects check (node) failed.' }
   if ($why) { throw "The projects can't be used: $why. Nothing was changed." }
+  $projectsLine = ($projects | ForEach-Object { "$($_.name) (cap $(Format-Share $_.maxVms), reserve $(Format-Share $_.reserveVms)$(if ($_.images) { ", images $(@($_.images).Count)" }))" }) -join '; '
 }
 # The helper refuses a policy whose session cap is below one lease (helper/policy.js): refuse it here first.
 if ($MaxSessionMinutes -and ($MaxSessionMinutes -lt 5 -or $MaxSessionMinutes -gt 1440 -or $MaxSessionMinutes -lt $MaxLeaseMinutes)) { throw "-MaxSessionMinutes must be 5-1440 and at least -MaxLeaseMinutes ($MaxLeaseMinutes)." }
@@ -224,7 +235,7 @@ $cpus = [int]$cs.NumberOfLogicalProcessors
 $ramGB = [int][Math]::Floor($cs.TotalPhysicalMemory / 1GB)
 $policy = [ordered]@{
   schema = 1; prefix = 'hvmcp'
-  maxVms = $(if ($MaxVms) { $MaxVms } else { [Math]::Max(1, [Math]::Min(4, [Math]::Floor($cpus / 4))) })
+  maxVms = $poolMaxVms
   maxCoresPerVm = $(if ($MaxCoresPerVm) { $MaxCoresPerVm } else { [Math]::Max(1, [Math]::Min(8, [Math]::Floor($cpus / 4))) })
   maxMemoryMBTotal = $(if ($MaxMemoryGB) { $MaxMemoryGB * 1024 } else { [Math]::Max(4096, [Math]::Floor($ramGB / 2) * 1024) })
   maxDiskGBPerVm = $MaxDiskGBPerVm; diskFolders = $folders; allowNetwork = $AllowNetwork
@@ -232,13 +243,7 @@ $policy = [ordered]@{
   allowUnpinnedIso = [bool]$AllowUnpinnedIso
   buildRoots = @($buildRoots)
 }
-if ($projects.Count) {
-  # Again with this policy's maxVms, now known: the reservations, per OS, may not add up to more.
-  $why = (ConvertTo-Json -InputObject @($projects) -Depth 6 -Compress) | & $nodeCheck -e "const p = require(process.argv[1]); let t = ''; process.stdin.on('data', d => t += d).on('end', () => { process.stdout.write(p.projectProblems(JSON.parse(t), Number(process.argv[2])).join('; ')) })" (Join-Path $src 'helper\policy.js') $policy.maxVms
-  if ($LASTEXITCODE) { throw 'The projects check (node) failed.' }
-  if ($why) { throw "The projects can't be used: $why." }
-  $policy.projects = @($projects)
-}
+if ($projects.Count) { $policy.projects = @($projects) } # checked, against this maxVms, before anything changed
 if ($MaxSessionMinutes) { $policy.maxSessionMinutes = $MaxSessionMinutes }
 $policyFile = Join-Path $state 'policy.json'
 Write-SecureFile $policyFile ($policy | ConvertTo-Json -Depth 4) @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=ReadAndExecute") $ADMINS
@@ -252,7 +257,7 @@ foreach ($d in $folders) { $bad += @(Test-ExclusiveAcl $d -Allowed $SYSTEM, $ADM
 if ($bad.Count) { throw "The helper's folders aren't as setup made them: $($bad -join '; ')" }
 Step "State in $state; VM disks in $($folders -join ', '); ACLs checked."
 Step "Build folders set by an admin (beside each client's MCP roots): $(if ($buildRoots.Count) { $buildRoots -join '; ' } else { 'none' })."
-Step "Projects sharing the pool: $(if ($projects.Count) { ($projects | ForEach-Object { "$($_.name) (cap $(if ($null -ne $_.maxVms) { $_.maxVms } else { 'none' }), reserve $([int]$_.reserveVms))" }) -join '; ' } else { 'none (one shared pool, first come first served)' })."
+Step "Projects sharing the pool: $projectsLine."
 Step ("Policy: up to {0} VMs, {1} cores each, {2} GB memory in all, {3} GB disks; network {4}; unpinned ISOs {5}; leases up to {6} min, work sessions up to {7} min." -f $policy.maxVms, $policy.maxCoresPerVm, ($policy.maxMemoryMBTotal / 1024), $policy.maxDiskGBPerVm, $(if ($AllowNetwork) { 'allowed (internal switch only)' } else { 'not allowed' }), $(if ($AllowUnpinnedIso) { 'allowed' } else { 'refused' }), $MaxLeaseMinutes, $(if ($MaxSessionMinutes) { $MaxSessionMinutes } else { [Math]::Max($MaxLeaseMinutes, 480) }))
 
 # 8. Start.

@@ -269,15 +269,26 @@ test('setup\'s -ProjectsFile check uses the helper\'s own policy code, before an
   assert.ok(block, 'the projects block in install.ps1')
   const sc = scratch('setup-projects')
   const file = path.join(sc.dir, 'projects.ps1')
-  fs.writeFileSync(file, `param([string]$ProjectsFile, [string]$state, [string]$src)\n$ErrorActionPreference = 'Stop'\n${block[0]}\n"projects: $($projects.Count)"\n`)
-  const run = json => {
+  // The block runs as setup runs it, before any change: the projects read, the pool's VM limit worked out, the whole
+  // check (reservations against that limit included), and the report formatted.
+  fs.writeFileSync(file, `param([string]$ProjectsFile, [string]$state, [string]$src, [int]$MaxVms = 0)\n$ErrorActionPreference = 'Stop'\n${block[0]}\n"projects: $($projects.Count)"\n"line: $projectsLine"\n`)
+  const run = (json, maxVms = 3) => {
     const pf = path.join(sc.dir, `p-${Math.random().toString(16).slice(2)}.json`)
     fs.writeFileSync(pf, json)
-    return spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, '-ProjectsFile', pf, '-state', sc.stateDir, '-src', path.join(__dirname, '..')], { encoding: 'utf8', env: ps51Env() })
+    return spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, '-ProjectsFile', pf, '-state', sc.stateDir, '-src', path.join(__dirname, '..'), '-MaxVms', String(maxVms)], { encoding: 'utf8', env: ps51Env() })
   }
   const good = run(JSON.stringify([{ name: 'cli', folders: ['D:\\Dev\\cli'], maxVms: 2, reserveVms: 1 }, { name: 'mcp', folders: ['D:\\Dev\\mcp'] }]))
   assert.strictEqual(good.status, 0, good.stdout + good.stderr)
   assert.match(good.stdout, /projects: 2/)
+  assert.match(good.stdout, /line: cli \(cap 2, reserve 1\); mcp \(cap none, reserve none\)/)
+  // Shares per OS are formatted as they are, never cast to a number (that threw after the service had stopped).
+  const perOs = run(JSON.stringify([{ name: 'cli', folders: ['D:\\Dev\\cli'], maxVms: { windows: 2, linux: 1 }, reserveVms: { windows: 1 }, images: ['ab'.repeat(32)] }]))
+  assert.strictEqual(perOs.status, 0, perOs.stdout + perOs.stderr)
+  assert.match(perOs.stdout, /line: cli \(cap windows 2, linux 1, reserve windows 1, images 1\)/)
+  // Reservations over the pool's VMs are refused here, before anything changes (not after the service has stopped).
+  const over = run(JSON.stringify([{ name: 'cli', folders: ['D:\\Dev\\cli'], reserveVms: { windows: 2 } }]), 1)
+  assert.notStrictEqual(over.status, 0)
+  assert.match((over.stdout + over.stderr).replace(/\s+/g, ' '), /The projects can't be used: the projects reserve 2 windows VMs in all, over the policy's maxVms \(1\)\. Nothing was changed\./)
   const bad = run(JSON.stringify([{ name: 'cli', folders: ['D:\\Dev'], reserveVms: 1, maxVms: 0 }, { name: 'cli', folders: ['D:\\Dev\\mcp'] }]))
   assert.notStrictEqual(bad.status, 0)
   const said = (bad.stdout + bad.stderr).replace(/\s+/g, ' ') // PowerShell wraps its error lines
