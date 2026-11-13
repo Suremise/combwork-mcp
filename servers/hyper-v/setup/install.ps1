@@ -35,17 +35,13 @@ param(
   [switch]$AllowUnpinnedIso,
   [string[]]$BuildRoot = @()
 )
-# Windows PowerShell 5.1 only, refused before any check or change (MC-1506): setup's storage and ACL routines use .NET Framework calls that PowerShell 7 doesn't have. Run from PowerShell 7, an earlier setup
-# stopped the service, then failed part-way. The refusal prints the one line to run instead, with the same arguments.
+# Windows PowerShell 5.1 only (MC-1506), refused before any check or change:
+# setup's storage and ACL routines use .NET Framework calls that PowerShell 7
+# doesn't have.
+# Run from PowerShell 7, an earlier setup stopped the service, then failed part-way. The refusal says how to run it
+# under 5.1, with the arguments used (they aren't rebuilt here: -File can't carry every type).
 if ($PSVersionTable.PSEdition -ne 'Desktop') {
-  $again = @('powershell -NoProfile -ExecutionPolicy Bypass -File', "`"$PSCommandPath`"")
-  foreach ($k in $PSBoundParameters.Keys) {
-    $v = $PSBoundParameters[$k]
-    if ($v -is [Management.Automation.SwitchParameter]) { if ($v.IsPresent) { $again += "-$k" } }
-    elseif ($v -is [bool]) { $again += "-$k `$$($v.ToString().ToLower())" }
-    else { $again += "-$k " + ((@($v) | ForEach-Object { "`"$_`"" }) -join ',') }
-  }
-  [Console]::Error.WriteLine("This needs Windows PowerShell 5.1, not PowerShell $($PSVersionTable.PSVersion): nothing was checked or changed. Run it as one line in an admin Windows PowerShell:`n  $($again -join ' ')")
+  [Console]::Error.WriteLine("This needs Windows PowerShell 5.1, not PowerShell $($PSVersionTable.PSVersion): nothing was checked or changed. Run it again in an admin Windows PowerShell, as one line, with the same arguments you used:`n  powershell -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" <the same arguments>")
   exit 1
 }
 $ErrorActionPreference = 'Stop'

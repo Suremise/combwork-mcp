@@ -304,22 +304,23 @@ const PWSH = (() => {
   return r.status === 0 ? r.stdout.split(/\r?\n/)[0].trim() : null
 })()
 
-test('setup, uninstall and approve refuse PowerShell 7 first, change nothing, and give the one 5.1 line to run', { skip: !PWSH && 'pwsh is not installed' }, () => {
+test('setup, uninstall and approve refuse PowerShell 7 first, change nothing, and say how to run them under 5.1', { skip: !PWSH && 'pwsh is not installed' }, () => {
   const { spawnSync } = require('child_process')
   const sc = scratch('ps7-refused')
   const disk = path.join(sc.dir, 'never-made')
   const run = (file, args) => spawnSync(PWSH, ['-NoProfile', '-NonInteractive', '-File', file, ...args], { encoding: 'utf8' })
   const setup = path.join(__dirname, '..', 'setup')
   const cases = [
-    [path.join(setup, 'install.ps1'), ['-DiskFolder', disk, '-BuildRoot', 'C:\\some build', '-AllowUnpinnedIso'], `-DiskFolder "${disk}" -BuildRoot "C:\\some build" -AllowUnpinnedIso`],
-    [path.join(setup, 'uninstall.ps1'), ['-KeepPool'], '-KeepPool'],
-    [path.join(__dirname, '..', 'helper', 'approve.ps1'), ['-Plan', 'p-0123456789abcdef'], '-Plan "p-0123456789abcdef"']
+    [path.join(setup, 'install.ps1'), ['-DiskFolder', disk, '-BuildRoot', 'C:\\some build', '-AllowUnpinnedIso']],
+    [path.join(setup, 'uninstall.ps1'), ['-KeepPool']],
+    [path.join(__dirname, '..', 'helper', 'approve.ps1'), ['-Plan', 'p-0123456789abcdef']]
   ]
-  for (const [file, args, again] of cases) {
+  for (const [file, args] of cases) {
     const r = run(file, args)
     assert.strictEqual(r.status, 1, `${file}: ${r.stdout}${r.stderr}`)
-    assert.match(r.stderr, /This needs Windows PowerShell 5\.1, not PowerShell 7[^:]*: nothing was checked or changed/)
-    assert.ok(r.stderr.includes(`powershell -NoProfile -ExecutionPolicy Bypass -File "${file}" ${again}`), `the line to run again, for ${file}: ${r.stderr}`)
+    assert.match(r.stderr, /This needs Windows PowerShell 5\.1, not PowerShell 7[^:]*: nothing was checked or changed\. Run it again in an admin Windows PowerShell, as one line, with the same arguments you used:/)
+    // The fixed 5.1 line with this script's own path; the arguments are the user's to repeat, not rebuilt here.
+    assert.ok(r.stderr.includes(`powershell -NoProfile -ExecutionPolicy Bypass -File "${file}" <the same arguments>`), `the line to run again, for ${file}: ${r.stderr}`)
     // Refused before anything else: not even the admin check ran.
     assert.doesNotMatch(r.stdout + r.stderr, /Run this in an admin PowerShell|Run approve\.ps1 from/)
   }
