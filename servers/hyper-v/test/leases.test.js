@@ -409,3 +409,29 @@ test('a lease ending during vm_start (disconnect or deadline, guest hung or neve
     }
   }
 })
+
+test('a disconnect whose staging cleanup fails (a staged file held open) still ends the lease; the cleanup is retried', async t => {
+  const path = require('path')
+  const fs = require('fs')
+  const sc = scratch('locked-staging')
+  sc.env.HYPERV_MCP_RETRY_MS = '200'
+  const { h, admin } = await withPool(sc, 1)
+  t.after(() => h.stop())
+  const a = h.conn(10)
+  const vm = await leased(a)
+  await a.request('start')
+  await a.request('stage_begin'); await a.request('stage_file', { path: 'held.bin', size: 1 }); await a.request('stage_chunk', { data: Buffer.from('x').toString('base64') }); await a.request('stage_end')
+  const runs = path.join(sc.stateDir, 'runs')
+  const stagingDir = path.join(runs, fs.readdirSync(runs)[0], 'staging')
+  // Held with share mode 0 (libuv's UV_FS_O_EXLOCK), like a reader that doesn't share delete: removing it fails.
+  const fd = fs.openSync(path.join(stagingDir, 'held.bin'), fs.constants.O_RDONLY | 0x10000000)
+  try {
+    a.close()
+    await waitFor(async () => /; free/.test((await admin.request('status')).text), 10_000, 'the lease to end despite the failed cleanup')
+    assert.strictEqual(vmOf(sc, vm).state, 'Off', 'restored')
+    assert.ok(fs.existsSync(stagingDir), 'the held staging is still there, recorded for retry')
+  } finally { fs.closeSync(fd) }
+  await waitFor(() => !fs.existsSync(stagingDir), 10_000, 'the retried cleanup to remove the staging once released')
+  const b = h.conn(11)
+  assert.strictEqual(await leased(b), vm, 'and the VM can be leased again')
+})

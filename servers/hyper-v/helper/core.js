@@ -70,6 +70,7 @@ class Helper {
     this.imageJob = null
     this.lastJob = null
     this.quiesced = false
+    this.pendingCleanup = new Set() // staging folders that couldn't be removed yet (retried; swept at every start)
     this.timers = new Set()
     this.ready = false
   }
@@ -190,17 +191,23 @@ class Helper {
 
   connect(connId, pid) { this.conns.set(connId, { pid, vmId: null, stage: null }) }
 
-  /** A connection closed (its MCP server exited or was killed): its lease ends. */
+  /**
+   * A connection closed (its MCP server exited or was killed): its lease ends first (which kills its in-flight
+   * operations, such as a copy-in reading the staged build), and only then is its staging removed. Staging cleanup can't
+   * fail the disconnect: a folder still held open is recorded and retried.
+   */
   async disconnect(connId) {
     const c = this.conns.get(connId)
     this.conns.delete(connId)
     if (!c) return
-    this.dropStage(c)
-    const lease = c.vmId && this.leases.get(c.vmId)
-    if (lease && lease.connId === connId) {
-      lease.connId = null
-      if (lease.kept) return // kept for inspection: it reverts at its deadline
-      await this.endLease(lease, 'its connection closed')
+    try {
+      const lease = c.vmId && this.leases.get(c.vmId)
+      if (lease && lease.connId === connId) {
+        lease.connId = null
+        if (!lease.kept) await this.endLease(lease, 'its connection closed') // a kept one reverts at its deadline
+      }
+    } finally {
+      this.dropStage(c)
     }
   }
 
@@ -332,6 +339,7 @@ class Helper {
 
   /** Retries quarantined VMs that nobody holds. */
   async retryQuarantined() {
+    for (const dir of [...this.pendingCleanup]) this.removeStaging(dir)
     for (const vmId of this.state.quarantined.keys()) {
       const vm = this.state.vms.get(vmId)
       if (vm && vm.ready && !vm.removing && !this.leases.has(vmId)) await this.vmLock(vmId)(() => this.restore(vm)).catch(() => {})
@@ -340,8 +348,24 @@ class Helper {
 
   // ---------- build staging ----------
 
+  /** Abandons a connection's staged build: closes any staged file still open, then removes it. Never throws. */
   dropStage(c) {
-    if (c?.stage) { fs.rmSync(c.stage.dir, { recursive: true, force: true }); c.stage = null }
+    const st = c?.stage
+    if (!st) return
+    c.stage = null
+    if (st.current) { try { fs.closeSync(st.current.fd) } catch { /* closed */ } st.current = null }
+    this.removeStaging(st.dir)
+  }
+
+  /** Removes a staging folder; one that can't be removed yet (a file still open) is recorded and retried. */
+  removeStaging(dir) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true })
+      this.pendingCleanup.delete(dir)
+    } catch (e) {
+      if (!this.pendingCleanup.has(dir)) this.log(`staging cleanup of ${dir} failed (${e.code || e.message}): retried later`)
+      this.pendingCleanup.add(dir)
+    }
   }
 
   stageBegin(connId) {
