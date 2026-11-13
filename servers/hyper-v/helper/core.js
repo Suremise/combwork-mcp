@@ -10,7 +10,11 @@
  * - Every pool change is journalled before each side effect, and recovered at start (journal.js).
  * - Every start restores the clean checkpoint by id first, unconditionally; every stop and release restores it and
  *   verifies the baseline (Off, parent = clean, adapter disconnected, reserve 0). A VM that fails that is quarantined.
- * - Leases end on release, at their deadline, or when their connection closes.
+ * - Leases end on release, at their deadline, or when their connection closes. A lease can be renewed (vm_renew) while
+ *   its deadline hasn't passed, up to the policy's maxLeaseMinutes at a time and its maxSessionMinutes from acquire.
+ * - A warm session's sync (vm_sync) copies files into the running guest's C:\build only, over PowerShell Direct (no
+ *   host share), from a staging of exactly the plan's files hashed here; the guest side (guest-sync.ps1) never follows
+ *   a link. It never restores, and it never stands in for one: release, the deadline and a disconnect still restore.
  */
 const fs = require('fs')
 const crypto = require('crypto')
@@ -41,6 +45,27 @@ function canonical(v) {
   if (Array.isArray(v)) return `[${v.map(canonical).join(',')}]`
   if (v && typeof v === 'object') return `{${Object.keys(v).sort().filter(k => v[k] !== undefined).map(k => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`
   return JSON.stringify(v)
+}
+
+/**
+ * A guest path's canonical identity on Windows: its segments (paths.js, so "/" and "\" are one) joined by "\" and
+ * upper-cased one UTF-16 unit at a time, as .NET's ToUpperInvariant does (guest-sync.ps1 uses that: the same identity on
+ * both sides). A unit whose upper case is longer (such as ß) stays as it is, as in .NET.
+ */
+function keyOf(parts) {
+  return parts.join('\\').split('').map(ch => { const u = ch.toUpperCase(); return u.length === 1 ? u : ch }).join('')
+}
+
+/** A key of `a` that is a proper ancestor (a folder) of a key of `b`, as [its path, the descendant's path], or null. */
+function ancestorClash(a, b) {
+  for (const [k, f] of b) {
+    const parts = k.split('\\')
+    for (let i = 1; i < parts.length; i++) {
+      const up = parts.slice(0, i).join('\\')
+      if (a.has(up)) return [a.get(up).path, f.path]
+    }
+  }
+  return null
 }
 
 /** A simple FIFO lock. */
@@ -269,20 +294,46 @@ class Helper {
         const next = [...this.leases.values()].sort((a, b) => a.deadline - b.deadline)[0]
         throw new Error(`No VM is free (${ready.length} in the pool${s.quarantined.size ? `, ${s.quarantined.size} quarantined` : ''}).${next ? ` The next lease ends by ${new Date(next.deadline).toISOString()}.` : ''} Try again later.`)
       }
+      const now = this.now()
+      const sessionEnd = now + policyMod.sessionMinutes(this.policy) * MINUTE_MS
       const lease = {
         leaseId: `l-${hex(6)}`, vmId: vm.vmId, vmName: vm.vmName, connId, ownerConn: connId, pid: c.pid, ending: null, children: new Set(),
-        deadline: this.now() + Math.round(minutes * MINUTE_MS), keepOnFailure: !!keepOnFailure,
-        kept: false, running: false, failed: false, runs: 0, dirty: false, network: false, reserve: 0
+        acquiredAt: now, sessionEnd, deadline: Math.min(sessionEnd, now + Math.round(minutes * MINUTE_MS)), keepOnFailure: !!keepOnFailure,
+        kept: false, running: false, failed: false, runs: 0, dirty: false, network: false, reserve: 0,
+        // What the helper knows of the guest's C:\build (vm_sync): the files it placed, by canonical key; gen moves on at
+        // every start, sync and the lease's end (a plan from an earlier gen is stale); trusted is false while an apply
+        // is unfinished or after one failed, when only a full sync or a reset may follow.
+        sync: { record: new Map(), gen: 0, trusted: false, plan: null }
       }
       this.leases.set(vm.vmId, lease)
       c.vmId = vm.vmId
       this.armDeadline(lease)
-      return { text: `Leased ${vm.vmName} (lease ${lease.leaseId}) until ${new Date(lease.deadline).toISOString()}. Call vm_start next; always vm_release when done.`, data: { lease: lease.leaseId, vm: vm.vmName, deadline: lease.deadline } }
+      return { text: `Leased ${vm.vmName} (lease ${lease.leaseId}) until ${new Date(lease.deadline).toISOString()}; vm_renew can extend it up to ${new Date(sessionEnd).toISOString()} (the policy's work-session cap). Call vm_start next; always vm_release when done.`, data: { lease: lease.leaseId, vm: vm.vmName, deadline: lease.deadline, sessionEnd } }
     })
   }
 
+  /**
+   * vm_renew: the lease's deadline becomes now + minutes (1 to maxLeaseMinutes), never past its session's end (acquire +
+   * the policy's maxSessionMinutes). Refused once the deadline has passed, even before its timer has fired, so an
+   * expired lease can't be brought back; and while the lease is ending.
+   */
+  renew(connId, { minutes = 60 } = {}) {
+    const lease = this.leaseOf(connId)
+    const now = this.now()
+    if (now >= lease.deadline) throw new Error(`This connection's lease on ${lease.vmName} has passed its deadline and is ending: it can't be renewed. vm_acquire again.`)
+    const max = this.policy.maxLeaseMinutes
+    if (!Number.isFinite(minutes) || minutes < 1 || minutes > max) throw new Error(`minutes must be 1-${max} (the policy's maxLeaseMinutes).`)
+    const want = now + Math.round(minutes * MINUTE_MS)
+    if (want > lease.sessionEnd) {
+      throw new Error(`That is past this work session's end, ${new Date(lease.sessionEnd).toISOString()} (the policy's maxSessionMinutes, ${policyMod.sessionMinutes(this.policy)} min from vm_acquire): at most ${Math.floor((lease.sessionEnd - now) / MINUTE_MS)} minutes now. Nothing was changed.`)
+    }
+    lease.deadline = want
+    this.armDeadline(lease)
+    return { text: `Renewed: ${lease.vmName} is yours until ${new Date(want).toISOString()} (the session ends by ${new Date(lease.sessionEnd).toISOString()}).`, data: { deadline: want, sessionEnd: lease.sessionEnd } }
+  }
+
   armDeadline(lease) {
-    clearTimeout(lease.timer)
+    if (lease.timer) { clearTimeout(lease.timer); this.timers.delete(lease.timer) }
     lease.timer = setTimeout(() => {
       this.timers.delete(lease.timer)
       void this.endLease(lease, 'its deadline passed')
@@ -299,6 +350,10 @@ class Helper {
     if (this.leases.get(lease.vmId) !== lease) return Promise.resolve({ ok: true, text: 'already released' })
     if (lease.ending) return lease.ending
     clearTimeout(lease.timer)
+    this.timers.delete(lease.timer)
+    lease.sync.gen++
+    lease.sync.trusted = false
+    lease.sync.plan = null
     // Its in-flight operations (a long vm_run, a copy) are killed now: the lease is over, and its VM's restore must not
     // wait for them. The guest side dies with the restore.
     for (const ch of lease.children) { try { ch.kill() } catch { /* gone */ } }
@@ -368,13 +423,19 @@ class Helper {
     }
   }
 
-  stageBegin(connId) {
+  /**
+   * Starts staging a build: for vm_start (no planId), or for a vm_sync plan (planId), whose staging takes exactly the
+   * plan's needed files, each once, at the plan's size and SHA-256 (hashed here as the bytes arrive, never taken on trust).
+   */
+  stageBegin(connId, { planId } = {}) {
     const lease = this.leaseOf(connId)
     const c = this.conns.get(connId)
+    let plan = null
+    if (planId !== undefined) plan = this.currentPlan(lease, planId)
     this.dropStage(c)
     const dir = join(this.dir, 'runs', lease.leaseId + '-' + hex(4), 'staging')
     fs.mkdirSync(dir, { recursive: true })
-    c.stage = { dir, files: 0, bytes: 0, current: null, done: false }
+    c.stage = { dir, files: 0, bytes: 0, current: null, done: false, plan, hashes: new Map() }
     return { text: 'staging' }
   }
 
@@ -384,12 +445,19 @@ class Helper {
     if (!st || st.done) throw new Error('no build being staged: stage_begin first')
     this.closeStaged(st)
     const parts = segments(path)
+    const key = keyOf(parts)
     if (!Number.isInteger(size) || size < 0) throw new Error('bad size')
+    if (st.hashes.has(key)) throw new Error(`${path}: staged twice (as ${st.hashes.get(key).path})`)
+    if (st.plan) {
+      const want = st.plan.need.get(key)
+      if (!want) throw new Error(`${path}: not one of the files sync plan ${st.plan.planId} needs`)
+      if (want.size !== size) throw new Error(`${path}: ${size} bytes, but the plan has ${want.size}: it changed while syncing. Call vm_sync again.`)
+    }
     if (st.bytes + size > this.policy.maxBuildMB * 1024 * 1024) throw new Error(`the build is over the policy's ${this.policy.maxBuildMB} MB`)
     if (++st.files > 100_000) throw new Error('the build has more than 100000 files')
     const file = join(st.dir, ...parts)
     fs.mkdirSync(join(file, '..'), { recursive: true })
-    st.current = { fd: fs.openSync(file, 'wx'), left: size, path }
+    st.current = { fd: fs.openSync(file, 'wx'), left: size, size, path: parts.join('\\'), key, hash: crypto.createHash('sha256') }
     st.bytes += size
     return { text: 'ok' }
   }
@@ -400,25 +468,143 @@ class Helper {
     const buf = Buffer.from(String(data), 'base64')
     if (buf.length > CHUNK_MAX || buf.length > st.current.left) throw new Error(`${st.current.path}: more bytes than its size`)
     fs.writeSync(st.current.fd, buf)
+    st.current.hash.update(buf)
     st.current.left -= buf.length
     return { text: 'ok' }
   }
 
   closeStaged(st) {
     if (!st.current) return
-    fs.closeSync(st.current.fd)
-    const short = st.current.left
-    const p = st.current.path
+    const cur = st.current
     st.current = null
-    if (short) throw new Error(`${p}: ${short} bytes short of its size`)
+    fs.closeSync(cur.fd)
+    if (cur.left) throw new Error(`${cur.path}: ${cur.left} bytes short of its size`)
+    const sha256 = cur.hash.digest('hex')
+    if (st.plan && st.plan.need.get(cur.key).sha256 !== sha256) throw new Error(`${cur.path}: its content isn't what the plan hashed: it changed while syncing. Call vm_sync again.`)
+    st.hashes.set(cur.key, { path: cur.path, size: cur.size, sha256 })
   }
 
   stageEnd(connId) {
     const st = this.conns.get(connId)?.stage
     if (!st) throw new Error('no build being staged')
     this.closeStaged(st)
+    if (st.plan) {
+      const missing = [...st.plan.need].filter(([k]) => !st.hashes.has(k)).map(([, f]) => f.path)
+      if (missing.length) throw new Error(`sync plan ${st.plan.planId} needs ${missing.length} file(s) not staged: ${missing.slice(0, 10).join(', ')}${missing.length > 10 ? ', …' : ''}`)
+    }
     st.done = true
     return { text: `staged ${st.files} files, ${st.bytes} bytes`, data: { files: st.files, bytes: st.bytes } }
+  }
+
+  // ---------- warm sessions: sync ----------
+
+  /** The lease's current sync plan, if planId names it and it is still current (same lease, same gen); else throws. */
+  currentPlan(lease, planId) {
+    const p = lease.sync.plan
+    if (typeof planId !== 'string' || !p || p.planId !== planId) throw new Error(`Sync plan ${planId} is not this lease's current plan (replaced by a newer one, or used): call vm_sync again.`)
+    if (p.leaseId !== lease.leaseId || p.gen !== lease.sync.gen) throw new Error(`Sync plan ${planId} is stale (the VM was started, reset or synced since): call vm_sync again.`)
+    return p
+  }
+
+  /**
+   * sync_plan: compares the build's manifest (the server's walk of an allowed folder: [{ path, size, sha256 }]) with
+   * what the helper placed in C:\build, and returns the plan: the files it needs (new or changed) and the ones to remove
+   * (in the record, gone from the manifest; with delete, the default). full: everything, into a cleared C:\build.
+   */
+  syncPlan(connId, { files, full = false, delete: del = true } = {}) {
+    const lease = this.leaseOf(connId)
+    if (lease.kept) throw new Error(`${lease.vmName} is kept for inspection: vm_release it first.`)
+    if (!lease.running) throw new Error('The VM is not running: vm_start it first (a sync copies into the running guest).')
+    if (!Array.isArray(files) || files.length > 100_000) throw new Error('files must be a list of at most 100000 entries')
+    const manifest = new Map()
+    let bytes = 0
+    for (const f of files) {
+      if (!f || typeof f !== 'object') throw new Error('each file must be { path, size, sha256 }')
+      let parts
+      try { parts = segments(f.path) } catch (e) { throw new Error(`"${f.path}": ${e.message}`) }
+      if (!Number.isInteger(f.size) || f.size < 0) throw new Error(`"${f.path}": bad size`)
+      if (typeof f.sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(f.sha256)) throw new Error(`"${f.path}": bad sha256`)
+      const key = keyOf(parts)
+      if (manifest.has(key)) throw new Error(`"${f.path}" and "${manifest.get(key).path}" are the same file on Windows (case and slashes don't count)`)
+      manifest.set(key, { path: parts.join('\\'), size: f.size, sha256: f.sha256 })
+      bytes += f.size
+    }
+    if (bytes > this.policy.maxBuildMB * 1024 * 1024) throw new Error(`the build is over the policy's ${this.policy.maxBuildMB} MB`)
+    const clash = ancestorClash(manifest, manifest)
+    if (clash) throw new Error(`"${clash[0]}" is a file, and also a folder of "${clash[1]}": refused`)
+    const s = lease.sync
+    if (!full && !s.trusted) throw new Error('The last sync or start didn\'t finish, so C:\\build may be partly changed: use vm_sync with full: true (recopies everything), or vm_reset.')
+    const need = new Map()
+    const remove = []
+    if (full) {
+      for (const [k, f] of manifest) need.set(k, f)
+    } else {
+      for (const [k, f] of manifest) { const r = s.record.get(k); if (!r || r.size !== f.size || r.sha256 !== f.sha256) need.set(k, f) }
+      const gone = new Map([...s.record].filter(([k]) => !manifest.has(k)))
+      if (del) for (const r of gone.values()) remove.push(r.path)
+      else {
+        // Kept files stay in the record (a later delete:true removes them); one in the way of the new build can't stay.
+        const c1 = ancestorClash(gone, manifest) // [kept, new]
+        const c2 = ancestorClash(manifest, gone) // [new, kept]
+        const [kept, fresh] = c1 || (c2 && [c2[1], c2[0]]) || []
+        if (kept) throw new Error(`with delete: false, "${kept}" (kept) and "${fresh}" (new) can't both be there: sync with delete: true, or full: true. Nothing was changed.`)
+      }
+    }
+    const plan = { planId: `sp-${hex(8)}`, leaseId: lease.leaseId, gen: s.gen, full: !!full, delete: !!del, need, remove, manifest }
+    s.plan = plan // replaces any earlier plan
+    return {
+      text: `Sync plan ${plan.planId}: ${need.size} file(s) to copy, ${full ? 'C:\\build cleared first' : `${remove.length} to remove, ${manifest.size - need.size} unchanged`}.`,
+      data: { planId: plan.planId, need: [...need.values()].map(f => f.path), remove: remove.length, unchanged: full ? 0 : manifest.size - need.size }
+    }
+  }
+
+  /**
+   * sync: applies the current plan to the running guest (guest-sync.ps1 through hv.ps1's sync-in), without a restore.
+   * Rechecked inside the VM's lock. C:\build is untrusted from the first change until the apply finishes: a failure,
+   * a timeout or the lease ending leaves it untrusted, and only a full sync or a reset may follow.
+   */
+  async sync(connId, { planId } = {}) {
+    const lease = this.leaseOf(connId)
+    const c = this.conns.get(connId)
+    const vm = this.vmOf(lease)
+    return this.vmLock(vm.vmId)(async () => {
+      this.stillHeld(lease)
+      if (lease.kept || !lease.running) throw new Error('The VM is not running: vm_start it first.')
+      const plan = this.currentPlan(lease, planId)
+      const st = c.stage
+      if (plan.need.size && !(st && st.plan === plan && st.done)) throw new Error(`Sync plan ${plan.planId}'s files aren't all staged: stage them first.`)
+      const s = lease.sync
+      s.plan = null
+      s.trusted = false
+      const gen = ++s.gen
+      const t0 = this.now()
+      try {
+        const creds = this.creds()
+        const r = await this.hv('sync-in', {
+          ...this.ident(vm), cred: creds.admin, source: plan.need.size ? st.dir : null, guestStage: `C:\\hvmcp\\sync-${gen}`,
+          files: [...plan.need.values()].map(f => f.path), remove: plan.remove, full: plan.full, delete: plan.delete
+        }, this.forLease(lease, 30 * 60_000))
+        this.stillHeld(lease)
+        if (plan.full) s.record = new Map(plan.manifest)
+        else {
+          for (const p of plan.remove) {
+            const k = keyOf(segments(p))
+            for (const rk of [...s.record.keys()]) if (rk === k || rk.startsWith(k + '\\')) s.record.delete(rk)
+          }
+          for (const [k, f] of plan.need) s.record.set(k, f)
+        }
+        s.trusted = true
+        const copied = Number(r.copied) || 0
+        return {
+          text: `Synced into ${vm.vmName}'s C:\\build without a restore: ${copied} file(s) copied (${[...plan.need.values()].reduce((n, f) => n + f.size, 0)} bytes), ${plan.full ? 'after clearing it' : `${Number(r.removed) || 0} removed, ${plan.manifest.size - plan.need.size} unchanged`}; ${((this.now() - t0) / 1000).toFixed(1)} s. C:\\out and everything else in the guest are as the last run left them.`,
+          data: { copied, removed: Number(r.removed) || 0, full: plan.full }
+        }
+      } catch (e) {
+        throw new Error(`The sync failed (${e.message}). C:\\build may be partly changed: the next vm_sync must be full: true, or vm_reset.`)
+      } finally {
+        if (c.stage && c.stage.plan === plan) this.dropStage(c)
+      }
+    })
   }
 
   // ---------- runs ----------
@@ -430,6 +616,7 @@ class Helper {
     if (network && !this.policy.allowNetwork) throw new Error('The policy does not allow networking.')
     if (network && this.state.switch?.phase !== 'created') throw new Error('The pool has no internal switch: create the pool with network on to use networking.')
     if (!Number.isInteger(reserveCpu) || reserveCpu < 0 || reserveCpu > this.policy.maxReservePercent) throw new Error(`reserveCpu must be a whole percentage, 0-${this.policy.maxReservePercent} (the policy's cap).`)
+    if (c.stage?.plan) this.dropStage(c) // a sync's partial staging is never a start's build
     if (c.stage && !c.stage.done) throw new Error('the build is still being staged')
     const vm = this.vmOf(lease)
     return this.vmLock(vm.vmId)(async () => {
@@ -437,6 +624,13 @@ class Helper {
       const t0 = this.now()
       lease.running = false
       lease.failed = false
+      // C:\build is the clean checkpoint's (empty) once restored, then the build's: untrusted until the copy finishes,
+      // so a failed start leaves no earlier record usable. Any sync plan is stale from here.
+      const s = lease.sync
+      s.gen++
+      s.plan = null
+      s.trusted = false
+      s.record = new Map()
       const r = await this.restore(vm) // unconditionally, before every run
       if (!r.ok) { lease.dirty = true; throw new Error(`${r.text} The start was refused.`) }
       const tRestore = this.now()
@@ -458,8 +652,10 @@ class Helper {
         const res = await this.hv('copy-in', { ...this.ident(vm), cred: creds.admin, userName: creds.user.user, source: c.stage.dir }, this.forLease(lease, 30 * 60_000))
         this.stillHeld(lease)
         build = `build copied in to C:\\build (${c.stage.files} files, ${c.stage.bytes} bytes${res.ms ? `, ${(res.ms / 1000).toFixed(1)} s` : ''})`
+        s.record = new Map(c.stage.hashes)
         this.dropStage(c)
       }
+      s.trusted = true
       return {
         text: `Started ${vm.vmName} from its clean checkpoint: restore ${((tRestore - t0) / 1000).toFixed(1)} s, guest ready after ${(waited / 1000).toFixed(1)} s; ${build}; network ${network ? `ON (internal switch ${this.state.switch.name})` : 'off'}; CPU reserve ${reserveCpu}%. C:\\out is empty. Deadline ${new Date(lease.deadline).toISOString()}.`,
         data: { vm: vm.vmName, network: !!network, reserveCpu }
@@ -572,6 +768,7 @@ class Helper {
     const r = await this.vmLock(vm.vmId)(() => { this.stillHeld(lease); return this.restore(vm) })
     lease.running = false
     lease.dirty = !r.ok
+    Object.assign(lease.sync, { gen: lease.sync.gen + 1, plan: null, trusted: false, record: new Map() })
     return { text: r.ok ? `Reverted: ${r.text}` : r.text, isError: !r.ok }
   }
 
@@ -591,7 +788,7 @@ class Helper {
       const l = this.leases.get(v.vmId)
       const state = s.quarantined.has(v.vmId) ? `QUARANTINED (${s.quarantined.get(v.vmId)})`
         : v.removing ? 'removing' : !v.ready ? 'creating'
-          : l ? `leased${l.kept ? ', kept for inspection' : ''}${l.running ? ', running' : ''} until ${new Date(l.deadline).toISOString()}` : 'free'
+          : l ? `leased${l.kept ? ', kept for inspection' : ''}${l.running ? ', running' : ''} until ${new Date(l.deadline).toISOString()} (session ends by ${new Date(l.sessionEnd).toISOString()})` : 'free'
       return `- ${v.vmName}: ${v.cores} cores, ${v.memoryMB} MB, ${v.diskGB} GB disk; ${state}${v.vmId === mine ? ' (yours)' : ''}${expiry(v, this.now())}`
     })
     const img = [...s.images.values()].at(-1)
@@ -602,7 +799,7 @@ class Helper {
       this.imageJob ? `Image: ${this.imageJob.progress}` : this.lastImage ? `Image: ${this.lastImage}` : null,
       this.quiesced ? `Quiesced for uninstall: no new leases${this.quiesced.allowRemove ? '; only an approved remove of the pool' : '; no pool changes'}.` : null,
       this.recovery?.length ? `At start-up: ${this.recovery.join(' ')}` : null,
-      `Policy: up to ${this.policy.maxVms} VMs, ${this.policy.maxCoresPerVm} cores each, ${this.policy.maxMemoryMBTotal} MB in all, ${this.policy.maxDiskGBPerVm} GB disks, in ${this.policy.diskFolders.join('; ')}; network ${this.policy.allowNetwork ? 'allowed (internal switch only)' : 'not allowed'}; CPU reserve up to ${this.policy.maxReservePercent}%; leases up to ${this.policy.maxLeaseMinutes} min.`,
+      `Policy: up to ${this.policy.maxVms} VMs, ${this.policy.maxCoresPerVm} cores each, ${this.policy.maxMemoryMBTotal} MB in all, ${this.policy.maxDiskGBPerVm} GB disks, in ${this.policy.diskFolders.join('; ')}; network ${this.policy.allowNetwork ? 'allowed (internal switch only)' : 'not allowed'}; CPU reserve up to ${this.policy.maxReservePercent}%; leases up to ${this.policy.maxLeaseMinutes} min at a time, renewable to ${policyMod.sessionMinutes(this.policy)} min per work session${this.policy.maxSessionMinutes === undefined ? ' (the default)' : ''}.`,
       `Build folders set by an admin (install.ps1 -BuildRoot): ${this.policy.buildRoots.length ? this.policy.buildRoots.join('; ') : 'none'}.`
     ]
     return { text: lines.filter(Boolean).join('\n'), data: { vms: s.vms.size, job: this.job ? this.job.op : null, epoch: this.journal.epoch, connections: this.conns.size, lastJob: this.lastJob } }
@@ -891,7 +1088,10 @@ class Helper {
     switch (op) {
       case 'status': return this.status(connId)
       case 'acquire': return this.acquire(connId, args)
-      case 'stage_begin': return this.stageBegin(connId)
+      case 'renew': return this.renew(connId, args)
+      case 'sync_plan': return this.syncPlan(connId, args)
+      case 'sync': return this.sync(connId, args)
+      case 'stage_begin': return this.stageBegin(connId, args)
       case 'stage_file': return this.stageFile(connId, args)
       case 'stage_chunk': return this.stageChunk(connId, args)
       case 'stage_end': return this.stageEnd(connId)
@@ -911,7 +1111,7 @@ class Helper {
   }
 }
 
-const PROTOCOL = 'hyperv-mcp/1'
+const PROTOCOL = 'hyperv-mcp/2' // 2: renew, sync_plan, sync (MC-1497)
 const EVAL_DAYS = 90
 const DAY_MS = 24 * 60 * 60 * 1000
 
@@ -954,4 +1154,4 @@ function describePlan(plan, digest, approve) {
   return lines.join('\n')
 }
 
-module.exports = { Helper, canonical, baselineProblem, expiry, PLAN_ID_RE, PROTOCOL }
+module.exports = { Helper, canonical, baselineProblem, expiry, keyOf, ancestorClash, PLAN_ID_RE, PROTOCOL }

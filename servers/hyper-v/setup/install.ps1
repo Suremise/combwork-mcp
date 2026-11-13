@@ -15,6 +15,8 @@
 # Direct mode (-Mode Direct) installs no service: it adds -User to Hyper-V Administrators instead, so any program you
 # run, agents included, can drive Hyper-V without the server's rules. Read the README before choosing it.
 #
+# -MaxSessionMinutes caps a work session (vm_renew can extend a lease up to it, from vm_acquire): 5-1440 and at least
+# -MaxLeaseMinutes. Left out, the helper uses 480 (or -MaxLeaseMinutes, if that is more).
 # It is idempotent: run it again to update the helper or change the policy. It keeps an existing pool and its state.
 # It never enables Windows features or restarts the PC: if Hyper-V is off, it says how to turn it on and stops.
 param(
@@ -28,6 +30,7 @@ param(
   [bool]$AllowNetwork = $true,
   [int]$MaxReservePercent = 100,
   [int]$MaxLeaseMinutes = 240,
+  [int]$MaxSessionMinutes = 0,
   [int]$MaxBuildMB = 2048,
   [switch]$AllowUnpinnedIso,
   [string[]]$BuildRoot = @()
@@ -95,6 +98,8 @@ $buildRoots = @($BuildRoot | Where-Object { $_ } | ForEach-Object {
 } | Select-Object -Unique)
 # The helper's policy check allows at most 16 (helper/policy.js): refuse more here, before anything changes.
 if ($buildRoots.Count -gt 16) { throw "At most 16 build roots: $($buildRoots.Count) were given." }
+# The helper refuses a policy whose session cap is below one lease (helper/policy.js): refuse it here first.
+if ($MaxSessionMinutes -and ($MaxSessionMinutes -lt 5 -or $MaxSessionMinutes -gt 1440 -or $MaxSessionMinutes -lt $MaxLeaseMinutes)) { throw "-MaxSessionMinutes must be 5-1440 and at least -MaxLeaseMinutes ($MaxLeaseMinutes)." }
 $pins = New-Object Collections.ArrayList
 $receipts = $null
 try {
@@ -146,7 +151,7 @@ $bad = @(Test-ExclusiveAcl $install -Allowed $SYSTEM, $ADMINS, $USERS -Writers $
 if ($bad.Count) { throw "$install isn't admin-only after setting its ACL: $($bad -join '; ')" }
 # Nothing earlier in it is kept: every file the service runs is copied fresh below (a stray file could be loaded instead).
 Get-ChildItem -LiteralPath $install -Force | Remove-Item -Recurse -Force
-foreach ($f in 'core.js', 'helper.js', 'hv.js', 'hv.ps1', 'images.js', 'iso.js', 'journal.js', 'paths.js', 'policy.js', 'unattend.js', 'approve.ps1') {
+foreach ($f in 'core.js', 'helper.js', 'hv.js', 'hv.ps1', 'guest-sync.ps1', 'images.js', 'iso.js', 'journal.js', 'paths.js', 'policy.js', 'unattend.js', 'approve.ps1') {
   Copy-Item -LiteralPath (Join-Path $src "helper\$f") -Destination (Join-Path $install $f) -Force
 }
 Copy-Item -LiteralPath (Join-Path $src 'meta.json') -Destination (Join-Path $install 'meta.json') -Force
@@ -195,6 +200,7 @@ $policy = [ordered]@{
   allowUnpinnedIso = [bool]$AllowUnpinnedIso
   buildRoots = @($buildRoots)
 }
+if ($MaxSessionMinutes) { $policy.maxSessionMinutes = $MaxSessionMinutes }
 $policyFile = Join-Path $state 'policy.json'
 Write-SecureFile $policyFile ($policy | ConvertTo-Json -Depth 4) @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=ReadAndExecute") $ADMINS
 
@@ -207,7 +213,7 @@ foreach ($d in $folders) { $bad += @(Test-ExclusiveAcl $d -Allowed $SYSTEM, $ADM
 if ($bad.Count) { throw "The helper's folders aren't as setup made them: $($bad -join '; ')" }
 Step "State in $state; VM disks in $($folders -join ', '); ACLs checked."
 Step "Build folders set by an admin (beside each client's MCP roots): $(if ($buildRoots.Count) { $buildRoots -join '; ' } else { 'none' })."
-Step ("Policy: up to {0} VMs, {1} cores each, {2} GB memory in all, {3} GB disks; network {4}; unpinned ISOs {5}." -f $policy.maxVms, $policy.maxCoresPerVm, ($policy.maxMemoryMBTotal / 1024), $policy.maxDiskGBPerVm, $(if ($AllowNetwork) { 'allowed (internal switch only)' } else { 'not allowed' }), $(if ($AllowUnpinnedIso) { 'allowed' } else { 'refused' }))
+Step ("Policy: up to {0} VMs, {1} cores each, {2} GB memory in all, {3} GB disks; network {4}; unpinned ISOs {5}; leases up to {6} min, work sessions up to {7} min." -f $policy.maxVms, $policy.maxCoresPerVm, ($policy.maxMemoryMBTotal / 1024), $policy.maxDiskGBPerVm, $(if ($AllowNetwork) { 'allowed (internal switch only)' } else { 'not allowed' }), $(if ($AllowUnpinnedIso) { 'allowed' } else { 'refused' }), $MaxLeaseMinutes, $(if ($MaxSessionMinutes) { $MaxSessionMinutes } else { [Math]::Max($MaxLeaseMinutes, 480) }))
 
 # 8. Start.
 if ($Mode -eq 'Service') {

@@ -28,7 +28,7 @@ test('tools, instructions and the kill switch', async t => {
   assert.strictEqual(init.result.serverInfo.name, 'hyper-v')
   assert.match(init.result.instructions, /turned off/)
   const list = await off.request('tools/list')
-  assert.deepStrictEqual(list.result.tools.map(x => x.name), ['vm_acquire', 'vm_start', 'vm_run', 'vm_read_out', 'vm_stop', 'vm_release', 'vm_status', 'pool_plan', 'pool_create', 'pool_resize', 'pool_remove', 'pool_status'])
+  assert.deepStrictEqual(list.result.tools.map(x => x.name), ['vm_acquire', 'vm_start', 'vm_renew', 'vm_sync', 'vm_reset', 'vm_run', 'vm_read_out', 'vm_stop', 'vm_release', 'vm_status', 'pool_plan', 'pool_create', 'pool_resize', 'pool_remove', 'pool_status'])
   assert.match((await off.call('vm_acquire')).text, /turned off: set HYPERV_MCP_ENABLED=1/)
   assert.match((await off.call('vm_status')).text, /Mode: direct.*TURNED OFF/)
   assert.ok(fs.existsSync(sc.stateDir))
@@ -169,4 +169,7 @@ test('a helper from before admin-set build folders: none are used, and status sa
   t.after(() => s.close())
   assert.match((await s.call('vm_status')).text, /set by an admin: none \(the helper predates them: run setup again/)
   assert.match((await s.call('vm_start', { build: path.join(sc.dir, 'outside') })).text, /not under an allowed folder.*predates them/)
+  // Nor the warm-session operations: the tools say to update it, and status names the protocol gap.
+  assert.match((await s.call('vm_status')).text, /The helper speaks hyperv-mcp\/1, this server hyperv-mcp\/2: run setup again/)
+  assert.match((await s.call('vm_renew', { minutes: 10 })).text, /predates warm sessions .*run setup again/)
 })

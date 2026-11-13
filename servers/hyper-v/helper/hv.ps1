@@ -258,6 +258,28 @@ try {
       } finally { Remove-PSSession $s }
       @{ ms = [int]((Get-Date) - $t0).TotalMilliseconds }
     }
+    'sync-in' {
+      # vm_sync: into the running guest's C:\build without a restore. The staged files go to a fresh guest staging
+      # folder (PowerShell Direct, no share); guest-sync.ps1, a fixed file beside this one, checks every path and moves
+      # them into place, never following a link. Only C:\build and the staging under C:\hvmcp are touched.
+      $vm = Get-OwnVm $a
+      if ($vm.State -ne 'Running') { throw 'the VM is not running' }
+      if ([string]$a.guestStage -notmatch '^C:\\hvmcp\\sync-\d{1,9}$') { throw 'bad guest staging folder' }
+      $sync = [scriptblock]::Create([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'guest-sync.ps1')))
+      $t0 = Get-Date
+      $s = New-PSSession -VMId $vm.Id -Credential (Cred $a.cred)
+      try {
+        $files = @(@($a.files) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
+        if ($files.Count) {
+          [void](Invoke-Command -Session $s -ScriptBlock $sync -ArgumentList @{ action = 'prepare'; stage = [string]$a.guestStage })
+          $items = @(Get-ChildItem -LiteralPath ([string]$a.source) -Force)
+          if ($items.Count) { Copy-Item -ToSession $s -Path $items.FullName -Destination ([string]$a.guestStage) -Recurse -Force }
+        }
+        $j = @{ action = 'apply'; root = 'C:\build'; stage = [string]$a.guestStage; files = $files; remove = @(@($a.remove) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ }); full = [bool]$a.full; delete = [bool]$a.delete }
+        $r = Invoke-Command -Session $s -ScriptBlock $sync -ArgumentList $j
+      } finally { Remove-PSSession $s }
+      @{ ms = [int]((Get-Date) - $t0).TotalMilliseconds; copied = [int]$r.copied; removed = [int]$r.removed }
+    }
     'guest-run' {
       $vm = Get-OwnVm $a
       $j = @{ n = [int]$a.n; command = [string]$a.command; shell = [string]$a.shell; cwd = [string]$a.cwd; timeoutSec = [int]$a.timeoutSec; cap = [int]$a.cap }

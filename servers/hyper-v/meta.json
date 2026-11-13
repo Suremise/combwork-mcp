@@ -1,6 +1,6 @@
 {
-  "version": "1.0.2",
-  "description": "Disposable Hyper-V test VMs from a pool: several agents at once, each run from a clean checkpoint.",
+  "version": "1.1.0",
+  "description": "Disposable Hyper-V test VMs from a pool: several agents at once, each run from a clean checkpoint, or kept warm for a work session with only changed files synced in.",
   "tags": ["testing", "windows", "hyper-v", "vm"],
   "requires": {
     "os": ["windows"],
