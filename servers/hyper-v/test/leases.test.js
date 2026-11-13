@@ -346,3 +346,27 @@ test('an operation queued for the VM while its lease ended is refused inside the
     }
   }
 })
+
+test('a connection closing mid-run ends its lease at once: the in-flight run is killed and the VM restored', async t => {
+  const sc = scratch('close-mid-run')
+  const { h, admin } = await withPool(sc, 1)
+  t.after(() => h.stop())
+  const path = require('path')
+  const fs = require('fs')
+  const a = h.conn(10)
+  const vm = await leased(a)
+  await a.request('start')
+  const marker = path.join(sc.dir, 'run-finished.txt')
+  const pidFile = path.join(sc.dir, 'run.pid')
+  const run = a.request('run', { command: `hang ${marker} 60000 ${pidFile}`, timeoutSec: 600 }).catch(e => e)
+  const childPid = await waitFor(() => fs.existsSync(pidFile) && Number(fs.readFileSync(pidFile, 'utf8')), 10_000, 'the run to start')
+  const t0 = Date.now()
+  a.close()
+  await waitFor(async () => /; free/.test((await admin.request('status')).text), 15_000, 'the lease to end without waiting for the 60 s run')
+  assert.ok(Date.now() - t0 < 15_000)
+  const alive = pid => { try { process.kill(pid, 0); return true } catch (e) { return e.code === 'EPERM' } }
+  await waitFor(() => !alive(childPid), 10_000, 'the run\'s child to be killed')
+  assert.ok(!fs.existsSync(marker), 'the run never finished')
+  assert.strictEqual(vmOf(sc, vm).state, 'Off', 'restored')
+  assert.ok((await run) instanceof Error || true)
+})

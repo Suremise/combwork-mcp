@@ -74,25 +74,64 @@ $GuestRun = {
   [IO.File]::WriteAllText($script, [string]$j.command, (New-Object Text.UTF8Encoding $false))
   $inner = if ($ext -eq 'ps1') { "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$script`"" } else { "cmd.exe /d /c `"$script`"" }
   $wrapper = "$dir\wrap-$n.cmd"
-  [IO.File]::WriteAllText($wrapper, "@echo off`r`ncd /d `"$($j.cwd)`" 2>nul`r`n$inner > `"$base.stdout.txt`" 2> `"$base.stderr.txt`"`r`necho %ERRORLEVEL%> `"$base.exit`"`r`n", (New-Object Text.ASCIIEncoding))
+  # The exit code is written with the redirection first: "echo 0> file" would redirect handle 0 (cmd treats a digit
+  # before > as a handle number) and leave the file empty.
+  [IO.File]::WriteAllText($wrapper, "@echo off`r`ncd /d `"$($j.cwd)`" 2>nul`r`n$inner > `"$base.stdout.txt`" 2> `"$base.stderr.txt`"`r`n> `"$base.exit`" echo %ERRORLEVEL%`r`n", (New-Object Text.ASCIIEncoding))
   Remove-Item "$base.exit" -ErrorAction SilentlyContinue
+  $exitCode = {
+    try { $t = [IO.File]::ReadAllText("$base.exit").Trim() } catch { return $null }
+    if ($t -match '^-?\d{1,10}$') { return [int]$t } else { return $null }
+  }
   $timedOut = $false; $killed = $false; $procId = $null
   if ($j.runAs) {
+    # The standard user runs through a one-off scheduled task, which needs "Log on as a batch job" (not granted to
+    # Users by default): granted here, inside this disposable guest only.
+    if (-not ('HvMcpLsa' -as [type])) {
+      Add-Type -TypeDefinition @'
+using System; using System.ComponentModel; using System.Runtime.InteropServices; using System.Security.Principal;
+public static class HvMcpLsa {
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct LSA_UNICODE_STRING { public ushort Length; public ushort MaximumLength; public string Buffer; }
+  [StructLayout(LayoutKind.Sequential)] struct LSA_OBJECT_ATTRIBUTES { public int Length; public IntPtr RootDirectory; public IntPtr ObjectName; public uint Attributes; public IntPtr SecurityDescriptor; public IntPtr SecurityQualityOfService; }
+  [DllImport("advapi32.dll")] static extern uint LsaOpenPolicy(IntPtr system, ref LSA_OBJECT_ATTRIBUTES attrs, uint access, out IntPtr handle);
+  [DllImport("advapi32.dll")] static extern uint LsaAddAccountRights(IntPtr handle, byte[] sid, LSA_UNICODE_STRING[] rights, uint count);
+  [DllImport("advapi32.dll")] static extern uint LsaClose(IntPtr handle);
+  [DllImport("advapi32.dll")] static extern int LsaNtStatusToWinError(uint status);
+  public static void Grant(string account, string right) {
+    var sid = (SecurityIdentifier)new NTAccount(account).Translate(typeof(SecurityIdentifier));
+    var b = new byte[sid.BinaryLength]; sid.GetBinaryForm(b, 0);
+    var attrs = new LSA_OBJECT_ATTRIBUTES(); IntPtr h;
+    uint st = LsaOpenPolicy(IntPtr.Zero, ref attrs, 0x000F0FFF, out h);
+    if (st != 0) throw new Win32Exception(LsaNtStatusToWinError(st));
+    try {
+      var r = new LSA_UNICODE_STRING { Buffer = right, Length = (ushort)(right.Length * 2), MaximumLength = (ushort)(right.Length * 2 + 2) };
+      st = LsaAddAccountRights(h, b, new[] { r }, 1);
+      if (st != 0) throw new Win32Exception(LsaNtStatusToWinError(st));
+    } finally { LsaClose(h); }
+  }
+}
+'@
+    }
+    [HvMcpLsa]::Grant([string]$j.runAs.user, 'SeBatchLogonRight')
     $task = "hvmcp-run-$n"
     $act = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument "/d /c `"$wrapper`""
     Register-ScheduledTask -TaskName $task -Action $act -User ([string]$j.runAs.user) -Password ([string]$j.runAs.password) -RunLevel Limited -Force | Out-Null
     Start-ScheduledTask -TaskName $task
     $deadline = (Get-Date).AddSeconds([int]$j.timeoutSec)
-    while (-not (Test-Path "$base.exit") -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
-    if (-not (Test-Path "$base.exit")) { $timedOut = $true; Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue; $killed = $true }
+    while ($null -eq (& $exitCode) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
+    if ($null -eq (& $exitCode)) {
+      $timedOut = $true
+      Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
+      $killed = ((Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue).State -ne 'Running')
+    }
     Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
   } else {
     $p = Start-Process -FilePath 'cmd.exe' -ArgumentList "/d /c `"$wrapper`"" -PassThru -WindowStyle Hidden
     $procId = $p.Id
     if (-not $p.WaitForExit([int]$j.timeoutSec * 1000)) {
       $timedOut = $true
-      & taskkill.exe /T /F /PID $procId 2>&1 | Out-Null
-      $killed = $true
+      # Through cmd, so taskkill's own messages can't become PowerShell errors; killed only once the process is gone.
+      & cmd.exe /d /c "taskkill /T /F /PID $procId >nul 2>&1"
+      $killed = $p.WaitForExit(10000)
     }
   }
   $read = {
@@ -102,8 +141,7 @@ $GuestRun = {
     try { $len = [Math]::Min($fs.Length, [long]$j.cap); $b = New-Object byte[] $len; [void]$fs.Read($b, 0, $len); return @([Text.Encoding]::UTF8.GetString($b), ($fs.Length -gt $len)) } finally { $fs.Close() }
   }
   $o = & $read "$base.stdout.txt"; $e = & $read "$base.stderr.txt"
-  $code = $null
-  if (Test-Path "$base.exit") { $t = (Get-Content "$base.exit" -Raw).Trim(); if ($t -match '^-?\d{1,10}$') { $code = [int]$t } }
+  $code = & $exitCode
   @{ exitCode = $code; timedOut = $timedOut; killed = $killed; stdout = $o[0]; stdoutCut = $o[1]; stderr = $e[0]; stderrCut = $e[1] }
 }
 

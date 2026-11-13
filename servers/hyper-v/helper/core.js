@@ -217,6 +217,11 @@ class Helper {
    * queued for the lock while its lease ended (deadline, disconnect, release) must not act on a VM that is being
    * restored, or has been handed to someone else.
    */
+  /** hv options that register the operation's PowerShell with the lease, so ending the lease can kill it. */
+  forLease(lease, timeoutMs = 120_000) {
+    return { timeoutMs, onChild: ch => { lease.children.add(ch); ch.on('exit', () => lease.children.delete(ch)) } }
+  }
+
   stillHeld(lease) {
     if (this.leases.get(lease.vmId) !== lease || lease.ending) throw new Error(`This connection's lease on ${lease.vmName} ended while the request waited: call vm_acquire again.`)
   }
@@ -250,7 +255,7 @@ class Helper {
         throw new Error(`No VM is free (${ready.length} in the pool${s.quarantined.size ? `, ${s.quarantined.size} quarantined` : ''}).${next ? ` The next lease ends by ${new Date(next.deadline).toISOString()}.` : ''} Try again later.`)
       }
       const lease = {
-        leaseId: `l-${hex(6)}`, vmId: vm.vmId, vmName: vm.vmName, connId, ownerConn: connId, pid: c.pid, ending: null,
+        leaseId: `l-${hex(6)}`, vmId: vm.vmId, vmName: vm.vmName, connId, ownerConn: connId, pid: c.pid, ending: null, children: new Set(),
         deadline: this.now() + Math.round(minutes * MINUTE_MS), keepOnFailure: !!keepOnFailure,
         kept: false, running: false, failed: false, runs: 0, dirty: false, network: false, reserve: 0
       }
@@ -279,6 +284,9 @@ class Helper {
     if (this.leases.get(lease.vmId) !== lease) return Promise.resolve({ ok: true, text: 'already released' })
     if (lease.ending) return lease.ending
     clearTimeout(lease.timer)
+    // Its in-flight operations (a long vm_run, a copy) are killed now: the lease is over, and its VM's restore must not
+    // wait for them. The guest side dies with the restore.
+    for (const ch of lease.children) { try { ch.kill() } catch { /* gone */ } }
     lease.ending = (async () => {
       const vm = this.state.vms.get(lease.vmId)
       let r = { ok: true, text: `${lease.vmName} restored to clean.` }
@@ -411,7 +419,7 @@ class Helper {
       if (waited === null) throw new Error(`${vm.vmName} started but its guest didn't answer within ${Math.round(READY_WAIT_MS / 1000)} s. vm_stop it and try again.`)
       let build = 'no build'
       if (c.stage?.done) {
-        const res = await this.hv('copy-in', { ...this.ident(vm), cred: creds.admin, userName: creds.user.user, source: c.stage.dir }, { timeoutMs: 30 * 60_000 })
+        const res = await this.hv('copy-in', { ...this.ident(vm), cred: creds.admin, userName: creds.user.user, source: c.stage.dir }, this.forLease(lease, 30 * 60_000))
         build = `build copied in to C:\\build (${c.stage.files} files, ${c.stage.bytes} bytes${res.ms ? `, ${(res.ms / 1000).toFixed(1)} s` : ''})`
         this.dropStage(c)
       }
@@ -452,7 +460,7 @@ class Helper {
       this.stillHeld(lease)
       const n = ++lease.runs
       const creds = this.creds()
-      const r = await this.hv('guest-run', { ...this.ident(vm), cred: creds.admin, runAs: as === 'user' ? creds.user : null, n, command, shell, timeoutSec, cwd: cwd || 'C:\\build', cap: OUTPUT_CAP }, { timeoutMs: (timeoutSec + 120) * 1000 })
+      const r = await this.hv('guest-run', { ...this.ident(vm), cred: creds.admin, runAs: as === 'user' ? creds.user : null, n, command, shell, timeoutSec, cwd: cwd || 'C:\\build', cap: OUTPUT_CAP }, this.forLease(lease, (timeoutSec + 120) * 1000))
       const exit = Number.isInteger(r.exitCode) ? r.exitCode : null
       if (r.timedOut || exit !== 0) lease.failed = true
       const out = s => (typeof s === 'string' ? s : '').slice(0, OUTPUT_CAP)
@@ -482,7 +490,7 @@ class Helper {
     return this.vmLock(vm.vmId)(async () => {
       this.stillHeld(lease)
       const creds = this.creds()
-      const listing = await this.hv('guest-list', { ...this.ident(vm), cred: creds.admin })
+      const listing = await this.hv('guest-list', { ...this.ident(vm), cred: creds.admin }, this.forLease(lease))
       const files = (Array.isArray(listing.files) ? listing.files : []).filter(f => f && typeof f.path === 'string' && Number.isFinite(f.size)).slice(0, 1000)
       const skipped = Array.isArray(listing.skipped) ? listing.skipped.slice(0, 50).map(String) : []
       if (!want.length && !match) {
@@ -494,7 +502,7 @@ class Helper {
       for (const p of want) { const f = byPath.get(p.toLowerCase()); if (f) chosen.push(f); else missing.push(p) }
       if (match) for (const f of files) if (match(f.path) && !chosen.includes(f)) chosen.push(f)
       const r = chosen.length
-        ? await this.hv('guest-read', { ...this.ident(vm), cred: creds.admin, paths: chosen.map(f => f.path), maxBytes, maxTotalBytes })
+        ? await this.hv('guest-read', { ...this.ident(vm), cred: creds.admin, paths: chosen.map(f => f.path), maxBytes, maxTotalBytes }, this.forLease(lease))
         : { files: [] }
       let total = 0
       const got = []

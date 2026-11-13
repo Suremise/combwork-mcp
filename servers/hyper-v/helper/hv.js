@@ -30,8 +30,11 @@ function crashPoint(when, op) {
   }
 }
 
-/** Runs op with args; resolves the script's answer object, or rejects with its error. */
-function hv(op, args = {}, { timeoutMs = 120_000 } = {}) {
+/**
+ * Runs op with args; resolves the script's answer object, or rejects with its error. onChild(child) is told the
+ * PowerShell process, so a lease that ends can kill its in-flight operations.
+ */
+function hv(op, args = {}, { timeoutMs = 120_000, onChild } = {}) {
   crashPoint('before', op)
   const stub = process.env.HYPERV_MCP_PS_STUB
   const [cmd, argv] = stub
@@ -39,6 +42,7 @@ function hv(op, args = {}, { timeoutMs = 120_000 } = {}) {
     : ['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', SCRIPT]]
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, argv, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+    if (onChild) onChild(child)
     let out = ''
     let err = ''
     let done = false

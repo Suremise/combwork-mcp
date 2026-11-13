@@ -63,9 +63,10 @@ function serve(input, output, makeHelper, log = () => {}) {
       log(`connection ${c} from pid ${pid}`)
     } else if (kind === 'close') {
       if (!queues.has(rest)) return
-      const q = queues.get(rest)
       queues.delete(rest)
-      q.then(() => helper.disconnect(rest)).catch(e => log(`disconnect ${rest}: ${e.message}`))
+      // At once, not after the connection's queued requests: its lease ends now (its in-flight operations are killed and
+      // whatever is still queued finds no lease), so a killed client never holds a VM until a long run finishes.
+      helper.disconnect(rest).catch(e => log(`disconnect ${rest}: ${e.message}`))
     } else if (kind === 'msg') {
       const sp = rest.indexOf(' ')
       const c = rest.slice(0, sp)
