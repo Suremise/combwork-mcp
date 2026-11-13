@@ -1,5 +1,5 @@
 // Several projects sharing the pool (MC-1502): a project is what the caller's roots say (the one project with a folder
-// they're in; none or several is "other"); caps and reservations at every grant; vm_acquire's FIFO queue with bounded
+// they're in; none or several is "other"); caps at every grant (no reserved VMs: Darren, 13 Nov); vm_acquire's FIFO queue with bounded
 // waits (HYPERV_MCP_WAIT_MS), a place kept between calls (HYPERV_MCP_KEEP_MS), grants only to a waiting request, a
 // newer call superseding an older one, a disconnect leaving the line, and a freed VM (release, pool job) going to the
 // first waiter allowed it; build folders scoped per project; setup's projects check. Through helper.js (the host
@@ -40,20 +40,19 @@ test('no projects: one shared pool, first come first served, as before', async (
   await h.stop()
 })
 
-test('caps and reservations: cli 2 + mcp 1 on 3 VMs; a reservation is never given to another project or "other"', async () => {
+test('caps: cli 2 + mcp 1 on 3 VMs; cli at its cap is refused while mcp still gets its VM', async () => {
   const sc0 = scratch('pr-share-setup')
   const cli = path.join(sc0.dir, 'cli')
   const mcp = path.join(sc0.dir, 'mcp')
-  const { h } = await pool('pr-share', 3, [{ name: 'cli', folders: [cli], maxVms: 2 }, { name: 'mcp', folders: [mcp], maxVms: 1, reserveVms: 1 }])
-  const [c1, c2, c3, m1, o1] = [h.conn(1), h.conn(2), h.conn(3), h.conn(4), h.conn(5)]
+  const { h } = await pool('pr-share', 3, [{ name: 'cli', folders: [cli], maxVms: 2 }, { name: 'mcp', folders: [mcp], maxVms: 1 }])
+  const [c1, c2, c3, m1, m2, o1] = [1, 2, 3, 4, 5, 6].map(i => h.conn(i))
   assert.match((await acquire(c1, { roots: [path.join(cli, 'worktree')] })).text, /^Leased .* for project cli /)
-  // The second free VM is the last one not kept for mcp: cli may take it (2 free, 1 owed to mcp).
   assert.match((await acquire(c2, { roots: [cli] })).text, /for project cli/)
-  // cli is at its cap; the last VM is mcp's reservation, so "other" can't have it either.
   assert.match((await acquire(c3, { roots: [cli] })).error, /^No VM for you now: project cli holds its windows cap of 2 \(3 in the pool\)/)
-  assert.match((await acquire(o1, { roots: [path.join(sc0.dir, 'web')] })).error, /^No VM for you now: the free windows VM is reserved for mcp/)
   assert.match((await acquire(m1, { roots: [mcp] })).text, /for project mcp/)
-  assert.match(await status(c1), /Projects: cli holds 2 windows of its cap of 2; mcp holds 1 windows of its cap of 1, 1 kept for it; other holds 0\./)
+  assert.match((await acquire(m2, { roots: [mcp] })).error, /project mcp holds its windows cap of 1/)
+  assert.match((await acquire(o1, { roots: [path.join(sc0.dir, 'web')] })).error, /^No VM is free \(3 in the pool\)/)
+  assert.match(await status(c1), /Projects: cli holds 2 windows of its cap of 2; mcp holds 1 windows of its cap of 1; other holds 0\./)
   await h.stop()
 })
 
@@ -270,45 +269,46 @@ test('setup\'s -ProjectsFile check uses the helper\'s own policy code, before an
   const sc = scratch('setup-projects')
   const file = path.join(sc.dir, 'projects.ps1')
   // The block runs as setup runs it, before any change: the projects read, the pool's VM limit worked out, the whole
-  // check (reservations against that limit included), and the report formatted.
+  // check, and the report formatted.
   fs.writeFileSync(file, `param([string]$ProjectsFile, [string]$state, [string]$src, [int]$MaxVms = 0)\n$ErrorActionPreference = 'Stop'\n${block[0]}\n"projects: $($projects.Count)"\n"line: $projectsLine"\n`)
   const run = (json, maxVms = 3) => {
     const pf = path.join(sc.dir, `p-${Math.random().toString(16).slice(2)}.json`)
     fs.writeFileSync(pf, json)
     return spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, '-ProjectsFile', pf, '-state', sc.stateDir, '-src', path.join(__dirname, '..'), '-MaxVms', String(maxVms)], { encoding: 'utf8', env: ps51Env() })
   }
-  const good = run(JSON.stringify([{ name: 'cli', folders: ['D:\\Dev\\cli'], maxVms: 2, reserveVms: 1 }, { name: 'mcp', folders: ['D:\\Dev\\mcp'] }]))
+  const good = run(JSON.stringify([{ name: 'cli', folders: ['D:\\Dev\\cli'], maxVms: 2 }, { name: 'mcp', folders: ['D:\\Dev\\mcp'] }]))
   assert.strictEqual(good.status, 0, good.stdout + good.stderr)
   assert.match(good.stdout, /projects: 2/)
-  assert.match(good.stdout, /line: cli \(cap 2, reserve 1\); mcp \(cap none, reserve none\)/)
-  // Shares per OS are formatted as they are, never cast to a number (that threw after the service had stopped).
-  const perOs = run(JSON.stringify([{ name: 'cli', folders: ['D:\\Dev\\cli'], maxVms: { windows: 2, linux: 1 }, reserveVms: { windows: 1 }, images: ['ab'.repeat(32)] }]))
+  assert.match(good.stdout, /line: cli \(cap 2\); mcp \(cap none\)/)
+  // Caps per OS are formatted as they are, never cast to a number (that threw after the service had stopped).
+  const perOs = run(JSON.stringify([{ name: 'cli', folders: ['D:\\Dev\\cli'], maxVms: { windows: 2, linux: 1 }, images: ['ab'.repeat(32)] }]))
   assert.strictEqual(perOs.status, 0, perOs.stdout + perOs.stderr)
-  assert.match(perOs.stdout, /line: cli \(cap windows 2, linux 1, reserve windows 1, images 1\)/)
-  // Reservations over the pool's VMs are refused here, before anything changes (not after the service has stopped).
-  const over = run(JSON.stringify([{ name: 'cli', folders: ['D:\\Dev\\cli'], reserveVms: { windows: 2 } }]), 1)
-  assert.notStrictEqual(over.status, 0)
-  assert.match((over.stdout + over.stderr).replace(/\s+/g, ' '), /The projects can't be used: the projects reserve 2 windows VMs in all, over the policy's maxVms \(1\)\. Nothing was changed\./)
-  const bad = run(JSON.stringify([{ name: 'cli', folders: ['D:\\Dev'], reserveVms: 1, maxVms: 0 }, { name: 'cli', folders: ['D:\\Dev\\mcp'] }]))
+  assert.match(perOs.stdout, /line: cli \(cap windows 2, linux 1, images 1\)/)
+  // A file from before reserved VMs were dropped is refused here, before anything changes, saying why.
+  const reserved = run(JSON.stringify([{ name: 'cli', folders: ['D:\\Dev\\cli'], reserveVms: { windows: 1 } }]), 1)
+  assert.notStrictEqual(reserved.status, 0)
+  assert.match((reserved.stdout + reserved.stderr).replace(/\s+/g, ' '), /The projects can't be used: project "cli": reserveVms isn't supported \(projects share the pool by their maxVms caps and the line\)\. Nothing was changed\./)
+  const bad = run(JSON.stringify([{ name: 'cli', folders: ['D:\\Dev'], maxVms: -1 }, { name: 'cli', folders: ['D:\\Dev\\mcp'] }]))
   assert.notStrictEqual(bad.status, 0)
   const said = (bad.stdout + bad.stderr).replace(/\s+/g, ' ') // PowerShell wraps its error lines
-  assert.match(said, /The projects can't be used: project "cli": its windows reserveVms \(1\) is over its windows maxVms \(0\); project "cli": the name is taken; project "cli": folder "D:\\Dev\\mcp" overlaps another of its folders .*Nothing was changed\./)
+  assert.match(said, /The projects can't be used: project "cli": maxVms must be a whole number 0-64, or one per OS .*; project "cli": the name is taken; project "cli": folder "D:\\Dev\\mcp" overlaps another of its folders .*Nothing was changed\./)
   const overlap = run(JSON.stringify([{ name: 'cli', folders: ['D:\\Dev'] }, { name: 'mcp', folders: ['D:\\Dev\\mcp'] }]))
   assert.match((overlap.stdout + overlap.stderr).replace(/\s+/g, ' '), /project "mcp": folder "D:\\Dev\\mcp" overlaps project "cli"'s \(one root must belong to one project\)/)
   const notJson = run('{ nope')
   assert.match(notJson.stdout + notJson.stderr, /can't be read as JSON/)
 })
 
-test('the policy\'s projects: names, numbers, overlaps and the reservations against the pool\'s maxVms', () => {
+test('the policy\'s projects: names, caps per OS, image lists, overlaps; reserved VMs refused', () => {
   const policy = require('../helper/policy')
   const D = (...p) => ['D:', ...p].join(path.win32.sep) // Windows paths, without escaping
   const base = { ...policy.DEFAULTS, diskFolders: [D('hv')], maxVms: 3 }
-  const ok = { ...base, projects: [{ name: 'cli', folders: [D('Dev', 'cli'), D('Dev', 'cli-wt')], maxVms: 2, reserveVms: 1 }, { name: 'mcp', folders: [D('Dev', 'mcp')], reserveVms: 2, buildRoots: [D('b')] }] }
+  const ok = { ...base, projects: [{ name: 'cli', folders: [D('Dev', 'cli'), D('Dev', 'cli-wt')], maxVms: 2 }, { name: 'mcp', folders: [D('Dev', 'mcp')], maxVms: { windows: 1, linux: 0 }, images: ['ab'.repeat(32)], buildRoots: [D('b')] }] }
   assert.deepStrictEqual(policy.problems(ok), [])
   const why = p => policy.problems({ ...base, projects: p }).join('\n')
-  assert.match(why([{ name: 'a', folders: [D('a')], reserveVms: 2 }, { name: 'b', folders: [D('b')], reserveVms: 2 }]), /the projects reserve 4 windows VMs in all, over the policy's maxVms \(3\)/)
+  assert.match(why([{ name: 'a', folders: [D('a')], reserveVms: 1 }]), /project "a": reserveVms isn't supported/)
   assert.match(why([{ name: 'a', folders: [D('a')], maxVms: -1 }]), /maxVms must be a whole number 0-64, or one per OS/)
-  assert.match(why([{ name: 'a', folders: [D('a')], reserveVms: 1.5 }]), /reserveVms must be a whole number 0-64, or one per OS/)
+  assert.match(why([{ name: 'a', folders: [D('a')], maxVms: { mac: 1 } }]), /maxVms must be a whole number 0-64, or one per OS \(windows, linux\)/)
+  assert.match(why([{ name: 'a', folders: [D('a')], images: ['abc'] }]), /images must be a list of at most 16 image SHA-256s/)
   assert.match(why([{ name: 'other', folders: [D('a')] }]), /the name is taken \("other" is everyone outside the projects\)/)
   assert.match(why([{ name: 'A b', folders: [D('a')] }]), /name must be 1-32 lower-case letters/)
   assert.match(why([{ name: 'a', folders: [] }]), /folders must list 1-16 folders/)

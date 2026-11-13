@@ -296,19 +296,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\combwork-mcp\ser
 
 ```json
 [
-  { "name": "app", "folders": ["D:\\src\\app", "D:\\src\\app.worktrees"], "maxVms": 2, "reserveVms": 1,
+  { "name": "app", "folders": ["D:\\src\\app", "D:\\src\\app.worktrees"], "maxVms": 2,
     "buildRoots": ["C:\\Users\\you\\AppData\\Local\\app-builds"] },
-  { "name": "tools", "folders": ["D:\\src\\tools", "D:\\src\\tools.worktrees"], "maxVms": 1, "reserveVms": 1 }
+  { "name": "tools", "folders": ["D:\\src\\tools", "D:\\src\\tools.worktrees"], "maxVms": { "windows": 1, "linux": 1 } }
 ]
 ```
 
 - **Which project a session is in:** the one whose `folders` hold its MCP roots (checkouts and worktrees). A session
-  whose roots are in no project, in several, or that sends none (an older server) is in **other**, which has no cap and
-  no reservation: it shares what nobody reserved. One project's folder may not be inside, around or the same as another's.
-- **`maxVms`** caps how many VMs the project holds at once. **`reserveVms`** keeps that many for it: a free VM goes to
-  another project (or other) only while the free ones still cover every other project's unmet reservation. Both are
-  **per OS**: a number means Windows, or give one per OS, such as `{ "windows": 2, "linux": 1 }`; the reservations of an
-  OS can't add up to more than the policy's VMs. A cap of 0 for an OS means the project may not use it.
+  whose roots are in no project, in several, or that sends none (an older server) is in **other**, which has no cap.
+  One project's folder may not be inside, around or the same as another's.
+- **`maxVms`** caps how many VMs the project holds at once, **per OS**: a number means Windows, or give one per OS, such
+  as `{ "windows": 2, "linux": 1 }`. A cap of 0 for an OS means the project may not use it. There are no reserved VMs:
+  the caps and the line keep projects from starving each other (a `reserveVms` field is refused).
 - **`images`** (optional) lists the images the project may use, by SHA-256. Left out, it may use every image of the OSes
   it may use.
 - **`buildRoots`** are build folders for that project alone (beside its sessions' own roots). `-BuildRoot`'s folders stay
@@ -316,13 +315,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\combwork-mcp\ser
   roots, so it only ever sees `-BuildRoot`'s.
 - **The line:** `vm_acquire` with `wait: true` joins one first-come line for the whole pool and waits about 20 s per call
   (under a client's 60 s tool timeout). A VM that comes free (a release, a lease's deadline, a quarantine cleared, a pool
-  job finished) goes to the first waiter it's allowed to: a waiter its project's cap or another project's reservation
-  blocks keeps its place, and later ones are served past it. A call that ends without a VM says where it stands, and its
+  job finished) goes to the first waiter it's allowed to: a waiter its project's cap blocks keeps its place, and later ones are served past it. A call that ends without a VM says where it stands, and its
   place is kept for 2 minutes: the next call resumes it. A VM goes only to a session that is waiting right then, never
   to one that stopped calling. A newer call from the same session takes over an older one, and closing the session
   leaves the line. Without `wait`, `vm_acquire` never jumps the line: waiting sessions are served first.
 - A lease keeps the project it was granted for, whatever its session's roots say later.
-- `vm_status` shows each project's VMs against its cap and reservation, the line in order (and why each waiter is
+- `vm_status` shows each project's VMs against its caps, the line in order (and why each waiter is
   waiting), and the session's own project.
 
 ### A pool from more than one image
@@ -339,8 +337,7 @@ kind through MC-1500's guest driver, with no change to the pool.
 - **`vm_acquire({ os = 'windows', image? })`** takes only VMs of that OS, and of that image when given. A request for an
   OS or image the session's project may not use is refused at once, never put in line. A waiter is only ever given a VM
   of its own kind.
-- **Shares by OS:** caps and reservations count VMs of the request's OS. A reservation is covered by any usable free VM
-  of its OS: the image only narrows which one is taken.
+- **Caps by OS:** a project's cap for an OS counts its VMs of that OS.
 - **One VM per session**, as before: a project that needs Windows and Linux together uses two sessions (two agents).
 - Setup checks the file with the helper's own policy code before changing anything. A rerun without `-ProjectsFile`
   keeps the list; `-ProjectsFile none` clears it.
@@ -673,18 +670,19 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   times out, never starts or fails restoring the VM after its output is read (a session-0 timeout still doesn't); the
   password never in a reply, the journal or a log; and a helper that predates the protocol refused before anything
   runs.
-- `projects.test.js`, sharing the pool: one shared pool with no projects; caps and a reservation (never given to another
-  project or other); the line, first come first served, a capped waiter passed over keeping its place, an abandoned
+- `projects.test.js`, sharing the pool: one shared pool with no projects; caps (one project at its cap refused while
+  another still gets its VM); the line, first come first served, a capped waiter passed over keeping its place, an abandoned
   wait never given a VM and its place expiring, a repeat call keeping its place, a disconnect leaving it, a resize
   serving the next waiter, and a newer call superseding an older one (in-process); a lease keeping its project; which
   project a session is in; through `server.js`, a project's own build folder refused to others, and a newer helper
-  still serving this server; setup's projects check under Windows PowerShell 5.1; the policy's rules for projects.
+  still serving this server; setup's projects check under Windows PowerShell 5.1, before any change (caps per OS
+  formatted, never cast; `reserveVms` refused); the policy's rules for projects.
 - `images.test.js`, a pool from more than one image (a stub "linux" kind, made only in the journal): groups by image
   (a resize adding to or taking from one image's VMs only); `vm_acquire` by OS and image, one VM per session; VMs made
   before images were recorded, recovered through their plans, or unknown when that can't be proved (a plain Windows
-  acquire takes one, an exact image never does, a group resize leaves them alone); shares by OS and the image list (a
-  project at its Windows cap still gets Linux, a Linux reservation kept, a forbidden OS or image refused, never queued);
-  a reservation covered by any free VM of its OS; a waiter never given another kind; and, through `server.js`, no
+  acquire takes one, an exact image never does, a group resize leaves them alone); caps by OS and the image list (a
+  project at its Windows cap still gets Linux, a forbidden OS or image refused, never queued); a waiter never given
+  another kind; and, through `server.js`, no
   acquire at all sent to a helper without `images` for an image or Linux.
 - `approvals.test.js`:
   - unapproved plans;

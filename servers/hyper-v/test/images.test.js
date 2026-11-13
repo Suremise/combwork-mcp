@@ -1,6 +1,6 @@
 // A pool built from more than one image (MC-1502, gap 3; Darren's decision): each VM's image and OS (recorded at create,
 // recovered through its approved plan for older VMs, else "legacy", never guessed); groups by image in pool_plan;
-// vm_acquire({ os, image }); a project's caps and reservations per OS, and its image allowlist; one VM per session.
+// vm_acquire({ os, image }); a project's caps per OS, and its image allowlist; one VM per session.
 // Only Windows exists for real: a "linux" image here is a stub kind, made only in the journal (no Linux guest code).
 // Through helper.js (the host protocol) against the stub Hyper-V, and server.js for the compatibility check.
 const test = require('node:test')
@@ -123,12 +123,11 @@ test('a VM made before images were recorded: recovered through its approved plan
   await h2.stop()
 })
 
-test('per-OS shares and the image allowlist: a cap per OS, a reservation per OS, images a project may not use', async () => {
+test('caps per OS and the image allowlist: at its Windows cap a project still gets Linux; images it may not use', async () => {
   const sc0 = scratch('img-shares-roots')
-  const [p1, p2, p3] = ['p1', 'p2', 'p3'].map(n => path.join(sc0.dir, n))
+  const [p1, p3] = ['p1', 'p3'].map(n => path.join(sc0.dir, n))
   const projects = [
     { name: 'p1', folders: [p1], maxVms: { windows: 1, linux: 1 } },
-    { name: 'p2', folders: [p2], reserveVms: { linux: 1 } },
     { name: 'p3', folders: [p3], images: [B], maxVms: { linux: 0 } }
   ]
   const { sc, h, admin } = await mixed('img-shares', { projects })
@@ -138,9 +137,8 @@ test('per-OS shares and the image allowlist: a cap per OS, a reservation per OS,
   assert.match((await acquire(a, { roots: [p1] })).text, /for project p1/)
   assert.match((await acquire(b, { roots: [p1] })).error, /project p1 holds its windows cap of 1/)
   assert.match((await acquire(b, { roots: [p1], os: 'linux' })).text, /for project p1 \(linux/, 'at its Windows cap, p1 still gets a Linux VM')
-  // One Linux VM left, and p2 is owed one: "other" can't have it, p2 can.
-  assert.match((await acquire(c, { os: 'linux' })).error, /the free linux VM is reserved for p2/)
-  assert.match((await acquire(d, { roots: [p2], os: 'linux' })).text, /for project p2 \(linux/)
+  assert.match((await acquire(c, { roots: [p1], os: 'linux' })).error, /project p1 holds its linux cap of 1/)
+  assert.match((await acquire(d, { os: 'linux' })).text, /\(linux, image efefefefefef\)/, 'other takes the last Linux VM: no reserved VMs')
   // p3 may use image B only, and no Linux: refused at once, never queued.
   assert.match((await acquire(e, { roots: [p3], image: A, wait: true })).error, /^No VM for you: project p3 may not use image abababababab\./)
   assert.match((await acquire(e, { roots: [p3], os: 'linux', wait: true })).error, /project p3 may not use linux VMs/)
@@ -148,19 +146,6 @@ test('per-OS shares and the image allowlist: a cap per OS, a reservation per OS,
   assert.match((await acquire(e, { roots: [p3] })).text, /for project p3 /)
   assert.match((await e.request('status')).text, /windows, image cdcdcdcdcdcd; [^\n]*\(yours\)/, 'p3 got B, its only image')
   assert.match(await status(admin), /p3 holds 0 linux of its cap of 0, 1 windows \(images cdcdcdcdcdcd only\)/)
-  await h.stop()
-})
-
-test('a reservation counts every free VM of the OS; the image only narrows which one is taken', async () => {
-  const sc0 = scratch('img-reserve-roots')
-  const p2 = path.join(sc0.dir, 'p2')
-  const { sc, h, admin } = await mixed('img-reserve', { projects: [{ name: 'p2', folders: [p2], reserveVms: { windows: 1 } }] })
-  await change(sc, admin, { action: 'resize', image: A, vms: 1 })
-  await change(sc, admin, { action: 'resize', image: B, vms: 1 })
-  // Free: one A, one B; p2 is owed one Windows VM. Asking for A takes A, and B covers p2.
-  assert.match((await acquire(h.conn(1), { image: A })).text, /image abababababab/)
-  assert.match((await acquire(h.conn(2), { image: B })).error, /the free windows VM is reserved for p2/)
-  assert.match((await acquire(h.conn(3), { roots: [p2] })).text, /for project p2/)
   await h.stop()
 })
 

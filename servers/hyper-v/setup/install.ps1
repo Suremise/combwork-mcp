@@ -16,7 +16,7 @@
 # run, agents included, can drive Hyper-V without the server's rules. Read the README before choosing it.
 #
 # -ProjectsFile names a JSON file listing projects that share the pool fairly (README, "Sharing the pool between
-# projects"): each { name, folders, maxVms?, reserveVms?, buildRoots? }. It is checked by the helper's own policy code
+# projects"): each { name, folders, maxVms?, images?, buildRoots? }. It is checked by the helper's own policy code
 # before anything changes, and copied into policy.json. Left out, a rerun keeps the current list; -ProjectsFile none
 # clears it.
 # -MaxSessionMinutes caps a work session (vm_renew can extend a lease up to it, from vm_acquire): 5-1440 and at least
@@ -123,8 +123,8 @@ elseif ($ProjectsFile) {
   $current = Join-Path $state 'policy.json'
   if (Test-Path -LiteralPath $current) { try { $projects = @((Get-Content -Raw -LiteralPath $current | ConvertFrom-Json).projects | Where-Object { $_ }) } catch { $projects = @() } }
 }
-# The pool's VM limit, worked out here (read-only) so the projects' reservations are checked against it before anything
-# changes: -MaxVms, or a quarter of the host's logical CPUs (1-4). Step 7 writes this same value.
+# The pool's VM limit, worked out here (read-only), before anything changes: -MaxVms, or a quarter of the host's
+# logical CPUs (1-4). Step 7 writes this same value.
 $poolMaxVms = $(if ($MaxVms) { $MaxVms } else { [Math]::Max(1, [Math]::Min(4, [Math]::Floor(([int](Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors) / 4))) })
 # A project's cap or reservation for the report: a number (Windows), or one per OS, never cast.
 function Format-Share($v) {
@@ -136,10 +136,10 @@ $projectsLine = 'none (one shared pool, first come first served)'
 if ($projects.Count) {
   $nodeCheck = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
   if (-not $nodeCheck) { throw 'Node (18 or later) is not on PATH.' }
-  $why = (ConvertTo-Json -InputObject @($projects) -Depth 6 -Compress) | & $nodeCheck -e "const p = require(process.argv[1]); let t = ''; process.stdin.on('data', d => t += d).on('end', () => { const w = p.projectProblems(JSON.parse(t), Number(process.argv[2])); process.stdout.write(w.join('; ')) })" (Join-Path $src 'helper\policy.js') $poolMaxVms
+  $why = (ConvertTo-Json -InputObject @($projects) -Depth 6 -Compress) | & $nodeCheck -e "const p = require(process.argv[1]); let t = ''; process.stdin.on('data', d => t += d).on('end', () => { const w = p.projectProblems(JSON.parse(t)); process.stdout.write(w.join('; ')) })" (Join-Path $src 'helper\policy.js')
   if ($LASTEXITCODE) { throw 'The projects check (node) failed.' }
   if ($why) { throw "The projects can't be used: $why. Nothing was changed." }
-  $projectsLine = ($projects | ForEach-Object { "$($_.name) (cap $(Format-Share $_.maxVms), reserve $(Format-Share $_.reserveVms)$(if ($_.images) { ", images $(@($_.images).Count)" }))" }) -join '; '
+  $projectsLine = ($projects | ForEach-Object { "$($_.name) (cap $(Format-Share $_.maxVms)$(if ($_.images) { ", images $(@($_.images).Count)" }))" }) -join '; '
 }
 # The helper refuses a policy whose session cap is below one lease (helper/policy.js): refuse it here first.
 if ($MaxSessionMinutes -and ($MaxSessionMinutes -lt 5 -or $MaxSessionMinutes -gt 1440 -or $MaxSessionMinutes -lt $MaxLeaseMinutes)) { throw "-MaxSessionMinutes must be 5-1440 and at least -MaxLeaseMinutes ($MaxLeaseMinutes)." }

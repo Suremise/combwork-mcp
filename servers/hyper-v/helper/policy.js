@@ -31,7 +31,7 @@ const MAX_BUILD_ROOTS = 16
 const MAX_PROJECTS = 16
 const PROJECT_RE = /^[a-z][a-z0-9-]{0,31}$/
 const OSES = ['windows', 'linux']
-/** A project's cap or reservation as { os: n }: a plain number means Windows (the only kind before images had an OS). */
+/** A project's cap as { os: n }: a plain number means Windows (the only kind before images had an OS). */
 const byOs = v => v === undefined ? undefined : typeof v === 'number' ? { windows: v } : v
 /** Why a policy folder isn't an absolute local folder (not UNC, a device path, a drive root or with ".."), or null. */
 const folderProblem = f =>
@@ -64,25 +64,28 @@ function problems(p) {
     if (!Array.isArray(p.buildRoots) || p.buildRoots.length > MAX_BUILD_ROOTS) out.push(`buildRoots must be a list of at most ${MAX_BUILD_ROOTS} folders`)
     else for (const f of p.buildRoots) { const why = folderProblem(f); if (why) out.push(`build root "${f}" ${why}`) }
   }
-  // Projects sharing the pool (MC-1502), optional: setup's -ProjectsFile. Each: { name, folders, maxVms?, reserveVms?,
+  // Projects sharing the pool (MC-1502), optional: setup's -ProjectsFile. Each: { name, folders, maxVms?, images?,
   // buildRoots? }. A caller belongs to the one project with a folder its roots are in, so no project folder may be the
   // same as, inside or around another project's.
-  if (p.projects !== undefined) out.push(...projectProblems(p.projects, p.maxVms))
+  if (p.projects !== undefined) out.push(...projectProblems(p.projects))
   return out
 }
 
 /** Problems with a policy's projects list. */
-function projectProblems(projects, maxVms) {
+function projectProblems(projects) {
   const out = []
   if (!Array.isArray(projects) || projects.length > MAX_PROJECTS) return [`projects must be a list of at most ${MAX_PROJECTS}`]
   const names = new Set()
   const owned = [] // [folder (lower case), project]
-  const reserved = {} // by OS
   for (const [i, pr] of projects.entries()) {
     const at = `project ${typeof pr?.name === 'string' ? `"${pr.name}"` : i + 1}`
     if (!pr || typeof pr !== 'object' || Array.isArray(pr)) { out.push(`${at} must be an object`); continue }
-    const known = ['name', 'folders', 'maxVms', 'reserveVms', 'buildRoots', 'images']
-    for (const k of Object.keys(pr)) if (!known.includes(k)) out.push(`${at}: unknown field "${k}"`)
+    const known = ['name', 'folders', 'maxVms', 'buildRoots', 'images']
+    for (const k of Object.keys(pr)) {
+      // Reserved VMs were dropped (Darren, 13 Nov): projects share by their caps and the line.
+      if (k === 'reserveVms') out.push(`${at}: reserveVms isn't supported (projects share the pool by their maxVms caps and the line)`)
+      else if (!known.includes(k)) out.push(`${at}: unknown field "${k}"`)
+    }
     if (!PROJECT_RE.test(pr.name ?? '')) out.push(`${at}: name must be 1-32 lower-case letters, digits and -, starting with a letter`)
     else if (names.has(pr.name) || pr.name === 'other') out.push(`${at}: the name is taken${pr.name === 'other' ? ' ("other" is everyone outside the projects)' : ''}`)
     names.add(pr.name)
@@ -96,20 +99,10 @@ function projectProblems(projects, maxVms) {
       }
       owned.push([n, pr.name])
     }
-    // maxVms and reserveVms: a whole number (Windows), or by OS: { "windows": 2, "linux": 1 }.
-    const shares = {}
-    for (const k of ['maxVms', 'reserveVms']) {
-      const v = pr[k]
-      if (v === undefined) continue
-      const ok = int(v, 0, 64) || (v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length && Object.entries(v).every(([os, n]) => OSES.includes(os) && int(n, 0, 64)))
-      if (!ok) out.push(`${at}: ${k} must be a whole number 0-64, or one per OS (${OSES.join(', ')}), such as { "windows": 2, "linux": 1 }`)
-      else shares[k] = byOs(v)
-    }
-    for (const os of OSES) {
-      const cap = shares.maxVms?.[os]
-      const res = shares.reserveVms?.[os]
-      if (cap !== undefined && res !== undefined && res > cap) out.push(`${at}: its ${os} reserveVms (${res}) is over its ${os} maxVms (${cap})`)
-      if (res) reserved[os] = (reserved[os] || 0) + res
+    // maxVms: a whole number (Windows), or by OS: { "windows": 2, "linux": 1 }; 0 means the project may not use that OS.
+    const v = pr.maxVms
+    if (v !== undefined && !(int(v, 0, 64) || (v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length && Object.entries(v).every(([os, n]) => OSES.includes(os) && int(n, 0, 64))))) {
+      out.push(`${at}: maxVms must be a whole number 0-64, or one per OS (${OSES.join(', ')}), such as { "windows": 2, "linux": 1 }`)
     }
     if (pr.images !== undefined && (!Array.isArray(pr.images) || pr.images.length > 16 || pr.images.some(i => typeof i !== 'string' || !/^[0-9a-f]{64}$/i.test(i)))) out.push(`${at}: images must be a list of at most 16 image SHA-256s (64 hex digits)`)
     if (pr.buildRoots !== undefined) {
@@ -117,7 +110,6 @@ function projectProblems(projects, maxVms) {
       else for (const f of pr.buildRoots) { const why = folderProblem(f); if (why) out.push(`${at}: build root "${f}" ${why}`) }
     }
   }
-  for (const [os, n] of Object.entries(reserved)) if (int(maxVms, 1, 64) && n > maxVms) out.push(`the projects reserve ${n} ${os} VMs in all, over the policy's maxVms (${maxVms})`)
   return out
 }
 
@@ -130,7 +122,7 @@ function load(dir) {
   const bad = problems(p)
   if (bad.length) throw new Error(`policy.json is not usable: ${bad.join('; ')}. Run setup again.`)
   const projects = (p.projects ?? []).map(pr => Object.freeze({
-    name: pr.name, folders: Object.freeze(pr.folders.map(tidy)), maxVms: byOs(pr.maxVms), reserveVms: byOs(pr.reserveVms) ?? {},
+    name: pr.name, folders: Object.freeze(pr.folders.map(tidy)), maxVms: byOs(pr.maxVms),
     buildRoots: Object.freeze((pr.buildRoots ?? []).map(tidy)), images: Object.freeze((pr.images ?? []).map(i => i.toLowerCase()))
   }))
   return Object.freeze({ ...p, diskFolders: Object.freeze(p.diskFolders.map(tidy)), buildRoots: Object.freeze((p.buildRoots ?? []).map(tidy)), projects: Object.freeze(projects) })

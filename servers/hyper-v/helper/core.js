@@ -374,13 +374,8 @@ class Helper {
     const p = this.policy.projects.find(x => x.name === project)
     const cap = p?.maxVms?.[want.os]
     if (cap !== undefined && this.held(project, want.os) >= cap) return `project ${project} holds its ${want.os} cap of ${cap}`
-    const mine = this.candidates(project, want)
-    if (!mine.length) return want.image ? `none of image ${want.image.slice(0, 12)} is free` : this.freeVms().some(v => this.osOf(v) === want.os) || want.os === 'windows' ? 'none is free' : `the pool has no free ${want.os} VM`
-    const freeOs = this.freeVms().filter(v => this.osOf(v) === want.os).length
-    const owed = this.policy.projects.filter(q => q.name !== project).map(q => ({ q, n: Math.max(0, (q.reserveVms?.[want.os] || 0) - this.held(q.name, want.os)) })).filter(x => x.n)
-    const total = owed.reduce((a, x) => a + x.n, 0)
-    if (freeOs - 1 < total) return `the free ${want.os} VM${freeOs > 1 ? 's are' : ' is'} reserved for ${owed.map(x => x.q.name).join(', ')}`
-    return null
+    if (this.candidates(project, want).length) return null
+    return want.image ? `none of image ${want.image.slice(0, 12)} is free` : this.freeVms().some(v => this.osOf(v) === want.os) || want.os === 'windows' ? 'none is free' : `the pool has no free ${want.os} VM`
   }
 
   /** Makes the lease (under the pool lock): the first free VM, for this connection and project. */
@@ -1125,8 +1120,8 @@ class Helper {
     const out = []
     if (this.policy.projects.length) {
       const per =this.policy.projects.map(p => {
-        const oses = [...new Set([...Object.keys(p.maxVms || {}), ...Object.keys(p.reserveVms || {}), ...[...this.leases.values()].filter(l => l.project === p.name).map(l => l.os)])]
-        const parts = (oses.length ? oses : ['windows']).map(os => `${this.held(p.name, os)} ${os}${p.maxVms?.[os] !== undefined ? ` of its cap of ${p.maxVms[os]}` : ''}${p.reserveVms?.[os] ? `, ${p.reserveVms[os]} kept for it` : ''}`)
+        const oses = [...new Set([...Object.keys(p.maxVms || {}), ...[...this.leases.values()].filter(l => l.project === p.name).map(l => l.os)])]
+        const parts = (oses.length ? oses : ['windows']).map(os => `${this.held(p.name, os)} ${os}${p.maxVms?.[os] !== undefined ? ` of its cap of ${p.maxVms[os]}` : ''}`)
         return `${p.name} holds ${parts.join(', ')}${p.images.length ? ` (images ${p.images.map(i => i.slice(0, 12)).join(', ')} only)` : ''}`
       })
       out.push(`Projects: ${per.join('; ')}; other holds ${this.held('other')}.`)
