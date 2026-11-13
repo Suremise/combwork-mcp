@@ -102,7 +102,8 @@ and test accounts.
      `-MaxDiskGBPerVm`, `-AllowNetwork $false`, `-MaxReservePercent`, `-MaxLeaseMinutes`, `-MaxSessionMinutes`
      (a work session's cap for `vm_renew`: 5-1440 and at least `-MaxLeaseMinutes`; left out, 480 or
      `-MaxLeaseMinutes` if that is more), `-MaxBuildMB`, `-AllowUnpinnedIso`. `-BuildRoot` names folders builds may also
-     come from (see "Build folders set by an admin").
+     come from (see "Build folders set by an admin"). `-ProjectsFile` names the projects that share the pool fairly (see
+     "Sharing the pool between projects").
 
    It never enables a Windows feature or restarts the PC. If Hyper-V is off, it says how to turn it on and stops.
 3. Add the server to your client, with `HYPERV_MCP_ENABLED=1`:
@@ -231,7 +232,7 @@ The pool is built from the **Windows 11 Enterprise evaluation** ISO. Microsoft's
 
 | Tool | What it does |
 |---|---|
-| `vm_acquire({ minutes=60, keepOnFailure=false })` | Leases one free VM to this session (one VM per session) until `vm_release`, its deadline (at most the policy's `maxLeaseMinutes`), or this server exiting. Refuses when none is free, saying when the next lease ends. |
+| `vm_acquire({ minutes=60, keepOnFailure=false, wait=false })` | Leases one VM to this session (one VM per session) until `vm_release`, its deadline (at most the policy's `maxLeaseMinutes`), or this server exiting. Without `wait`, it refuses when none is free for this session's project, saying why (none free, the project's cap, a VM kept for another project), when the next lease ends, and where it would stand in line. With `wait: true` it waits in line about 20 s, and a repeat call within 2 minutes keeps its place (see "Sharing the pool between projects"). |
 | `vm_start({ build?, network=false, reserveCpu=0, interactive=false })` | Restores the clean checkpoint (always), applies this run's network and CPU reserve, and starts the VM. It waits for the guest, then copies `build` in to `C:\build` and leaves an empty `C:\out`. With `interactive: 'user'` (the standard user) or `'admin'`, it first logs that account on interactively: autologon, one guest restart (tens of seconds), then it waits for the account's desktop session (see "The interactive session"). Refused on a VM kept for inspection: release it, and acquire again. |
 | `vm_renew({ minutes=60 })` | Sets the lease's deadline to now + `minutes` (1 to the policy's `maxLeaseMinutes`), never past the work session's end: `maxSessionMinutes` after `vm_acquire` (`vm_status` shows both). Refused once the deadline has passed, even a moment before the helper ends the lease. |
 | `vm_sync({ build?, full=false, delete=true })` | Copies only the files that changed in `build` (default: the folder last started or synced) into the **running** guest's `C:\build`, without a restore: `C:\out`, installed software and anything else the runs left stay. The server hashes the folder (same roots checks as `vm_start`, every time; links skipped); the helper compares that with what it placed in `C:\build` and takes only the new or changed files, hashing them itself as they arrive. Files gone from the folder are removed unless `delete` is false. Only what the helper copied is tracked: if your runs changed `C:\build` themselves, use `full: true` (clears `C:\build`, copies everything) or `vm_reset`. After a sync fails, only those two are accepted. |
@@ -268,7 +269,7 @@ client's settings (Claude Code's `additionalDirectories`, Codex's `HYPERV_MCP_AL
 folders at setup:
 
 ```
-powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\combwork-mcp\servers\hyper-v\setup\install.ps1" -DiskFolder D:\hyperv-mcp -BuildRoot "C:\Users\you\AppData\Local\combwork-cli"
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\combwork-mcp\servers\hyper-v\setup\install.ps1" -DiskFolder D:\hyperv-mcp -BuildRoot "C:\Users\you\AppData\Local\app-builds"
 ```
 
 - A build may then come from your MCP roots **or** from inside one of these folders, for every client, with no client
@@ -283,6 +284,47 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\combwork-mcp\ser
   account's folder. Setup refuses a drive root, a UNC path, `..`, and a link or junction on the way.
 - To change them, run setup again with the new list. A rerun replaces it: leave `-BuildRoot` out to clear it.
 - `vm_status` lists them, and says why any isn't used. A helper from before them reports none: run setup again.
+
+### Sharing the pool between projects
+
+With nothing set up, every project shares one pool, first come first served. An admin can name the projects that use it,
+so none of them takes every VM, in a JSON file given to setup (one line, in an admin Windows PowerShell):
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\combwork-mcp\servers\hyper-v\setup\install.ps1" -DiskFolder D:\hyperv-mcp -ProjectsFile D:\hyperv-projects.json
+```
+
+```json
+[
+  { "name": "app", "folders": ["D:\\src\\app", "D:\\src\\app.worktrees"], "maxVms": 2, "reserveVms": 1,
+    "buildRoots": ["C:\\Users\\you\\AppData\\Local\\app-builds"] },
+  { "name": "tools", "folders": ["D:\\src\\tools", "D:\\src\\tools.worktrees"], "maxVms": 1, "reserveVms": 1 }
+]
+```
+
+- **Which project a session is in:** the one whose `folders` hold its MCP roots (checkouts and worktrees). A session
+  whose roots are in no project, in several, or that sends none (an older server) is in **other**, which has no cap and
+  no reservation: it shares what nobody reserved. One project's folder may not be inside, around or the same as another's.
+- **`maxVms`** caps how many VMs the project holds at once. **`reserveVms`** keeps that many for it: a free VM goes to
+  another project (or other) only while the free ones still cover every other project's unmet reservation. The
+  reservations can't add up to more than the policy's VMs.
+- **`buildRoots`** are build folders for that project alone (beside its sessions' own roots). `-BuildRoot`'s folders stay
+  everyone's. To move a folder from everyone to one project, update the agents' servers first: an older server sends no
+  roots, so it only ever sees `-BuildRoot`'s.
+- **The line:** `vm_acquire` with `wait: true` joins one first-come line for the whole pool and waits about 20 s per call
+  (under a client's 60 s tool timeout). A VM that comes free (a release, a lease's deadline, a quarantine cleared, a pool
+  job finished) goes to the first waiter it's allowed to: a waiter its project's cap or another project's reservation
+  blocks keeps its place, and later ones are served past it. A call that ends without a VM says where it stands, and its
+  place is kept for 2 minutes: the next call resumes it. A VM goes only to a session that is waiting right then, never
+  to one that stopped calling. A newer call from the same session takes over an older one, and closing the session
+  leaves the line. Without `wait`, `vm_acquire` never jumps the line: waiting sessions are served first.
+- A lease keeps the project it was granted for, whatever its session's roots say later.
+- `vm_status` shows each project's VMs against its cap and reservation, the line in order (and why each waiter is
+  waiting), and the session's own project.
+- Setup checks the file with the helper's own policy code before changing anything. A rerun without `-ProjectsFile`
+  keeps the list; `-ProjectsFile none` clears it.
+- **It's advisory, like the roots it comes from:** it keeps honest agents from starving each other, not a determined one
+  (any program running as you can name any roots).
 
 ## Configuration (`env`)
 
@@ -299,10 +341,24 @@ Test-only:
 - `HYPERV_MCP_CRASH_AT`: crash injection;
 - `HYPERV_MCP_STATE_DIR`;
 - timing: `HYPERV_MCP_POLL_MS`, `HYPERV_MCP_READY_WAIT_MS`, `HYPERV_MCP_INSTALL_WAIT_MS`, `HYPERV_MCP_RETRY_MS`,
-  `HYPERV_MCP_MINUTE_MS`;
+  `HYPERV_MCP_MINUTE_MS`, `HYPERV_MCP_LOGON_STABLE_MS`, `HYPERV_MCP_WAIT_MS`, `HYPERV_MCP_KEEP_MS`;
 - `HYPERV_MCP_MIN_ISO_BYTES`.
 
 The service's environment is set by its host, which users can't change.
+
+### Server and helper versions
+
+The server and the helper speak a numbered protocol, and since protocol 3 the helper also names its added features
+(`vm_status` shows the helper's protocol). A server uses a feature when the helper speaks **at least** its protocol, or
+names it, so a newer helper keeps serving older servers:
+- protocol 2: `vm_renew`, `vm_sync`, `vm_reset`;
+- protocol 3: `vm_start`'s `interactive` and `vm_run`'s `session`;
+- feature `projects` (protocol 3): projects, `vm_acquire`'s `wait` and a project's own build folders.
+
+The helper stays at protocol 3 for `projects` because hyper-v 1.2.0's server asks for exactly hyperv-mcp/3 before an
+interactive run: it keeps working with this helper. An older helper refuses each newer feature with "run setup again"
+rather than quietly ignoring it. A newer feature also needs the newer server: an agent's server loads at its start, so
+update the server (and restart the agent) as well as the helper.
 
 ## Security model
 
@@ -509,7 +565,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\projects.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
 ```
 
 - `units.test.js`:
@@ -594,6 +650,12 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   times out, never starts or fails restoring the VM after its output is read (a session-0 timeout still doesn't); the
   password never in a reply, the journal or a log; and a helper that predates the protocol refused before anything
   runs.
+- `projects.test.js`, sharing the pool: one shared pool with no projects; caps and a reservation (never given to another
+  project or other); the line, first come first served, a capped waiter passed over keeping its place, an abandoned
+  wait never given a VM and its place expiring, a repeat call keeping its place, a disconnect leaving it, a resize
+  serving the next waiter, and a newer call superseding an older one (in-process); a lease keeping its project; which
+  project a session is in; through `server.js`, a project's own build folder refused to others, and a newer helper
+  still serving this server; setup's projects check under Windows PowerShell 5.1; the policy's rules for projects.
 - `approvals.test.js`:
   - unapproved plans;
   - forged approvals: another digest, operation or epoch, expired, a malformed nonce, another plan's id, a writable

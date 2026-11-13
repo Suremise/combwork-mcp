@@ -213,7 +213,7 @@ m.Helper.prototype.request = async function (connId, op, args) {
   await s.call('vm_acquire', { minutes: 30 })
   const r = await s.call('vm_start', { interactive: 'user' })
   assert.ok(r.isError)
-  assert.match(r.text, /The helper speaks hyperv-mcp\/2, and the interactive session needs hyperv-mcp\/3: run setup again/)
+  assert.match(r.text, /The helper speaks hyperv-mcp\/2, and the interactive session needs hyperv-mcp\/3 or later: run setup again/)
   assert.ok(!sc.stub().calls.some(c => c.op === 'guest-logon'))
   await s.call('vm_start')
   assert.match((await s.call('vm_run', { command: 'whoami', as: 'user', session: 'interactive' })).text, /needs hyperv-mcp\/3/)

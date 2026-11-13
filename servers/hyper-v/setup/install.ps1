@@ -15,6 +15,10 @@
 # Direct mode (-Mode Direct) installs no service: it adds -User to Hyper-V Administrators instead, so any program you
 # run, agents included, can drive Hyper-V without the server's rules. Read the README before choosing it.
 #
+# -ProjectsFile names a JSON file listing projects that share the pool fairly (README, "Sharing the pool between
+# projects"): each { name, folders, maxVms?, reserveVms?, buildRoots? }. It is checked by the helper's own policy code
+# before anything changes, and copied into policy.json. Left out, a rerun keeps the current list; -ProjectsFile none
+# clears it.
 # -MaxSessionMinutes caps a work session (vm_renew can extend a lease up to it, from vm_acquire): 5-1440 and at least
 # -MaxLeaseMinutes. Left out, the helper uses 480 (or -MaxLeaseMinutes, if that is more).
 # It is idempotent: run it again to update the helper or change the policy. It keeps an existing pool and its state.
@@ -33,7 +37,8 @@ param(
   [int]$MaxSessionMinutes = 0,
   [int]$MaxBuildMB = 2048,
   [switch]$AllowUnpinnedIso,
-  [string[]]$BuildRoot = @()
+  [string[]]$BuildRoot = @(),
+  [string]$ProjectsFile = ''
 )
 # Windows PowerShell 5.1 only (MC-1506), refused before any check or change:
 # setup's storage and ACL routines use .NET Framework calls that PowerShell 7
@@ -107,6 +112,24 @@ $buildRoots = @($BuildRoot | Where-Object { $_ } | ForEach-Object {
 } | Select-Object -Unique)
 # The helper's policy check allows at most 16 (helper/policy.js): refuse more here, before anything changes.
 if ($buildRoots.Count -gt 16) { throw "At most 16 build roots: $($buildRoots.Count) were given." }
+# Projects (MC-1502): -ProjectsFile's list, checked by the helper's own policy.js (with node, which setup needs anyway)
+# before anything changes; left out, the current policy's list is kept; 'none' clears it.
+$projects = @()
+if ($ProjectsFile -eq 'none') { $projects = @() }
+elseif ($ProjectsFile) {
+  # Unrolled: Windows PowerShell's ConvertFrom-Json passes a JSON array on as one object.
+  try { $projects = @((Get-Content -Raw -LiteralPath $ProjectsFile | ConvertFrom-Json) | ForEach-Object { $_ }) } catch { throw "-ProjectsFile $ProjectsFile can't be read as JSON: $($_.Exception.Message)" }
+} else {
+  $current = Join-Path $state 'policy.json'
+  if (Test-Path -LiteralPath $current) { try { $projects = @((Get-Content -Raw -LiteralPath $current | ConvertFrom-Json).projects | Where-Object { $_ }) } catch { $projects = @() } }
+}
+if ($projects.Count) {
+  $nodeCheck = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
+  if (-not $nodeCheck) { throw 'Node (18 or later) is not on PATH.' }
+  $why = (ConvertTo-Json -InputObject @($projects) -Depth 6 -Compress) | & $nodeCheck -e "const p = require(process.argv[1]); let t = ''; process.stdin.on('data', d => t += d).on('end', () => { const w = p.projectProblems(JSON.parse(t)); process.stdout.write(w.join('; ')) })" (Join-Path $src 'helper\policy.js')
+  if ($LASTEXITCODE) { throw 'The projects check (node) failed.' }
+  if ($why) { throw "The projects can't be used: $why. Nothing was changed." }
+}
 # The helper refuses a policy whose session cap is below one lease (helper/policy.js): refuse it here first.
 if ($MaxSessionMinutes -and ($MaxSessionMinutes -lt 5 -or $MaxSessionMinutes -gt 1440 -or $MaxSessionMinutes -lt $MaxLeaseMinutes)) { throw "-MaxSessionMinutes must be 5-1440 and at least -MaxLeaseMinutes ($MaxLeaseMinutes)." }
 $pins = New-Object Collections.ArrayList
@@ -209,6 +232,11 @@ $policy = [ordered]@{
   allowUnpinnedIso = [bool]$AllowUnpinnedIso
   buildRoots = @($buildRoots)
 }
+if ($projects.Count) {
+  $reserved = ($projects | ForEach-Object { [int]$_.reserveVms } | Measure-Object -Sum).Sum
+  if ($reserved -gt $policy.maxVms) { throw "The projects reserve $reserved VMs in all, over the policy's maxVms ($($policy.maxVms))." }
+  $policy.projects = @($projects)
+}
 if ($MaxSessionMinutes) { $policy.maxSessionMinutes = $MaxSessionMinutes }
 $policyFile = Join-Path $state 'policy.json'
 Write-SecureFile $policyFile ($policy | ConvertTo-Json -Depth 4) @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=ReadAndExecute") $ADMINS
@@ -222,6 +250,7 @@ foreach ($d in $folders) { $bad += @(Test-ExclusiveAcl $d -Allowed $SYSTEM, $ADM
 if ($bad.Count) { throw "The helper's folders aren't as setup made them: $($bad -join '; ')" }
 Step "State in $state; VM disks in $($folders -join ', '); ACLs checked."
 Step "Build folders set by an admin (beside each client's MCP roots): $(if ($buildRoots.Count) { $buildRoots -join '; ' } else { 'none' })."
+Step "Projects sharing the pool: $(if ($projects.Count) { ($projects | ForEach-Object { "$($_.name) (cap $(if ($null -ne $_.maxVms) { $_.maxVms } else { 'none' }), reserve $([int]$_.reserveVms))" }) -join '; ' } else { 'none (one shared pool, first come first served)' })."
 Step ("Policy: up to {0} VMs, {1} cores each, {2} GB memory in all, {3} GB disks; network {4}; unpinned ISOs {5}; leases up to {6} min, work sessions up to {7} min." -f $policy.maxVms, $policy.maxCoresPerVm, ($policy.maxMemoryMBTotal / 1024), $policy.maxDiskGBPerVm, $(if ($AllowNetwork) { 'allowed (internal switch only)' } else { 'not allowed' }), $(if ($AllowUnpinnedIso) { 'allowed' } else { 'refused' }), $MaxLeaseMinutes, $(if ($MaxSessionMinutes) { $MaxSessionMinutes } else { [Math]::Max($MaxLeaseMinutes, 480) }))
 
 # 8. Start.

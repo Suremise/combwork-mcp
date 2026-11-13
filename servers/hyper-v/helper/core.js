@@ -36,6 +36,10 @@ const RETRY_MS = Number(process.env.HYPERV_MCP_RETRY_MS || 5 * 60_000)
 const CHUNK_MAX = 1024 * 1024
 const MANIFEST_BATCH = 5000 // entries per manifest_add, at most (server.js sends batches of at most 1 MB of JSON)
 const MINUTE_MS = Number(process.env.HYPERV_MCP_MINUTE_MS || 60_000) // test-only: shorter lease minutes
+// vm_acquire's queue (MC-1502): one request waits at most WAIT_MS (under a client's 60 s tool timeout), and a place in
+// line is kept KEEP_MS after a wait ends without a VM, for the caller's next vm_acquire. Test-only overrides.
+const WAIT_MS = Number(process.env.HYPERV_MCP_WAIT_MS || 20_000)
+const KEEP_MS = Number(process.env.HYPERV_MCP_KEEP_MS || 120_000)
 
 const hex = n => crypto.randomBytes(n).toString('hex')
 const sleep = ms => new Promise(r => setTimeout(r, ms))
@@ -98,6 +102,10 @@ class Helper {
     this.lastJob = null
     this.quiesced = false
     this.pendingCleanup = new Set() // staging folders that couldn't be removed yet (retried; swept at every start)
+    // vm_acquire's FIFO queue: { connId, project, since, minutes, keepOnFailure, pending: { token, settle } | null,
+    // expires }. An entry is active while one of its requests is waiting (pending), and only an active one is given a VM.
+    this.queue = []
+    this.tokens = 0
     this.timers = new Set()
     this.ready = false
   }
@@ -226,6 +234,7 @@ class Helper {
   async disconnect(connId) {
     const c = this.conns.get(connId)
     this.conns.delete(connId)
+    this.leaveQueue(connId, 'its connection closed')
     if (!c) return
     try {
       const lease = c.vmId && this.leases.get(c.vmId)
@@ -280,40 +289,189 @@ class Helper {
     return [...s.vms.values()].filter(v => v.ready && !v.removing && !s.quarantined.has(v.vmId) && !this.leases.has(v.vmId))
   }
 
-  acquire(connId, { minutes = 60, keepOnFailure = false } = {}) {
-    return this.poolLock(async () => {
+  // ---------- projects, fair share and the queue (MC-1502) ----------
+
+  /**
+   * The caller's project, from the roots its server sends (real paths): the one project with a folder that one of them is
+   * in (or is). None, several, or no roots (an older server) is "other". Advisory, like the roots themselves: it keeps
+   * honest agents from starving each other, not a determined one.
+   */
+  projectOf(roots) {
+    const list = Array.isArray(roots) ? roots.filter(r => typeof r === 'string' && /^[a-zA-Z]:[\\/]/.test(r) && r.length <= 1024).slice(0, 64) : []
+    const norm = f => win32.normalize(f).replace(/\\+$/, '').toLowerCase()
+    const hits = new Set()
+    for (const r of list.map(norm)) {
+      for (const p of this.policy.projects) if (p.folders.some(f => { const n = norm(f); return r === n || r.startsWith(n + '\\') })) hits.add(p.name)
+    }
+    return hits.size === 1 ? [...hits][0] : 'other'
+  }
+
+  held(project) { return [...this.leases.values()].filter(l => l.project === project).length }
+
+  /**
+   * Why a free VM can't go to this project now, or null. Its cap, then every other project's unmet reservation, which
+   * the free VMs must still cover after this one goes.
+   */
+  blocked(project) {
+    const p = this.policy.projects.find(x => x.name === project)
+    if (p?.maxVms !== undefined && this.held(project) >= p.maxVms) return `project ${project} holds its cap of ${p.maxVms}`
+    const free = this.freeVms().length
+    if (!free) return 'none is free'
+    const owed = this.policy.projects.filter(q => q.name !== project).map(q => ({ q, n: Math.max(0, (q.reserveVms || 0) - this.held(q.name)) })).filter(x => x.n)
+    const total = owed.reduce((a, x) => a + x.n, 0)
+    if (free - 1 < total) return `the free VM${free > 1 ? 's are' : ' is'} reserved for ${owed.map(x => x.q.name).join(', ')}`
+    return null
+  }
+
+  /** Makes the lease (under the pool lock): the first free VM, for this connection and project. */
+  grant(connId, project, minutes, keepOnFailure) {
+    const c = this.conns.get(connId)
+    if (!c) throw new Error('unknown connection')
+    const vm = this.freeVms()[0]
+    const now = this.now()
+    const sessionEnd = now + policyMod.sessionMinutes(this.policy) * MINUTE_MS
+    const lease = {
+      leaseId: `l-${hex(6)}`, vmId: vm.vmId, vmName: vm.vmName, connId, ownerConn: connId, pid: c.pid, ending: null, children: new Set(),
+      acquiredAt: now, sessionEnd, deadline: Math.min(sessionEnd, now + Math.round(minutes * MINUTE_MS)), keepOnFailure: !!keepOnFailure,
+      kept: false, running: false, failed: false, runs: 0, dirty: false, network: false, reserve: 0,
+      // project: pinned here, so a later change of the caller's roots never moves the lease or its count.
+      project,
+      // interactive: the account logged on in the guest by this start ('user' or 'admin'), or null.
+      interactive: null,
+      // What the helper knows of the guest's C:\build (vm_sync): the files it placed, by canonical key; gen moves on at
+      // every start, sync and the lease's end (a plan from an earlier gen is stale); trusted is false while an apply
+      // is unfinished or after one failed, when only a full sync or a reset may follow.
+      sync: { record: new Map(), gen: 0, trusted: false, plan: null }
+    }
+    this.leases.set(vm.vmId, lease)
+    c.vmId = vm.vmId
+    this.armDeadline(lease)
+    const share = project === 'other' ? '' : ` for project ${project}`
+    return { text: `Leased ${vm.vmName} (lease ${lease.leaseId})${share} until ${new Date(lease.deadline).toISOString()}; vm_renew can extend it up to ${new Date(sessionEnd).toISOString()} (the policy's work-session cap). Call vm_start next; always vm_release when done.`, data: { lease: lease.leaseId, vm: vm.vmName, deadline: lease.deadline, sessionEnd, project } }
+  }
+
+  /** Settles an entry's waiting request once: with a result, or an error. Its token makes a late timer a no-op. */
+  settle(e, outcome) {
+    const w = e.pending
+    if (!w) return
+    e.pending = null
+    clearTimeout(w.timer)
+    this.timers.delete(w.timer)
+    w.settle(outcome)
+  }
+
+  /** Inactive entries past their keep time leave the queue. */
+  dropExpired() {
+    const now = this.now()
+    this.queue = this.queue.filter(e => e.pending || !(e.expires <= now))
+  }
+
+  /**
+   * Under the pool lock: gives free VMs to active entries, first come first served. An entry its project's cap or
+   * another's reservation blocks keeps its place, and later ones are served past it. Never waits on anything.
+   */
+  drain() {
+    if (this.quiesced) { for (const e of this.queue.splice(0)) this.settle(e, { error: new Error('The helper is being uninstalled: no new leases.') }); return }
+    this.dropExpired()
+    for (const e of [...this.queue]) {
+      if (!this.freeVms().length) break
+      if (!e.pending || this.blocked(e.project)) continue
+      this.queue = this.queue.filter(x => x !== e)
+      let outcome
+      try { outcome = { result: this.grant(e.connId, e.project, e.minutes, e.keepOnFailure) } } catch (err) { outcome = { error: err } }
+      this.settle(e, outcome)
+    }
+  }
+
+  /** A drain once the change that freed a VM (a lease ended, a quarantine cleared, a pool job ended) has committed. */
+  kick() { void this.poolLock(async () => this.drain()).catch(() => {}) }
+
+  leaveQueue(connId, why) {
+    const e = this.queue.find(x => x.connId === connId)
+    if (!e) return
+    this.queue = this.queue.filter(x => x !== e)
+    this.settle(e, { error: new Error(`The wait for a VM ended: ${why}.`) })
+  }
+
+  position(connId) {
+    const i = this.queue.findIndex(x => x.connId === connId)
+    return i < 0 ? this.queue.length + 1 : i + 1
+  }
+
+  /**
+   * vm_acquire. Without wait: the queue's active waiters are served first, then this call gets a VM only if one is free
+   * for its project now (its cap, and the other projects' reservations); otherwise it's refused, saying why and where it
+   * would stand. With wait: it takes (or resumes) the connection's place in line and waits at most WAIT_MS; a VM freed
+   * meanwhile goes to the first active entry it is allowed to; a wait that ends without one keeps the place KEEP_MS for
+   * the next call. A newer call from the same connection supersedes a waiting one. The pool lock is held only for these
+   * decisions, never while waiting.
+   */
+  async acquire(connId, { minutes = 60, keepOnFailure = false, wait = false, roots } = {}) {
+    const step = await this.poolLock(async () => {
       if (this.quiesced) throw new Error('The helper is being uninstalled: no new leases.')
       const c = this.conns.get(connId)
       if (!c) throw new Error('unknown connection')
       if (c.vmId && this.leases.get(c.vmId)?.connId === connId) throw new Error(`This connection already has ${this.leases.get(c.vmId).vmName}: one VM per connection.`)
       const max = this.policy.maxLeaseMinutes
       if (!Number.isFinite(minutes) || minutes < 1 || minutes > max) throw new Error(`minutes must be 1-${max} (the policy's maxLeaseMinutes).`)
-      const vm = this.freeVms()[0]
-      if (!vm) {
-        const s = this.state
-        const ready = [...s.vms.values()].filter(v => v.ready)
-        if (!ready.length) throw new Error('The pool has no VMs yet: ask the user to create one (pool_plan, then their approval, then pool_create).')
+      const s = this.state
+      if (![...s.vms.values()].some(v => v.ready)) throw new Error('The pool has no VMs yet: ask the user to create one (pool_plan, then their approval, then pool_create).')
+      this.dropExpired()
+      let e = this.queue.find(x => x.connId === connId)
+      if (e) this.settle(e, { error: new Error('Superseded by a newer vm_acquire from this connection.') })
+      if (!wait) {
+        this.drain()
+        const project = e ? e.project : this.projectOf(roots)
+        const why = this.blocked(project)
+        if (!why) {
+          if (e) this.queue = this.queue.filter(x => x !== e)
+          return { result: this.grant(connId, project, minutes, keepOnFailure) }
+        }
         const next = [...this.leases.values()].sort((a, b) => a.deadline - b.deadline)[0]
-        throw new Error(`No VM is free (${ready.length} in the pool${s.quarantined.size ? `, ${s.quarantined.size} quarantined` : ''}).${next ? ` The next lease ends by ${new Date(next.deadline).toISOString()}.` : ''} Try again later.`)
+        const pool = `${s.vms.size} in the pool${s.quarantined.size ? `, ${s.quarantined.size} quarantined` : ''}${this.queue.length ? `, ${this.queue.length} waiting` : ''}`
+        throw new Error(`${why === 'none is free' ? `No VM is free (${pool}).` : `No VM for you now: ${why} (${pool}).`}${next ? ` The next lease ends by ${new Date(next.deadline).toISOString()}.` : ''} Try again later, or vm_acquire with wait: true to wait in line (you'd be number ${this.position(connId)}).`)
       }
-      const now = this.now()
-      const sessionEnd = now + policyMod.sessionMinutes(this.policy) * MINUTE_MS
-      const lease = {
-        leaseId: `l-${hex(6)}`, vmId: vm.vmId, vmName: vm.vmName, connId, ownerConn: connId, pid: c.pid, ending: null, children: new Set(),
-        acquiredAt: now, sessionEnd, deadline: Math.min(sessionEnd, now + Math.round(minutes * MINUTE_MS)), keepOnFailure: !!keepOnFailure,
-        kept: false, running: false, failed: false, runs: 0, dirty: false, network: false, reserve: 0,
-        // interactive: the account logged on in the guest by this start ('user' or 'admin'), or null.
-        interactive: null,
-        // What the helper knows of the guest's C:\build (vm_sync): the files it placed, by canonical key; gen moves on at
-        // every start, sync and the lease's end (a plan from an earlier gen is stale); trusted is false while an apply
-        // is unfinished or after one failed, when only a full sync or a reset may follow.
-        sync: { record: new Map(), gen: 0, trusted: false, plan: null }
+      if (!e) {
+        e = { connId, project: this.projectOf(roots), since: this.now(), expires: null, pending: null }
+        this.queue.push(e)
       }
-      this.leases.set(vm.vmId, lease)
-      c.vmId = vm.vmId
-      this.armDeadline(lease)
-      return { text: `Leased ${vm.vmName} (lease ${lease.leaseId}) until ${new Date(lease.deadline).toISOString()}; vm_renew can extend it up to ${new Date(sessionEnd).toISOString()} (the policy's work-session cap). Call vm_start next; always vm_release when done.`, data: { lease: lease.leaseId, vm: vm.vmName, deadline: lease.deadline, sessionEnd } }
+      Object.assign(e, { minutes, keepOnFailure, expires: null })
+      const token = ++this.tokens
+      const done = new Promise(resolve => {
+        const timer = setTimeout(() => {
+          this.timers.delete(timer)
+          if (e.pending?.token !== token) return
+          e.pending = null
+          e.expires = this.now() + KEEP_MS
+          resolve({ waiting: true })
+        }, WAIT_MS)
+        timer.unref?.()
+        this.timers.add(timer)
+        e.pending = { token, timer, settle: resolve }
+      })
+      this.drain()
+      return { done, e }
     })
+    if (step.result) return step.result
+    const out = await step.done
+    if (out.error) throw out.error
+    if (out.result) return out.result
+    // Waited WAIT_MS without a VM: the place is kept for the next call.
+    return await this.poolLock(async () => {
+      const why = this.blocked(step.e.project) || 'none is free'
+      const i = this.queue.indexOf(step.e)
+      return {
+        text: `Still waiting for a VM (${why}): number ${i + 1} of ${this.queue.length} in line. Call vm_acquire with wait: true again within ${Math.round(KEEP_MS / 1000)} s to keep your place.`,
+        data: { waiting: true, position: i + 1, of: this.queue.length, project: step.e.project }
+      }
+    })
+  }
+
+  /** The caller's project and the build folders it may use: its own (policy) and the global ones. */
+  whoami(roots) {
+    const project = this.projectOf(roots)
+    const own = this.policy.projects.find(p => p.name === project)?.buildRoots || []
+    return { text: project, data: { project, buildRoots: [...own, ...this.policy.buildRoots], projectBuildRoots: [...own] } }
   }
 
   /**
@@ -369,6 +527,7 @@ class Helper {
       const owner = this.conns.get(lease.ownerConn)
       if (owner && owner.vmId === lease.vmId) owner.vmId = null
       this.log(`lease ${lease.leaseId} on ${lease.vmName} ended (${why}): ${r.text}`)
+      this.kick()
       return r
     })()
     return lease.ending
@@ -403,6 +562,7 @@ class Helper {
       const vm = this.state.vms.get(vmId)
       if (vm && vm.ready && !vm.removing && !this.leases.has(vmId)) await this.vmLock(vmId)(() => this.restore(vm)).catch(() => {})
     }
+    this.kick()
   }
 
   // ---------- build staging ----------
@@ -892,6 +1052,21 @@ class Helper {
 
   // ---------- status ----------
 
+  /** vm_status's lines on sharing: each project's use against its share, "other", and the queue in order. */
+  shareLines() {
+    this.dropExpired()
+    const out = []
+    if (this.policy.projects.length) {
+      const per = this.policy.projects.map(p => `${p.name} holds ${this.held(p.name)}${p.maxVms !== undefined ? ` of its cap of ${p.maxVms}` : ''}${p.reserveVms ? `, ${p.reserveVms} kept for it` : ''}`)
+      out.push(`Projects: ${per.join('; ')}; other holds ${this.held('other')}.`)
+    }
+    if (this.queue.length) {
+      const now = this.now()
+      out.push(`Waiting in line: ${this.queue.map((e, i) => `${i + 1}. ${e.project}, ${Math.round((now - e.since) / 1000)} s${e.pending ? '' : ' (between calls)'}${this.blocked(e.project) ? ` (${this.blocked(e.project)})` : ''}`).join('; ')}.`)
+    }
+    return out
+  }
+
   status(connId) {
     const s = this.state
     const mine = connId && this.conns.get(connId)?.vmId
@@ -906,6 +1081,7 @@ class Helper {
     const lines = [
       `Pool: ${vms.length ? `${vms.length} VM(s)` : 'no VMs'}; switch: ${s.switch ? `${s.switch.name} (${s.switch.phase})` : 'none'}; image: ${img ? `${img.edition} ${img.build} (${img.sha256.slice(0, 12)}…, ${img.pinned ? 'pinned' : img.source})` : 'none'}.`,
       ...vms,
+      ...this.shareLines(),
       this.job ? `Pool job in progress: ${this.job.op} (${this.job.jobId}): ${this.job.progress}` : this.lastJob ? `Last pool job: ${this.lastJob.op} ${this.lastJob.ok ? 'finished' : 'FAILED'}: ${this.lastJob.note}` : null,
       this.imageJob ? `Image: ${this.imageJob.progress}` : this.lastImage ? `Image: ${this.lastImage}` : null,
       this.quiesced ? `Quiesced for uninstall: no new leases${this.quiesced.allowRemove ? '; only an approved remove of the pool' : '; no pool changes'}.` : null,
@@ -1039,7 +1215,7 @@ class Helper {
       job.promise = this.runJob(job, plan).then(
         note => { this.journal.append({ t: 'jobEnd', jobId, ok: true, note }); this.lastJob = { op, ok: true, note } },
         e => { this.journal.append({ t: 'jobEnd', jobId, ok: false, note: e.message }); this.lastJob = { op, ok: false, note: e.message } }
-      ).finally(() => { this.job = null })
+      ).finally(() => { this.job = null; this.kick() })
       return { text: `Approved plan ${planId} accepted: pool job ${jobId} (${op}) is running. ${op === 'remove' ? '' : 'Creating a VM installs Windows unattended: about 20-40 minutes each, one at a time. '}Follow it with pool_status.`, data: { jobId } }
     })
   }
@@ -1218,13 +1394,17 @@ class Helper {
       case 'pool_resize': return this.apply('resize', args)
       case 'pool_remove': return this.apply('remove', args)
       case 'quiesce': return this.quiesce()
-      case 'version': return { text: PROTOCOL, data: { protocol: PROTOCOL, buildRoots: [...this.policy.buildRoots] } }
+      case 'version': return { text: PROTOCOL, data: { protocol: PROTOCOL, features: [...FEATURES], buildRoots: [...this.policy.buildRoots] } }
+      case 'whoami': return this.whoami(args.roots)
       default: throw new Error(`unknown operation ${op}`)
     }
   }
 }
 
 const PROTOCOL = 'hyperv-mcp/3' // 2: renew, sync_plan, sync (MC-1497); 3: start's interactive, run's session (MC-1503)
+// Additive features since protocol 3, by name, so a server that asks for exactly hyperv-mcp/3 (hyper-v 1.2.0) keeps
+// working with this helper: 'projects' = projects, acquire's wait and roots, whoami (MC-1502).
+const FEATURES = ['projects']
 const EVAL_DAYS = 90
 const DAY_MS = 24 * 60 * 60 * 1000
 

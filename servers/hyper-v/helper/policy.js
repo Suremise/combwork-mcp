@@ -28,6 +28,8 @@ const DEFAULTS = {
 }
 
 const MAX_BUILD_ROOTS = 16
+const MAX_PROJECTS = 16
+const PROJECT_RE = /^[a-z][a-z0-9-]{0,31}$/
 /** Why a policy folder isn't an absolute local folder (not UNC, a device path, a drive root or with ".."), or null. */
 const folderProblem = f =>
   typeof f !== 'string' || !/^[a-zA-Z]:[\\/]/.test(f) || f.split(/[\\/]/).includes('..') || win32.parse(f).root === win32.normalize(f)
@@ -59,6 +61,47 @@ function problems(p) {
     if (!Array.isArray(p.buildRoots) || p.buildRoots.length > MAX_BUILD_ROOTS) out.push(`buildRoots must be a list of at most ${MAX_BUILD_ROOTS} folders`)
     else for (const f of p.buildRoots) { const why = folderProblem(f); if (why) out.push(`build root "${f}" ${why}`) }
   }
+  // Projects sharing the pool (MC-1502), optional: setup's -ProjectsFile. Each: { name, folders, maxVms?, reserveVms?,
+  // buildRoots? }. A caller belongs to the one project with a folder its roots are in, so no project folder may be the
+  // same as, inside or around another project's.
+  if (p.projects !== undefined) out.push(...projectProblems(p.projects, p.maxVms))
+  return out
+}
+
+/** Problems with a policy's projects list. */
+function projectProblems(projects, maxVms) {
+  const out = []
+  if (!Array.isArray(projects) || projects.length > MAX_PROJECTS) return [`projects must be a list of at most ${MAX_PROJECTS}`]
+  const names = new Set()
+  const owned = [] // [folder (lower case), project]
+  let reserved = 0
+  for (const [i, pr] of projects.entries()) {
+    const at = `project ${typeof pr?.name === 'string' ? `"${pr.name}"` : i + 1}`
+    if (!pr || typeof pr !== 'object' || Array.isArray(pr)) { out.push(`${at} must be an object`); continue }
+    const known = ['name', 'folders', 'maxVms', 'reserveVms', 'buildRoots']
+    for (const k of Object.keys(pr)) if (!known.includes(k)) out.push(`${at}: unknown field "${k}"`)
+    if (!PROJECT_RE.test(pr.name ?? '')) out.push(`${at}: name must be 1-32 lower-case letters, digits and -, starting with a letter`)
+    else if (names.has(pr.name) || pr.name === 'other') out.push(`${at}: the name is taken${pr.name === 'other' ? ' ("other" is everyone outside the projects)' : ''}`)
+    names.add(pr.name)
+    if (!Array.isArray(pr.folders) || !pr.folders.length || pr.folders.length > MAX_BUILD_ROOTS) out.push(`${at}: folders must list 1-${MAX_BUILD_ROOTS} folders`)
+    else for (const f of pr.folders) {
+      const why = folderProblem(f)
+      if (why) { out.push(`${at}: folder "${f}" ${why}`); continue }
+      const n = tidy(f).toLowerCase()
+      for (const [o, other] of owned) {
+        if (n === o || n.startsWith(o + '\\') || o.startsWith(n + '\\')) out.push(`${at}: folder "${f}" overlaps ${other === pr.name ? 'another of its folders' : `project "${other}"'s`} (one root must belong to one project)`)
+      }
+      owned.push([n, pr.name])
+    }
+    for (const k of ['maxVms', 'reserveVms']) if (pr[k] !== undefined && !int(pr[k], 0, 64)) out.push(`${at}: ${k} must be a whole number 0-64`)
+    if (int(pr.maxVms, 0, 64) && int(pr.reserveVms, 0, 64) && pr.reserveVms > pr.maxVms) out.push(`${at}: reserveVms (${pr.reserveVms}) is over its maxVms (${pr.maxVms})`)
+    if (int(pr.reserveVms, 0, 64)) reserved += pr.reserveVms
+    if (pr.buildRoots !== undefined) {
+      if (!Array.isArray(pr.buildRoots) || pr.buildRoots.length > MAX_BUILD_ROOTS) out.push(`${at}: buildRoots must be a list of at most ${MAX_BUILD_ROOTS} folders`)
+      else for (const f of pr.buildRoots) { const why = folderProblem(f); if (why) out.push(`${at}: build root "${f}" ${why}`) }
+    }
+  }
+  if (int(maxVms, 1, 64) && reserved > maxVms) out.push(`the projects reserve ${reserved} VMs in all, over the policy's maxVms (${maxVms})`)
   return out
 }
 
@@ -70,7 +113,11 @@ function load(dir) {
   }
   const bad = problems(p)
   if (bad.length) throw new Error(`policy.json is not usable: ${bad.join('; ')}. Run setup again.`)
-  return Object.freeze({ ...p, diskFolders: Object.freeze(p.diskFolders.map(tidy)), buildRoots: Object.freeze((p.buildRoots ?? []).map(tidy)) })
+  const projects = (p.projects ?? []).map(pr => Object.freeze({
+    name: pr.name, folders: Object.freeze(pr.folders.map(tidy)), maxVms: pr.maxVms, reserveVms: pr.reserveVms ?? 0,
+    buildRoots: Object.freeze((pr.buildRoots ?? []).map(tidy))
+  }))
+  return Object.freeze({ ...p, diskFolders: Object.freeze(p.diskFolders.map(tidy)), buildRoots: Object.freeze((p.buildRoots ?? []).map(tidy)), projects: Object.freeze(projects) })
 }
 
 /**
@@ -104,4 +151,4 @@ function underDiskFolder(policy, folder) {
   return policy.diskFolders.some(d => f.startsWith(lower(d) + '\\') && f.length > d.length + 1)
 }
 
-module.exports = { load, problems, checkPool, underDiskFolder, sessionMinutes, DEFAULTS, FILE, PREFIX_RE }
+module.exports = { load, problems, projectProblems, checkPool, underDiskFolder, sessionMinutes, DEFAULTS, FILE, PREFIX_RE }
