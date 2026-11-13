@@ -397,3 +397,31 @@ test('uninstall teardown (non-elevated, fakes): verified targets only; resumable
   // Hyper-V's grantee pattern is for disk folders only.
   assert.match(a.capabilityInState, /isn't as setup and the helper leave it/); assert.strictEqual(a.capabilityInStateQuiet, true)
 })
+
+// install.ps1's -BuildRoot checks, run as setup runs them (the block itself, cut from the script, not elevated): they
+// refuse what the helper's policy check would (more than 16, a drive root, '..'), before setup changes anything.
+test('setup: -BuildRoot is refused as the policy would, before anything changes', { skip: !windows }, () => {
+  const { spawnSync } = require('child_process')
+  const src = fs.readFileSync(path.join(__dirname, '..', 'setup', 'install.ps1'), 'utf8')
+  const block = /^\$buildRoots = @\(\$BuildRoot[\s\S]*?^if \(\$buildRoots\.Count -gt 16\).*$/m.exec(src)
+  assert.ok(block, 'the -BuildRoot block is in install.ps1')
+  const sc = scratch('setup-buildroots')
+  const file = path.join(sc.dir, 'buildroots.ps1')
+  fs.writeFileSync(file, `param([string[]]$BuildRoot = @())\n$ErrorActionPreference = 'Stop'\n${block[0]}\nConvertTo-Json -Compress @{ buildRoots = @($buildRoots) }\n`)
+  const run = roots => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', `& '${file}' -BuildRoot ${roots.map(r => `'${r}'`).join(',')} 3>$null`], { encoding: 'utf8', env: ps51Env() })
+  const many = n => Array.from({ length: n }, (_, i) => path.join(sc.dir, `root-${i}`))
+  const sixteen = run([...many(16), path.join(sc.dir, 'root-0') + '\\'])
+  assert.strictEqual(sixteen.status, 0, sixteen.stderr)
+  const written = JSON.parse(sixteen.stdout.trim()).buildRoots
+  assert.strictEqual(written.length, 16, 'a repeat (with a trailing \\) counts once')
+  assert.deepStrictEqual(policy.problems({ ...policy.DEFAULTS, diskFolders: ['D:\\hv'], buildRoots: written }), [])
+  const seventeen = run(many(17))
+  assert.notStrictEqual(seventeen.status, 0)
+  assert.match(seventeen.stderr + seventeen.stdout, /At most 16 build roots: 17 were given/)
+  assert.match(policy.problems({ ...policy.DEFAULTS, diskFolders: ['D:\\hv'], buildRoots: many(17) }).join(), /at most 16/)
+  for (const bad of ['C:\\', 'relative', path.join(sc.dir, 'a') + '\\..\\b']) {
+    const r = run([bad])
+    assert.notStrictEqual(r.status, 0, bad)
+    assert.match(r.stderr + r.stdout, /Build root .* must be/, bad)
+  }
+})

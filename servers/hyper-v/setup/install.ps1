@@ -93,6 +93,8 @@ $buildRoots = @($BuildRoot | Where-Object { $_ } | ForEach-Object {
   if (-not (Test-Path -LiteralPath $b -PathType Container)) { Write-Warning "Build root $b doesn't exist yet: it is recorded, and used once it exists." }
   $b
 } | Select-Object -Unique)
+# The helper's policy check allows at most 16 (helper/policy.js): refuse more here, before anything changes.
+if ($buildRoots.Count -gt 16) { throw "At most 16 build roots: $($buildRoots.Count) were given." }
 $pins = New-Object Collections.ArrayList
 $receipts = $null
 try {
