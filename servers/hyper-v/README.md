@@ -87,10 +87,7 @@ and test accounts.
      add to the group later must sign in again before their membership counts;
    - `%ProgramData%\hyperv-mcp` (the helper's state) and the disk folder, both readable only by SYSTEM,
      Administrators and the service. `policy.json` and `approvals\` in there are writable only by Administrators and
-     SYSTEM. Setup doesn't just add its grants: each of these folders, and `%ProgramFiles%\hyperv-mcp`, gets an ACL
-     built from scratch, so any earlier grant to anyone else is removed, from the folder and from everything already
-     in it. The only exception is Hyper-V's own grants to each VM's SID on its files, which the VM needs. It refuses
-     a folder that is, contains or sits under a link or junction, and checks the result before it goes on;
+     SYSTEM. How setup makes them trustworthy is under "Storage" below;
    - `policy.json`, the pool's hard limits. By default they're derived from the host: up to a quarter of its logical
      CPUs per VM (at most 8), half its memory in all, up to 4 VMs, 128 GB disks, networking allowed (internal switch
      only), unpinned ISOs refused. Override any of them: `-MaxVms`, `-MaxCoresPerVm`, `-MaxMemoryGB`,
@@ -114,6 +111,39 @@ and test accounts.
    or `HYPERV_MCP_ALLOWED_ROOTS` (see "Multiple projects"). The [top-level README](../../README.md#install) shows the
    entry for each client's format.
 4. Build the pool: ask an agent to plan one (next section).
+
+### Storage: where it may be, and how setup trusts it
+
+The helper trusts what is in its state folder (the journal, plans, approvals, guest credentials) and its disk folders
+(the verified images). So setup must know those bytes were written only by itself and the helper:
+
+- **Supported locations.**
+  - The state folder is `%ProgramData%\hyperv-mcp`, and the code goes in `%ProgramFiles%\hyperv-mcp`. Both are found
+    through Windows' known-folder API, not environment variables.
+  - A disk folder must be a **top-level folder on a local fixed drive**, such as `D:\hyperv-mcp`. Anything deeper is
+    refused.
+- **Parents are checked, never changed.** Before anything else, setup checks every folder above each of these, from
+  the drive root down:
+  - no link or junction;
+  - owned by Administrators, SYSTEM or TrustedInstaller;
+  - nobody else may delete or rename inside it, change its permissions, or take it over.
+
+  An insecure parent stops setup with nothing changed: fix its permissions yourself, or choose another location.
+  While setup runs it holds every parent and storage folder open in a way that stops anyone renaming, deleting or
+  replacing them.
+- **Created secure, with a receipt.** A missing storage folder is created with its final permissions in the same call
+  that creates it, so nobody else can ever have written there. Setup then records the folder's identity (its volume
+  and file id) in `HKLM\SOFTWARE\hyperv-mcp\Storage`, a key only Administrators and SYSTEM can write.
+- **Existing storage is trusted only by its receipt.** A folder that already exists is used only if:
+  - its receipt matches its identity;
+  - it and everything in it still have only the expected owners and permissions.
+
+  Setup never repairs or re-permissions an existing folder. A folder without a receipt is refused untouched: one made
+  by someone else, by an older setup, or whose creation was interrupted. So is one whose identity differs (deleted and
+  made again). To use that location, remove the folder (and any pool in it, first), then run setup again.
+- **Files setup writes** (`policy.json`) are created with their final permissions under a temporary name, then renamed
+  into place.
+- `uninstall.ps1 -KeepPool` keeps the folders and their receipts. `-RemovePool` removes both.
 
 **In Combwork:** pack it (`node scripts\pack.mjs hyper-v` at the repo root) and add `dist\hyper-v.zip` with **Add MCP
 Server from File** in the MCP view. Its definition goes in as `combwork-mcp.example.json`
@@ -357,8 +387,18 @@ node --test test\units.test.js test\leases.test.js test\approvals.test.js test\r
     folders, download URLs;
   - the policy, the journal (a torn last line cut off, then reopen → append → reopen keeping every record),
     canonical plans, the answer file's escaping, the evaluation-expiry warning;
-  - setup's ACLs, non-elevated on temp folders (`test\acl-check.ps1`): earlier grants removed from a folder and
-    everything in it, VM grants kept on disk files, links inside or above refused before any change;
+  - setup's storage and ACL routines themselves, non-elevated on temp folders and a test registry key
+    (`test\acl-check.ps1`):
+    - a folder created with its final security and its receipt, then trusted unchanged on the next run;
+    - the injected boundary: a folder created, with a forged journal, between "missing" and the create, refused and
+      left untouched, with no receipt minted;
+    - a legacy folder (exclusive, but no receipt) refused, and an interrupted creation (no receipt) failing closed;
+    - a folder deleted and made again (another identity) refused;
+    - a parent granting Users DeleteChild refused, and a junction parent refused;
+    - a pinned parent that can't be renamed while setup holds it;
+    - a receipts key that Users can write, refused;
+    - a file written with its own ACL, not the old file's;
+    - for the install folder: earlier grants removed, VM grants kept, links refused before any change;
   - `approve.ps1` refusing to run outside the install folder.
 - `leases.test.js`:
   - leases across connections; a connection closing, the deadline, keep and `keepOnFailure`;
@@ -425,4 +465,5 @@ repo, and `npm test` clears earlier runs' folders first.
   - `approve.ps1`;
   - `host\HvMcpHost.cs` (the service host's source).
 - `setup\install.ps1`, `setup\uninstall.ps1`: the only elevated steps besides approvals. `setup\acl.ps1` holds
-  setup's ACL functions (tested non-elevated by `test\acl-check.ps1`).
+  setup's storage and ACL routines, with `setup\Storage.cs` for the Windows calls they need (both tested non-elevated
+  by `test\acl-check.ps1`).

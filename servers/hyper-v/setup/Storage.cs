@@ -34,8 +34,16 @@ public static class HvMcpStorage {
   static extern uint GetSecurityDescriptorLength(IntPtr sd);
   [DllImport("kernel32.dll")]
   static extern IntPtr LocalFree(IntPtr p);
+  [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+  static extern bool MoveFileExW(string from, string to, uint flags);
 
-  const uint READ_CONTROL = 0x00020000, FILE_READ_ATTRIBUTES = 0x80;
+  /// <summary>Renames from over to (same volume), replacing it. The renamed file keeps its own security descriptor (unlike
+  /// ReplaceFile, which copies the replaced file's).</summary>
+  public static void RenameOver(string from, string to) {
+    if (!MoveFileExW(from, to, 0x1 /* MOVEFILE_REPLACE_EXISTING */)) throw new Win32Exception(Marshal.GetLastWin32Error(), "rename " + from);
+  }
+
+  const uint READ_CONTROL = 0x00020000, FILE_READ_ATTRIBUTES = 0x80, FILE_LIST_DIRECTORY = 0x1;
   const uint FILE_SHARE_READ = 1, FILE_SHARE_WRITE = 2, OPEN_EXISTING = 3;
   const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000, FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
   const int ERROR_ALREADY_EXISTS = 183;
@@ -54,9 +62,11 @@ public static class HvMcpStorage {
     } finally { pin.Free(); }
   }
 
-  /// <summary>Opens without following reparse points, sharing read/write but not delete (pins it). Throws on failure.</summary>
+  /// <summary>Opens without following reparse points, sharing read/write but not delete (pins it). Throws on failure.
+  /// It asks for FILE_LIST_DIRECTORY (FILE_READ_DATA) too: a handle with only metadata access (attributes, READ_CONTROL)
+  /// takes no part in sharing checks, so it wouldn't stop a rename.</summary>
   public static SafeFileHandle Open(string path) {
-    var h = CreateFileW(path, READ_CONTROL | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING,
+    var h = CreateFileW(path, FILE_LIST_DIRECTORY | READ_CONTROL | FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, IntPtr.Zero, OPEN_EXISTING,
       FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
     if (h.IsInvalid) { int err = Marshal.GetLastWin32Error(); h.Dispose(); throw new Win32Exception(err, "open " + path); }
     return h;

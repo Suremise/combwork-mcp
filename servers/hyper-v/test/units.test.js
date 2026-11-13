@@ -233,7 +233,7 @@ test('the 90-day evaluation: a warning from 14 days before, counted from the cle
   assert.strictEqual(expiry({}, t0), '')
 })
 
-test('setup ACLs: earlier grants removed from a folder and what it holds; VM grants kept; links refused (non-elevated)', { skip: !windows }, () => {
+test('setup storage and ACLs (non-elevated): grants removed; VM grants kept; links refused; secure creation, receipts, parents, pins', { skip: !windows }, () => {
   const { spawnSync } = require('child_process')
   const sc = scratch('acl')
   const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, 'acl-check.ps1'), '-Dir', sc.dir], { encoding: 'utf8' })
@@ -253,14 +253,31 @@ test('setup ACLs: earlier grants removed from a folder and what it holds; VM gra
   assert.strictEqual(a.innerUnchanged, true, 'refused before changing anything')
   assert.match(a.ancestorLink, /is a link or junction/)
   assert.strictEqual(a.ancestorUnchanged, true)
-  // Provenance: a forged state folder is refused before anything changes; fresh and already-secured ones are fine.
-  assert.match(a.evil, /already exists with contents setup didn't secure, so they can't be trusted .*Nothing was changed/)
-  assert.strictEqual(a.evilJournalUntouched, true)
-  assert.strictEqual(a.evilAclUntouched, true, 'refused untouched: no repair that would make it look trusted')
-  assert.match(a.evilOwned, /can't be trusted/, 'without the grant, its user-owned contents are still refused')
-  assert.strictEqual(a.missing, 'fresh')
-  assert.strictEqual(a.empty, 'fresh')
-  assert.strictEqual(a.good, 'trusted')
+  // Trusted storage (s52), through setup's own routines.
+  assert.strictEqual(a.ancestorsOk, true, 'the temp folder\'s real parents pass the parent check')
+  assert.strictEqual(a.created, 'created')
+  assert.strictEqual(a.createdProtected, true, 'created with its final, protected security')
+  assert.strictEqual(a.createdUsers, false)
+  assert.strictEqual(a.receipt, true, 'its receipt was written')
+  assert.strictEqual(a.again, 'trusted', 'the next run trusts it by its receipt')
+  assert.strictEqual(a.againUnchanged, true, 'and changes nothing on it')
+  assert.match(a.race, /exists, but setup has no receipt for it.*Nothing was changed/, 'created by someone else between the check and the create: refused')
+  assert.strictEqual(a.raceForgedUntouched, true, 'the forged journal is left as it was')
+  assert.strictEqual(a.raceNoReceipt, true, 'no receipt is minted for a folder setup didn\'t create')
+  assert.match(a.legacy, /no receipt/, 'an exclusive folder without a receipt (an older setup\'s) is refused')
+  assert.strictEqual(a.rawCreate, true)
+  assert.strictEqual(a.rawCreateAgain, false, 'CreateSecure never reuses an existing folder')
+  assert.match(a.interrupted, /no receipt/, 'a creation interrupted before its receipt fails closed')
+  assert.match(a.swap, /identity differs from the receipt/, 'a folder deleted and made again doesn\'t match its receipt')
+  assert.strictEqual(a.fileText, '{"schema":1}')
+  assert.strictEqual(a.fileUsers, false, 'the written file has its own ACL, not the old file\'s')
+  assert.strictEqual(a.fileProtected, true)
+  assert.strictEqual(a.fileTemps, 0)
+  assert.match(a.weakParent, /S-1-5-32-545 holds rights 0x40 there/, 'a parent granting Users DeleteChild is refused')
+  assert.match(a.junctionParent, /is a link or junction/)
+  assert.strictEqual(a.pinnedRename, 'MethodInvocationException', 'a pinned parent can\'t be renamed while setup runs')
+  assert.strictEqual(a.unpinnedRename, 'moved', 'and can once released')
+  assert.match(a.weakKey, /isn't protected \(S-1-5-32-545 can write it\)/, 'a receipts key that Users can write is refused')
 })
 
 test('approve.ps1 runs only from the installed, admin-only folder', { skip: !windows }, () => {

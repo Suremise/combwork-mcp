@@ -50,30 +50,100 @@ $via = Join-Path $Dir 'via'
 try { Set-ExclusiveAcl (Join-Path $via 'x') @("$SYSTEM=FullControl"); $r.ancestorLink = 'accepted' } catch { $r.ancestorLink = $_.Exception.Message }
 $r.ancestorUnchanged = -not (Test-Path (Join-Path $target 'x'))
 
-# 4. Provenance (Assert-TrustedOrFresh, run by setup before any change): a state folder an ordinary user could write,
-# holding a forged recovery journal, a plan and an approval, is refused untouched; missing or empty folders are fresh;
-# a folder already as setup leaves it is trusted. $svc stands for the helper's account: not this user.
-$svc = 'S-1-5-80-1-2-3-4-5'
-$evil = Join-Path $Dir 'evil-state'
-New-Item -ItemType Directory -Force (Join-Path $evil 'approvals'), (Join-Path $evil 'plans') | Out-Null
-$journal = '{"t":"epoch","epoch":"' + ('e' * 32) + '"}' + "`n" + '{"t":"switch","phase":"removing","name":"foreign-internal","switchId":"foreign-switch-id","jobId":"j-1"}' + "`n"
-[IO.File]::WriteAllText((Join-Path $evil 'journal.jsonl'), $journal)
-Set-Content (Join-Path $evil 'plans\p-0000000000000000.json') '{}'
-Set-Content (Join-Path $evil 'approvals\p-0000000000000000.json') '{}'
-& icacls.exe $evil /grant '*S-1-5-32-545:(OI)(CI)M' | Out-Null
-try { [void](Assert-TrustedOrFresh $evil -Allowed $SYSTEM, $svc -Owners $SYSTEM, $svc); $r.evil = 'accepted' } catch { $r.evil = $_.Exception.Message }
-$r.evilJournalUntouched = [IO.File]::ReadAllText((Join-Path $evil 'journal.jsonl')) -eq $journal
-$r.evilAclUntouched = Has $evil $USERS
-# The same forged folder, even with the Users grant removed, is still not trusted: its contents are owned by this user.
-& icacls.exe $evil /remove:g '*S-1-5-32-545' /T | Out-Null
-try { [void](Assert-TrustedOrFresh $evil -Allowed $SYSTEM, $svc, $me -Writers $SYSTEM, $svc -Owners $SYSTEM, $svc); $r.evilOwned = 'accepted' } catch { $r.evilOwned = $_.Exception.Message }
-$r.missing = Assert-TrustedOrFresh (Join-Path $Dir 'not-there') -Allowed $SYSTEM -Owners $SYSTEM
-$empty = Join-Path $Dir 'empty'; New-Item -ItemType Directory -Force $empty | Out-Null
-& icacls.exe $empty /grant '*S-1-5-32-545:(OI)(CI)M' | Out-Null
-$r.empty = Assert-TrustedOrFresh $empty -Allowed $SYSTEM -Owners $SYSTEM
-$good = Join-Path $Dir 'good'
-Set-ExclusiveAcl $good @("$SYSTEM=FullControl", "$me=FullControl")
-Set-Content (Join-Path $good 'journal.jsonl') '{}'
-$r.good = Assert-TrustedOrFresh $good -Allowed $SYSTEM, $me -Owners $SYSTEM, $me
+
+# 4. Trusted storage (design MC-1488/s52), through setup's own routines: Open-TrustedAncestors, Open-ReceiptKey,
+# Use-StorageFolder, Write-SecureFile. Non-elevated, so this user stands in for Administrators (owner and trusted
+# principal) and the receipts key lives under HKCU; setup uses HKLM and Administrators.
+$base = Join-Path $Dir 'storage'; New-Item -ItemType Directory -Force $base | Out-Null
+$trusted = @($SYSTEM, 'S-1-5-32-544', $script:TrustedInstaller, $me)
+$grants = @("$SYSTEM=FullControl", "$me=FullControl")
+$keyName = "Software\hyperv-mcp-test-$([guid]::NewGuid().ToString('n'))\Storage"
+$pins = New-Object Collections.ArrayList
+$receipts = $null
+try {
+  Open-TrustedAncestors (Join-Path $base 'x') $trusted $pins
+  $r.ancestorsOk = $pins.Count -gt 0
+  $receipts = Open-ReceiptKey ([Microsoft.Win32.Registry]::CurrentUser) $keyName $trusted $me
+  $use = { param($p, $hook) Use-StorageFolder $p $grants $me $receipts -Allowed $trusted -Owners $trusted -Pins $pins -BeforeCreate $hook }
+
+  # Created with its final security, and trusted by its receipt on the next run (unchanged).
+  $new = Join-Path $base 'new'
+  $r.created = & $use $new $null
+  $sddl1 = (Get-Acl -LiteralPath $new).GetSecurityDescriptorSddlForm('Owner, Access')
+  $r.createdProtected = (Get-Acl -LiteralPath $new).AreAccessRulesProtected
+  $r.createdUsers = Has $new $USERS
+  $r.receipt = [bool]$receipts.GetValue($new.ToLowerInvariant())
+  Set-Content (Join-Path $new 'journal.jsonl') '{}'
+  $r.again = & $use $new $null
+  $r.againUnchanged = (Get-Acl -LiteralPath $new).GetSecurityDescriptorSddlForm('Owner, Access') -eq $sddl1
+
+  # The injected boundary: after setup found the path missing, someone creates it first and plants a forged journal.
+  $race = Join-Path $base 'race'
+  $forged = '{"t":"switch","phase":"removing","name":"foreign-internal","switchId":"foreign-switch-id"}'
+  $hook = { param($p) New-Item -ItemType Directory $p | Out-Null; Set-Content -LiteralPath (Join-Path $p 'journal.jsonl') -Value $forged -NoNewline }
+  try { & $use $race $hook; $r.race = 'accepted' } catch { $r.race = $_.Exception.Message }
+  $r.raceForgedUntouched = (Get-Content -LiteralPath (Join-Path $race 'journal.jsonl') -Raw) -eq $forged
+  $r.raceNoReceipt = $null -eq $receipts.GetValue($race.ToLowerInvariant())
+
+  # Legacy: secured as an older setup did (exclusive ACL, contents), but no receipt.
+  $legacy = Join-Path $base 'legacy'
+  Set-ExclusiveAcl $legacy $grants
+  Set-Content (Join-Path $legacy 'journal.jsonl') '{}'
+  try { & $use $legacy $null; $r.legacy = 'accepted' } catch { $r.legacy = $_.Exception.Message }
+
+  # An interrupted creation: made securely, but its receipt never written. Fails closed.
+  $cut = Join-Path $base 'interrupted'
+  $sec = New-Object Security.AccessControl.DirectorySecurity; $sec.SetAccessRuleProtection($true, $false)
+  $sec.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier $me), 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')))
+  $sec.SetOwner((New-Object Security.Principal.SecurityIdentifier $me))
+  $r.rawCreate = [HvMcpStorage]::CreateSecure($cut, $sec.GetSecurityDescriptorBinaryForm())
+  $r.rawCreateAgain = [HvMcpStorage]::CreateSecure($cut, $sec.GetSecurityDescriptorBinaryForm()) # exists: false, never reused
+  try { & $use $cut $null; $r.interrupted = 'accepted' } catch { $r.interrupted = $_.Exception.Message }
+
+  # A receipt for a folder that was deleted and made again (same path, another identity).
+  $swap = Join-Path $base 'swap'
+  [void](& $use $swap $null)
+  Close-Pins $pins # release the pin on it, to let it be deleted (as nothing could while setup ran)
+  Remove-Item -LiteralPath $swap -Recurse -Force
+  [void][HvMcpStorage]::CreateSecure($swap, $sec.GetSecurityDescriptorBinaryForm())
+  try { & $use $swap $null; $r.swap = 'accepted' } catch { $r.swap = $_.Exception.Message }
+
+  # A file with its final ACL from the start, renamed over the old one.
+  $pf = Join-Path $new 'policy.json'
+  Set-Content $pf 'old'
+  & icacls.exe $pf /grant '*S-1-5-32-545:M' | Out-Null
+  Write-SecureFile $pf '{"schema":1}' @("$SYSTEM=FullControl", "$me=ReadAndExecute") $me
+  $r.fileText = [IO.File]::ReadAllText($pf)
+  $r.fileUsers = Has $pf $USERS
+  $r.fileProtected = (Get-Acl -LiteralPath $pf).AreAccessRulesProtected
+  $r.fileTemps = @(Get-ChildItem -LiteralPath $new -Filter 'policy.json.new-*').Count
+} finally {
+  Close-Pins $pins
+  if ($receipts) { $receipts.Dispose() }
+}
+
+# Parents: one granting Users DeleteChild is refused; one that is a junction is refused; a pinned one can't be renamed.
+$weak = Join-Path $base 'weak'; New-Item -ItemType Directory -Force $weak | Out-Null
+$acl = Get-Acl -LiteralPath $weak
+$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier $USERS), 'DeleteSubdirectoriesAndFiles', 'Allow')))
+Set-Acl -LiteralPath $weak -AclObject $acl
+$p2 = New-Object Collections.ArrayList
+try { Open-TrustedAncestors (Join-Path $weak 'x') $trusted $p2; $r.weakParent = 'accepted' } catch { $r.weakParent = $_.Exception.Message } finally { Close-Pins $p2 }
+$jt = Join-Path $base 'jtarget'; New-Item -ItemType Directory -Force $jt | Out-Null
+$jn = Join-Path $base 'jn'; & cmd.exe /c mklink /J $jn $jt | Out-Null
+try { Open-TrustedAncestors (Join-Path $jn 'x') $trusted $p2; $r.junctionParent = 'accepted' } catch { $r.junctionParent = $_.Exception.Message } finally { Close-Pins $p2 }
+$pin = Join-Path $base 'pinme'; New-Item -ItemType Directory -Force $pin | Out-Null
+Open-TrustedAncestors (Join-Path $pin 'child') $trusted $p2
+try { [IO.Directory]::Move($pin, "$pin-moved"); $r.pinnedRename = 'moved' } catch { $r.pinnedRename = $_.Exception.GetType().Name }
+Close-Pins $p2
+try { [IO.Directory]::Move($pin, "$pin-moved"); $r.unpinnedRename = 'moved' } catch { $r.unpinnedRename = $_.Exception.Message }
+
+# A receipts key that lets Users write it is refused.
+$k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($keyName, $true)
+$ks = $k.GetAccessControl()
+$ks.AddAccessRule((New-Object Security.AccessControl.RegistryAccessRule((New-Object Security.Principal.SecurityIdentifier $USERS), 'SetValue', 'Allow')))
+$k.SetAccessControl($ks); $k.Dispose()
+try { $kk = Open-ReceiptKey ([Microsoft.Win32.Registry]::CurrentUser) $keyName $trusted $me; $kk.Dispose(); $r.weakKey = 'accepted' } catch { $r.weakKey = $_.Exception.Message }
+[Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($keyName.Substring(0, $keyName.LastIndexOf('\')), $false)
 
 [Console]::Out.WriteLine('RESULT:' + (ConvertTo-Json $r -Compress -Depth 4))

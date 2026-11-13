@@ -21,8 +21,8 @@ $me = New-Object Security.Principal.WindowsPrincipal ([Security.Principal.Window
 if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run this in an admin PowerShell (Run as administrator).' }
 if ($KeepPool -and $RemovePool) { throw 'Choose -KeepPool or -RemovePool, not both.' }
 
-$install = Join-Path $env:ProgramFiles 'hyperv-mcp'
-$state = Join-Path $env:ProgramData 'hyperv-mcp'
+$install = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'hyperv-mcp'
+$state = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'hyperv-mcp'
 $svc = 'HyperVMcp'
 $svcAccount = "NT SERVICE\$svc"
 $groupName = 'Hyper-V MCP Users'
@@ -90,12 +90,38 @@ if (Test-Path $install) { Remove-Item -LiteralPath $install -Recurse -Force; Ste
 
 if ($RemovePool -and (Test-Path $state)) {
   $policy = Get-Content -LiteralPath (Join-Path $state 'policy.json') -Raw | ConvertFrom-Json
-  foreach ($d in @($policy.diskFolders)) {
-    foreach ($sub in 'pool', 'images') { $p = Join-Path $d $sub; if (Test-Path $p) { Remove-Item -LiteralPath $p -Recurse -Force } }
-    if ((Test-Path $d) -and -not (Get-ChildItem -LiteralPath $d -Force)) { Remove-Item -LiteralPath $d -Force }
+  $disks = @($policy.diskFolders | ForEach-Object { [IO.Path]::GetFullPath([string]$_).TrimEnd('\') })
+  # The pool's VMs were removed above (by id, through the helper's journal): their folders must be gone. Anything left in
+  # pool\ is refused, not deleted blindly.
+  foreach ($d in $disks) {
+    $pool = Join-Path $d 'pool'
+    $left = @(if (Test-Path -LiteralPath $pool) { Get-ChildItem -LiteralPath $pool -Force })
+    if ($left.Count) { throw "$pool still holds $($left.Count) item(s) ($($left[0].FullName)) after the pool's removal: inspect them (pool_status, $state\helper.log), then run this again. Nothing more was removed." }
+  }
+  foreach ($d in $disks) {
+    foreach ($sub in 'pool', 'images') {
+      $p = Join-Path $d $sub
+      if (Test-Path -LiteralPath $p) {
+        $n = @(Get-ChildItem -LiteralPath $p -Recurse -Force -File)
+        Remove-Item -LiteralPath $p -Recurse -Force
+        Step "Removed $p ($($n.Count) file(s): $(($n | ForEach-Object { $_.Name }) -join ', '))."
+      }
+    }
+    if ((Test-Path -LiteralPath $d) -and -not (Get-ChildItem -LiteralPath $d -Force)) { Remove-Item -LiteralPath $d -Force; Step "Removed $d (empty)." }
+    elseif (Test-Path -LiteralPath $d) { Step "Kept ${d}: it holds other things ($((Get-ChildItem -LiteralPath $d -Force | ForEach-Object { $_.Name }) -join ', '))." }
   }
   Remove-Item -LiteralPath $state -Recurse -Force
-  Step 'The pool''s images, the disk folders (when empty) and the helper''s state are removed.'
+  Step "Removed $state (the helper's journal, policy and guest credentials)."
+  # Their receipts (setup's records of the folders it created) go with them; a folder kept above keeps its receipt.
+  $rk = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\hyperv-mcp\Storage', $true)
+  if ($rk) {
+    foreach ($p in @($state, (Join-Path $state 'approvals')) + $disks) {
+      if (-not (Test-Path -LiteralPath $p) -and $null -ne $rk.GetValue($p.ToLowerInvariant())) { $rk.DeleteValue($p.ToLowerInvariant()); Step "Removed the storage receipt for $p." }
+    }
+    $empty = $rk.ValueCount -eq 0
+    $rk.Dispose()
+    if ($empty) { [Microsoft.Win32.Registry]::LocalMachine.DeleteSubKeyTree('SOFTWARE\hyperv-mcp', $false); Step 'Removed HKLM\SOFTWARE\hyperv-mcp.' }
+  }
 } elseif (Test-Path $state) {
   Step "Kept: $state and the pool's disk folders (run setup again to use the pool, or uninstall again with -RemovePool after setup)."
 }
