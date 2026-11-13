@@ -115,6 +115,11 @@ const helper = helperLink()
 
 // ---------- builds ----------
 
+/** The client's allowed roots as real paths, for the helper's project matching ([] when none are allowed). */
+async function rootList() {
+  try { const r = await buildRoots(); return r.refusal ? [] : r.roots.slice(0, 64) } catch { return [] }
+}
+
 async function buildRoots() {
   return allowedRoots({
     client: await roots.list(),
@@ -132,7 +137,11 @@ async function buildRoots() {
  */
 async function adminRoots() {
   let v
-  try { v = await helper.request('version') } catch (e) { return { usable: [], unusable: [], note: `unknown (${e.message})` } }
+  try {
+    // A helper that knows projects (hyperv-mcp/4) gives this caller's project's folders beside the global ones, for the
+    // roots it has now: asked every time, never kept, so a roots change is seen at once.
+    v = (await helperProtocol()).features.includes('projects') ? await helper.request('whoami', { roots: await rootList() }) : await helper.request('version')
+  } catch (e) { return { usable: [], unusable: [], note: `unknown (${e.message})` } }
   if (!Array.isArray(v?.data?.buildRoots)) return { usable: [], unusable: [], note: 'none (the helper predates them: run setup again to update it)' }
   const usable = []
   const unusable = []
@@ -241,16 +250,28 @@ async function warm(op, args) {
 }
 
 /**
- * The interactive session (vm_start's interactive, vm_run's session) needs a helper that speaks this protocol: an older
- * one would ignore the option and run in session 0. Asked once per server, and only when the option is used.
+ * The helper's protocol number (hyperv-mcp/<n>), asked once per server: 0 if it can't be read. A feature needs "at
+ * least" its protocol, never exactly this server's, so a newer helper keeps serving an older server.
  */
-let protocolOk = null
-async function needInteractive() {
-  if (protocolOk === null) {
+let helperProto = null
+async function helperProtocol() {
+  if (helperProto === null) {
     const v = await helper.request('version')
-    protocolOk = v?.data?.protocol === PROTOCOL ? true : (v?.data?.protocol || 'an older protocol')
+    const m = /^hyperv-mcp\/(\d+)$/.exec(v?.data?.protocol || '')
+    helperProto = { n: m ? Number(m[1]) : 0, text: v?.data?.protocol || 'an older protocol', features: Array.isArray(v?.data?.features) ? v.data.features : [] }
   }
-  if (protocolOk !== true) throw new Error(`The helper speaks ${protocolOk}, and the interactive session needs ${PROTOCOL}: run setup again to update it (see the README, Setup).`)
+  return helperProto
+}
+/** Refuses a feature an older helper would silently ignore (the interactive session would run in session 0). */
+async function needProtocol(n, what) {
+  const p = await helperProtocol()
+  if (p.n < n) throw new Error(`The helper speaks ${p.text}, and ${what} needs hyperv-mcp/${n} or later: run setup again to update it (see the README, Setup).`)
+}
+const needInteractive = () => needProtocol(3, 'the interactive session')
+/** Refuses a feature (added since protocol 3, by name) that an older helper doesn't have. */
+async function needFeature(name, what) {
+  const p = await helperProtocol()
+  if (!p.features.includes(name)) throw new Error(`The helper (${p.text}) has no '${name}' feature, which ${what} needs: run setup again to update it (see the README, Setup).`)
 }
 
 // ---------- tools ----------
@@ -347,7 +368,10 @@ async function status() {
   } catch (e) { lines.push(`Builds: ${e.message}`) }
   try {
     const v = await helper.request('version')
-    if (v?.data?.protocol !== PROTOCOL) lines.push(`The helper speaks ${v?.data?.protocol}, this server ${PROTOCOL}: run setup again to update the helper.`)
+    const n = Number(/^hyperv-mcp\/(\d+)$/.exec(v?.data?.protocol || '')?.[1] || 0)
+    if (n < Number(PROTOCOL.split('/')[1])) lines.push(`The helper speaks ${v?.data?.protocol}, this server ${PROTOCOL}: run setup again to update the helper.`)
+    else if (n > Number(PROTOCOL.split('/')[1])) lines.push(`The helper speaks ${v?.data?.protocol}, newer than this server's ${PROTOCOL}: everything here works; update this server for the helper's newer tools.`)
+    if ((v?.data?.features || []).includes('projects')) lines.push(`Your project: ${text(await helper.request('whoami', { roots: await rootList() }))}.`)
     lines.push(text(await helper.request('status')))
   } catch (e) { lines.push(e.message) }
   return lines.join('\n')
@@ -358,9 +382,26 @@ const pass = op => async args => { const r = await helper.request(op, args); ret
 const tools = [
   {
     name: 'vm_acquire',
-    description: 'Lease one free VM from the pool, for this session only, until vm_release, the deadline, or this server exiting (which restores it). One VM per session. Refuses when none is free, saying when the next lease ends.',
-    inputSchema: { type: 'object', properties: { minutes: { type: 'number', description: 'Lease length, 1 to the policy\'s maximum (default 60).' }, keepOnFailure: { type: 'boolean', description: 'If a run fails, vm_stop keeps the VM as it is for inspection until release or the deadline. Default false.' } } },
-    run: pass('acquire')
+    description: 'Lease one VM from the pool, for this session only, until vm_release, the deadline, or this server exiting (which restores it). One VM per session. The pool may be shared fairly between projects (your project is the one your MCP roots are in): a project may have a cap, and VMs kept for another project are not yours. Without wait it refuses when none is free for you, saying why and where you\'d stand in line. With wait: true it waits in line (about 20 s per call); call it again within 2 minutes to keep your place until a VM is yours.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        minutes: { type: 'number', description: 'Lease length, 1 to the policy\'s maximum (default 60).' },
+        keepOnFailure: { type: 'boolean', description: 'If a run fails, vm_stop keeps the VM as it is for inspection until release or the deadline. Default false.' },
+        wait: { type: 'boolean', description: 'Wait in line for a VM (each call waits about 20 s; repeat it within 2 minutes to keep your place). Default false.' },
+        os: { type: 'string', enum: ['windows', 'linux'], description: 'The kind of VM. Default windows. (Linux VMs come with a Linux image in the pool.)' },
+        image: { type: 'string', description: 'Only a VM built from this image: its SHA-256, or its first 12+ hex digits (vm_status lists them). Default: any image of the OS your project may use.' }
+      }
+    },
+    run: async ({ minutes, keepOnFailure, wait, os, image } = {}) => {
+      const p = await helperProtocol()
+      if (wait) await needFeature('projects', 'waiting in line (wait: true)')
+      // A filter the helper can't honour is refused before anything is sent: dropped, it could lease the wrong kind.
+      if (image !== undefined || (os !== undefined && os !== 'windows')) await needFeature('images', `asking for ${image !== undefined ? 'an image' : `a ${os} VM`}`)
+      const args = { minutes, keepOnFailure, ...(p.features.includes('projects') ? { wait: !!wait, roots: await rootList() } : {}), ...(p.features.includes('images') ? { os, image } : {}) }
+      const r = await helper.request('acquire', args)
+      return { text: text(r), isError: r?.isError }
+    }
   },
   {
     name: 'vm_start',
@@ -473,7 +514,7 @@ const tools = [
         diskGB: { type: 'number' },
         location: { type: 'string', description: 'One of the policy\'s disk folders.' },
         network: { type: 'boolean', description: 'create: also create an internal switch so runs can ask for networking. Default false.' },
-        image: { type: 'object', description: '{ iso: "<path to the ISO>" } or { download: "<https URL on microsoft.com>" }. Omit to use the image already verified.' }
+        image: { type: ['object', 'string'], description: 'A new image to check: { iso: "<path to the ISO>" } or { download: "<https URL on microsoft.com>" }. Or a verified image\'s SHA-256 (or its first 12+ hex digits): create from it, or resize only the VMs built from it (its group). Omit to use the newest verified image (and, for resize, the whole pool).' }
       }
     },
     run: pass('pool_plan')
