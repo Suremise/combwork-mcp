@@ -77,6 +77,22 @@ try {
   $r.again = & $use $new $null
   $r.againUnchanged = (Get-Acl -LiteralPath $new).GetSecurityDescriptorSddlForm('Owner, Access') -eq $sddl1
 
+  # A disk folder as Hyper-V leaves it (measured on a real pool): its files granted to the Virtual Machines group, a VM's
+  # own account and Hyper-V's capability SID. Trusted with $HyperVGrantees; a Users grant on top is still refused.
+  $disk = Join-Path $base 'disk'
+  [void](Use-StorageFolder $disk $grants $me $receipts -Allowed $trusted -Owners $trusted -AllowPattern $script:HyperVGrantees -Pins $pins)
+  $vhdx = Join-Path $disk 'disk.vhdx'; Set-Content $vhdx 'v'
+  $acl = Get-Acl -LiteralPath $vhdx
+  foreach ($g in @('S-1-15-3-1024-2268835264-3721307629-241982045-173645152-1490879176-104643441-2915960892-1612460704', 'S-1-5-83-0', 'S-1-5-83-1-1377819372-1242569354-2268980144-1388075343')) {
+    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier $g), 'FullControl', 'Allow')))
+  }
+  Set-Acl -LiteralPath $vhdx -AclObject $acl
+  $r.hyperVGrants = & { try { Use-StorageFolder $disk $grants $me $receipts -Allowed $trusted -Owners $trusted -AllowPattern $script:HyperVGrantees -Pins $pins } catch { $_.Exception.Message } }
+  $acl = Get-Acl -LiteralPath $vhdx
+  $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier $USERS), 'Modify', 'Allow')))
+  Set-Acl -LiteralPath $vhdx -AclObject $acl
+  $r.hyperVPlusUsers = & { try { Use-StorageFolder $disk $grants $me $receipts -Allowed $trusted -Owners $trusted -AllowPattern $script:HyperVGrantees -Pins $pins } catch { $_.Exception.Message } }
+
   # The injected boundary: after setup found the path missing, someone creates it first and plants a forged journal.
   $race = Join-Path $base 'race'
   $forged = '{"t":"switch","phase":"removing","name":"foreign-internal","switchId":"foreign-switch-id"}'

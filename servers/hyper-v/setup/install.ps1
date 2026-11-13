@@ -84,7 +84,7 @@ $who = @($SYSTEM, $ADMINS, $runnerSid)
 $stateIs = Use-StorageFolder $state @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=Modify") $ADMINS $receipts -Allowed $who -Owners $who -Pins $pins
 $approvals = Join-Path $state 'approvals'
 $apprIs = Use-StorageFolder $approvals @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=ReadAndExecute") $ADMINS $receipts -Allowed $who -Writers $SYSTEM, $ADMINS -Owners $SYSTEM, $ADMINS -Pins $pins
-$diskIs = foreach ($d in $folders) { "$d $(Use-StorageFolder $d @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=FullControl") $ADMINS $receipts -Allowed $who -Owners $who -AllowPattern '^S-1-5-83-' -Pins $pins)" }
+$diskIs = foreach ($d in $folders) { "$d $(Use-StorageFolder $d @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=FullControl") $ADMINS $receipts -Allowed $who -Owners $who -AllowPattern $script:HyperVGrantees -Pins $pins)" }
 Step "Storage: state $stateIs, approvals $apprIs, disks $($diskIs -join ', ') (parents checked and held while setup runs)."
 # This installation's generation: an uninstall's record is bound to it.
 $ik = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\hyperv-mcp', $true)
@@ -181,7 +181,7 @@ Write-SecureFile $policyFile ($policy | ConvertTo-Json -Depth 4) @("$SYSTEM=Full
 $bad = @(Test-ExclusiveAcl $state -Allowed $SYSTEM, $ADMINS, $runnerSid -Owners $SYSTEM, $ADMINS, $runnerSid) +
   @(Test-ExclusiveAcl $approvals -Allowed $SYSTEM, $ADMINS, $runnerSid -Writers $SYSTEM, $ADMINS -Owners $SYSTEM, $ADMINS) +
   @(Test-ExclusiveAcl $policyFile -Allowed $SYSTEM, $ADMINS, $runnerSid -Writers $SYSTEM, $ADMINS -Owners $SYSTEM, $ADMINS)
-foreach ($d in $folders) { $bad += @(Test-ExclusiveAcl $d -Allowed $SYSTEM, $ADMINS, $runnerSid -AllowPattern '^S-1-5-83-') }
+foreach ($d in $folders) { $bad += @(Test-ExclusiveAcl $d -Allowed $SYSTEM, $ADMINS, $runnerSid -AllowPattern $script:HyperVGrantees) }
 if ($bad.Count) { throw "The helper's folders aren't as setup made them: $($bad -join '; ')" }
 Step "State in $state; VM disks in $($folders -join ', '); ACLs checked."
 Step ("Policy: up to {0} VMs, {1} cores each, {2} GB memory in all, {3} GB disks; network {4}; unpinned ISOs {5}." -f $policy.maxVms, $policy.maxCoresPerVm, ($policy.maxMemoryMBTotal / 1024), $policy.maxDiskGBPerVm, $(if ($AllowNetwork) { 'allowed (internal switch only)' } else { 'not allowed' }), $(if ($AllowUnpinnedIso) { 'allowed' } else { 'refused' }))

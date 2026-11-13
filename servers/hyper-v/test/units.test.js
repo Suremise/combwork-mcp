@@ -261,6 +261,8 @@ test('setup storage and ACLs (non-elevated): grants removed; VM grants kept; lin
   assert.strictEqual(a.receipt, true, 'its receipt was written')
   assert.strictEqual(a.again, 'trusted', 'the next run trusts it by its receipt')
   assert.strictEqual(a.againUnchanged, true, 'and changes nothing on it')
+  assert.strictEqual(a.hyperVGrants, 'trusted', 'a disk folder with what Hyper-V grants (VM group, a VM, its capability SID) is trusted')
+  assert.match(a.hyperVPlusUsers, /contents aren't as setup and the helper leave them.*S-1-5-32-545|BUILTIN.Users/, 'but a Users grant is still refused')
   assert.match(a.race, /exists, but setup has no receipt for it.*Nothing was changed/, 'created by someone else between the check and the create: refused')
   assert.strictEqual(a.raceForgedUntouched, true, 'the forged journal is left as it was')
   assert.strictEqual(a.raceNoReceipt, true, 'no receipt is minted for a folder setup didn\'t create')

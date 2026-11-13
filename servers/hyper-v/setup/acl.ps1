@@ -109,6 +109,14 @@ function Test-ExclusiveAcl([string]$Path, [string[]]$Allowed, [string[]]$Writers
 
 if (-not ('HvMcpStorage' -as [type])) { Add-Type -Path (Join-Path $PSScriptRoot 'Storage.cs') }
 
+# What Hyper-V itself grants on a pool's files, measured on a real pool (MC-1488 trial): the Virtual Machines group
+# (S-1-5-83-0), each VM's own account (S-1-5-83-1-..., which can also own a file), and a capability SID
+# (S-1-15-3-1024-2268835264-..., FullControl, set on the VM folders and inherited). A grant to a capability SID (S-1-15-3-)
+# only ever matches an AppContainer process holding that capability, and Windows then also requires the process's own
+# user or groups to be granted: it can't give access to anyone who isn't already granted it. So these are accepted in
+# disk folders; any other grantee is not.
+$script:HyperVGrantees = '^S-1-5-83-|^S-1-15-3-'
+
 $script:TrustedInstaller = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
 # Rights on an ancestor that would let their holder replace what is under it: DELETE_CHILD, DELETE (the ancestor itself
 # can be renamed away; ignored on a volume root, which can't be), WRITE_DAC, WRITE_OWNER, GENERIC_ALL. GENERIC_WRITE maps

@@ -32,7 +32,16 @@ function New-Fixture([int]$vms = 2) {
   $k = $HKCU.OpenSubKey($f.keyPath, $true); $k.SetValue('InstallId', [guid]::NewGuid().ToString('n')); $k.Dispose()
   Set-Content (Join-Path $f.state 'journal.jsonl') '{"t":"epoch"}'
   New-Item -ItemType Directory -Force (Join-Path $f.disk 'images') | Out-Null; Set-Content (Join-Path $f.disk 'images\x.iso') 'iso'
-  for ($i = 1; $i -le $vms; $i++) { New-Item -ItemType Directory -Force (Join-Path $f.disk "pool\i-$i") | Out-Null; Set-Content (Join-Path $f.disk "pool\i-$i\disk.vhdx") 'vhd' }
+  for ($i = 1; $i -le $vms; $i++) {
+    New-Item -ItemType Directory -Force (Join-Path $f.disk "pool\i-$i") | Out-Null
+    $vhd = Join-Path $f.disk "pool\i-$i\disk.vhdx"; Set-Content $vhd 'vhd'
+    # As Hyper-V leaves a VM's files: its capability SID, the Virtual Machines group and the VM's own account.
+    $acl = Get-Acl -LiteralPath $vhd
+    foreach ($g in @('S-1-15-3-1024-2268835264-3721307629-241982045-173645152-1490879176-104643441-2915960892-1612460704', 'S-1-5-83-0', "S-1-5-83-1-1-2-3-$i")) {
+      $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier $g), 'FullControl', 'Allow')))
+    }
+    Set-Acl -LiteralPath $vhd -AclObject $acl
+  }
   New-Item -ItemType Directory -Force $f.install | Out-Null; Set-Content (Join-Path $f.install 'helper.js') 'js'
   return $f
 }

@@ -86,7 +86,7 @@ function Test-Target([string]$Path, [string[]]$RootOwners, [string[]]$Who, [Coll
   if ([HvMcpStorage]::Attributes($h) -band [HvMcpStorage]::FILE_ATTRIBUTE_REPARSE_POINT) { throw "$Path is a link or junction: refusing to delete through it. Nothing was changed." }
   $owner = Get-OwnerSid (Get-HandleSecurity $h)
   if ($RootOwners -notcontains $owner) { throw "$Path is owned by $owner, not Administrators or SYSTEM: it isn't setup's, so it won't be deleted. Nothing was changed." }
-  $bad = @(Test-ExclusiveAcl $Path -Allowed $Who -Owners $Who -AllowPattern '^S-1-5-83-')
+  $bad = @(Test-ExclusiveAcl $Path -Allowed $Who -Owners $Who -AllowPattern $script:HyperVGrantees)
   if ($bad.Count) { throw "$Path isn't as setup and the helper leave it ($($bad[0])$(if ($bad.Count -gt 1) { "; and $($bad.Count - 1) more" })), so it won't be deleted. Nothing was changed." }
   return [HvMcpStorage]::Identity($h)
 }
