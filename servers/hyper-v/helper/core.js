@@ -132,8 +132,8 @@ class Helper {
     s = this.state
     if (s.switch && s.switch.phase !== 'created') {
       try {
-        await this.finishSwitch(s.switch)
-        notes.push(`Finished the interrupted change to switch ${s.switch.name}.`)
+        const r = await this.finishSwitch(s.switch)
+        notes.push(r.foreign ? `A switch named ${s.switch.name} exists but isn't the pool's (another id, no token of ours): left untouched.` : `Finished the interrupted change to switch ${s.switch.name}.`)
       } catch (e) {
         notes.push(`Couldn't finish the change to switch ${s.switch.name}: ${e.message}.`)
       }
@@ -178,9 +178,12 @@ class Helper {
 
   async finishSwitch(sw) {
     if (sw.phase === 'creating' || sw.phase === 'removing') {
-      await this.hv('remove-switch', { name: sw.name, switchId: sw.switchId })
+      // Only the pool's own: by its journalled id, or by the token written into its Notes at creation, never by name.
+      const r = await this.hv('remove-switch', { name: sw.name, switchId: sw.switchId, token: sw.token })
       this.journal.append({ t: 'switch', jobId: sw.jobId, name: sw.name, phase: 'removed' })
+      return r
     }
+    return {}
   }
 
   // ---------- connections and leases ----------
@@ -205,7 +208,17 @@ class Helper {
     const c = this.conns.get(connId)
     const lease = c?.vmId && this.leases.get(c.vmId)
     if (!lease || lease.connId !== connId) throw new Error('This connection has no VM: call vm_acquire first.')
+    if (lease.ending) throw new Error(`This connection's lease on ${lease.vmName} is ending: call vm_acquire again.`)
     return lease
+  }
+
+  /**
+   * Inside a VM's lock, before acting for a lease: the lease must still be the VM's, and not ending. An operation that
+   * queued for the lock while its lease ended (deadline, disconnect, release) must not act on a VM that is being
+   * restored, or has been handed to someone else.
+   */
+  stillHeld(lease) {
+    if (this.leases.get(lease.vmId) !== lease || lease.ending) throw new Error(`This connection's lease on ${lease.vmName} ended while the request waited: call vm_acquire again.`)
   }
 
   vmOf(lease) {
@@ -237,7 +250,7 @@ class Helper {
         throw new Error(`No VM is free (${ready.length} in the pool${s.quarantined.size ? `, ${s.quarantined.size} quarantined` : ''}).${next ? ` The next lease ends by ${new Date(next.deadline).toISOString()}.` : ''} Try again later.`)
       }
       const lease = {
-        leaseId: `l-${hex(6)}`, vmId: vm.vmId, vmName: vm.vmName, connId, pid: c.pid,
+        leaseId: `l-${hex(6)}`, vmId: vm.vmId, vmName: vm.vmName, connId, ownerConn: connId, pid: c.pid, ending: null,
         deadline: this.now() + Math.round(minutes * MINUTE_MS), keepOnFailure: !!keepOnFailure,
         kept: false, running: false, failed: false, runs: 0, dirty: false, network: false, reserve: 0
       }
@@ -258,17 +271,25 @@ class Helper {
     this.timers.add(lease.timer)
   }
 
-  /** Ends a lease: restores the VM, frees it (or quarantines it if the restore can't be confirmed). */
-  async endLease(lease, why) {
-    if (this.leases.get(lease.vmId) !== lease) return { ok: true, text: 'already released' }
+  /**
+   * Ends a lease: marks it ending at once (so nothing new, and nothing still queued, acts for it), restores the VM, then
+   * frees it (or it is quarantined if the restore can't be confirmed). Ending twice shares the one ending.
+   */
+  endLease(lease, why) {
+    if (this.leases.get(lease.vmId) !== lease) return Promise.resolve({ ok: true, text: 'already released' })
+    if (lease.ending) return lease.ending
     clearTimeout(lease.timer)
-    const vm = this.state.vms.get(lease.vmId)
-    let r = { ok: true, text: `${lease.vmName} restored to clean.` }
-    if (vm) r = await this.vmLock(vm.vmId)(() => this.restore(vm))
-    this.leases.delete(lease.vmId)
-    for (const c of this.conns.values()) if (c.vmId === lease.vmId) c.vmId = null
-    this.log(`lease ${lease.leaseId} on ${lease.vmName} ended (${why}): ${r.text}`)
-    return r
+    lease.ending = (async () => {
+      const vm = this.state.vms.get(lease.vmId)
+      let r = { ok: true, text: `${lease.vmName} restored to clean.` }
+      if (vm) r = await this.vmLock(vm.vmId)(() => this.restore(vm))
+      if (this.leases.get(lease.vmId) === lease) this.leases.delete(lease.vmId)
+      const owner = this.conns.get(lease.ownerConn)
+      if (owner && owner.vmId === lease.vmId) owner.vmId = null
+      this.log(`lease ${lease.leaseId} on ${lease.vmName} ended (${why}): ${r.text}`)
+      return r
+    })()
+    return lease.ending
   }
 
   /**
@@ -372,13 +393,15 @@ class Helper {
     if (c.stage && !c.stage.done) throw new Error('the build is still being staged')
     const vm = this.vmOf(lease)
     return this.vmLock(vm.vmId)(async () => {
+      this.stillHeld(lease)
       const t0 = this.now()
       lease.running = false
       lease.failed = false
       const r = await this.restore(vm) // unconditionally, before every run
       if (!r.ok) { lease.dirty = true; throw new Error(`${r.text} The start was refused.`) }
       const tRestore = this.now()
-      await this.hv('configure-start', { ...this.ident(vm), switchName: network ? this.state.switch.name : null, reserve: reserveCpu })
+      const sw = network ? this.state.switch : null
+      await this.hv('configure-start', { ...this.ident(vm), switchName: sw ? sw.name : null, switchId: sw ? sw.switchId : null, reserve: reserveCpu })
       lease.running = true
       lease.dirty = true
       lease.network = !!network
@@ -426,6 +449,7 @@ class Helper {
     if (cwd !== undefined && (typeof cwd !== 'string' || !/^[a-zA-Z]:\\/.test(cwd) || cwd.length > 260 || /[\0-\x1f"]/.test(cwd))) throw new Error('cwd must be an absolute guest folder such as C:\\build')
     const vm = this.vmOf(lease)
     return this.vmLock(vm.vmId)(async () => {
+      this.stillHeld(lease)
       const n = ++lease.runs
       const creds = this.creds()
       const r = await this.hv('guest-run', { ...this.ident(vm), cred: creds.admin, runAs: as === 'user' ? creds.user : null, n, command, shell, timeoutSec, cwd: cwd || 'C:\\build', cap: OUTPUT_CAP }, { timeoutMs: (timeoutSec + 120) * 1000 })
@@ -456,6 +480,7 @@ class Helper {
     }
     const match = glob !== undefined ? globMatcher(glob) : null
     return this.vmLock(vm.vmId)(async () => {
+      this.stillHeld(lease)
       const creds = this.creds()
       const listing = await this.hv('guest-list', { ...this.ident(vm), cred: creds.admin })
       const files = (Array.isArray(listing.files) ? listing.files : []).filter(f => f && typeof f.path === 'string' && Number.isFinite(f.size)).slice(0, 1000)
@@ -492,7 +517,7 @@ class Helper {
       lease.running = false
       return { text: `${vm.vmName} is kept for inspection as it is (not restored)${keep ? '' : ' because a run failed and the lease has keepOnFailure'}. It is restored when you vm_release it or at the lease's deadline (${new Date(lease.deadline).toISOString()}); vm_start is refused until then.` }
     }
-    const r = await this.vmLock(vm.vmId)(() => this.restore(vm))
+    const r = await this.vmLock(vm.vmId)(() => { this.stillHeld(lease); return this.restore(vm) })
     lease.running = false
     lease.dirty = !r.ok
     return { text: r.ok ? `Reverted: ${r.text}` : r.text, isError: !r.ok }
@@ -523,11 +548,11 @@ class Helper {
       ...vms,
       this.job ? `Pool job in progress: ${this.job.op} (${this.job.jobId}): ${this.job.progress}` : this.lastJob ? `Last pool job: ${this.lastJob.op} ${this.lastJob.ok ? 'finished' : 'FAILED'}: ${this.lastJob.note}` : null,
       this.imageJob ? `Image: ${this.imageJob.progress}` : this.lastImage ? `Image: ${this.lastImage}` : null,
-      this.quiesced ? 'Quiesced for uninstall: no new leases.' : null,
+      this.quiesced ? `Quiesced for uninstall: no new leases${this.quiesced.allowRemove ? '; only an approved remove of the pool' : '; no pool changes'}.` : null,
       this.recovery?.length ? `At start-up: ${this.recovery.join(' ')}` : null,
       `Policy: up to ${this.policy.maxVms} VMs, ${this.policy.maxCoresPerVm} cores each, ${this.policy.maxMemoryMBTotal} MB in all, ${this.policy.maxDiskGBPerVm} GB disks, in ${this.policy.diskFolders.join('; ')}; network ${this.policy.allowNetwork ? 'allowed (internal switch only)' : 'not allowed'}; CPU reserve up to ${this.policy.maxReservePercent}%; leases up to ${this.policy.maxLeaseMinutes} min.`
     ]
-    return { text: lines.filter(Boolean).join('\n'), data: { vms: s.vms.size, job: this.job ? this.job.op : null, epoch: this.journal.epoch } }
+    return { text: lines.filter(Boolean).join('\n'), data: { vms: s.vms.size, job: this.job ? this.job.op : null, epoch: this.journal.epoch, connections: this.conns.size, lastJob: this.lastJob } }
   }
 
   // ---------- pool plans ----------
@@ -622,7 +647,7 @@ class Helper {
     return this.poolLock(async () => {
       if (typeof planId !== 'string' || !PLAN_ID_RE.test(planId)) throw new Error('planId must be a plan id from pool_plan (p- and 16 hex digits)')
       if (this.job) throw new Error(`A pool job is already running (${this.job.op}, ${this.job.jobId}): wait for it (pool_status).`)
-      if (this.quiesced) throw new Error('The helper is being uninstalled: no pool changes.')
+      if (this.quiesced && !(op === 'remove' && this.quiesced.allowRemove)) throw new Error('The helper is being uninstalled: no pool changes (only uninstall -RemovePool\'s own approved remove).')
       let bytes
       try { bytes = fs.readFileSync(join(this.dir, 'plans', `${planId}.json`)) } catch { throw new Error(`No plan ${planId}.`) }
       const plan = JSON.parse(bytes.toString('utf8'))
@@ -691,8 +716,16 @@ class Helper {
     const done = []
     if (plan.switch) {
       job.progress = `creating the internal switch ${plan.switch}`
-      this.journal.append({ t: 'switch', jobId: job.jobId, name: plan.switch, phase: 'creating' })
-      const sw = await this.hv('new-switch', { name: plan.switch })
+      const token = hex(16)
+      this.journal.append({ t: 'switch', jobId: job.jobId, name: plan.switch, phase: 'creating', token })
+      let sw
+      try {
+        sw = await this.hv('new-switch', { name: plan.switch, token })
+      } catch (e) {
+        // Undo whatever the attempt made: only a switch carrying this token can be removed.
+        await this.finishSwitch(this.state.switch).catch(() => {})
+        throw new Error(`creating the switch ${plan.switch}: ${e.message}`)
+      }
       this.journal.append({ t: 'switch', jobId: job.jobId, name: plan.switch, phase: 'created', switchId: sw.switchId })
     }
     for (const r of plan.remove || []) {
@@ -705,7 +738,7 @@ class Helper {
       job.progress = `removing the switch ${plan.removeSwitch}`
       const sw = this.state.switch
       this.journal.append({ t: 'switch', jobId: job.jobId, name: sw.name, phase: 'removing', switchId: sw.switchId })
-      await this.hv('remove-switch', { name: sw.name, switchId: sw.switchId })
+      await this.hv('remove-switch', { name: sw.name, switchId: sw.switchId, token: sw.token })
       this.journal.append({ t: 'switch', jobId: job.jobId, name: sw.name, phase: 'removed' })
       done.push(`removed the switch ${sw.name}`)
     }
@@ -771,6 +804,8 @@ class Helper {
   /**
    * Quiesce for uninstall: authorised like a pool change, by approvals\quiesce.json (written by the elevated
    * uninstall.ps1) with an unused nonce. Refuses new leases, ends every lease (kept ones too) and restores every VM.
+   * Its purpose decides what may still happen: 'keep-pool' allows no pool change at all; 'remove-pool' allows exactly
+   * one kind, an approved remove plan (uninstall -RemovePool's own), and nothing else.
    */
   quiesce() {
     return this.poolLock(async () => {
@@ -782,9 +817,12 @@ class Helper {
         const acl = await this.hv('approval-acl', { dir: this.approvalsDir, file })
         if (!acl.ok) throw new Error(`quiesce: ${acl.why}`)
       }
+      if (!['keep-pool', 'remove-pool'].includes(a.purpose)) throw new Error('quiesce: its approval names no purpose (keep-pool or remove-pool)')
       if (this.job) throw new Error(`a pool job is running (${this.job.op}): wait for it`)
-      this.journal.append({ t: 'job', jobId: `j-${hex(6)}`, op: 'quiesce', nonce: a.nonce })
-      this.quiesced = true
+      const jobId = `j-${hex(6)}`
+      this.journal.append({ t: 'job', jobId, op: 'quiesce', nonce: a.nonce })
+      this.journal.append({ t: 'jobEnd', jobId, ok: true, note: a.purpose })
+      this.quiesced = { allowRemove: a.purpose === 'remove-pool' }
       const failed = []
       for (const lease of [...this.leases.values()]) { lease.kept = false; const r = await this.endLease(lease, 'uninstall'); if (!r.ok) failed.push(lease.vmName) }
       for (const vm of this.state.vms.values()) if (vm.ready && !this.leases.has(vm.vmId)) { const r = await this.vmLock(vm.vmId)(() => this.restore(vm)); if (!r.ok && !failed.includes(vm.vmName)) failed.push(vm.vmName) }

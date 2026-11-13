@@ -134,3 +134,56 @@ test('a quarantined VM that can\'t be restored at start-up stays quarantined and
   t.after(() => h.stop())
   assert.match((await h.conn(1).request('status')).text, /QUARANTINED \(restore: injected failure of restore\)/)
 })
+
+// A same-named switch that isn't the pool's (another id, no token of ours in its Notes) is never removed or used.
+const FOREIGN = { 'hvmcp-internal': { id: 'foreign-switch-id', type: 'Internal', notes: '' } }
+
+test('a foreign switch with the pool\'s switch name survives a create that fails on it, and the next start', async t => {
+  const sc = await prepared('foreign-switch-fail')
+  sc.patchStub(s => { s.switches = { ...FOREIGN } })
+  let h = await startHelper(sc)
+  const admin = h.conn(1)
+  const p = (await admin.request('pool_plan', { action: 'create', vms: 1, cores: 2, memoryGB: 4, network: true })).data.planId
+  approve(sc, p)
+  await admin.request('pool_create', { planId: p })
+  await waitFor(async () => /Last pool job: create FAILED: creating the switch hvmcp-internal: .*already exists/.test((await admin.request('status')).text))
+  assert.deepStrictEqual(sc.stub().switches, FOREIGN, 'untouched by the failed create')
+  await h.stop()
+  h = await startHelper(sc)
+  t.after(() => h.stop())
+  assert.deepStrictEqual(sc.stub().switches, FOREIGN, 'untouched by recovery')
+  assert.match((await h.conn(1).request('status')).text, /switch: none/)
+})
+
+test('a crash before creating the switch, with a foreign one of that name present: recovery leaves it alone', async t => {
+  const sc = await prepared('foreign-switch-crash')
+  sc.patchStub(s => { s.switches = { ...FOREIGN } })
+  const h = await crashCreate(sc, 'before:new-switch', { network: true })
+  t.after(() => h.stop())
+  assert.deepStrictEqual(sc.stub().switches, FOREIGN)
+  assert.match((await h.conn(1).request('status')).text, /exists but isn't the pool's .*left untouched/)
+})
+
+test('a switch made but not journalled (a failure after New-VMSwitch) is found by its token and removed', async t => {
+  const sc = await prepared('switch-token')
+  sc.patchStub(s => { s.failAfterSwitch = true })
+  const h = await startHelper(sc)
+  t.after(() => h.stop())
+  const admin = h.conn(1)
+  const p = (await admin.request('pool_plan', { action: 'create', vms: 1, cores: 2, memoryGB: 4, network: true })).data.planId
+  approve(sc, p)
+  await admin.request('pool_create', { planId: p })
+  await waitFor(async () => /Last pool job: create FAILED/.test((await admin.request('status')).text))
+  assert.deepStrictEqual(sc.stub().switches, {}, 'its own switch, found by token, is gone')
+})
+
+test('a start with networking uses the pool\'s switch by id: a same-named replacement is refused', async t => {
+  const sc = scratch('switch-replaced')
+  const { h } = await withPool(sc, 1, { network: true })
+  t.after(() => h.stop())
+  sc.patchStub(s => { s.switches['hvmcp-internal'] = { id: 'replacement-id', type: 'Internal', notes: '' } })
+  const a = h.conn(10)
+  await a.request('acquire')
+  await assert.rejects(a.request('start', { network: true }), /switch hvmcp-internal \(id .*\) is missing, renamed or not internal/)
+  assert.ok(!Object.values(sc.stub().vms).some(v => v.switchName), 'no adapter was connected')
+})

@@ -87,7 +87,10 @@ and test accounts.
      add to the group later must sign in again before their membership counts;
    - `%ProgramData%\hyperv-mcp` (the helper's state) and the disk folder, both readable only by SYSTEM,
      Administrators and the service. `policy.json` and `approvals\` in there are writable only by Administrators and
-     SYSTEM;
+     SYSTEM. Setup doesn't just add its grants: each of these folders, and `%ProgramFiles%\hyperv-mcp`, gets an ACL
+     built from scratch, so any earlier grant to anyone else is removed, from the folder and from everything already
+     in it. The only exception is Hyper-V's own grants to each VM's SID on its files, which the VM needs. It refuses
+     a folder that is, contains or sits under a link or junction, and checks the result before it goes on;
    - `policy.json`, the pool's hard limits. By default they're derived from the host: up to a quarter of its logical
      CPUs per VM (at most 8), half its memory in all, up to 4 VMs, 128 GB disks, networking allowed (internal switch
      only), unpinned ISOs refused. Override any of them: `-MaxVms`, `-MaxCoresPerVm`, `-MaxMemoryGB`,
@@ -259,13 +262,19 @@ Even a forged approval can only do what the policy allows.
 **The journal and recovery.** `%ProgramData%\hyperv-mcp\journal.jsonl` is append-only, and each record is flushed
 before the side effect it announces:
 - a create records its intent (a random VM name and its own folder) before `New-VM`, and the VM's id right after;
+- a switch is recorded with a random token before `New-VMSwitch`, which writes that token into the switch's Notes as
+  it creates it; its id is recorded right after;
 - a remove marks its VMs before removing them;
 - only one pool job runs at a time, and pool jobs and leases share one lock, so a remove can't race an acquire.
 
-At every start, before it serves anyone, the helper replays the journal:
+At every start, before it serves anyone, the helper replays the journal. A half-written last record (a crash
+mid-write) is cut off the file first, so nothing is ever appended onto it. Then:
 - an unfinished create is rolled back. Its VM is found only by its exact random name **and** its exact folder, never
   by the prefix, so nothing else is ever adopted;
-- an unfinished remove or switch change is finished;
+- an unfinished remove is finished;
+- an unfinished switch change is finished, on the pool's switch only. That's the one with its recorded id or its token
+  in its Notes, never a switch that merely has the same name: a same-named switch of someone else's is left
+  untouched and reported. A start with networking also connects to the switch by its id, never its name;
 - open jobs are closed;
 - every VM is restored, and every lease from before is void.
 
@@ -313,8 +322,13 @@ With a pool present it refuses unless you choose:
   then everything, with the state last.
 
 Either way it first asks the helper to **quiesce**: no new leases, every lease ended (kept ones too), every VM
-restored. A VM that can't be restored stops the uninstall, named. Each step can be run again, so an interrupted
-uninstall is finished by running it again. Approvals kept with `-KeepPool` simply expire.
+restored. A VM that can't be restored stops the uninstall, named. The quiesce's own admin-written approval names its
+purpose:
+- with `-KeepPool`, the helper then allows no pool change at all;
+- with `-RemovePool`, it allows exactly one, this uninstall's own approved remove.
+
+Each step can be run again, so an interrupted uninstall is finished by running it again: the restarted helper
+completes a half-done remove before anything else. Approvals kept with `-KeepPool` simply expire.
 
 ## Limits
 
@@ -341,7 +355,11 @@ node --test test\units.test.js test\leases.test.js test\approvals.test.js test\r
     (truncated, corrupt checksums, byte flips, a missing or bad WIM);
   - the image checks: pinned, downloaded, local and unpinned, signatures, edition and architecture, the helper's own
     folders, download URLs;
-  - the policy, the journal (a torn last line), canonical plans, the answer file's escaping.
+  - the policy, the journal (a torn last line cut off, then reopen → append → reopen keeping every record),
+    canonical plans, the answer file's escaping, the evaluation-expiry warning;
+  - setup's ACLs, non-elevated on temp folders (`test\acl-check.ps1`): earlier grants removed from a folder and
+    everything in it, VM grants kept on disk files, links inside or above refused before any change;
+  - `approve.ps1` refusing to run outside the install folder.
 - `leases.test.js`:
   - leases across connections; a connection closing, the deadline, keep and `keepOnFailure`;
   - the restore before every start;
@@ -350,18 +368,26 @@ node --test test\units.test.js test\leases.test.js test\approvals.test.js test\r
   - a checkpoint replaced under its name;
   - ownership: a renamed VM, and a foreign VM with the prefix never touched;
   - networking and the reserve cap; staging limits; runs (as user, timeout, caps); `read_out`;
-  - protocol abuse, and that an agent's command never reaches a host command line.
+  - protocol abuse, and that an agent's command never reaches a host command line;
+  - a lease that is ending: its connection refused at once; an operation already queued for the VM's lock when the
+    lease ended (start, run) refused inside the lock; the VM handed on only once restored.
 - `approvals.test.js`:
   - unapproved plans;
   - forged approvals: another digest, operation or epoch, expired, a malformed nonce, another plan's id, a writable
     folder;
   - a plan changed after approval; single use; opaque plan ids;
   - the policy as the hard limit, even with a forged plan;
-  - one pool job at a time; remove against a leased VM; acquire racing remove; quiesce.
+  - one pool job at a time; remove against a leased VM; acquire racing remove;
+  - quiesce and its purposes. Uninstall `-RemovePool` end to end (quiesce, plan, approve, remove: only that change
+    allowed), and interrupted mid-remove, then run again.
 - `recovery.test.js`:
   - the helper crashing before and after each side effect of a create, a remove and a switch change (ten points in a
     create), then restarting: everything rolled back or completed, and nothing that merely shares a name adopted;
-  - a restart restores every VM and voids every lease.
+  - a restart restores every VM and voids every lease;
+  - the switch, by id or token only:
+    - a foreign switch with its name survives a failed create, a crash and recovery;
+    - an unjournalled switch of ours is found by its token;
+    - a same-named replacement is refused at start.
 - `server.test.js`: `server.js` over stdio in direct mode:
   - the tools and the kill switch;
   - a build copied in, with links skipped, then read back, including images;
@@ -371,8 +397,8 @@ node --test test\units.test.js test\leases.test.js test\approvals.test.js test\r
   - service mode without the helper.
 - `host.test.js`: `HvMcpHost.cs` compiled with the in-box `csc.exe` and run in console mode, with `server.js` over the
   real pipe:
-  - the helper killed mid-run: its run's child dies with the job object, the client is told, and the respawned helper
-    restores the VM before the pipe reopens;
+  - the helper killed mid-run: its run's child (by its recorded PID) dies with the job object, the client is told, and
+    the respawned helper restores the VM before the pipe reopens;
   - the host killed: its helper dies too;
   - a pipe name already taken is refused;
   - a client can't forge framing, and an over-long line closes only that connection.
@@ -398,4 +424,5 @@ repo, and `npm test` clears earlier runs' folders first.
   - `hv.js` and `hv.ps1` (the only way it acts on Hyper-V);
   - `approve.ps1`;
   - `host\HvMcpHost.cs` (the service host's source).
-- `setup\install.ps1`, `setup\uninstall.ps1`: the only elevated steps besides approvals.
+- `setup\install.ps1`, `setup\uninstall.ps1`: the only elevated steps besides approvals. `setup\acl.ps1` holds
+  setup's ACL functions (tested non-elevated by `test\acl-check.ps1`).

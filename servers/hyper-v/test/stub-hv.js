@@ -6,7 +6,8 @@
  * It enforces what hv.ps1 does: Get-OwnVm (the id must name a VM with the expected name inside the expected folder).
  * Guest commands are a tiny language: "echo <text>", "exit <n>", "sleep" (never ends), "write <path> <text>",
  * "check <path>" (exit 0 if it exists), "shutdown" (the guest shuts itself down: Off, its disk changes kept),
- * "hang <host file> <ms>" (blocks, then writes that file: to show a killed run never finishes).
+ * "hang <host file> <ms> <pid file>" (records its PID, blocks, then writes the file: a killed run never finishes).
+ * restoreGate: a host path; restore waits until that file exists (to hold the VM's lock at a known point).
  * Faults (state.fail): { "<op>": n } fails the next n calls of op; restoreLeaves: { switchName, reserve, state } makes
  * restore leave that behind; signatureBad: true; aclBad: "<why>"; installNeverReady: true.
  */
@@ -81,6 +82,7 @@ function run(s, op, a) {
     }
     case 'restore': {
       const vm = own(s, a)
+      if (s.restoreGate) while (!fs.existsSync(s.restoreGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25) // held until the test opens the gate
       const cp = vm.checkpoints.find(c => c.id === a.checkpointId)
       if (!cp) throw new Error('its clean checkpoint (by id) is missing')
       vm.state = 'Off'
@@ -96,7 +98,9 @@ function run(s, op, a) {
       const vm = own(s, a)
       if (vm.state !== 'Off') throw new Error('the VM is not Off after its restore')
       if (a.switchName) {
-        if (s.switches[a.switchName]?.type !== 'Internal') throw new Error(`switch ${a.switchName} is missing or not internal`)
+        const sw = s.switches[a.switchName]
+        if (!a.switchId) throw new Error(`no recorded id for switch ${a.switchName}`)
+        if (!sw || sw.id !== a.switchId || sw.type !== 'Internal') throw new Error(`switch ${a.switchName} (id ${a.switchId}) is missing, renamed or not internal`)
         vm.switchName = a.switchName
       }
       vm.reserve = a.reserve
@@ -130,7 +134,8 @@ function run(s, op, a) {
       if (cmd === 'whoami') return { ...base, stdout: base.as }
       if (cmd === 'big') return { ...base, stdout: 'x'.repeat(a.cap), stdoutCut: true }
       if (cmd === 'shutdown') { vm.state = 'Off'; return base }
-      if (cmd === 'hang') { // a long run: if it is ever let finish, it leaves a marker file on the host (rest[0])
+      if (cmd === 'hang') { // a long run: records its PID (rest[2]), and if it is ever let finish, leaves a marker (rest[0])
+        if (rest[2]) fs.writeFileSync(rest[2], String(process.pid))
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(rest[1] || 4000))
         fs.writeFileSync(rest[0], 'finished')
         return base
@@ -164,18 +169,18 @@ function run(s, op, a) {
       return { removed: true }
     }
     case 'new-switch': {
+      if (!/^[0-9a-f]{32}$/.test(a.token || '')) throw new Error('a switch needs its ownership token')
       if (s.switches[a.name]) throw new Error(`a switch named ${a.name} already exists`)
       const id = crypto.randomUUID()
-      s.switches[a.name] = { id, type: 'Internal' }
+      s.switches[a.name] = { id, type: 'Internal', notes: `hvmcp:${a.token}` }
+      if (s.failAfterSwitch) { s.failAfterSwitch = false; throw new Error('injected failure after New-VMSwitch') }
       return { switchId: id }
     }
     case 'remove-switch': {
-      const sw = s.switches[a.name]
-      if (!sw) return { gone: true }
-      if (sw.type !== 'Internal') throw new Error('not internal')
-      if (a.switchId && sw.id !== a.switchId) throw new Error('another id')
-      delete s.switches[a.name]
-      return { removed: true }
+      // Only by id or the token in its notes, never by name alone (as hv.ps1).
+      const mine = Object.entries(s.switches).filter(([, sw]) => sw.type === 'Internal' && ((a.switchId && sw.id === a.switchId) || (/^[0-9a-f]{32}$/.test(a.token || '') && sw.notes === `hvmcp:${a.token}`)))
+      if (mine.length) { delete s.switches[mine[0][0]]; return { removed: true } }
+      return { gone: true, foreign: !!s.switches[a.name] }
     }
     case 'make-iso': fs.writeFileSync(a.out, 'iso'); return { out: a.out }
     case 'signatures': return { files: a.files.map(f => ({ file: f, ok: !s.signatureBad, why: s.signatureBad ? 'signature NotSigned' : null })) }

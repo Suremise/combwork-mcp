@@ -14,7 +14,8 @@
  *   rolledBack{ intentId }                                an unfinished create was undone
  *   removing  { jobId, vmId }                             about to remove this VM
  *   removed   { vmId }
- *   switch    { jobId, name, phase: 'creating'|'created'|'removing'|'removed', switchId? }
+ *   switch    { jobId, name, phase: 'creating'|'created'|'removing'|'removed', token, switchId? }   token: written
+ *             into the switch's Notes at creation, so it is recognised as the pool's even before its id is journalled
  *   jobEnd    { jobId, ok, note }
  *   quarantine{ vmId, why } / unquarantine { vmId }       a VM that couldn't be confirmed clean, and its release
  */
@@ -32,19 +33,33 @@ class Journal {
     this.seq = 0
   }
 
-  /** Reads every record; a fresh state gets its epoch. A torn last line (a crash mid-write) is ignored. */
+  /**
+   * Reads every record; a fresh state gets its epoch. A torn last line (a crash mid-write) is cut off the file, flushed,
+   * before anything is appended: the file then ends at its last complete record, with its newline. A last record that
+   * is complete JSON without its newline gets the newline. Any other unreadable line is an error.
+   */
   open() {
     fs.mkdirSync(this.dir, { recursive: true })
-    let text = ''
-    try { text = fs.readFileSync(this.file, 'utf8') } catch (e) { if (e.code !== 'ENOENT') throw e }
-    const lines = text.split('\n')
-    for (let i = 0; i < lines.length; i++) {
-      if (!lines[i].trim()) continue
+    let buf = Buffer.alloc(0)
+    try { buf = fs.readFileSync(this.file) } catch (e) { if (e.code !== 'ENOENT') throw e }
+    let at = 0 // the byte offset just after the last complete record's newline
+    let n = 0
+    while (at < buf.length) {
+      const nl = buf.indexOf(0x0a, at)
+      const end = nl < 0 ? buf.length : nl
+      const line = buf.toString('utf8', at, end)
+      n++
+      let rec
       try {
-        this.records.push(JSON.parse(lines[i]))
+        rec = line.trim() ? JSON.parse(line) : null
       } catch (e) {
-        if (i < lines.length - 1 && lines.slice(i + 1).some(l => l.trim())) throw new Error(`journal record ${i + 1} is unreadable: ${e.message}`)
+        if (nl >= 0 && buf.subarray(nl + 1).toString('utf8').trim()) throw new Error(`journal record ${n} is unreadable: ${e.message}`)
+        this.repair(at, false) // a torn last line: cut it off
+        break
       }
+      if (rec) this.records.push(rec)
+      if (nl < 0) { this.repair(buf.length, true); break } // complete, but its newline was never written
+      at = nl + 1
     }
     this.seq = this.records.reduce((m, r) => Math.max(m, r.seq || 0), 0)
     if (!this.records.length || this.records[0].t !== 'epoch') {
@@ -52,6 +67,18 @@ class Journal {
       this.append({ t: 'epoch', epoch: crypto.randomBytes(16).toString('hex') })
     }
     return this
+  }
+
+  /** Makes the file end at a complete record: truncates it to `length`, or adds the missing newline; then flushes. */
+  repair(length, addNewline) {
+    const fd = fs.openSync(this.file, 'r+')
+    try {
+      if (addNewline) fs.writeSync(fd, '\n', length)
+      else fs.ftruncateSync(fd, length)
+      fs.fsyncSync(fd)
+    } finally {
+      fs.closeSync(fd)
+    }
   }
 
   get epoch() { return this.records[0].epoch }
@@ -105,7 +132,7 @@ class Journal {
         case 'removed': s.vms.delete(r.vmId); s.quarantined.delete(r.vmId); break
         case 'switch':
           if (r.phase === 'removed') s.switch = null
-          else s.switch = { name: r.name, switchId: r.switchId ?? s.switch?.switchId ?? null, phase: r.phase, jobId: r.jobId }
+          else s.switch = { name: r.name, switchId: r.switchId ?? s.switch?.switchId ?? null, token: r.token ?? s.switch?.token ?? null, phase: r.phase, jobId: r.jobId }
           break
         case 'quarantine': s.quarantined.set(r.vmId, r.why); break
         case 'unquarantine': s.quarantined.delete(r.vmId); break

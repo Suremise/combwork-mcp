@@ -158,7 +158,7 @@ test('policy: problems named; disk folders strictly inside; caps', () => {
   assert.match(policy.checkPool({ ...p, allowNetwork: false }, [vm], { network: true }).join(), /does not allow networking/)
 })
 
-test('journal: flushed records replay; a torn last line (a crash mid-write) is ignored; a torn middle line is an error', () => {
+test('journal: flushed records replay; a torn last line (a crash mid-write) is cut off; damage in the middle is an error', () => {
   const sc = scratch('journal')
   const dir = path.join(sc.dir, 'j')
   const j = new Journal(dir).open()
@@ -170,12 +170,37 @@ test('journal: flushed records replay; a torn last line (a crash mid-write) is i
   const s = j2.state()
   assert.strictEqual(s.vms.get('v1').ready, false)
   assert.strictEqual(s.intents.get('i-1').done, false)
-  fs.appendFileSync(path.join(dir, 'journal.jsonl'), '\n{"t":"removed","vmId":"v1"}\n')
+  assert.ok(fs.readFileSync(path.join(dir, 'journal.jsonl'), 'utf8').endsWith('}\n'), 'the torn tail was cut off')
+  fs.appendFileSync(path.join(dir, 'journal.jsonl'), '{"t":"ready","vmI\n{"t":"removed","vmId":"v1"}\n') // damage in the middle
   assert.throws(() => new Journal(dir).open(), /record 4 is unreadable/)
   const other = path.join(sc.dir, 'k')
   fs.mkdirSync(other)
   fs.writeFileSync(path.join(other, 'journal.jsonl'), '{"t":"intent"}\n')
   assert.throws(() => new Journal(other).open(), /no epoch record/)
+})
+
+test('journal: after a torn write, reopen → append → reopen keeps every record (a consumed nonce too)', () => {
+  const sc = scratch('journal-torn')
+  const dir = path.join(sc.dir, 'j')
+  const file = path.join(dir, 'journal.jsonl')
+  const j = new Journal(dir).open()
+  j.append({ t: 'job', jobId: 'j1', op: 'create', planId: 'p-1', nonce: 'a'.repeat(32) })
+  fs.appendFileSync(file, '{"t":"intent","jobId":"j1","intentId":"i-1","vmN') // the crash: half a record
+  const j2 = new Journal(dir).open()
+  assert.ok(fs.readFileSync(file, 'utf8').endsWith('\n'), 'the torn tail is cut off on open')
+  j2.append({ t: 'jobEnd', jobId: 'j1', ok: false, note: 'interrupted' })
+  j2.append({ t: 'job', jobId: 'j2', op: 'remove', planId: 'p-2', nonce: 'b'.repeat(32) })
+  const j3 = new Journal(dir).open()
+  const s = j3.state()
+  assert.strictEqual(s.jobs.get('j1').ended, true, 'the jobEnd written after the torn line survives')
+  assert.ok(s.usedNonces.has('a'.repeat(32)) && s.usedNonces.has('b'.repeat(32)), 'both consumed nonces survive')
+  assert.strictEqual(j3.records.length, 4)
+  // A complete last record whose newline was never written gets it, and is kept.
+  fs.writeFileSync(file, fs.readFileSync(file, 'utf8') + '{"t":"jobEnd","jobId":"j2","ok":true,"note":"x","seq":99}')
+  const j4 = new Journal(dir).open()
+  assert.strictEqual(j4.state().jobs.get('j2').ended, true)
+  j4.append({ t: 'quarantine', vmId: 'v', why: 'test' })
+  assert.strictEqual(new Journal(dir).open().state().quarantined.get('v'), 'test')
 })
 
 test('canonical plan text and the baseline check', () => {
@@ -206,6 +231,28 @@ test('the 90-day evaluation: a warning from 14 days before, counted from the cle
   assert.match(expiry(vm, t0 + 80 * day), /expires in about 10 day\(s\)/)
   assert.match(expiry(vm, t0 + 91 * day), /has expired/)
   assert.strictEqual(expiry({}, t0), '')
+})
+
+test('setup ACLs: earlier grants removed from a folder and what it holds; VM grants kept; links refused (non-elevated)', { skip: !windows }, () => {
+  const { spawnSync } = require('child_process')
+  const sc = scratch('acl')
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, 'acl-check.ps1'), '-Dir', sc.dir], { encoding: 'utf8' })
+  const line = (r.stdout || '').split(/\r?\n/).find(l => l.startsWith('RESULT:'))
+  assert.ok(line, `acl-check.ps1 failed: ${r.stdout}\n${r.stderr}`)
+  const a = JSON.parse(line.slice(7))
+  assert.strictEqual(a.usersBefore, true, 'the grants were there before')
+  assert.deepStrictEqual(a.usersAfter ?? [], [], 'Users\' grants are gone from the folder and everything in it')
+  assert.deepStrictEqual(a.problems ?? [], [])
+  assert.strictEqual(a.protected, true)
+  assert.strictEqual(a.detected, true, 'a grant added afterwards is reported')
+  assert.strictEqual(a.vhdBefore, true, 'the VM\'s and Users\' grants were there before')
+  assert.strictEqual(a.vmKept, true, 'a VM\'s own grant on its disk stays')
+  assert.strictEqual(a.usersOnVhd, false)
+  assert.deepStrictEqual(a.vmProblems ?? [], [])
+  assert.match(a.innerLink, /holds links or junctions/)
+  assert.strictEqual(a.innerUnchanged, true, 'refused before changing anything')
+  assert.match(a.ancestorLink, /is a link or junction/)
+  assert.strictEqual(a.ancestorUnchanged, true)
 })
 
 test('approve.ps1 runs only from the installed, admin-only folder', { skip: !windows }, () => {

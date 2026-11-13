@@ -114,8 +114,9 @@ test('a kept VM is restored at the deadline', async t => {
   await a.request('start')
   await a.request('stop', { keep: true })
   a.close() // a kept VM outlives its connection, until its deadline
-  await new Promise(r => setTimeout(r, 100))
-  assert.match((await admin.request('status')).text, /kept for inspection/)
+  // The close is processed once the helper counts one connection (admin's) again: then the lease must still be kept.
+  const st = await waitFor(async () => { const s = await admin.request('status'); return s.data.connections === 1 && s }, 5000, 'the helper to process the close')
+  assert.match(st.text, /kept for inspection/)
   await waitFor(async () => /; free/.test((await admin.request('status')).text), 5000, 'the deadline')
   assert.strictEqual(vmOf(sc, vm).state, 'Off')
 })
@@ -278,8 +279,70 @@ test('the protocol: malformed lines and unknown connections are refused without 
   a.raw('1 "t":"close","c":1}')
   h.send('msg 999 {"id":1,"op":"acquire"}')
   h.send('open x 1')
-  await new Promise(r => setTimeout(r, 200))
-  assert.match((await admin.request('status')).text, /; free/)
+  // The helper reads its input in order, so admin's reply to this later status line means every line above was handled.
+  const st = await admin.request('status')
+  assert.match(st.text, /; free/)
+  assert.strictEqual(st.data.connections, 2, 'no connection was opened or closed by the junk')
   assert.ok(await leased(a), 'the connection still works')
   await assert.rejects(a.request('nope'), /unknown operation/)
+})
+
+test('a lease that is ending refuses its connection at once, and its VM goes to the next client only once restored', async t => {
+  const sc = scratch('ending-refuses')
+  sc.env.HYPERV_MCP_MINUTE_MS = '400'
+  const { h, admin } = await withPool(sc, 1)
+  t.after(() => h.stop())
+  const gate = require('path').join(sc.dir, 'restore-gate')
+  const restores = () => sc.stub().calls.filter(c => c.op === 'restore').length
+  const a = h.conn(10)
+  const vm = await leased(a, { minutes: 1 }) // its deadline: 400 ms here
+  const before = restores()
+  sc.patchStub(s => { s.restoreGate = gate })
+  await waitFor(() => restores() > before, 10_000, 'the deadline\'s restore to begin (it waits at the gate)')
+  await assert.rejects(a.request('start'), /lease on hvmcp-[0-9a-f]+ is ending: call vm_acquire again/)
+  const b = h.conn(11)
+  await assert.rejects(b.request('acquire'), /No VM is free/, 'not handed on while it is being restored')
+  require('fs').writeFileSync(gate, 'open')
+  await waitFor(async () => /; free/.test((await admin.request('status')).text), 10_000, 'the restore to finish')
+  assert.strictEqual(await leased(b), vm)
+  assert.deepStrictEqual(sc.stub().calls.filter(c => c.op === 'configure-start'), [], 'a\'s start never ran')
+  assert.strictEqual(vmOf(sc, vm).state, 'Off')
+})
+
+test('an operation queued for the VM while its lease ended is refused inside the lock (start and run)', async t => {
+  const { Helper } = require('../helper/core')
+  const { hv } = require('../helper/hv')
+  for (const op of ['start', 'run']) {
+    const sc = scratch(`queued-${op}`)
+    const { h } = await withPool(sc, 1)
+    await h.stop()
+    const saved = { ...process.env }
+    Object.assign(process.env, { HYPERV_MCP_PS_STUB: sc.env.HYPERV_MCP_PS_STUB, HYPERV_MCP_STUB_STATE: sc.env.HYPERV_MCP_STUB_STATE, HYPERV_MCP_POLL_MS: '10' })
+    const helper = new Helper({ stateDir: sc.stateDir, hv, checkApprovalAcl: false })
+    try {
+      await helper.init()
+      helper.connect('a', 1)
+      await helper.acquire('a', {})
+      const lease = [...helper.leases.values()][0]
+      if (op === 'run') await helper.start('a', {})
+      const callsBefore = sc.stub().calls.length
+      let open
+      const hold = new Promise(r => { open = r })
+      const held = helper.vmLock(lease.vmId)(() => hold) // something holds the VM's lock
+      const queued = op === 'start' ? helper.start('a', {}) : helper.run('a', { command: 'echo late' })
+      const ended = helper.endLease(lease, 'test: its deadline') // the lease ends while the operation waits
+      open()
+      await held
+      await assert.rejects(queued, /ended while the request waited/, op)
+      assert.strictEqual((await ended).ok, true)
+      const later = sc.stub().calls.slice(callsBefore).map(c => c.op)
+      assert.ok(!later.includes('configure-start') && !later.includes('guest-run'), `the queued ${op} never acted: ${later}`)
+      helper.connect('b', 2)
+      assert.match((await helper.acquire('b', {})).text, /Leased/, 'the next client gets it, restored')
+      assert.strictEqual(Object.values(sc.stub().vms)[0].state, 'Off')
+    } finally {
+      helper.close()
+      process.env = saved
+    }
+  }
 })

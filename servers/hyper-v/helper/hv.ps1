@@ -241,9 +241,11 @@ try {
       $vm = Get-OwnVm $a
       if ($vm.State -ne 'Off') { throw 'the VM is not Off after its restore' }
       if ($a.switchName) {
-        $sw = Get-VMSwitch -Name ([string]$a.switchName) -ErrorAction SilentlyContinue | Where-Object { $_.Name -ceq [string]$a.switchName }
-        if (-not $sw -or $sw.SwitchType -ne 'Internal') { throw "switch $($a.switchName) is missing or not internal" }
-        Get-VMNetworkAdapter -VM $vm | Connect-VMNetworkAdapter -SwitchName $sw.Name
+        # The pool's switch by its journalled id, never by name alone.
+        if (-not $a.switchId) { throw "no recorded id for switch $($a.switchName)" }
+        $sw = Get-VMSwitch -Id ([guid]$a.switchId) -ErrorAction SilentlyContinue
+        if (-not $sw -or $sw.Name -cne [string]$a.switchName -or $sw.SwitchType -ne 'Internal') { throw "switch $($a.switchName) (id $($a.switchId)) is missing, renamed or not internal" }
+        Get-VMNetworkAdapter -VM $vm | Connect-VMNetworkAdapter -VMSwitch $sw
       }
       Set-VMProcessor -VM $vm -Reserve ([int]$a.reserve)
       Start-VM -VM $vm
@@ -283,18 +285,25 @@ try {
       }
     }
     'new-switch' {
+      if ([string]$a.token -notmatch '^[0-9a-f]{32}$') { throw 'a switch needs its ownership token' }
       if (Get-VMSwitch -Name ([string]$a.name) -ErrorAction SilentlyContinue) { throw "a switch named $($a.name) already exists" }
-      $sw = New-VMSwitch -Name ([string]$a.name) -SwitchType Internal
+      # The token in its Notes, set as it is created, marks it as the pool's even before its id is journalled.
+      $sw = New-VMSwitch -Name ([string]$a.name) -SwitchType Internal -Notes "hvmcp:$($a.token)"
       @{ switchId = $sw.Id.ToString() }
     }
     'remove-switch' {
-      $sw = Get-VMSwitch -Name ([string]$a.name) -ErrorAction SilentlyContinue | Where-Object { $_.Name -ceq [string]$a.name }
-      if (-not $sw) { @{ gone = $true } }
+      # Only the pool's own switch: matched by its journalled id, or by the token in its Notes. Never by name alone: a
+      # same-named switch that matches neither is someone else's and is left untouched (reported as foreign).
+      $mine = @(Get-VMSwitch -ErrorAction SilentlyContinue | Where-Object {
+        $_.SwitchType -eq 'Internal' -and (
+          ($a.switchId -and $_.Id.ToString() -eq [string]$a.switchId) -or
+          ([string]$a.token -match '^[0-9a-f]{32}$' -and $_.Notes -ceq "hvmcp:$($a.token)"))
+      })
+      if ($mine.Count -gt 1) { throw "more than one switch matches the pool's id or token" }
+      if ($mine.Count -eq 1) { Remove-VMSwitch -VMSwitch $mine[0] -Force; @{ removed = $true } }
       else {
-        if ($sw.SwitchType -ne 'Internal') { throw "switch $($a.name) is not internal: not the pool's" }
-        if ($a.switchId -and $sw.Id.ToString() -ne [string]$a.switchId) { throw "switch $($a.name) has another id: not the pool's" }
-        Remove-VMSwitch -VMSwitch $sw -Force
-        @{ removed = $true }
+        $named = @(Get-VMSwitch -Name ([string]$a.name) -ErrorAction SilentlyContinue | Where-Object { $_.Name -ceq [string]$a.name })
+        @{ gone = $true; foreign = ($named.Count -gt 0) }
       }
     }
     'make-iso' {

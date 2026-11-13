@@ -37,6 +37,7 @@ function PipeOpen { return [bool]([IO.Directory]::GetFiles('\\.\pipe\') | Where-
 $me = New-Object Security.Principal.WindowsPrincipal ([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run this in an admin PowerShell (Run as administrator).' }
 
+. (Join-Path $PSScriptRoot 'acl.ps1')     # Set-ExclusiveAcl, Set-ExclusiveFileAcl, Test-ExclusiveAcl
 $src = Split-Path -Parent $PSScriptRoot   # servers\hyper-v
 $install = Join-Path $env:ProgramFiles 'hyperv-mcp'
 $state = Join-Path $env:ProgramData 'hyperv-mcp'
@@ -78,17 +79,21 @@ $userSid = (New-Object Security.Principal.NTAccount $User).Translate([Security.P
 $usersSid = "$((Get-LocalGroup -Name $groupName).SID.Value);$userSid"
 Step "Group '$groupName' holds $User; $User may also open the pipe directly (no need to sign in again)."
 
-# 4. The code, installed where only Administrators can write.
-New-Item -ItemType Directory -Force -Path $install | Out-Null
+# 4. The code, installed where only Administrators can write. The service is stopped first (a running helper's VMs are
+# restored by the next one's recovery), and the folder's ACL is made exclusive, and checked, before any code goes in.
+$existing = Get-Service $svc -ErrorAction SilentlyContinue
+if ($existing -and $existing.Status -ne 'Stopped') { Stop-Service $svc -Force; (Get-Service $svc).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(60)); Step "Service $svc stopped for the update." }
+$SYSTEM = 'S-1-5-18'; $ADMINS = 'S-1-5-32-544'; $USERS = 'S-1-5-32-545'
+Set-ExclusiveAcl $install @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$USERS=ReadAndExecute") -SetOwner
+$bad = @(Test-ExclusiveAcl $install -Allowed $SYSTEM, $ADMINS, $USERS -Writers $SYSTEM, $ADMINS -Owners $SYSTEM, $ADMINS)
+if ($bad.Count) { throw "$install isn't admin-only after setting its ACL: $($bad -join '; ')" }
 foreach ($f in 'core.js', 'helper.js', 'hv.js', 'hv.ps1', 'images.js', 'iso.js', 'journal.js', 'paths.js', 'policy.js', 'unattend.js', 'approve.ps1') {
   Copy-Item -LiteralPath (Join-Path $src "helper\$f") -Destination (Join-Path $install $f) -Force
 }
 Copy-Item -LiteralPath (Join-Path $src 'meta.json') -Destination (Join-Path $install 'meta.json') -Force
-Step "Helper code copied to $install."
+Step "Helper code copied to $install (only Administrators and SYSTEM can write there)."
 
 if ($Mode -eq 'Service') {
-  $existing = Get-Service $svc -ErrorAction SilentlyContinue
-  if ($existing -and $existing.Status -ne 'Stopped') { Stop-Service $svc -Force; (Get-Service $svc).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(60)) }
   $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
   if (-not (Test-Path $csc)) { throw "The .NET Framework compiler is missing ($csc)." }
   $exe = Join-Path $install 'HvMcpHost.exe'
@@ -113,22 +118,18 @@ $hvMembers = @(Get-LocalGroupMember -SID $HVADMINS -ErrorAction SilentlyContinue
 if ($hvMembers -notcontains $runner) { Add-LocalGroupMember -SID $HVADMINS -Member $runner }
 Step "$runner is in Hyper-V Administrators."
 
-# 6. The state folder and the disk folders, with their ACLs.
-function Set-Owned([string]$path, [string[]]$grants) {
-  New-Item -ItemType Directory -Force -Path $path | Out-Null
-  $ia = @($path, '/inheritance:r', '/grant:r', '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F') + ($grants | ForEach-Object { '/grant:r'; $_ })
-  $o = & icacls.exe @ia 2>&1
-  if ($LASTEXITCODE -ne 0) { throw "icacls $path failed: $o" }
-  & icacls.exe $path /setowner '*S-1-5-32-544' 2>&1 | Out-Null
-}
-Set-Owned $state @("${runner}:(OI)(CI)M")
-Set-Owned (Join-Path $state 'approvals') @("${runner}:(OI)(CI)RX")
+# 6. The state folder and the disk folders, each with an ACL built from scratch (any earlier grant to anyone else is
+# removed, also on what they already hold), then checked. Done before the helper next reads them.
+$runnerSid = (New-Object Security.Principal.NTAccount $runner).Translate([Security.Principal.SecurityIdentifier]).Value
+Set-ExclusiveAcl $state @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=Modify") -SetOwner
+$approvals = Join-Path $state 'approvals'
+Set-ExclusiveAcl $approvals @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=ReadAndExecute") -SetOwner
 $folders = @($DiskFolder | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') })
 foreach ($d in $folders) {
   if ([IO.Path]::GetPathRoot($d).TrimEnd('\') -eq $d) { throw "Disk folder $d is a drive root: name a folder, such as D:\hyperv-mcp." }
-  Set-Owned $d @("${runner}:(OI)(CI)F")
+  # Children keep Hyper-V's own grants to each VM's SID (S-1-5-83-...): a VM can't start without them.
+  Set-ExclusiveAcl $d @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=FullControl") -SetOwner -ChildKeep '^S-1-5-83-'
 }
-Step "State in $state; VM disks in $($folders -join ', ')."
 
 # 7. The policy: hard limits for every pool change, writable only by Administrators and SYSTEM.
 $cs = Get-CimInstance Win32_ComputerSystem
@@ -145,8 +146,16 @@ $policy = [ordered]@{
 }
 $policyFile = Join-Path $state 'policy.json'
 [IO.File]::WriteAllText($policyFile, ($policy | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding $false))
-$o = & icacls.exe $policyFile /inheritance:r /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' "${runner}:RX" 2>&1
-if ($LASTEXITCODE -ne 0) { throw "icacls $policyFile failed: $o" }
+Set-ExclusiveFileAcl $policyFile @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=ReadAndExecute") -SetOwner
+
+# The result, checked: only SYSTEM, Administrators and the helper's account have any access to the state; only the
+# first two can write policy.json and approvals\; the disk folders also allow Hyper-V's per-VM SIDs.
+$bad = @(Test-ExclusiveAcl $state -Allowed $SYSTEM, $ADMINS, $runnerSid -Owners $SYSTEM, $ADMINS, $runnerSid) +
+  @(Test-ExclusiveAcl $approvals -Allowed $SYSTEM, $ADMINS, $runnerSid -Writers $SYSTEM, $ADMINS -Owners $SYSTEM, $ADMINS) +
+  @(Test-ExclusiveAcl $policyFile -Allowed $SYSTEM, $ADMINS, $runnerSid -Writers $SYSTEM, $ADMINS -Owners $SYSTEM, $ADMINS)
+foreach ($d in $folders) { $bad += @(Test-ExclusiveAcl $d -Allowed $SYSTEM, $ADMINS, $runnerSid -AllowPattern '^S-1-5-83-') }
+if ($bad.Count) { throw "The helper's folders aren't as setup made them: $($bad -join '; ')" }
+Step "State in $state; VM disks in $($folders -join ', '); ACLs checked."
 Step ("Policy: up to {0} VMs, {1} cores each, {2} GB memory in all, {3} GB disks; network {4}; unpinned ISOs {5}." -f $policy.maxVms, $policy.maxCoresPerVm, ($policy.maxMemoryMBTotal / 1024), $policy.maxDiskGBPerVm, $(if ($AllowNetwork) { 'allowed (internal switch only)' } else { 'not allowed' }), $(if ($AllowUnpinnedIso) { 'allowed' } else { 'refused' }))
 
 # 8. Start.

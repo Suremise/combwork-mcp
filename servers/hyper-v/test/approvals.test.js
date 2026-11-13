@@ -163,9 +163,65 @@ test('quiesce needs its own admin-written approval; then no new leases and every
   await a.request('start')
   await a.request('stop', { keep: true })
   await assert.rejects(admin.request('quiesce'), /for uninstall\.ps1 only/)
-  const epoch = sc.journal()[0].epoch
-  fs.writeFileSync(path.join(sc.stateDir, 'approvals', 'quiesce.json'), JSON.stringify({ nonce: crypto.randomBytes(16).toString('hex'), epoch, expires: new Date(Date.now() + 60_000).toISOString() }))
+  quiesceApproval(sc, { purpose: undefined })
+  await assert.rejects(admin.request('quiesce'), /names no purpose/)
+  quiesceApproval(sc, { purpose: 'keep-pool' })
   assert.match((await admin.request('quiesce')).text, /Quiesced: no leases, every VM restored \(2\)/)
   await assert.rejects(h.conn(11).request('acquire'), /being uninstalled/)
   await assert.rejects(admin.request('quiesce'), /expired, used or from another state/, 'its nonce is used')
+  // keep-pool allows no pool change at all, an approved remove included.
+  const p = (await admin.request('pool_plan', { action: 'remove' })).data.planId
+  approve(sc, p)
+  await assert.rejects(admin.request('pool_remove', { planId: p }), /being uninstalled: no pool changes/)
+  assert.strictEqual(Object.keys(sc.stub().vms).length, 2)
+})
+
+/** Writes approvals\quiesce.json as uninstall.ps1 does. */
+function quiesceApproval(sc, over = {}) {
+  const a = { nonce: crypto.randomBytes(16).toString('hex'), epoch: sc.journal()[0].epoch, expires: new Date(Date.now() + 60_000).toISOString(), purpose: 'remove-pool', ...over }
+  fs.writeFileSync(path.join(sc.stateDir, 'approvals', 'quiesce.json'), JSON.stringify(a))
+}
+
+test('uninstall -RemovePool end to end: quiesce (remove-pool) → plan → approve → remove; only that remove is allowed', async t => {
+  const sc = scratch('uninstall-remove')
+  const { h, admin } = await withPool(sc, 2, { network: true })
+  t.after(() => h.stop())
+  const a = h.conn(10)
+  await a.request('acquire')
+  quiesceApproval(sc)
+  assert.match((await admin.request('quiesce')).text, /Quiesced/)
+  await assert.rejects(h.conn(11).request('acquire'), /being uninstalled/)
+  const grow = (await admin.request('pool_plan', { action: 'resize', vms: 3 })).data
+  if (grow?.planId) { approve(sc, grow.planId); await assert.rejects(admin.request('pool_resize', { planId: grow.planId }), /no pool changes/) }
+  const p = (await admin.request('pool_plan', { action: 'remove' })).data.planId
+  approve(sc, p)
+  await admin.request('pool_remove', { planId: p })
+  await waitFor(async () => /Last pool job: remove finished/.test((await admin.request('status')).text))
+  assert.deepStrictEqual(Object.keys(sc.stub().vms), [])
+  assert.deepStrictEqual(sc.stub().switches, {})
+  assert.match((await admin.request('status')).text, /Pool: no VMs; switch: none/)
+})
+
+test('uninstall -RemovePool interrupted mid-remove, then run again: recovery finishes it, and a new quiesce works', async t => {
+  const sc = scratch('uninstall-interrupted')
+  let { h, admin } = await withPool(sc, 2)
+  quiesceApproval(sc)
+  await admin.request('quiesce')
+  const p = (await admin.request('pool_plan', { action: 'remove' })).data.planId
+  approve(sc, p)
+  await h.stop()
+  // The same helper state, quiesced again by a fresh helper that crashes after removing the first VM.
+  h = await startHelper(sc, { HYPERV_MCP_CRASH_AT: 'after:remove-vm' })
+  admin = h.conn(1)
+  quiesceApproval(sc)
+  await admin.request('quiesce')
+  admin.request('pool_remove', { planId: p }).catch(() => {})
+  assert.strictEqual(await h.exited, 99)
+  h = await startHelper(sc) // uninstall run again: the restarted helper recovers first
+  t.after(() => h.stop())
+  admin = h.conn(1)
+  assert.deepStrictEqual(Object.keys(sc.stub().vms), [], 'the interrupted remove was completed by recovery')
+  quiesceApproval(sc)
+  assert.match((await admin.request('quiesce')).text, /Quiesced: no leases, every VM restored \(0\)/)
+  assert.match((await admin.request('status')).text, /Pool: no VMs/)
 })

@@ -50,9 +50,11 @@ if ($Mode -eq 'Service' -and $running) {
   Step "The helper is running; the pool has $vms VM(s)."
   if ($vms -gt 0 -and -not $KeepPool -and -not $RemovePool) { throw "The pool has $vms VM(s): run again with -KeepPool (keep them, for a later setup) or -RemovePool (remove them first). Nothing was changed." }
   if ($st.data.job) { throw "A pool job is running ($($st.data.job)): wait for it (pool_status), then run this again. Nothing was changed." }
-  # Quiesce, authorised by an approval only Administrators can write.
+  # Quiesce, authorised by an approval only Administrators can write. Its purpose: with -RemovePool the helper then
+  # still allows exactly one change, this uninstall's own approved remove; otherwise none.
   $rng = [Security.Cryptography.RandomNumberGenerator]::Create(); $nb = New-Object byte[] 16; $rng.GetBytes($nb)
-  $q = [ordered]@{ nonce = (-join ($nb | ForEach-Object { $_.ToString('x2') })); epoch = (Epoch); expires = [DateTimeOffset]::UtcNow.AddMinutes(10).ToString('o') } | ConvertTo-Json -Compress
+  $purpose = if ($RemovePool) { 'remove-pool' } else { 'keep-pool' }
+  $q = [ordered]@{ nonce = (-join ($nb | ForEach-Object { $_.ToString('x2') })); epoch = (Epoch); expires = [DateTimeOffset]::UtcNow.AddMinutes(10).ToString('o'); purpose = $purpose } | ConvertTo-Json -Compress
   [IO.File]::WriteAllText((Join-Path $state 'approvals\quiesce.json'), $q, (New-Object Text.UTF8Encoding $false))
   $res = Invoke-Helper 'quiesce'
   Remove-Item -LiteralPath (Join-Path $state 'approvals\quiesce.json') -Force
