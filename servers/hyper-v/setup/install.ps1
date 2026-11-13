@@ -151,7 +151,7 @@ $bad = @(Test-ExclusiveAcl $install -Allowed $SYSTEM, $ADMINS, $USERS -Writers $
 if ($bad.Count) { throw "$install isn't admin-only after setting its ACL: $($bad -join '; ')" }
 # Nothing earlier in it is kept: every file the service runs is copied fresh below (a stray file could be loaded instead).
 Get-ChildItem -LiteralPath $install -Force | Remove-Item -Recurse -Force
-foreach ($f in 'core.js', 'helper.js', 'hv.js', 'hv.ps1', 'guest-sync.ps1', 'images.js', 'iso.js', 'journal.js', 'paths.js', 'policy.js', 'unattend.js', 'approve.ps1') {
+foreach ($f in 'core.js', 'helper.js', 'hv.js', 'hv.ps1', 'guest-sync.ps1', 'guest-agent.ps1', 'images.js', 'iso.js', 'journal.js', 'paths.js', 'policy.js', 'unattend.js', 'approve.ps1') {
   Copy-Item -LiteralPath (Join-Path $src "helper\$f") -Destination (Join-Path $install $f) -Force
 }
 Copy-Item -LiteralPath (Join-Path $src 'meta.json') -Destination (Join-Path $install 'meta.json') -Force

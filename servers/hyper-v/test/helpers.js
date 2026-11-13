@@ -52,6 +52,7 @@ function scratch(name, { policy = {}, stub = {} } = {}) {
       HYPERV_MCP_POLL_MS: '10',
       HYPERV_MCP_READY_WAIT_MS: '3000',
       HYPERV_MCP_INSTALL_WAIT_MS: '3000',
+      HYPERV_MCP_LOGON_STABLE_MS: '30',
       HYPERV_MCP_RETRY_MS: '600000',
       HYPERV_MCP_CRASH_AT: ''
     },

@@ -31,6 +31,7 @@ const MAX_COMMAND = 8000
 const READY_WAIT_MS = Number(process.env.HYPERV_MCP_READY_WAIT_MS || 5 * 60_000)
 const INSTALL_WAIT_MS = Number(process.env.HYPERV_MCP_INSTALL_WAIT_MS || 90 * 60_000)
 const POLL_MS = Number(process.env.HYPERV_MCP_POLL_MS || 3000)
+const LOGON_STABLE_MS = Number(process.env.HYPERV_MCP_LOGON_STABLE_MS || 10_000) // test-only override
 const RETRY_MS = Number(process.env.HYPERV_MCP_RETRY_MS || 5 * 60_000)
 const CHUNK_MAX = 1024 * 1024
 const MANIFEST_BATCH = 5000 // entries per manifest_add, at most (server.js sends batches of at most 1 MB of JSON)
@@ -724,18 +725,24 @@ class Helper {
 
   /**
    * vm_start's interactive logon: hv.ps1 'guest-logon' turns on autologon of the account (its password as the guest's LSA
-   * secret, wiped by the next restore) and restarts the guest; then waits, as the lease's, for a new boot with the
-   * account's explorer running in a session >= 1. Returns the ms it took, or null.
+   * secret, wiped by the next restore), installs the session's watcher (guest-agent.ps1) to start at logon, turns UAC's
+   * Admin Approval Mode off for the admin (so its session is elevated), and restarts the guest. Then it waits, as the
+   * lease's, for a new boot with the account's watcher running in a session >= 1, seen twice LOGON_STABLE_MS apart on the
+   * same boot: the guest may restart once more by itself after an autologon (MC-1504's trial). Returns the ms, or null.
    */
   async logon(vm, lease, which, creds) {
     const account = creds[which]
-    const before = await this.hv('guest-logon', { ...this.ident(vm), cred: creds.admin, logon: account }, this.forLease(lease, 120_000))
+    const before = await this.hv('guest-logon', { ...this.ident(vm), cred: creds.admin, logon: account, elevated: which === 'admin' }, this.forLease(lease, 120_000))
     const t0 = this.now()
+    let seen = null // { boot, at }: the watcher first seen on this boot
     while (this.now() - t0 < READY_WAIT_MS) {
       this.stillHeld(lease)
       const r = await this.hv('guest-session', { ...this.ident(vm), cred: creds.admin, account: account.user }, this.forLease(lease, 60_000)).catch(() => null)
       this.stillHeld(lease)
-      if (r && r.boot !== before.boot && Array.isArray(r.sessions) && r.sessions.length) return this.now() - t0
+      if (r && r.boot !== before.boot && Array.isArray(r.sessions) && r.sessions.length) {
+        if (seen?.boot === r.boot && this.now() - seen.at >= LOGON_STABLE_MS) return this.now() - t0
+        if (seen?.boot !== r.boot) seen = { boot: r.boot, at: this.now() }
+      } else seen = null
       await sleep(POLL_MS)
     }
     return null
@@ -772,7 +779,7 @@ class Helper {
       const creds = this.creds()
       const args = {
         ...this.ident(vm), cred: creds.admin, runAs: !interactive && as === 'user' ? creds.user : null, n, command, shell, timeoutSec, cwd: cwd || 'C:\\build', cap: OUTPUT_CAP,
-        interactive: interactive ? { account: creds[as].user, elevated: as === 'admin' } : null
+        interactive: interactive ? { account: creds[as].user } : null
       }
       let r
       try {

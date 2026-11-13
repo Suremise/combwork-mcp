@@ -63,12 +63,13 @@ public static class HvMcpIsoWriter {
 # Runs one command inside the guest, as whichever guest account the session belongs to (its admin, or its standard user:
 # see 'guest-run'), with
 # stdout and stderr redirected to C:\out\.run-<n>.*; on a timeout, kills its process tree by PID. Fixed text: the
-# command reaches the guest as data and is written to a script file there.
+# command reaches the guest as data and is written to a script file there, in $j.dir: C:\hvmcp for the admin, and
+# C:\hvmcp\user for the standard user (after an interactive logon, C:\hvmcp is read-only for users: see $GuestLogon).
 $GuestRun = {
   param($j)
   $ErrorActionPreference = 'Stop'
   $n = [int]$j.n
-  $dir = 'C:\hvmcp'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  $dir = [string]$j.dir; New-Item -ItemType Directory -Force -Path $dir | Out-Null
   $base = "C:\out\.run-$n"
   $ext = if ($j.shell -eq 'powershell') { 'ps1' } else { 'cmd' }
   $script = "$dir\run-$n.$ext"
@@ -103,47 +104,39 @@ $GuestRun = {
   @{ exitCode = $code; timedOut = $timedOut; killed = $killed; stdout = $o[0]; stdoutCut = $o[1]; stderr = $e[0]; stderrCut = $e[1] }
 }
 
-# vm_run with session 'interactive' (MC-1503): the command runs in the logged-on account's own desktop session. PowerShell
-# Direct can't put a process there, so this registers a one-off scheduled task for that account with an interactive
-# token (no password stored with it) and starts it. The wrapper is as $GuestRun's, but writes the exit code aside and
-# moves it into place, so it is read whole or not at all. Only that exit file within timeoutSec is a clean finish
-# (clean = $true). Anything else (a timeout, a task that never ran, an error here) is unclean: nothing is done to prove
-# the run's processes ended, because the helper then restores the VM, which ends them all.
+# vm_run with session 'interactive' (MC-1503, MC-1504): the command runs in the logged-on account's own desktop session.
+# PowerShell Direct can't put a process there, and Task Scheduler won't start one there on the first autologon (MC-1504's
+# trial), so the watcher guest-logon started in that session at logon (guest-agent.ps1) runs it. This writes the script
+# and the wrapper (as $GuestRun's, but the exit code is written aside and moved into place, so it is read whole or not
+# at all), then publishes the request req\<n>.go by renaming a finished req\<n>.tmp; the watcher claims it and starts
+# the wrapper. Only that exit file within timeoutSec is a clean finish (clean = $true). Anything else (a timeout, no
+# watcher to claim it, an error here) is unclean: nothing is done to prove the run's processes ended, because the
+# helper then restores the VM, which ends them all. Run as the guest's admin.
 $GuestRunInteractive = {
   param($j)
   $ErrorActionPreference = 'Stop'
   $n = [int]$j.n
-  $dir = 'C:\hvmcp'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  $dir = 'C:\hvmcp'; $req = "$dir\req"
+  if (-not (Test-Path -LiteralPath "$dir\agent.ps1")) { throw 'no interactive logon in this guest (no watcher)' }
   $base = "C:\out\.run-$n"
   $ext = if ($j.shell -eq 'powershell') { 'ps1' } else { 'cmd' }
   $script = "$dir\run-$n.$ext"
   [IO.File]::WriteAllText($script, [string]$j.command, (New-Object Text.UTF8Encoding $false))
   $inner = if ($ext -eq 'ps1') { "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$script`"" } else { "cmd.exe /d /c `"$script`"" }
-  $wrapper = "$dir\wrap-$n.cmd"
   foreach ($f in "$base.exit", "$base.exit.tmp") { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
-  [IO.File]::WriteAllText($wrapper, "@echo off`r`ncd /d `"$($j.cwd)`" 2>nul`r`n$inner > `"$base.stdout.txt`" 2> `"$base.stderr.txt`"`r`n> `"$base.exit.tmp`" echo %ERRORLEVEL%`r`nmove /y `"$base.exit.tmp`" `"$base.exit`" >nul`r`n", (New-Object Text.ASCIIEncoding))
-  $task = "hvmcp-run-$n"
-  $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument "/d /c `"$wrapper`""
-  $principal = New-ScheduledTaskPrincipal -UserId ([string]$j.account) -LogonType Interactive -RunLevel $(if ($j.elevated) { 'Highest' } else { 'Limited' })
-  $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds ([int]$j.timeoutSec + 60))
-  Register-ScheduledTask -TaskName $task -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+  [IO.File]::WriteAllText("$dir\wrap-$n.cmd", "@echo off`r`ncd /d `"$($j.cwd)`" 2>nul`r`n$inner > `"$base.stdout.txt`" 2> `"$base.stderr.txt`"`r`n> `"$base.exit.tmp`" echo %ERRORLEVEL%`r`nmove /y `"$base.exit.tmp`" `"$base.exit`" >nul`r`n", (New-Object Text.ASCIIEncoding))
+  [IO.File]::WriteAllText("$req\$n.tmp", 'run')
+  [IO.File]::Move("$req\$n.tmp", "$req\$n.go")
   $code = $null; $why = $null
-  try {
-    Start-ScheduledTask -TaskName $task
-    $deadline = (Get-Date).AddSeconds([int]$j.timeoutSec)
-    while ($null -eq $code -and (Get-Date) -lt $deadline) {
-      Start-Sleep -Milliseconds 200
-      $t = $null
-      try { $t = [IO.File]::ReadAllText("$base.exit").Trim() } catch {}
-      if ($t -match '^-?\d{1,10}$') { $code = [int]$t }
-    }
-    if ($null -eq $code) {
-      $info = Get-ScheduledTaskInfo -TaskName $task
-      $why = if ($info.LastRunTime -and $info.LastRunTime.Year -gt 2000) { "no exit within $($j.timeoutSec) s" } else { "the task never started (is the account still logged on?), result $($info.LastTaskResult)" }
-    }
-  } finally {
-    try { Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue } catch {}
-    try { Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+  $deadline = (Get-Date).AddSeconds([int]$j.timeoutSec)
+  while ($null -eq $code -and (Get-Date) -lt $deadline) {
+    Start-Sleep -Milliseconds 200
+    $t = $null
+    try { $t = [IO.File]::ReadAllText("$base.exit").Trim() } catch {}
+    if ($t -match '^-?\d{1,10}$') { $code = [int]$t }
+  }
+  if ($null -eq $code) {
+    $why = if (Test-Path -LiteralPath "$req\$n.go") { "the session's watcher never took the run (is the account still logged on?)" } else { "no exit within $($j.timeoutSec) s" }
   }
   $read = {
     param($f)
@@ -205,12 +198,17 @@ $GuestSetup = {
   @{ editionId = $cv.EditionID; build = $cv.CurrentBuild; ubr = $cv.UBR }
 }
 
-# vm_start's interactive logon (MC-1503): Winlogon autologon of one guest account at the next boot, its password as the
-# LSA secret DefaultPassword (readable only by SYSTEM and admins; not the registry value, which Users can read), the
-# first-logon animation and privacy questions off, then a restart. All of it is inside the throwaway guest: the next
-# restore of the clean checkpoint takes it away.
+# vm_start's interactive logon (MC-1503, MC-1504): Winlogon autologon of one guest account at the next boot, its password
+# as the LSA secret DefaultPassword (readable only by SYSTEM and admins; not the registry value, which Users can read),
+# the first-logon animation and privacy questions off, and the session's watcher (guest-agent.ps1, as C:\hvmcp\agent.ps1)
+# started at logon by an HKLM Run entry. C:\hvmcp is made admin-only (Users read and execute) so no user can change the
+# watcher or a wrapper it starts; C:\hvmcp\user is where a standard user's session-0 runs stage their scripts; req is
+# where requests are published, writable by the logged-on account only so its watcher can claim them. For an admin
+# logon ($elevated), UAC's Admin Approval Mode is turned off (EnableLUA 0), so the admin's session, and its watcher, are
+# elevated. Then a restart. All of it is inside the throwaway guest: the next restore of the clean checkpoint takes it
+# away.
 $GuestLogon = {
-  param($u, $p)
+  param($u, $p, $elevated, $agent)
   $ErrorActionPreference = 'Stop'
   if (-not ('HvLsa' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -243,18 +241,26 @@ public static class HvLsa {
   Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name EnableFirstLogonAnimation -Value 0 -Type DWord
   New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE' -Force | Out-Null
   Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE' -Name DisablePrivacyExperience -Value 1 -Type DWord
+  if ($elevated) { Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name EnableLUA -Value 0 -Type DWord }
+  $icacls = { param($path) $out = & icacls.exe @args 2>&1; if ($LASTEXITCODE) { throw "icacls $path failed: $out" } }
+  New-Item -ItemType Directory -Force -Path 'C:\hvmcp', 'C:\hvmcp\user', 'C:\hvmcp\req' | Out-Null
+  & $icacls C:\hvmcp C:\hvmcp /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX'
+  & $icacls C:\hvmcp\user C:\hvmcp\user /grant '*S-1-5-32-545:(OI)(CI)M'
+  & $icacls C:\hvmcp\req C:\hvmcp\req /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' "${u}:(OI)(CI)M"
+  [IO.File]::WriteAllText('C:\hvmcp\agent.ps1', [string]$agent, (New-Object Text.UTF8Encoding $false))
+  Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name hvmcp-agent -Value 'powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\hvmcp\agent.ps1'
   $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
   # A short delay, so this call returns before the guest goes down.
   & shutdown.exe /r /t 3 /f /d p:4:1 | Out-Null
   @{ boot = $boot }
 }
 
-# The guest's boot time and the sessions (>= 1) in which the account's explorer runs: its interactive logon.
+# The guest's boot time and the sessions (>= 1) in which the account's watcher runs: its interactive logon, ready for runs.
 $GuestSession = {
   param($u)
   $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
-  $ids = @(Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" | Where-Object {
-    $_.SessionId -ge 1 -and (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User -eq $u } | ForEach-Object { [int]$_.SessionId })
+  $ids = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object {
+    $_.SessionId -ge 1 -and $_.CommandLine -match 'C:\\hvmcp\\agent\.ps1' -and (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User -eq $u } | ForEach-Object { [int]$_.SessionId })
   @{ boot = $boot; sessions = $ids }
 }
 
@@ -387,7 +393,8 @@ try {
     }
     'guest-logon' {
       $vm = Get-OwnVm $a
-      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestLogon -ArgumentList ([string]$a.logon.user), ([string]$a.logon.password)
+      $agent = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'guest-agent.ps1'))
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestLogon -ArgumentList ([string]$a.logon.user), ([string]$a.logon.password), ([bool]$a.elevated), $agent
     }
     'guest-session' {
       $vm = Get-OwnVm $a
@@ -397,12 +404,12 @@ try {
     'guest-run' {
       $vm = Get-OwnVm $a
       if ($a.interactive) {
-        # In the logged-on account's own session (vm_start interactive), through a one-off scheduled task: run as the
-        # guest's admin, over PowerShell Direct.
-        $j = @{ n = [int]$a.n; command = [string]$a.command; shell = [string]$a.shell; cwd = [string]$a.cwd; timeoutSec = [int]$a.timeoutSec; cap = [int]$a.cap; account = [string]$a.interactive.account; elevated = [bool]$a.interactive.elevated }
+        # In the logged-on account's own session (vm_start interactive), through its watcher: published as the guest's
+        # admin, over PowerShell Direct.
+        $j = @{ n = [int]$a.n; command = [string]$a.command; shell = [string]$a.shell; cwd = [string]$a.cwd; timeoutSec = [int]$a.timeoutSec; cap = [int]$a.cap }
         Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestRunInteractive -ArgumentList $j
       } else {
-        $j = @{ n = [int]$a.n; command = [string]$a.command; shell = [string]$a.shell; cwd = [string]$a.cwd; timeoutSec = [int]$a.timeoutSec; cap = [int]$a.cap }
+        $j = @{ n = [int]$a.n; command = [string]$a.command; shell = [string]$a.shell; cwd = [string]$a.cwd; timeoutSec = [int]$a.timeoutSec; cap = [int]$a.cap; dir = $(if ($a.runAs) { 'C:\hvmcp\user' } else { 'C:\hvmcp' }) }
         $as = Cred $a.cred
         if ($a.runAs) {
           # As the guest's standard user: its own PowerShell Direct session, which (like any remote session) needs the
