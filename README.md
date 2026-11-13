@@ -14,6 +14,7 @@ Every server uses only Node built-ins: no dependencies, and no `npm install` to 
 | [`ollama`](servers/ollama/) | Lets agents hand bulky reading and drafting work to local [Ollama](https://ollama.com) models. The server reads the files itself, so only the answer reaches the agent. | Any OS with Node and Ollama |
 | [`trilium`](servers/trilium/) | Lets agents search, read and add to your [Trilium Notes](https://github.com/TriliumNext/Trilium) over its ETAPI, lean on tokens: a compact index of the note tree, outline-first reading, no delete or move. The token stays in an environment variable. | Any OS with Node and a Trilium server |
 | [`windows-sandbox`](servers/windows-sandbox/) | Lets an agent test a build on a clean, throwaway Windows in Windows Sandbox: start one, run commands, take screenshots, collect files, and always stop it. | Windows 11 Pro/Enterprise |
+| [`hyper-v`](servers/hyper-v/) | Gives agents disposable Hyper-V test VMs from a pool, several at once: lease one, start it from its clean checkpoint with a build copied in, run commands, read files back, and stop it, which restores it. A helper service holds the Hyper-V rights; each pool change is approved by the user in an elevated prompt. | Windows 11 Pro/Enterprise with Hyper-V |
 
 Each server's README covers its setup, tools, configuration, safety notes and limits.
 
@@ -24,6 +25,9 @@ Each server's README covers its setup, tools, configuration, safety notes and li
 - **`trilium`:** a Trilium Notes (TriliumNext) server you can reach, and an ETAPI token for it.
 - **`windows-sandbox`:** Windows 11 **Pro, Enterprise or Education, 24H2 or later**, with virtualisation turned on in
   the firmware and the **Windows Sandbox** optional feature installed. (Windows Home has no Windows Sandbox.)
+- **`hyper-v`:** Windows 11 **Pro, Enterprise or Education** with **Hyper-V** turned on, Node installed for all users,
+  its helper service set up once in an admin PowerShell, and a Windows 11 Enterprise evaluation ISO for the pool (see
+  [its README](servers/hyper-v/#setup)).
 
 ## Install
 
@@ -193,7 +197,7 @@ A change a reader can't ignore raises `schemaVersion`. `scripts/catalog.mjs` (`v
 ## Tests
 
 ```powershell
-npm test          # the automated tests (no network, no real Sandbox: wsb.exe is stubbed), about a minute
+npm test          # the automated tests (no network, no real Sandbox or VM: wsb.exe and hv.ps1 are stubbed), a few minutes
 npm run pack      # same as node scripts\pack.mjs
 ```
 

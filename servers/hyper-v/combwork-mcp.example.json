@@ -1,0 +1,11 @@
+{
+  "description": "Disposable Hyper-V test VMs from a shared pool (vm_acquire, vm_start, vm_run, vm_read_out, vm_stop, vm_release, vm_status; pool_plan, pool_create, pool_resize, pool_remove, pool_status). Several agents at once, each run restored from a clean checkpoint, builds copied in from the project, network off by default. Needs its helper service set up once in an admin PowerShell (setup\\install.ps1); every pool change is approved by the user in an admin PowerShell. Turn on only in a dedicated testing project: every agent in a project where it is on gets it. Requires Windows 11 Pro/Enterprise with Hyper-V, and Node 18+.",
+  "command": "node",
+  "args": [
+    "${CW_MCP_DIR}/hyper-v/server.js"
+  ],
+  "env": {
+    "HYPERV_MCP_ENABLED": "1",
+    "HYPERV_MCP_ROOTS_FROM_CWD": "1"
+  }
+}

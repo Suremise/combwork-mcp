@@ -11,7 +11,7 @@ const { pathToFileURL } = require('url')
 
 const REPO = path.join(__dirname, '..')
 const ROOT = process.env.CATALOG_TEST_SCRATCH || path.join(require('./clean-scratch').SCRATCH, 'catalog-tests')
-const SERVERS = ['ollama', 'trilium', 'windows-sandbox']
+const SERVERS = ['hyper-v', 'ollama', 'trilium', 'windows-sandbox']
 
 const load = name => import(pathToFileURL(path.join(REPO, 'scripts', name)).href)
 

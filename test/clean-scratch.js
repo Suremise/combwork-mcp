@@ -16,7 +16,8 @@ const SCRATCH = path.join(process.env.LOCALAPPDATA || os.tmpdir(), 'combwork-mcp
 /** Each suite's scratch folder (its env setting, else the default) and the files its scratch() always writes. */
 const TARGETS = {
   'windows-sandbox': { base: process.env.WSB_TEST_SCRATCH || path.join(SCRATCH, 'wsb-mcp-tests'), marker: ['stub.json'] },
-  ollama: { base: process.env.OLLAMA_TEST_SCRATCH || path.join(SCRATCH, 'ollama-tests'), marker: ['home/.ssh/id_ed25519', 'outside/secret.txt'] }
+  ollama: { base: process.env.OLLAMA_TEST_SCRATCH || path.join(SCRATCH, 'ollama-tests'), marker: ['home/.ssh/id_ed25519', 'outside/secret.txt'] },
+  'hyper-v': { base: process.env.HYPERV_TEST_SCRATCH || path.join(SCRATCH, 'hyperv-mcp-tests'), marker: ['stub.json'] }
 }
 const NAME = /^(\d+)-\d+-/
 const RECENT_MS = 60 * 60 * 1000
