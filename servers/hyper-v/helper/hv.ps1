@@ -103,6 +103,58 @@ $GuestRun = {
   @{ exitCode = $code; timedOut = $timedOut; killed = $killed; stdout = $o[0]; stdoutCut = $o[1]; stderr = $e[0]; stderrCut = $e[1] }
 }
 
+# vm_run with session 'interactive' (MC-1503): the command runs in the logged-on account's own desktop session. PowerShell
+# Direct can't put a process there, so this registers a one-off scheduled task for that account with an interactive
+# token (no password stored with it) and starts it. The wrapper is as $GuestRun's, but writes the exit code aside and
+# moves it into place, so it is read whole or not at all. Only that exit file within timeoutSec is a clean finish
+# (clean = $true). Anything else (a timeout, a task that never ran, an error here) is unclean: nothing is done to prove
+# the run's processes ended, because the helper then restores the VM, which ends them all.
+$GuestRunInteractive = {
+  param($j)
+  $ErrorActionPreference = 'Stop'
+  $n = [int]$j.n
+  $dir = 'C:\hvmcp'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  $base = "C:\out\.run-$n"
+  $ext = if ($j.shell -eq 'powershell') { 'ps1' } else { 'cmd' }
+  $script = "$dir\run-$n.$ext"
+  [IO.File]::WriteAllText($script, [string]$j.command, (New-Object Text.UTF8Encoding $false))
+  $inner = if ($ext -eq 'ps1') { "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$script`"" } else { "cmd.exe /d /c `"$script`"" }
+  $wrapper = "$dir\wrap-$n.cmd"
+  foreach ($f in "$base.exit", "$base.exit.tmp") { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+  [IO.File]::WriteAllText($wrapper, "@echo off`r`ncd /d `"$($j.cwd)`" 2>nul`r`n$inner > `"$base.stdout.txt`" 2> `"$base.stderr.txt`"`r`n> `"$base.exit.tmp`" echo %ERRORLEVEL%`r`nmove /y `"$base.exit.tmp`" `"$base.exit`" >nul`r`n", (New-Object Text.ASCIIEncoding))
+  $task = "hvmcp-run-$n"
+  $action = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument "/d /c `"$wrapper`""
+  $principal = New-ScheduledTaskPrincipal -UserId ([string]$j.account) -LogonType Interactive -RunLevel $(if ($j.elevated) { 'Highest' } else { 'Limited' })
+  $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Seconds ([int]$j.timeoutSec + 60))
+  Register-ScheduledTask -TaskName $task -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+  $code = $null; $why = $null
+  try {
+    Start-ScheduledTask -TaskName $task
+    $deadline = (Get-Date).AddSeconds([int]$j.timeoutSec)
+    while ($null -eq $code -and (Get-Date) -lt $deadline) {
+      Start-Sleep -Milliseconds 200
+      $t = $null
+      try { $t = [IO.File]::ReadAllText("$base.exit").Trim() } catch {}
+      if ($t -match '^-?\d{1,10}$') { $code = [int]$t }
+    }
+    if ($null -eq $code) {
+      $info = Get-ScheduledTaskInfo -TaskName $task
+      $why = if ($info.LastRunTime -and $info.LastRunTime.Year -gt 2000) { "no exit within $($j.timeoutSec) s" } else { "the task never started (is the account still logged on?), result $($info.LastTaskResult)" }
+    }
+  } finally {
+    try { Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue } catch {}
+    try { Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+  }
+  $read = {
+    param($f)
+    if (-not (Test-Path -LiteralPath $f)) { return @('', $false) }
+    $fs = [IO.File]::Open($f, 'Open', 'Read', 'ReadWrite')
+    try { $len = [Math]::Min($fs.Length, [long]$j.cap); $b = New-Object byte[] $len; [void]$fs.Read($b, 0, $len); return @([Text.Encoding]::UTF8.GetString($b), ($fs.Length -gt $len)) } finally { $fs.Close() }
+  }
+  $o = & $read "$base.stdout.txt"; $e = & $read "$base.stderr.txt"
+  @{ exitCode = $code; clean = ($null -ne $code); timedOut = ($null -eq $code); why = $why; session = 'interactive'; stdout = $o[0]; stdoutCut = $o[1]; stderr = $e[0]; stderrCut = $e[1] }
+}
+
 # Lists C:\out (files only; links and other reparse points skipped, never followed).
 $GuestList = {
   $root = 'C:\out'; $files = @(); $skipped = @()
@@ -151,6 +203,59 @@ $GuestSetup = {
   Remove-Item 'C:\Windows\Panther\unattend*.xml', 'C:\Windows\Panther\Unattend\*.xml' -Force -ErrorAction SilentlyContinue
   $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
   @{ editionId = $cv.EditionID; build = $cv.CurrentBuild; ubr = $cv.UBR }
+}
+
+# vm_start's interactive logon (MC-1503): Winlogon autologon of one guest account at the next boot, its password as the
+# LSA secret DefaultPassword (readable only by SYSTEM and admins; not the registry value, which Users can read), the
+# first-logon animation and privacy questions off, then a restart. All of it is inside the throwaway guest: the next
+# restore of the clean checkpoint takes it away.
+$GuestLogon = {
+  param($u, $p)
+  $ErrorActionPreference = 'Stop'
+  if (-not ('HvLsa' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+public static class HvLsa {
+  [StructLayout(LayoutKind.Sequential)] struct LSA_STRING { public ushort Length, MaximumLength; public IntPtr Buffer; }
+  [StructLayout(LayoutKind.Sequential)] struct LSA_OBJECT_ATTRIBUTES { public int Length; public IntPtr RootDirectory, ObjectName; public int Attributes; public IntPtr SecurityDescriptor, SecurityQualityOfService; }
+  [DllImport("advapi32.dll")] static extern uint LsaOpenPolicy(IntPtr system, ref LSA_OBJECT_ATTRIBUTES attrs, uint access, out IntPtr policy);
+  [DllImport("advapi32.dll")] static extern uint LsaStorePrivateData(IntPtr policy, ref LSA_STRING key, ref LSA_STRING data);
+  [DllImport("advapi32.dll")] static extern uint LsaClose(IntPtr policy);
+  [DllImport("advapi32.dll")] static extern int LsaNtStatusToWinError(uint status);
+  static LSA_STRING Str(string s) { LSA_STRING r = new LSA_STRING(); r.Buffer = Marshal.StringToHGlobalUni(s); r.Length = (ushort)(s.Length * 2); r.MaximumLength = (ushort)(s.Length * 2 + 2); return r; }
+  public static void Store(string key, string value) {
+    LSA_OBJECT_ATTRIBUTES a = new LSA_OBJECT_ATTRIBUTES(); a.Length = Marshal.SizeOf(typeof(LSA_OBJECT_ATTRIBUTES));
+    IntPtr h; uint st = LsaOpenPolicy(IntPtr.Zero, ref a, 0x20 /* POLICY_CREATE_SECRET */, out h);
+    if (st != 0) throw new System.ComponentModel.Win32Exception(LsaNtStatusToWinError(st), "LsaOpenPolicy");
+    LSA_STRING k = Str(key), d = Str(value);
+    try { st = LsaStorePrivateData(h, ref k, ref d); if (st != 0) throw new System.ComponentModel.Win32Exception(LsaNtStatusToWinError(st), "LsaStorePrivateData"); }
+    finally { Marshal.FreeHGlobal(k.Buffer); Marshal.ZeroFreeGlobalAllocUnicode(d.Buffer); LsaClose(h); }
+  }
+}
+'@
+  }
+  $wl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+  Set-ItemProperty -Path $wl -Name AutoAdminLogon -Value '1'
+  Set-ItemProperty -Path $wl -Name DefaultUserName -Value $u
+  Set-ItemProperty -Path $wl -Name DefaultDomainName -Value $env:COMPUTERNAME
+  Remove-ItemProperty -Path $wl -Name DefaultPassword -ErrorAction SilentlyContinue
+  [HvLsa]::Store('DefaultPassword', $p)
+  Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name EnableFirstLogonAnimation -Value 0 -Type DWord
+  New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE' -Force | Out-Null
+  Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\OOBE' -Name DisablePrivacyExperience -Value 1 -Type DWord
+  $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
+  # A short delay, so this call returns before the guest goes down.
+  & shutdown.exe /r /t 3 /f /d p:4:1 | Out-Null
+  @{ boot = $boot }
+}
+
+# The guest's boot time and the sessions (>= 1) in which the account's explorer runs: its interactive logon.
+$GuestSession = {
+  param($u)
+  $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
+  $ids = @(Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" | Where-Object {
+    $_.SessionId -ge 1 -and (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User -eq $u } | ForEach-Object { [int]$_.SessionId })
+  @{ boot = $boot; sessions = $ids }
 }
 
 $MS_ROOTS = @('3B1EFD3A66EA28B16697394703A72CA340A05BD5', '8F43288AD272F3103B6FB1428485EA3014C0BCFE') # Microsoft Root CA 2010, 2011
@@ -280,22 +385,38 @@ try {
       } finally { Remove-PSSession $s }
       @{ ms = [int]((Get-Date) - $t0).TotalMilliseconds; copied = [int]$r.copied; removed = [int]$r.removed }
     }
+    'guest-logon' {
+      $vm = Get-OwnVm $a
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestLogon -ArgumentList ([string]$a.logon.user), ([string]$a.logon.password)
+    }
+    'guest-session' {
+      $vm = Get-OwnVm $a
+      if ($vm.State -ne 'Running') { throw 'the VM is not running' }
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestSession -ArgumentList ([string]$a.account)
+    }
     'guest-run' {
       $vm = Get-OwnVm $a
-      $j = @{ n = [int]$a.n; command = [string]$a.command; shell = [string]$a.shell; cwd = [string]$a.cwd; timeoutSec = [int]$a.timeoutSec; cap = [int]$a.cap }
-      $as = Cred $a.cred
-      if ($a.runAs) {
-        # As the guest's standard user: its own PowerShell Direct session, which (like any remote session) needs the
-        # account in Remote Management Users (S-1-5-32-580). Added here, as the guest's admin, inside this disposable guest
-        # only; a restore takes it away again.
-        $user = [string]$a.runAs.user
-        Invoke-Command -VMId $vm.Id -Credential $as -ScriptBlock {
-          param($u)
-          if (-not (Get-LocalGroupMember -SID 'S-1-5-32-580' | Where-Object { $_.Name -like "*\$u" })) { Add-LocalGroupMember -SID 'S-1-5-32-580' -Member $u }
-        } -ArgumentList $user
-        $as = Cred $a.runAs
+      if ($a.interactive) {
+        # In the logged-on account's own session (vm_start interactive), through a one-off scheduled task: run as the
+        # guest's admin, over PowerShell Direct.
+        $j = @{ n = [int]$a.n; command = [string]$a.command; shell = [string]$a.shell; cwd = [string]$a.cwd; timeoutSec = [int]$a.timeoutSec; cap = [int]$a.cap; account = [string]$a.interactive.account; elevated = [bool]$a.interactive.elevated }
+        Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestRunInteractive -ArgumentList $j
+      } else {
+        $j = @{ n = [int]$a.n; command = [string]$a.command; shell = [string]$a.shell; cwd = [string]$a.cwd; timeoutSec = [int]$a.timeoutSec; cap = [int]$a.cap }
+        $as = Cred $a.cred
+        if ($a.runAs) {
+          # As the guest's standard user: its own PowerShell Direct session, which (like any remote session) needs the
+          # account in Remote Management Users (S-1-5-32-580). Added here, as the guest's admin, inside this disposable guest
+          # only; a restore takes it away again.
+          $user = [string]$a.runAs.user
+          Invoke-Command -VMId $vm.Id -Credential $as -ScriptBlock {
+            param($u)
+            if (-not (Get-LocalGroupMember -SID 'S-1-5-32-580' | Where-Object { $_.Name -like "*\$u" })) { Add-LocalGroupMember -SID 'S-1-5-32-580' -Member $u }
+          } -ArgumentList $user
+          $as = Cred $a.runAs
+        }
+        Invoke-Command -VMId $vm.Id -Credential $as -ScriptBlock $GuestRun -ArgumentList $j
       }
-      Invoke-Command -VMId $vm.Id -Credential $as -ScriptBlock $GuestRun -ArgumentList $j
     }
     'guest-list' { $vm = Get-OwnVm $a; Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestList }
     'guest-read' {

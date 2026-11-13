@@ -170,6 +170,6 @@ test('a helper from before admin-set build folders: none are used, and status sa
   assert.match((await s.call('vm_status')).text, /set by an admin: none \(the helper predates them: run setup again/)
   assert.match((await s.call('vm_start', { build: path.join(sc.dir, 'outside') })).text, /not under an allowed folder.*predates them/)
   // Nor the warm-session operations: the tools say to update it, and status names the protocol gap.
-  assert.match((await s.call('vm_status')).text, /The helper speaks hyperv-mcp\/1, this server hyperv-mcp\/2: run setup again/)
+  assert.match((await s.call('vm_status')).text, /The helper speaks hyperv-mcp\/1, this server hyperv-mcp\/3: run setup again/)
   assert.match((await s.call('vm_renew', { minutes: 10 })).text, /predates warm sessions .*run setup again/)
 })

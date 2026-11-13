@@ -5,7 +5,8 @@ clean checkpoint with a build copied in, runs commands and gets their output, re
 stops it, which restores it. Several agents can each hold a VM at the same time. Optionally, a run can have its own
 reserved CPU, for timed runs. For a work session, an agent can instead keep its VM running: `vm_sync` copies only the
 files that changed into it, `vm_reset` gives a clean VM again on request, and `vm_renew` extends the lease within the
-policy. Release still restores it.
+policy. Release still restores it. Commands run in session 0 by default. For programs that need a real logged-on desktop
+(their own desktops or windows), a start can log a guest account on, and runs can then go into that session.
 
 It's the catalogue's alternative to [`windows-sandbox`](../windows-sandbox/), for any project. Windows Sandbox runs
 one guest at a time on the whole machine, whereas this pool runs as many as you give it. It runs over stdio
@@ -51,7 +52,7 @@ Hyper-V Administrators, so agents running as you can't drive Hyper-V directly.
 | Reserve CPU for one run (`reserveCpu`, a percentage of the VM's cores), up to the policy's cap; reset at stop. | Reserve beyond the cap, or change a VM's CPU outside a run. |
 | Restore the clean checkpoint **by id** before every start, unconditionally, and at every stop and release, then check that the VM is Off, at that checkpoint, disconnected, with no reserve. Keep a VM unrestored for inspection **only when asked**, until its lease ends. | Start a VM from anything but the clean checkpoint, or let one lease's changes reach the next. A VM that can't be confirmed clean is **quarantined**: never leased until a restore confirms it. |
 | Keep a leased VM running for a **work session**: several runs in one guest, with `vm_sync` copying changed files into its `C:\build` (no restore between them), and the lease renewed up to the policy's `maxLeaseMinutes` at a time and `maxSessionMinutes` in all. | Carry anything past the lease: release, the deadline and the session's connection closing all restore and verify it as above. Write anywhere in the guest but `C:\build` and its own staging folder when syncing, or follow a link or junction there. |
-| Run commands in a leased guest over PowerShell Direct, as its admin or its standard user, with passwords only the helper holds. | Run any program on the host except `powershell.exe` with its own fixed script (and `node` for itself). An agent's text never reaches a host command line or script: it's passed as JSON on stdin and arrives in the guest as data. |
+| Run commands in a leased guest over PowerShell Direct, as its admin or its standard user, with passwords only the helper holds. On request, log one of those accounts on in the guest (autologon, then a guest restart) and run commands in its desktop session through a one-off scheduled task; a run there that doesn't finish cleanly restores the VM. | Run any program on the host except `powershell.exe` with its own fixed script (and `node` for itself). An agent's text never reaches a host command line or script: it's passed as JSON on stdin and arrives in the guest as data. Leave a logon behind: autologon and its password live only inside the guest, and the next restore of the clean checkpoint removes them. |
 | Download the evaluation ISO over HTTPS from a `microsoft.com` host, and check an ISO before anything runs it (see "The image"). | Use an image that fails its checks, or a local ISO that isn't a known Microsoft image, unless setup allowed that and the user approved it as "not authenticated". |
 
 **Don't put real sign-ins, tokens or real CLIs in a VM.** It's for testing a build on a clean Windows. Use fake CLIs
@@ -228,11 +229,11 @@ The pool is built from the **Windows 11 Enterprise evaluation** ISO. Microsoft's
 | Tool | What it does |
 |---|---|
 | `vm_acquire({ minutes=60, keepOnFailure=false })` | Leases one free VM to this session (one VM per session) until `vm_release`, its deadline (at most the policy's `maxLeaseMinutes`), or this server exiting. Refuses when none is free, saying when the next lease ends. |
-| `vm_start({ build?, network=false, reserveCpu=0 })` | Restores the clean checkpoint (always), applies this run's network and CPU reserve, and starts the VM. It waits for the guest, then copies `build` in to `C:\build` and leaves an empty `C:\out`. Refused on a VM kept for inspection: release it, and acquire again. |
+| `vm_start({ build?, network=false, reserveCpu=0, interactive=false })` | Restores the clean checkpoint (always), applies this run's network and CPU reserve, and starts the VM. It waits for the guest, then copies `build` in to `C:\build` and leaves an empty `C:\out`. With `interactive: 'user'` (the standard user) or `'admin'`, it first logs that account on interactively: autologon, one guest restart (tens of seconds), then it waits for the account's desktop session (see "The interactive session"). Refused on a VM kept for inspection: release it, and acquire again. |
 | `vm_renew({ minutes=60 })` | Sets the lease's deadline to now + `minutes` (1 to the policy's `maxLeaseMinutes`), never past the work session's end: `maxSessionMinutes` after `vm_acquire` (`vm_status` shows both). Refused once the deadline has passed, even a moment before the helper ends the lease. |
 | `vm_sync({ build?, full=false, delete=true })` | Copies only the files that changed in `build` (default: the folder last started or synced) into the **running** guest's `C:\build`, without a restore: `C:\out`, installed software and anything else the runs left stay. The server hashes the folder (same roots checks as `vm_start`, every time; links skipped); the helper compares that with what it placed in `C:\build` and takes only the new or changed files, hashing them itself as they arrive. Files gone from the folder are removed unless `delete` is false. Only what the helper copied is tracked: if your runs changed `C:\build` themselves, use `full: true` (clears `C:\build`, copies everything) or `vm_reset`. After a sync fails, only those two are accepted. |
-| `vm_reset({ build?, network?, reserveCpu? })` | A clean VM now: exactly `vm_start` (restore first, verified), with this session's last start's `network` and `reserveCpu` and its last build unless given. |
-| `vm_run({ command, shell='cmd'\|'powershell', as='admin'\|'user', timeoutSec=120, cwd='C:\build' })` | Runs in the guest. stdout and stderr go to `C:\out\.run-<n>.*`, and the reply has the exit code and 16 KB of each. On a timeout, the command is killed inside by its PID (`taskkill /T /F`). `as: 'user'` runs as the standard user, for whom `C:\build` is read-only. |
+| `vm_reset({ build?, network?, reserveCpu?, interactive? })` | A clean VM now: exactly `vm_start` (restore first, verified), with this session's last start's `network`, `reserveCpu` and `interactive` and its last build unless given. |
+| `vm_run({ command, shell='cmd'\|'powershell', as='admin'\|'user', timeoutSec=120, cwd='C:\build', session='service'\|'interactive' })` | Runs in the guest. stdout and stderr go to `C:\out\.run-<n>.*`, and the reply has the exit code and 16 KB of each. `as: 'user'` runs as the standard user, for whom `C:\build` is read-only. `session: 'service'` (the default) runs in session 0 over PowerShell Direct; on a timeout, the command is killed inside by its PID (`taskkill /T /F`). `session: 'interactive'` runs in the desktop session `vm_start`'s `interactive` logged on, as that account (`as` must name it), through a one-off scheduled task. If it times out or doesn't finish cleanly, its output so far is returned and the VM is restored, which ends everything it started; `vm_start` or `vm_reset` goes on. |
 | `vm_read_out({ paths?, glob?, maxBytes=256 KB, maxTotalBytes=1 MB, base64=false })` | Files from the guest's `C:\out`, read in the guest and capped while reading, returned as data. Paths are relative and checked before the call (no `..`, drives, UNC or device paths, streams or device names). `glob` is matched against a listing. Links are skipped. With neither, it lists. Text as text, PNG/JPEG as images. Read before `vm_stop`, which discards them. |
 | `vm_stop({ keep=false })` | Turns the VM off and restores the clean checkpoint, then **verifies** it: Off, at the checkpoint (by id), adapter disconnected, reserve 0. It says "Reverted" only then. Otherwise **CLEANUP FAILED**, and the VM is quarantined. The lease stays. `keep` (or a failed run with `keepOnFailure`) leaves it as it is until release or the deadline. |
 | `vm_release()` | Restores the VM (as `vm_stop`) and ends the lease. |
@@ -396,7 +397,31 @@ right).
 
 **Guest credentials.** The answer file creates a guest admin (`hvadmin`) and a standard user (`hvuser`) with random
 passwords. The passwords are kept in the helper's state folder and passed to `hv.ps1` on stdin. Setup's copies of the
-answer file are deleted, on the host and in the guest.
+answer file are deleted, on the host and in the guest. An interactive start adds no credential on the host: it gives
+the account's existing password to the guest only, as the LSA secret `DefaultPassword` (readable only by SYSTEM and the
+guest's admins, not the Winlogon registry value, which users can read), and the next restore removes it.
+
+**The interactive session.** Session 0, where PowerShell Direct runs commands, is the services' session: its window
+station isn't interactive, there's no desktop and no shell, and a program that makes its own desktop on `winsta0` fails
+there (0x8007045A, `ERROR_DLL_INIT_FAILED`). A logged-on user's session (1 or more) has the interactive window station
+`WinSta0` with its desktops and the user's profile loaded. So:
+- `vm_start({ interactive })` turns on Winlogon autologon of `hvuser` or `hvadmin` in the guest (the first-logon
+  animation and privacy questions off) and restarts the guest. It then waits, as the lease's, for a new boot with the
+  account's `explorer.exe` in a session of 1 or more. A restart keeps the guest's disk, so a work session's sync record
+  stays right. The clean checkpoint isn't changed: every start without `interactive` is as before, and a restore
+  (stop, release, the deadline, `vm_reset`) logs nobody on.
+- `vm_run({ session: 'interactive' })` can't use PowerShell Direct, which can't place a process in another session.
+  The helper (as the guest's admin, over PowerShell Direct) registers a one-off scheduled task for the logged-on
+  account with an interactive token (no password stored with it), and starts it. The task runs the same kind of wrapper
+  as a session-0 run, in that session; the wrapper writes the exit code aside and moves it into place, so it's read
+  whole or not at all.
+  - **A clean finish** is that exit file within `timeoutSec`: the reply has the exit code and the output, and the task
+    is removed. Processes the command left running carry on, as they do after a session-0 run.
+  - **Anything else** (a timeout, a task that never ran because nobody is logged on, an error on the way) isn't chased
+    process by process. The output so far is read, then the helper **restores the VM**, which ends everything the run
+    started and removes the logon. The reply says so, and `vm_start` or `vm_reset` goes on (a reset logs the account
+    on again). It costs a restore and a restart, and keeps the rule simple: nothing from an unfinished interactive run
+    can outlive it.
 
 ## Uninstall
 
@@ -449,9 +474,12 @@ work as usual.
   but the clean baseline is taken powered off, so that "clean" is exact.
 - Output is capped at 16 KB per stream for `vm_run`, and `vm_read_out` at 256 KB per file and 1 MB per call by default.
   Write big results to a file in `C:\out` and read it in parts.
-- There's no interactive desktop or screenshots yet: commands run over PowerShell Direct, as the admin, or as the
-  standard user in its own PowerShell Direct session. For that, the guest's admin adds the user to the guest's Remote
-  Management Users group first, inside that throwaway guest only.
+- Commands run over PowerShell Direct in session 0, as the admin, or as the standard user in its own PowerShell Direct
+  session. For that, the guest's admin adds the user to the guest's Remote Management Users group first, inside that
+  throwaway guest only. A desktop session needs `vm_start`'s `interactive`: one guest restart, and only the account it
+  logged on can run there. There are no screenshots.
+- An interactive run that times out restores the VM (see "The interactive session"): give such runs a generous
+  `timeoutSec`.
 - Windows guests only. The evaluation expires after 90 days (see "Rebuilding").
 - A sync tracks only what the helper copied into `C:\build`. A run that changes `C:\build` itself isn't seen; a
   file renamed only in case on the host keeps its old spelling in the guest. `full: true` or `vm_reset` puts either
@@ -464,7 +492,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\interactive.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
 ```
 
 - `units.test.js`:
@@ -535,6 +563,12 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   junctions (`mklink /J`, no elevation): a junction as the root, on the way, inside a removed folder and in a full
   clear, never entered; file and folder transitions; escapes, odd names, duplicates by identity and a file with its
   descendant refused; `delete: false` blockers refused with nothing changed.
+- `interactive.test.js`, through `server.js`: an interactive start (one restart, the disk kept) and runs in its session
+  beside session-0 runs; the admin logon; refusals (nobody logged on, another account, bad values, a logon that never
+  appears); `vm_reset` keeping `interactive`, a stop logging nobody on, a sync across the logon; an interactive run that
+  times out, never starts or fails restoring the VM after its output is read (a session-0 timeout still doesn't); the
+  password never in a reply, the journal or a log; and a helper that predates the protocol refused before anything
+  runs.
 - `approvals.test.js`:
   - unapproved plans;
   - forged approvals: another digest, operation or epoch, expired, a malformed nonce, another plan's id, a writable
@@ -577,6 +611,8 @@ ISO, then:
 - two VMs running at once, each restoring cleanly;
 - a run killed mid-way and recovered (the server, the helper and the host each killed in turn);
 - a sentinel written in one run and absent in the next, including after a keep and a guest shutdown;
+- an interactive start, then a program that makes its own desktop and starts a child on it: it passes with
+  `session: 'interactive'` and still fails in session 0;
 - `C:\build` read-only for the user, and the host's build unchanged after the guest admin writes there;
 - uninstall `-KeepPool`, then setup again, which recognises the pool.
 

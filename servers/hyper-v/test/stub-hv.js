@@ -8,6 +8,11 @@
  * "check <path>" (exit 0 if it exists), "cat <path>" (its text as stdout; exit 1 if missing), "shutdown" (the guest shuts itself down: Off, its disk changes kept),
  * "hang <host file> <ms> <pid file>" (records its PID, blocks, then writes the file: a killed run never finishes).
  * restoreGate: a host path; restore waits until that file exists (to hold the VM's lock at a known point).
+ * Interactive logon (MC-1503): guest-logon records the account (never its password) and restarts the guest (its boot
+ * count moves on, so the disk stays); guest-session reports the boot and the session the logged-on account has. A
+ * restore and a start log nobody on. guest-run with interactive runs only as the logged-on account (clean: true when it
+ * exits); "sleep" times out, a run with nobody logged on never starts (both unclean), "logoff" logs the account off, and
+ * state.interactiveThrows makes the next one fail outright.
  * Faults (state.fail): { "<op>": n } fails the next n calls of op; restoreLeaves: { switchName, reserve, state } makes
  * restore leave that behind; signatureBad: true; aclBad: "<why>"; installNeverReady: true.
  */
@@ -100,6 +105,7 @@ function run(s, op, a) {
       vm.switchName = null
       vm.reserve = 0
       vm.disk = { ...cp.disk }
+      vm.loggedOn = null
       vm.restores = (vm.restores || 0) + 1
       if (s.restoreLeaves) Object.assign(vm, s.restoreLeaves)
       return facts(vm)
@@ -115,6 +121,8 @@ function run(s, op, a) {
       }
       vm.reserve = a.reserve
       vm.state = 'Running'
+      vm.boot = (vm.boot || 0) + 1
+      vm.loggedOn = null
       vm.disk['C:\\out'] = ''
       return { started: true }
     }
@@ -166,9 +174,42 @@ function run(s, op, a) {
       }
       return { ms: 5, copied: a.files.length, removed }
     }
+    case 'guest-logon': {
+      const vm = own(s, a)
+      if (vm.state !== 'Running') throw new Error('the VM is not running')
+      if (!a.logon?.user || !a.logon?.password) throw new Error('no account to log on')
+      const before = `boot-${vm.boot || 0}`
+      vm.boot = (vm.boot || 0) + 1 // the restart: the disk (C:\build, C:\out) stays
+      vm.loggedOn = s.logonNeverAppears ? null : a.logon.user
+      return { boot: before }
+    }
+    case 'guest-session': {
+      const vm = own(s, a)
+      if (vm.state !== 'Running') throw new Error('the VM is not running')
+      return { boot: `boot-${vm.boot || 0}`, sessions: vm.loggedOn === a.account ? [1] : [] }
+    }
     case 'guest-run': {
       const vm = own(s, a)
       if (vm.state !== 'Running') throw new Error('the VM is not running')
+      if (a.interactive) {
+        if (a.runAs) throw new Error('an interactive run is the logged-on account\'s, not a runAs')
+        const ib = { exitCode: 0, clean: true, timedOut: false, why: null, session: 'interactive', stdout: '', stdoutCut: false, stderr: '', stderrCut: false }
+        if (s.interactiveThrows) { s.interactiveThrows = false; throw new Error('injected failure of the interactive run') }
+        // interactiveGate: the run says it is under way (interactiveReached), then waits for the test to open the gate.
+        if (s.interactiveGate) {
+          fs.writeFileSync(s.interactiveReached, 'reached')
+          while (!fs.existsSync(s.interactiveGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25)
+          Object.assign(s, load()) // the test may have set faults meanwhile: keep them when this call saves
+        }
+        if (vm.loggedOn !== a.interactive.account) return { ...ib, exitCode: null, clean: false, timedOut: true, why: 'the task never started (is the account still logged on?), result 267011' }
+        const [icmd, ...irest] = String(a.command).split(' ')
+        if (icmd === 'sleep') return { ...ib, exitCode: null, clean: false, timedOut: true, why: `no exit within ${a.timeoutSec} s`, stdout: 'partial\r\n' }
+        if (icmd === 'whoami') return { ...ib, stdout: `${a.interactive.account} session 1${a.interactive.elevated ? ' elevated' : ''}` }
+        if (icmd === 'exit') return { ...ib, exitCode: Number(irest[0]) }
+        if (icmd === 'write') { vm.disk[`C:\\out\\${irest[0]}`] = Buffer.from(irest.slice(1).join(' ')).toString('base64'); return ib }
+        if (icmd === 'logoff') { vm.loggedOn = null; return ib }
+        return { ...ib, exitCode: 9009, stderr: `'${icmd}' is not recognized` }
+      }
       const [cmd, ...rest] = String(a.command).split(' ')
       const put = (p, t) => { vm.disk[p.includes(':') ? p : `C:\\out\\${p}`] = Buffer.from(t).toString('base64') }
       const base = { exitCode: 0, timedOut: false, killed: false, stdout: '', stdoutCut: false, stderr: '', stderrCut: false, as: a.runAs ? a.runAs.user : 'admin' }
