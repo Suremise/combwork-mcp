@@ -21,6 +21,7 @@ const DEFAULTS = {
   allowNetwork: true,
   maxReservePercent: 100,
   maxLeaseMinutes: 240,
+  maxSessionMinutes: 480,
   maxBuildMB: 2048,
   allowUnpinnedIso: false,
   buildRoots: []
@@ -49,6 +50,8 @@ function problems(p) {
   if (typeof p.allowNetwork !== 'boolean') out.push('allowNetwork must be true or false')
   if (!int(p.maxReservePercent, 0, 100)) out.push('maxReservePercent must be 0-100')
   if (!int(p.maxLeaseMinutes, 5, 24 * 60)) out.push('maxLeaseMinutes must be 5-1440')
+  // A work session's cap (vm_renew), optional so a policy from before it stays usable; never below one lease.
+  if (p.maxSessionMinutes !== undefined && (!int(p.maxSessionMinutes, 5, 24 * 60) || p.maxSessionMinutes < p.maxLeaseMinutes)) out.push('maxSessionMinutes must be 5-1440 and at least maxLeaseMinutes')
   if (!int(p.maxBuildMB, 1, 64 * 1024)) out.push('maxBuildMB must be 1-65536')
   if (typeof p.allowUnpinnedIso !== 'boolean') out.push('allowUnpinnedIso must be true or false')
   // Build folders an admin named at setup (install.ps1 -BuildRoot): optional, so a policy from before it stays usable.
@@ -89,6 +92,9 @@ function checkPool(policy, vms, { network = false } = {}) {
   return [...new Set(out)]
 }
 
+/** A work session's cap in minutes: from acquire, renewals can't take a lease past it. Without one set, 480 (or one lease). */
+const sessionMinutes = p => p.maxSessionMinutes ?? Math.max(p.maxLeaseMinutes, DEFAULTS.maxSessionMinutes)
+
 const lower = s => s.toLowerCase()
 /** Whether a folder is strictly inside one of the policy's disk folders (compared as normalised Windows paths). */
 function underDiskFolder(policy, folder) {
@@ -98,4 +104,4 @@ function underDiskFolder(policy, folder) {
   return policy.diskFolders.some(d => f.startsWith(lower(d) + '\\') && f.length > d.length + 1)
 }
 
-module.exports = { load, problems, checkPool, underDiskFolder, DEFAULTS, FILE, PREFIX_RE }
+module.exports = { load, problems, checkPool, underDiskFolder, sessionMinutes, DEFAULTS, FILE, PREFIX_RE }

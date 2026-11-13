@@ -3,7 +3,9 @@
 An MCP server that gives agents **disposable Hyper-V test VMs** from a pool. An agent leases a VM, starts it from its
 clean checkpoint with a build copied in, runs commands and gets their output, reads files back from one folder, and
 stops it, which restores it. Several agents can each hold a VM at the same time. Optionally, a run can have its own
-reserved CPU, for timed runs.
+reserved CPU, for timed runs. For a work session, an agent can instead keep its VM running: `vm_sync` copies only the
+files that changed into it, `vm_reset` gives a clean VM again on request, and `vm_renew` extends the lease within the
+policy. Release still restores it.
 
 It's the catalogue's alternative to [`windows-sandbox`](../windows-sandbox/), for any project. Windows Sandbox runs
 one guest at a time on the whole machine, whereas this pool runs as many as you give it. It runs over stdio
@@ -47,7 +49,8 @@ Hyper-V Administrators, so agents running as you can't drive Hyper-V directly.
 | Copy a build into a VM: the files of a folder that resolves, by real path, under your MCP roots or a build folder an admin named at setup, **copied** to `C:\build`. | Share or map any host folder into a guest: the guest never sees a live host path, so it can't change your files. Copy a build from outside your roots and the admin's build folders, or from your profile itself, its dot-folders (`~/.ssh`, `~/.claude`, …), `AppData` or its top folders, or anything under `AppData\Roaming`. Follow a link or junction in the build (they're skipped and named). |
 | Connect one VM to the pool's **internal** switch for one run, only when `vm_start` asks (`network: true`) and the policy allows it. | Give a guest the internet or your LAN. It's off by default: the adapter is disconnected, and the restore at stop puts it back. |
 | Reserve CPU for one run (`reserveCpu`, a percentage of the VM's cores), up to the policy's cap; reset at stop. | Reserve beyond the cap, or change a VM's CPU outside a run. |
-| Restore the clean checkpoint **by id** before every start, unconditionally, and at every stop and release, then check that the VM is Off, at that checkpoint, disconnected, with no reserve. Keep a VM unrestored for inspection **only when asked**, until its lease ends. | Start a run from anything but the clean checkpoint, or let one run's changes reach the next. A VM that can't be confirmed clean is **quarantined**: never leased until a restore confirms it. |
+| Restore the clean checkpoint **by id** before every start, unconditionally, and at every stop and release, then check that the VM is Off, at that checkpoint, disconnected, with no reserve. Keep a VM unrestored for inspection **only when asked**, until its lease ends. | Start a VM from anything but the clean checkpoint, or let one lease's changes reach the next. A VM that can't be confirmed clean is **quarantined**: never leased until a restore confirms it. |
+| Keep a leased VM running for a **work session**: several runs in one guest, with `vm_sync` copying changed files into its `C:\build` (no restore between them), and the lease renewed up to the policy's `maxLeaseMinutes` at a time and `maxSessionMinutes` in all. | Carry anything past the lease: release, the deadline and the session's connection closing all restore and verify it as above. Write anywhere in the guest but `C:\build` and its own staging folder when syncing, or follow a link or junction there. |
 | Run commands in a leased guest over PowerShell Direct, as its admin or its standard user, with passwords only the helper holds. | Run any program on the host except `powershell.exe` with its own fixed script (and `node` for itself). An agent's text never reaches a host command line or script: it's passed as JSON on stdin and arrives in the guest as data. |
 | Download the evaluation ISO over HTTPS from a `microsoft.com` host, and check an ISO before anything runs it (see "The image"). | Use an image that fails its checks, or a local ISO that isn't a known Microsoft image, unless setup allowed that and the user approved it as "not authenticated". |
 
@@ -60,7 +63,8 @@ and test accounts.
   - no VM, disk, checkpoint or switch outside the pool is touched;
   - nothing is written outside the helper's state folder and the setup's disk folders;
   - nothing exceeds the policy;
-  - every run starts from the clean checkpoint;
+  - every lease starts from the clean checkpoint, and every start restores it (a work session's runs between syncs
+    share one guest, by design: `vm_reset` is the clean start in between);
   - no host folder is shared into a guest.
 - **Not guaranteed:**
   - Against a program running as you, that a build came from your roots: such a program can send any file it can read.
@@ -91,8 +95,10 @@ and test accounts.
    - `policy.json`, the pool's hard limits. By default they're derived from the host: up to a quarter of its logical
      CPUs per VM (at most 8), half its memory in all, up to 4 VMs, 128 GB disks, networking allowed (internal switch
      only), unpinned ISOs refused. Override any of them: `-MaxVms`, `-MaxCoresPerVm`, `-MaxMemoryGB`,
-     `-MaxDiskGBPerVm`, `-AllowNetwork $false`, `-MaxReservePercent`, `-MaxLeaseMinutes`, `-MaxBuildMB`,
-     `-AllowUnpinnedIso`. `-BuildRoot` names folders builds may also come from (see "Build folders set by an admin").
+     `-MaxDiskGBPerVm`, `-AllowNetwork $false`, `-MaxReservePercent`, `-MaxLeaseMinutes`, `-MaxSessionMinutes`
+     (a work session's cap for `vm_renew`: 5-1440 and at least `-MaxLeaseMinutes`; left out, 480 or
+     `-MaxLeaseMinutes` if that is more), `-MaxBuildMB`, `-AllowUnpinnedIso`. `-BuildRoot` names folders builds may also
+     come from (see "Build folders set by an admin").
 
    It never enables a Windows feature or restarts the PC. If Hyper-V is off, it says how to turn it on and stops.
 3. Add the server to your client, with `HYPERV_MCP_ENABLED=1`:
@@ -223,6 +229,9 @@ The pool is built from the **Windows 11 Enterprise evaluation** ISO. Microsoft's
 |---|---|
 | `vm_acquire({ minutes=60, keepOnFailure=false })` | Leases one free VM to this session (one VM per session) until `vm_release`, its deadline (at most the policy's `maxLeaseMinutes`), or this server exiting. Refuses when none is free, saying when the next lease ends. |
 | `vm_start({ build?, network=false, reserveCpu=0 })` | Restores the clean checkpoint (always), applies this run's network and CPU reserve, and starts the VM. It waits for the guest, then copies `build` in to `C:\build` and leaves an empty `C:\out`. Refused on a VM kept for inspection: release it, and acquire again. |
+| `vm_renew({ minutes=60 })` | Sets the lease's deadline to now + `minutes` (1 to the policy's `maxLeaseMinutes`), never past the work session's end: `maxSessionMinutes` after `vm_acquire` (`vm_status` shows both). Refused once the deadline has passed, even a moment before the helper ends the lease. |
+| `vm_sync({ build?, full=false, delete=true })` | Copies only the files that changed in `build` (default: the folder last started or synced) into the **running** guest's `C:\build`, without a restore: `C:\out`, installed software and anything else the runs left stay. The server hashes the folder (same roots checks as `vm_start`, every time; links skipped); the helper compares that with what it placed in `C:\build` and takes only the new or changed files, hashing them itself as they arrive. Files gone from the folder are removed unless `delete` is false. Only what the helper copied is tracked: if your runs changed `C:\build` themselves, use `full: true` (clears `C:\build`, copies everything) or `vm_reset`. After a sync fails, only those two are accepted. |
+| `vm_reset({ build?, network?, reserveCpu? })` | A clean VM now: exactly `vm_start` (restore first, verified), with this session's last start's `network` and `reserveCpu` and its last build unless given. |
 | `vm_run({ command, shell='cmd'\|'powershell', as='admin'\|'user', timeoutSec=120, cwd='C:\build' })` | Runs in the guest. stdout and stderr go to `C:\out\.run-<n>.*`, and the reply has the exit code and 16 KB of each. On a timeout, the command is killed inside by its PID (`taskkill /T /F`). `as: 'user'` runs as the standard user, for whom `C:\build` is read-only. |
 | `vm_read_out({ paths?, glob?, maxBytes=256 KB, maxTotalBytes=1 MB, base64=false })` | Files from the guest's `C:\out`, read in the guest and capped while reading, returned as data. Paths are relative and checked before the call (no `..`, drives, UNC or device paths, streams or device names). `glob` is matched against a listing. Links are skipped. With neither, it lists. Text as text, PNG/JPEG as images. Read before `vm_stop`, which discards them. |
 | `vm_stop({ keep=false })` | Turns the VM off and restores the clean checkpoint, then **verifies** it: Off, at the checkpoint (by id), adapter disconnected, reserve 0. It says "Reverted" only then. Otherwise **CLEANUP FAILED**, and the VM is quarantined. The lease stays. `keep` (or a failed run with `keepOnFailure`) leaves it as it is until release or the deadline. |
@@ -347,6 +356,29 @@ After 3 starts within 10 minutes, the host exits and leaves the restart to the S
 itself dies, its job closes and the helper dies with it. The host refuses to start if its pipe name already exists,
 since another program may have created it first.
 
+**Warm sessions.** A lease can stay running across runs. Nothing about its end changes: release, the deadline and a
+disconnect restore and verify the VM, and kill whatever is in flight, a sync included. Renewals are bounded by the
+policy (each up to `maxLeaseMinutes`, all within `maxSessionMinutes` of the acquire, which setup refuses below one
+lease), and refused once the deadline has passed. A sync:
+- is planned against the helper's record of the files it placed in `C:\build` (by canonical Windows identity: case
+  and slashes don't count). A manifest naming one file twice, or a file and something inside it, is refused. The
+  manifest goes to the helper in batches of at most 1 MB, whatever the build's size, and `server.js` never sends a
+  request line over the service host's 4 MB limit (one over it would close the connection, and with it the lease);
+- is bound to its lease and a generation that moves on at every start, reset, sync and the lease's end, so a replaced,
+  used or stale plan is refused, and rechecked inside the VM's lock. Its staging must be exactly the plan's files,
+  each once, with the size and SHA-256 the plan has: the helper hashes them as they arrive;
+- marks `C:\build` untrusted before its first change. If it doesn't finish, only a full sync or a reset is accepted
+  next. A start that fails does the same;
+- is applied in the guest by `helper\guest-sync.ps1`, a fixed script run over PowerShell Direct. It checks
+  everything before it changes anything: `C:\build` and every existing folder on the way to each file or removal
+  must be real folders (a link or junction is refused), and in the way of a file or a folder is removed (or, with
+  `delete: false`, refused). It deletes without ever entering a link, and moves each file into place from a fresh
+  staging folder under `C:\hvmcp`.
+
+What a guest process does to `C:\build` while a sync runs, or between syncs, only touches the guest's own disposable
+disk, and isn't tracked: a sync copies what changed on the host, not what changed in the guest (`full: true` puts it
+right).
+
 **Files in and out.**
 - **In:** the server walks the build after the roots checks, skips links, and streams it over the pipe. The helper
   checks every name and writes the build to a private staging folder (`runs\<lease>\staging`, deleted after the copy and
@@ -360,6 +392,7 @@ since another program may have created it first.
 - **Out:** `vm_read_out` reads in the guest, in bounded chunks, and returns the bytes as data. Nothing is written to
   host disk, so there's no host-side link to follow.
 - **Between runs:** PowerShell Direct sessions are per call, and Guest Services stays off, so no channel stays open.
+  A sync is a copy too, by the same route: no share is opened for a warm session, so none can be left open.
 
 **Guest credentials.** The answer file creates a guest admin (`hvadmin`) and a standard user (`hvuser`) with random
 passwords. The passwords are kept in the helper's state folder and passed to `hv.ps1` on stdin. Setup's copies of the
@@ -420,6 +453,9 @@ work as usual.
   standard user in its own PowerShell Direct session. For that, the guest's admin adds the user to the guest's Remote
   Management Users group first, inside that throwaway guest only.
 - Windows guests only. The evaluation expires after 90 days (see "Rebuilding").
+- A sync tracks only what the helper copied into `C:\build`. A run that changes `C:\build` itself isn't seen; a
+  file renamed only in case on the host keeps its old spelling in the guest. `full: true` or `vm_reset` puts either
+  right. State across a guest reboot within a session isn't specially kept (a reboot is the guest's own business).
 
 ## Tests
 
@@ -428,7 +464,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
 ```
 
 - `units.test.js`:
@@ -463,7 +499,9 @@ node --test test\units.test.js test\leases.test.js test\approvals.test.js test\r
     - KeepPool, then reinstall, then RemovePool; a resume with other options refused; setup refused during a
       teardown;
     - legacy storage refused unless admin-owned, unchanged unless confirmed, removed when confirmed;
-  - `approve.ps1` refusing to run outside the install folder.
+  - `approve.ps1` refusing to run outside the install folder;
+  - setup's helper file list holding every helper file (and the zip the whole helper folder), and its
+    `-MaxSessionMinutes` check agreeing with the helper's.
 - `leases.test.js`:
   - leases across connections; a connection closing, the deadline, keep and `keepOnFailure`;
   - the restore before every start;
@@ -475,6 +513,28 @@ node --test test\units.test.js test\leases.test.js test\approvals.test.js test\r
   - protocol abuse, and that an agent's command never reaches a host command line;
   - a lease that is ending: its connection refused at once; an operation already queued for the VM's lock when the
     lease ended (start, run) refused inside the lock; the VM handed on only once restored.
+- `sessions.test.js` (warm work sessions):
+  - one VM held across several runs through `server.js`: a sync with nothing changed copies nothing; an edited and an
+    added file are the only ones copied; a removed one is removed; `C:\out` and the run's state stay; no restore until
+    `vm_reset`, which restores, recopies and keeps syncing; release restores to the verified baseline;
+  - the build folder checked at every sync and reset (outside the roots, the profile, a junction, a root the client
+    dropped); links in the build skipped;
+  - the record: `delete: false` then `delete: true`; a full sync replacing it outright; file and folder transitions;
+  - manifests: unsafe paths, the same file twice by Windows identity, a file and its descendant; sent in parts
+    (bound to the lease and generation, taken once, capped per batch and in all); a request line over 4 MB refused
+    by `server.js` before it is sent;
+  - plans: replaced, used and stale (after a reset) refused; staging exactly the needed files (not another, not twice,
+    not another size or content, none missing); a start never taking a plan's staging as its build;
+  - a failed sync, a failed full sync and a failed start leaving `C:\build` untrusted until a full sync or a reset;
+  - the guest's own change to `C:\build` untracked until a full sync;
+  - sync refused on a stopped or kept VM; a disconnect mid-sync killing it and restoring the VM;
+  - renewal with an injected clock and mocked timers: `maxLeaseMinutes`, the session cap exactly, refused at the
+    deadline before its timer fires, the policy's `maxSessionMinutes` check, one timer per lease however often it is
+    renewed, and the renewed deadline ending and restoring the lease.
+- `guest-sync.test.js`: `helper\guest-sync.ps1` itself, run with Windows PowerShell 5.1 on temp trees with real
+  junctions (`mklink /J`, no elevation): a junction as the root, on the way, inside a removed folder and in a full
+  clear, never entered; file and folder transitions; escapes, odd names, duplicates by identity and a file with its
+  descendant refused; `delete: false` blockers refused with nothing changed.
 - `approvals.test.js`:
   - unapproved plans;
   - forged approvals: another digest, operation or epoch, expired, a malformed nonce, another plan's id, a writable
@@ -508,7 +568,9 @@ node --test test\units.test.js test\leases.test.js test\approvals.test.js test\r
     the respawned helper restores the VM before the pipe reopens;
   - the host killed: its helper dies too;
   - a pipe name already taken is refused;
-  - a client can't forge framing, and an over-long line closes only that connection.
+  - a client can't forge framing, and an over-long line closes only that connection;
+  - a `vm_sync` of 18000 files (a 4.6 MB manifest) through the real pipe: batched, the warm session and its lease
+    intact.
 
 **The trial** on a real host (not automated): setup, then `pool_plan` → approval → `pool_create` from the pinned 25H2
 ISO, then:
@@ -528,7 +590,8 @@ repo, and `npm test` clears earlier runs' folders first.
 - `helper\`: the helper, installed by setup into `%ProgramFiles%\hyperv-mcp`:
   - `helper.js` (its entry under the host), `core.js` (the rules), `journal.js`, `policy.js`, `images.js`, `iso.js`,
     `unattend.js`, `paths.js`;
-  - `hv.js` and `hv.ps1` (the only way it acts on Hyper-V);
+  - `hv.js` and `hv.ps1` (the only way it acts on Hyper-V), and `guest-sync.ps1` (the guest side of `vm_sync`, run
+    in the guest by `hv.ps1`);
   - `approve.ps1`;
   - `host\HvMcpHost.cs` (the service host's source).
 - `setup\install.ps1`, `setup\uninstall.ps1`: the only elevated steps besides approvals. `setup\acl.ps1` holds

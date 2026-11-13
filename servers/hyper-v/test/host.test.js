@@ -103,6 +103,36 @@ test('the host: killing it ends its helper (the job closes); a pipe name already
   assert.ok(!pipeExists(pipe))
 })
 
+test('the host: a vm_sync whose manifest is over 4 MB goes in batches; the warm session and its lease survive', { skip }, async t => {
+  const sc = scratch('host-big-manifest')
+  const { h } = await withPool(sc, 1)
+  await h.stop()
+  const pipe = `hyperv-mcp-test-${process.pid}-d`
+  const host = await startHost(sc, pipe)
+  t.after(async () => { host.child.kill(); await host.exited })
+  await waitFor(() => pipeExists(pipe), 20_000, 'the pipe')
+  // 18000 empty files with 157-character paths: about 4.6 MB of manifest JSON, under every build cap.
+  const build = path.join(sc.builds, 'big')
+  const dirs = Array.from({ length: 18 }, (_, i) => path.join(build, `dir-${String(i).padStart(2, '0')}-${'d'.repeat(80)}`))
+  for (const d of dirs) fs.mkdirSync(d, { recursive: true })
+  for (let i = 0; i < 18000; i++) fs.writeFileSync(path.join(dirs[i % 18], `file-${String(i).padStart(5, '0')}-${'f'.repeat(54)}.txt`), '')
+  const manifestBytes = 18000 * (Buffer.byteLength(JSON.stringify({ path: `${path.basename(dirs[0])}/file-00000-${'f'.repeat(54)}.txt`, size: 0, sha256: '0'.repeat(64) })) + 1)
+  assert.ok(manifestBytes > 4 * 1024 * 1024, `the manifest is over the host's line limit (${manifestBytes} bytes)`)
+  const env = { ...sc.env, HYPERV_MCP_ENABLED: '1', HYPERV_MCP_PIPE: pipe }
+  const a = server(env, { roots: [sc.builds] })
+  t.after(() => a.close())
+  await a.call('vm_acquire')
+  await a.call('vm_start')
+  await a.call('vm_run', { command: 'write state.txt warm' })
+  const r1 = await a.call('vm_sync', { build })
+  assert.match(r1.text, /18000 file\(s\) copied/, r1.text)
+  const r2 = await a.call('vm_sync')
+  assert.match(r2.text, /0 file\(s\) copied .*0 removed, 18000 unchanged/, r2.text)
+  assert.doesNotMatch(host.log(), /over 4 MB/)
+  assert.match((await a.call('vm_status')).text, /leased, running.*\(yours\)/, 'the same lease, still running')
+  assert.match((await a.call('vm_read_out', { paths: ['state.txt'] })).content.map(c => c.text).join(), /warm/, 'no restore: the session\'s state is there')
+})
+
 test('the host: a client line can\'t forge framing, and an over-long line closes only that connection', { skip }, async t => {
   const sc = scratch('host-framing')
   const { h } = await withPool(sc, 1)

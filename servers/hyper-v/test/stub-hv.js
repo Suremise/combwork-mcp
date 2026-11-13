@@ -5,7 +5,7 @@
  *
  * It enforces what hv.ps1 does: Get-OwnVm (the id must name a VM with the expected name inside the expected folder).
  * Guest commands are a tiny language: "echo <text>", "exit <n>", "sleep" (never ends), "write <path> <text>",
- * "check <path>" (exit 0 if it exists), "shutdown" (the guest shuts itself down: Off, its disk changes kept),
+ * "check <path>" (exit 0 if it exists), "cat <path>" (its text as stdout; exit 1 if missing), "shutdown" (the guest shuts itself down: Off, its disk changes kept),
  * "hang <host file> <ms> <pid file>" (records its PID, blocks, then writes the file: a killed run never finishes).
  * restoreGate: a host path; restore waits until that file exists (to hold the VM's lock at a known point).
  * Faults (state.fail): { "<op>": n } fails the next n calls of op; restoreLeaves: { switchName, reserve, state } makes
@@ -130,6 +130,42 @@ function run(s, op, a) {
       walk(a.source, '')
       return { ms: 5 }
     }
+    case 'sync-in': {
+      // As guest-sync.ps1 on the guest's disk map (its path checks are proved on real trees by guest-sync.test.js).
+      // syncGate: a host path; the apply waits for it (records its PID in syncPidFile first), to be killed mid-apply.
+      const vm = own(s, a)
+      if (vm.state !== 'Running') throw new Error('the VM is not running')
+      if (!/^C:\\hvmcp\\sync-\d{1,9}$/.test(a.guestStage)) throw new Error('bad guest staging folder')
+      s.syncs = [...(s.syncs || []), { files: a.files, remove: a.remove, full: a.full, delete: a.delete }]
+      if (s.syncGate) {
+        if (s.syncPidFile) fs.writeFileSync(s.syncPidFile, String(process.pid))
+        save(s)
+        while (!fs.existsSync(s.syncGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25)
+      }
+      const B = 'c:\\build\\'
+      const rel = p => String(p).replace(/\//g, '\\')
+      const keysUnder = k => Object.keys(vm.disk).filter(d => d.toLowerCase() === k.toLowerCase() || d.toLowerCase().startsWith(k.toLowerCase() + '\\'))
+      let removed = 0
+      if (a.full) for (const d of Object.keys(vm.disk)) { if (d.toLowerCase().startsWith(B)) { delete vm.disk[d]; removed++ } }
+      else {
+        for (const r of a.remove) { const ks = keysUnder(`C:\\build\\${rel(r)}`); if (ks.length) removed++; for (const d of ks) delete vm.disk[d] }
+        const blockers = new Set()
+        for (const f of a.files) {
+          const parts = rel(f).split('\\')
+          for (let i = 1; i < parts.length; i++) { const up = `C:\\build\\${parts.slice(0, i).join('\\')}`; if (Object.keys(vm.disk).some(d => d.toLowerCase() === up.toLowerCase())) blockers.add(up) }
+          const dst = `C:\\build\\${rel(f)}`
+          if (keysUnder(dst).some(d => d.toLowerCase() !== dst.toLowerCase())) blockers.add(dst)
+        }
+        if (blockers.size && !a.delete) throw new Error(`with delete false, these are in the way and were left alone (nothing was changed): ${[...blockers].join(', ')}`)
+        for (const b of blockers) for (const d of keysUnder(b)) delete vm.disk[d]
+      }
+      for (const f of a.files) {
+        const dst = `C:\\build\\${rel(f)}`
+        for (const d of Object.keys(vm.disk)) if (d.toLowerCase() === dst.toLowerCase()) delete vm.disk[d]
+        vm.disk[dst] = fs.readFileSync(join(a.source, ...rel(f).split('\\'))).toString('base64')
+      }
+      return { ms: 5, copied: a.files.length, removed }
+    }
     case 'guest-run': {
       const vm = own(s, a)
       if (vm.state !== 'Running') throw new Error('the VM is not running')
@@ -140,6 +176,7 @@ function run(s, op, a) {
       if (cmd === 'exit') return { ...base, exitCode: Number(rest[0]) }
       if (cmd === 'sleep') return { ...base, exitCode: null, timedOut: true, killed: true }
       if (cmd === 'write') { put(rest[0], rest.slice(1).join(' ')); return base }
+      if (cmd === 'cat') { const v = vm.disk[rest[0]]; return v === undefined ? { ...base, exitCode: 1 } : { ...base, stdout: Buffer.from(v, 'base64').toString() } }
       if (cmd === 'check') return { ...base, exitCode: vm.disk[rest[0]] !== undefined ? 0 : 1 }
       if (cmd === 'whoami') return { ...base, stdout: base.as }
       if (cmd === 'big') return { ...base, stdout: 'x'.repeat(a.cap), stdoutCut: true }

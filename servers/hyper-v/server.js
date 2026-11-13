@@ -13,6 +13,7 @@
  * Self-contained on purpose: only Node built-ins (Node 18+), plain JSON-RPC over stdio. MIT licence.
  */
 const fs = require('fs')
+const crypto = require('crypto')
 const net = require('net')
 const { join, relative, sep } = require('path')
 const { createInterface } = require('readline')
@@ -29,7 +30,11 @@ const MODE = process.env.HYPERV_MCP_MODE === 'direct' ? 'direct' : 'service'
 const PIPE = `\\\\.\\pipe\\${process.env.HYPERV_MCP_PIPE || 'hyperv-mcp'}`
 const MAX_BUILD_MB = Number(process.env.HYPERV_MCP_MAX_BUILD_MB || 2048)
 const CHUNK = 768 * 1024
-const PROTOCOL = 'hyperv-mcp/1'
+const MANIFEST_BYTES = 1024 * 1024
+// The service host closes a connection whose request line is over 4 MB (HvMcpHost.cs MaxLine), and with it the lease:
+// a request that long is refused here instead, before it is sent.
+const MAX_LINE = 4 * 1024 * 1024 - 1024
+const PROTOCOL = 'hyperv-mcp/2'
 const splitList = v => String(v || '').split(';').map(s => s.trim()).filter(Boolean)
 
 const roots = rootsClient(m => process.stdout.write(JSON.stringify(m) + '\n'))
@@ -92,11 +97,13 @@ function helperLink() {
   }))
   return {
     request: async (op, args) => {
-      const s = sock || await connect()
       const id = ++seq
+      const line = JSON.stringify({ id, op, args: args ?? {} })
+      if (Buffer.byteLength(line) > MAX_LINE) throw new Error(`The request ${op} is over the helper's 4 MB line limit: it was not sent (your lease is untouched).`)
+      const s = sock || await connect()
       return new Promise((resolve, reject) => {
         waiting.set(id, { resolve, reject })
-        s.write(JSON.stringify({ id, op, args: args ?? {} }) + '\n')
+        s.write(line + '\n')
       })
     },
     takeLost: () => { const l = lost; lost = null; return l },
@@ -178,10 +185,33 @@ function walk(root) {
   return { files, skipped, bytes }
 }
 
+/** A file's SHA-256, read in chunks (it must still be the size the walk saw). */
+function hashFile(f) {
+  const fd = fs.openSync(f.full, 'r')
+  try {
+    if (fs.fstatSync(fd).size !== f.size) throw new Error(`${f.rel} changed while being read: try again`)
+    const h = crypto.createHash('sha256')
+    const buf = Buffer.alloc(Math.min(CHUNK, Math.max(1, f.size)))
+    for (let at = 0; at < f.size;) {
+      const n = fs.readSync(fd, buf, 0, Math.min(CHUNK, f.size - at), at)
+      if (!n) throw new Error(`${f.rel} got shorter while being read: try again`)
+      h.update(buf.subarray(0, n))
+      at += n
+    }
+    return h.digest('hex')
+  } finally { fs.closeSync(fd) }
+}
+
 /** Streams a build to the helper's staging folder. */
 async function stage(real) {
   const { files, skipped, bytes } = walk(real)
-  await helper.request('stage_begin')
+  await stageFiles(files)
+  return { files: files.length, bytes, skipped }
+}
+
+/** Streams files to the helper's staging (a start's build, or a sync plan's needed files with beginArgs { planId }). */
+async function stageFiles(files, beginArgs) {
+  await helper.request('stage_begin', beginArgs)
   for (const f of files) {
     const fd = fs.openSync(f.full, 'r')
     try {
@@ -200,12 +230,24 @@ async function stage(real) {
     }
   }
   await helper.request('stage_end')
-  return { files: files.length, bytes, skipped }
+}
+
+/** An older helper doesn't know the warm-session operations: say how to update it rather than "unknown operation". */
+async function warm(op, args) {
+  try { return await helper.request(op, args) } catch (e) {
+    if (/unknown operation/.test(e.message)) throw new Error('The helper predates warm sessions (vm_renew, vm_sync, vm_reset): run setup again to update it (see the README, Setup).')
+    throw e
+  }
 }
 
 // ---------- tools ----------
 
 const text = r => (typeof r === 'string' ? r : r?.text ?? '')
+
+// This session's last start (its options and build folder as given) and last synced build folder: vm_reset's and
+// vm_sync's defaults. A folder is checked again (buildFolder) every time it is used, never remembered as allowed.
+const session = { start: null, build: null }
+const skippedNote = list => list?.length ? `\nLinks skipped (never followed): ${list.slice(0, 20).join(', ')}${list.length > 20 ? ', …' : ''}` : ''
 
 async function vmStart({ build, network = false, reserveCpu = 0 } = {}) {
   let staged = null
@@ -214,8 +256,48 @@ async function vmStart({ build, network = false, reserveCpu = 0 } = {}) {
     staged = await stage(await buildFolder(build))
   }
   const r = await helper.request('start', { network: !!network, reserveCpu })
-  const skipped = staged?.skipped?.length ? `\nLinks skipped (never followed): ${staged.skipped.slice(0, 20).join(', ')}${staged.skipped.length > 20 ? ', …' : ''}` : ''
-  return { text: text(r) + skipped, isError: r.isError }
+  if (!r.isError) { session.start = { network: !!network, reserveCpu }; session.build = build ?? null }
+  return { text: text(r) + skippedNote(staged?.skipped), isError: r.isError }
+}
+
+/** vm_reset: a start (restore first, always), with this session's last start's options and build unless given. */
+async function vmReset({ build, network, reserveCpu } = {}) {
+  const last = session.start || { network: false, reserveCpu: 0 }
+  return vmStart({ build: build ?? session.build ?? undefined, network: network ?? last.network, reserveCpu: reserveCpu ?? last.reserveCpu })
+}
+
+/**
+ * vm_sync: hashes the build folder (an allowed one, checked by real path), asks the helper which files differ from what
+ * it placed in C:\build, stages only those, and applies the plan in the running guest. No restore.
+ */
+async function vmSync({ build, full = false, delete: del = true } = {}) {
+  const folder = build ?? session.build
+  if (folder === undefined || folder === null) throw new Error('build is required (no earlier vm_start or vm_sync in this session named one)')
+  if (typeof folder !== 'string' || !folder.trim()) throw new Error('build must be a folder path')
+  const real = await buildFolder(folder)
+  const { files, skipped } = walk(real)
+  // The manifest goes in batches of at most MANIFEST_BYTES of JSON (and the helper's 5000 entries), never one line:
+  // the service host closes a connection whose line is over 4 MB, which would end the lease.
+  await warm('manifest_begin')
+  let batch = []
+  let size = 0
+  const flush = async () => { if (batch.length) await warm('manifest_add', { files: batch }); batch = []; size = 0 }
+  for (const f of files) {
+    const e = { path: f.rel, size: f.size, sha256: hashFile(f) }
+    const n = Buffer.byteLength(JSON.stringify(e)) + 1
+    if (batch.length && (size + n > MANIFEST_BYTES || batch.length >= 5000)) await flush()
+    batch.push(e)
+    size += n
+  }
+  await flush()
+  const plan = await warm('sync_plan', { full: !!full, delete: del !== false })
+  const byPath = new Map(files.map(f => [f.rel.replace(/\//g, '\\'), f]))
+  const needed = (plan.data?.need || []).map(p => byPath.get(p))
+  if (needed.some(f => !f)) throw new Error('The helper asked for a file this walk doesn\'t have: call vm_sync again.')
+  if (needed.length) await stageFiles(needed, { planId: plan.data.planId })
+  const r = await warm('sync', { planId: plan.data.planId })
+  if (!r.isError) session.build = folder
+  return { text: text(r) + skippedNote(skipped), isError: r.isError }
 }
 
 const imageType = buf =>
@@ -278,6 +360,38 @@ const tools = [
       }
     },
     run: vmStart
+  },
+  {
+    name: 'vm_renew',
+    description: 'Extend this session\'s lease: its deadline becomes now + minutes (up to the policy\'s maxLeaseMinutes), never past the work session\'s end (the policy\'s maxSessionMinutes from vm_acquire; vm_status shows both). Refused once the deadline has passed.',
+    inputSchema: { type: 'object', properties: { minutes: { type: 'number', description: '1 to the policy\'s maxLeaseMinutes. Default 60.' } } },
+    run: async args => { const r = await warm('renew', args); return { text: text(r), isError: r?.isError } }
+  },
+  {
+    name: 'vm_sync',
+    description: 'Keep the running VM warm: copy only the files that changed in a build folder into its C:\\build, without a restore (C:\\out, installed software and other state stay). Files gone from the folder are removed from C:\\build unless delete is false. Only files this server copied in are tracked: if your runs changed C:\\build themselves, pass full: true (clears C:\\build and copies everything), or use vm_reset for a clean VM.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        build: { type: 'string', description: 'The build folder (as vm_start\'s build). Default: the one last started or synced in this session.' },
+        full: { type: 'boolean', description: 'Clear C:\\build and copy the whole folder. Needed after a sync failed. Default false.' },
+        delete: { type: 'boolean', description: 'Remove files that are gone from the folder. Default true.' }
+      }
+    },
+    run: vmSync
+  },
+  {
+    name: 'vm_reset',
+    description: 'Back to a clean VM now: restores its clean checkpoint and starts it again (exactly vm_start), with the build copied in. Defaults to this session\'s last start\'s network and reserveCpu, and the build last started or synced.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        build: { type: 'string', description: 'Default: the build last started or synced in this session.' },
+        network: { type: 'boolean' },
+        reserveCpu: { type: 'number' }
+      }
+    },
+    run: vmReset
   },
   {
     name: 'vm_run',
@@ -364,7 +478,7 @@ const tools = [
 
 const INSTRUCTIONS = [
   'Hyper-V tools give you a disposable Windows VM from a shared pool: vm_acquire, vm_start (with your build folder), vm_run, vm_read_out, vm_stop, then always vm_release.',
-  'Every start restores the VM\'s clean checkpoint, so nothing carries over between runs. Several agents can each hold a VM at once; if none is free, wait and retry.',
+  'Every start restores the VM\'s clean checkpoint. For a work session, keep the VM running instead: vm_sync copies only changed files into C:\\build, vm_reset gives a clean VM again, vm_renew extends the lease (within the policy). Several agents can each hold a VM at once; if none is free, wait and retry.',
   'Network is off unless you ask, and then only to an internal switch (no internet). Don\'t put real sign-ins, tokens or real CLIs in a VM.',
   'Write anything you want back to C:\\out inside, and read it with vm_read_out before vm_stop.',
   'pool_plan, pool_create, pool_resize and pool_remove change the pool: use them only when the user asks. The user approves each plan in an admin PowerShell; never run the approve line yourself.'

@@ -425,3 +425,31 @@ test('setup: -BuildRoot is refused as the policy would, before anything changes'
     assert.match(r.stderr + r.stdout, /Build root .* must be/, bad)
   }
 })
+
+test('setup copies every helper file the service runs (guest-sync.ps1 included), and the zip carries them', async () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'setup', 'install.ps1'), 'utf8')
+  const list = /^foreach \(\$f in ((?:'[^']+',? ?)+)\) \{\r?\n  Copy-Item -LiteralPath \(Join-Path \$src "helper\\\$f"\)/m.exec(src)
+  assert.ok(list, 'the helper file list in install.ps1')
+  const copied = list[1].split(',').map(s => s.trim().replace(/'/g, '')).sort()
+  const shipped = fs.readdirSync(path.join(__dirname, '..', 'helper')).filter(f => /\.(js|ps1)$/.test(f)).sort()
+  assert.deepStrictEqual(copied, shipped)
+  const { SERVERS } = await import(require('url').pathToFileURL(path.join(__dirname, '..', '..', '..', 'scripts', 'pack.mjs')).href)
+  assert.ok(SERVERS['hyper-v'].some(([from]) => from === 'helper'), 'the zip holds the whole helper folder')
+})
+
+test('setup: -MaxSessionMinutes is checked as the helper checks it, before anything changes', { skip: !windows }, () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'setup', 'install.ps1'), 'utf8')
+  const { spawnSync } = require('child_process')
+  const line = /^if \(\$MaxSessionMinutes -and .*$/m.exec(src)
+  assert.ok(line)
+  const sc = scratch('setup-session')
+  const file = path.join(sc.dir, 'session.ps1')
+  fs.writeFileSync(file, `param([int]$MaxLeaseMinutes = 240, [int]$MaxSessionMinutes = 0)\n$ErrorActionPreference = 'Stop'\n${line[0]}\n'ok'\n`)
+  const run = (lease, session) => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, '-MaxLeaseMinutes', String(lease), '-MaxSessionMinutes', String(session)], { encoding: 'utf8', env: ps51Env() })
+  for (const [lease, session, ok] of [[240, 0, true], [240, 480, true], [240, 240, true], [240, 239, false], [60, 4, false], [240, 1441, false]]) {
+    const r = run(lease, session)
+    assert.strictEqual(r.status === 0, ok, `${lease}/${session}: ${r.stdout}${r.stderr}`)
+    if (!ok) assert.match(r.stdout + r.stderr, /-MaxSessionMinutes must be 5-1440 and at least -MaxLeaseMinutes/)
+    if (session) assert.strictEqual(policy.problems({ ...policy.DEFAULTS, diskFolders: ['D:\\hv'], maxLeaseMinutes: lease, maxSessionMinutes: session }).length === 0, ok, `the helper agrees: ${lease}/${session}`)
+  }
+})
