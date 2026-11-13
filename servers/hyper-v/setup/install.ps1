@@ -38,6 +38,9 @@ $me = New-Object Security.Principal.WindowsPrincipal ([Security.Principal.Window
 if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run this in an admin PowerShell (Run as administrator).' }
 
 . (Join-Path $PSScriptRoot 'acl.ps1')     # trusted storage (Use-StorageFolder, receipts, ancestors) and ACL checks
+. (Join-Path $PSScriptRoot 'teardown.ps1') # Assert-NoTeardown
+# No install while an uninstall is unfinished (no helper may start during one).
+Assert-NoTeardown ([Microsoft.Win32.Registry]::LocalMachine) 'SOFTWARE\hyperv-mcp'
 $src = Split-Path -Parent $PSScriptRoot   # servers\hyper-v
 # Locations from Windows' known-folder API, not from environment variables.
 $install = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'hyperv-mcp'
@@ -83,6 +86,9 @@ $approvals = Join-Path $state 'approvals'
 $apprIs = Use-StorageFolder $approvals @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=ReadAndExecute") $ADMINS $receipts -Allowed $who -Writers $SYSTEM, $ADMINS -Owners $SYSTEM, $ADMINS -Pins $pins
 $diskIs = foreach ($d in $folders) { "$d $(Use-StorageFolder $d @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=FullControl") $ADMINS $receipts -Allowed $who -Owners $who -AllowPattern '^S-1-5-83-' -Pins $pins)" }
 Step "Storage: state $stateIs, approvals $apprIs, disks $($diskIs -join ', ') (parents checked and held while setup runs)."
+# This installation's generation: an uninstall's record is bound to it.
+$ik = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\hyperv-mcp', $true)
+try { $ik.SetValue('InstallId', [guid]::NewGuid().ToString('n')); $ik.Flush() } finally { $ik.Dispose() }
 
 # 2. Node: must be admin-only writable, since the service runs it with Hyper-V rights.
 $node = (Get-Command node.exe -ErrorAction SilentlyContinue).Source

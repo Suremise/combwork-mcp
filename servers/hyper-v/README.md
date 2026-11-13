@@ -344,21 +344,39 @@ In an admin PowerShell (one line):
 ```
 powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\combwork-mcp\servers\hyper-v\setup\uninstall.ps1" -KeepPool
 ```
-With a pool present it refuses unless you choose:
+Choose one:
 - `-KeepPool` removes the service, its rights, the group and the code, and **keeps** the VMs, the helper's state (the
-  journal, policy and guest credentials) and the disk folders. Running setup again recognises the pool: the service's
-  SID comes from its name, so its permissions still hold.
-- `-RemovePool` removes the pool first, through the helper's own journalled remove (you approve that plan as usual),
-  then everything, with the state last.
+  journal, policy and guest credentials), the disk folders and their storage receipts. Running setup again recognises
+  them by their receipts.
+- `-RemovePool` removes the pool first, through the helper's own journalled remove (you approve that plan as usual).
+  Then it removes the storage, then everything else.
 
-Either way it first asks the helper to **quiesce**: no new leases, every lease ended (kept ones too), every VM
-restored. A VM that can't be restored stops the uninstall, named. The quiesce's own admin-written approval names its
-purpose:
-- with `-KeepPool`, the helper then allows no pool change at all;
-- with `-RemovePool`, it allows exactly one, this uninstall's own approved remove.
+**What it may delete:** only storage it verifies, before any change, as setup's own:
+- for an install made by this setup, exactly the folders that have storage receipts. Each folder's identity must
+  match its receipt, and its owners and permissions must be setup's;
+- for an install made by an older setup (no receipts), only the state folder and the disk folder you name with
+  `-LegacyDiskFolder D:\hyperv-mcp`. Each is checked (owned by Administrators or SYSTEM, permissions only for the
+  expected accounts, no links, safe parents). Then you're shown exactly what will be deleted, and asked to type
+  DELETE. Their present permissions prove nothing about their history, so your confirmation is the authority;
+- without that evidence, nothing is deleted. `policy.json` is never a source of what to delete.
 
-Each step can be run again, so an interrupted uninstall is finished by running it again: the restarted helper
-completes a half-done remove before anything else. Approvals kept with `-KeepPool` simply expire.
+Nothing is ever deleted through a link.
+
+**In what order:**
+1. Verify everything, changing nothing, and write a record.
+2. Quiesce the helper and remove the pool: no new leases, every lease ended, every VM restored. The quiesce's own
+   admin-written approval names its purpose: with `-KeepPool` no pool change is allowed after it; with `-RemovePool`
+   only this uninstall's own approved remove.
+3. Stop the service. It stays registered, and the code stays.
+4. Delete the storage. A leftover in `pool\` stops here, with the service only stopped.
+5. Remove the service, its rights, the group and the code.
+6. Remove the receipts, the install's id and the record.
+
+**Interrupted?** Run it again with the same options: it resumes from its record (`HKLM\SOFTWARE\hyperv-mcp`). That
+record is bound to this installation and to the options it started with, and a rerun with other options is refused.
+Every step does nothing when its work is already done, so no rerun needs anything an earlier run removed. Setup refuses
+to run while an uninstall is unfinished. A finished `-KeepPool` leaves no record, so a later setup and `-RemovePool`
+work as usual.
 
 ## Limits
 
@@ -399,6 +417,19 @@ node --test test\units.test.js test\leases.test.js test\approvals.test.js test\r
     - a receipts key that Users can write, refused;
     - a file written with its own ACL, not the old file's;
     - for the install folder: earlier grants removed, VM grants kept, links refused before any change;
+  - uninstall's teardown (`setup\teardown.ps1`), non-elevated with strict fakes for its outside actions
+    (`test\teardown-check.ps1`):
+    - a crash at each of 25 points (before and after every action and every record write), then a rerun to
+      completion, without asking any action to redo what was undone;
+    - a forged `policy.json`, with and without a journal, refused, nothing deleted;
+    - an identity mismatch, a target replaced by a junction, or a link inside a target, all refused with nothing
+      changed; a link slipped in after verification removed as a link, never followed;
+    - a leftover in `pool\` refused;
+    - a cancelled approval, a remove that leaves a VM, and a failing `sc delete`, each stopping at its phase, then a
+      rerun;
+    - KeepPool, then reinstall, then RemovePool; a resume with other options refused; setup refused during a
+      teardown;
+    - legacy storage refused unless admin-owned, unchanged unless confirmed, removed when confirmed;
   - `approve.ps1` refusing to run outside the install folder.
 - `leases.test.js`:
   - leases across connections; a connection closing, the deadline, keep and `keepOnFailure`;
