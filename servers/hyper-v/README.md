@@ -144,6 +144,10 @@ The helper trusts what is in its state folder (the journal, plans, approvals, gu
 - **Files setup writes** (`policy.json`) are created with their final permissions under a temporary name, then renamed
   into place.
 - `uninstall.ps1 -KeepPool` keeps the folders and their receipts. `-RemovePool` removes both.
+- **Don't open these folders in Explorer.** Its "You don't currently have permission to access this folder" prompt,
+  if you click Continue, grants your account access to the folder and everything in it. Then agents running as you
+  could write there, and setup and uninstall will refuse to trust the folder. To look inside, use an admin
+  PowerShell (`Get-ChildItem D:\hyperv-mcp -Recurse`).
 
 **In Combwork:** pack it (`node scripts\pack.mjs hyper-v` at the repo root) and add `dist\hyper-v.zip` with **Add MCP
 Server from File** in the MCP view. Its definition goes in as `combwork-mcp.example.json`
