@@ -40,6 +40,38 @@ test('an interactive start logs the user on after one restart; its runs are in t
   assert.match((await s.call('vm_run', { command: 'exit 3', as: 'user', session: 'interactive' })).text, /Exit code 3 \(in the interactive session\)/)
 })
 
+test('the admin logon is elevated (UAC\'s Admin Approval Mode off) and the user\'s is not; service runs go on beside both', async t => {
+  const { sc, s, vm } = await session(t, 'ia-elevation')
+  await s.call('vm_start', { interactive: 'user' })
+  assert.match((await s.call('vm_run', { command: 'whoami', as: 'user', session: 'interactive' })).text, /--- stdout ---\nhvuser session 1\n/)
+  assert.match((await s.call('vm_run', { command: 'whoami', as: 'user' })).text, /--- stdout ---\nhvuser/)
+  assert.match((await s.call('vm_run', { command: 'whoami' })).text, /--- stdout ---\nadmin/)
+  await s.call('vm_reset', { interactive: 'admin' })
+  assert.match((await s.call('vm_run', { command: 'whoami', as: 'admin', session: 'interactive' })).text, /--- stdout ---\nhvadmin session 1 elevated\n/)
+  assert.match((await s.call('vm_run', { command: 'whoami', as: 'user' })).text, /--- stdout ---\nhvuser/)
+  assert.match((await s.call('vm_run', { command: 'whoami' })).text, /--- stdout ---\nadmin/)
+  assert.deepStrictEqual(vmOf(sc, vm).logons, [{ user: 'hvuser', elevated: false }, { user: 'hvadmin', elevated: true }])
+})
+
+test('the logon waits out the guest\'s own extra restart: the watcher must be seen twice on one boot', async t => {
+  const { sc, s, vm } = await session(t, 'ia-extra-restart')
+  sc.patchStub(st => { st.extraRestart = true })
+  assert.match((await s.call('vm_start', { interactive: 'user' })).text, /hvuser logged on interactively/)
+  assert.ok(vmOf(sc, vm).sessionChecks >= 3, 'seen, a restart, then seen twice on the new boot')
+  assert.match((await s.call('vm_run', { command: 'whoami', as: 'user', session: 'interactive' })).text, /hvuser session 1/)
+})
+
+test('a watcher that has gone: the run is never taken, and the VM is restored', async t => {
+  const { sc, s, vm } = await session(t, 'ia-no-watcher')
+  await s.call('vm_start', { interactive: 'user' })
+  await s.call('vm_run', { command: 'killwatcher', as: 'user', session: 'interactive' })
+  const r0 = vmOf(sc, vm).restores
+  const r = await s.call('vm_run', { command: 'whoami', as: 'user', session: 'interactive' })
+  assert.ok(r.isError)
+  assert.match(r.text, /didn't finish cleanly \(the session's watcher never took the run .*The VM was restored/)
+  assert.strictEqual(vmOf(sc, vm).restores, r0 + 1)
+})
+
 test('admin logon: runs elevated in its session, as admin only', async t => {
   const { s } = await session(t, 'ia-admin')
   await s.call('vm_start', { interactive: 'admin' })
@@ -100,7 +132,7 @@ test('an interactive run that doesn\'t finish cleanly restores the VM, after its
   // A run that never starts (the account logged off meanwhile), and a failure of the run itself: restored too.
   await s.call('vm_run', { command: 'logoff', as: 'user', session: 'interactive' })
   r0 = restores()
-  assert.match((await s.call('vm_run', { command: 'whoami', as: 'user', session: 'interactive' })).text, /didn't finish cleanly \(the task never started \(is the account still logged on\?\)/)
+  assert.match((await s.call('vm_run', { command: 'whoami', as: 'user', session: 'interactive' })).text, /didn't finish cleanly \(the session's watcher never took the run \(is the account still logged on\?\)/)
   assert.strictEqual(restores(), r0 + 1)
   await s.call('vm_reset')
   sc.patchStub(st => { st.interactiveThrows = true })
@@ -122,7 +154,7 @@ test('a run queued behind an interactive run whose restore fails never reaches t
   const { h } = await withPool(sc, 1)
   await h.stop()
   const saved = { ...process.env }
-  Object.assign(process.env, { HYPERV_MCP_PS_STUB: sc.env.HYPERV_MCP_PS_STUB, HYPERV_MCP_STUB_STATE: sc.env.HYPERV_MCP_STUB_STATE, HYPERV_MCP_POLL_MS: '10', HYPERV_MCP_READY_WAIT_MS: '3000' })
+  Object.assign(process.env, { HYPERV_MCP_PS_STUB: sc.env.HYPERV_MCP_PS_STUB, HYPERV_MCP_STUB_STATE: sc.env.HYPERV_MCP_STUB_STATE, HYPERV_MCP_POLL_MS: '10', HYPERV_MCP_READY_WAIT_MS: '3000', HYPERV_MCP_LOGON_STABLE_MS: '30' })
   const { Helper } = require('../helper/core')
   const { hv } = require('../helper/hv')
   const helper = new Helper({ stateDir: sc.stateDir, hv, checkApprovalAcl: false })
