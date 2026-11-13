@@ -29,6 +29,8 @@ param(
   [switch]$AllowUnpinnedIso
 )
 $ErrorActionPreference = 'Stop'
+# Started from a PowerShell 7 window, this 5.1 inherits PS7's module folders and can't load its own Get-Acl: drop them.
+$env:PSModulePath = (($env:PSModulePath -split ';') | Where-Object { $_ -and $_ -notmatch '(?<!Windows)PowerShell\\(\d[^\\]*\\)?Modules\\?$' }) -join ';'
 $ProgressPreference = 'SilentlyContinue'
 function Step($m) { Write-Host "- $m" }
 # Whether the helper's pipe exists, by listing the pipes (opening one would count as a client).

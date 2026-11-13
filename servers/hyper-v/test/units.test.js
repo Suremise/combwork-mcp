@@ -11,6 +11,7 @@ const iso = require('../helper/iso')
 const images = require('../helper/images')
 const policy = require('../helper/policy')
 const { Journal } = require('../helper/journal')
+const { ps51Env } = require('../helper/hv')
 const { canonical, baselineProblem, expiry } = require('../helper/core')
 const { autounattend } = require('../helper/unattend')
 const { hv } = require('../helper/hv')
@@ -236,7 +237,7 @@ test('the 90-day evaluation: a warning from 14 days before, counted from the cle
 test('setup storage and ACLs (non-elevated): grants removed; VM grants kept; links refused; secure creation, receipts, parents, pins', { skip: !windows }, () => {
   const { spawnSync } = require('child_process')
   const sc = scratch('acl')
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, 'acl-check.ps1'), '-Dir', sc.dir], { encoding: 'utf8' })
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, 'acl-check.ps1'), '-Dir', sc.dir], { encoding: 'utf8', env: ps51Env() })
   const line = (r.stdout || '').split(/\r?\n/).find(l => l.startsWith('RESULT:'))
   assert.ok(line, `acl-check.ps1 failed: ${r.stdout}\n${r.stderr}`)
   const a = JSON.parse(line.slice(7))
@@ -289,10 +290,48 @@ test('approve.ps1 runs only from the installed, admin-only folder', { skip: !win
   assert.match(r.stderr + r.stdout, /Run approve\.ps1 from .*hyperv-mcp, not from/)
 })
 
+test('ps51Env drops only PowerShell 7\'s module folders from PSModulePath', () => {
+  const env = ps51Env({
+    PSMODULEPATH: [
+      'C:\\Users\\u\\Documents\\PowerShell\\Modules', 'C:\\Program Files\\PowerShell\\Modules\\',
+      'c:\\program files\\powershell\\7\\Modules', 'C:\\Program Files\\PowerShell\\7-preview\\Modules', '',
+      'C:\\Users\\u\\Documents\\WindowsPowerShell\\Modules', 'C:\\Program Files\\WindowsPowerShell\\Modules',
+      'C:\\WINDOWS\\system32\\WindowsPowerShell\\v1.0\\Modules', 'D:\\tools\\Modules'
+    ].join(';'),
+    Path: 'C:\\Program Files\\PowerShell\\7'
+  })
+  assert.strictEqual(env.PSMODULEPATH, 'C:\\Users\\u\\Documents\\WindowsPowerShell\\Modules;C:\\Program Files\\WindowsPowerShell\\Modules;C:\\WINDOWS\\system32\\WindowsPowerShell\\v1.0\\Modules;D:\\tools\\Modules')
+  assert.strictEqual(env.Path, 'C:\\Program Files\\PowerShell\\7', 'other variables are kept as they were')
+})
+
+// The line a user types for setup, uninstall or an approval may be typed in a PowerShell 7 window: each script drops
+// PS7's module folders itself, with the same rule as ps51Env.
+const PS7_DIR = path.join(process.env.ProgramFiles || 'C:\\Program Files', 'PowerShell', '7', 'Modules')
+test('setup, uninstall and approve.ps1 load 5.1\'s own modules when started from PowerShell 7', { skip: !windows || !fs.existsSync(PS7_DIR) }, () => {
+  const { spawnSync } = require('child_process')
+  const lines = ['setup/install.ps1', 'setup/uninstall.ps1', 'helper/approve.ps1'].map(f => {
+    const m = fs.readFileSync(path.join(__dirname, '..', f), 'utf8').match(/^\$env:PSModulePath = .*$/m)
+    assert.ok(m, `${f} drops PowerShell 7's module folders`)
+    return m[0]
+  })
+  assert.strictEqual(new Set(lines).size, 1, 'the same line in each')
+  // As a PowerShell 7 window hands it down: PS7's own folders first.
+  const base = Object.entries(ps51Env())
+  const own = base.find(([k]) => k.toLowerCase() === 'psmodulepath')?.[1] || ''
+  const env = { ...Object.fromEntries(base.filter(([k]) => k.toLowerCase() !== 'psmodulepath')), PSModulePath: `${PS7_DIR};${own}` }
+  const run = script => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', env })
+  const probe = '(Get-Acl -LiteralPath $env:SystemRoot).Owner'
+  const without = run(probe)
+  assert.notStrictEqual(without.status, 0, 'without the line, 5.1 can\'t load Get-Acl here (else this test proves nothing)')
+  const fixed = run(`$ErrorActionPreference = 'Stop'; ${lines[0]}; ${probe}`)
+  assert.strictEqual(fixed.status, 0, fixed.stderr)
+  assert.match(fixed.stdout, /\S/)
+})
+
 test('uninstall teardown (non-elevated, fakes): verified targets only; resumable after a crash at every boundary', { skip: !windows, timeout: 600_000 }, () => {
   const { spawnSync } = require('child_process')
   const sc = scratch('teardown')
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, 'teardown-check.ps1'), '-Dir', sc.dir], { encoding: 'utf8', timeout: 590_000 })
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, 'teardown-check.ps1'), '-Dir', sc.dir], { encoding: 'utf8', env: ps51Env(), timeout: 590_000 })
   const line = (r.stdout || '').split(/\r?\n/).find(l => l.startsWith('RESULT:'))
   assert.ok(line, `teardown-check.ps1 failed: ${r.stdout}\n${r.stderr}`)
   const a = JSON.parse(line.slice(7))

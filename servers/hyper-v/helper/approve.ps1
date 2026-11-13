@@ -9,6 +9,8 @@
 # It runs only from %ProgramFiles%\hyperv-mcp (admin-only writable), dot-sources nothing and uses only in-box cmdlets.
 param([Parameter(Mandatory = $true)][string]$Plan)
 $ErrorActionPreference = 'Stop'
+# Started from a PowerShell 7 window, this 5.1 inherits PS7's module folders and can't load its own Get-Acl: drop them.
+$env:PSModulePath = (($env:PSModulePath -split ';') | Where-Object { $_ -and $_ -notmatch '(?<!Windows)PowerShell\\(\d[^\\]*\\)?Modules\\?$' }) -join ';'
 
 $install = Join-Path $env:ProgramFiles 'hyperv-mcp'
 if ((Split-Path -Parent $PSCommandPath).TrimEnd('\') -ne $install) { throw "Run approve.ps1 from $install, not from $(Split-Path -Parent $PSCommandPath)." }

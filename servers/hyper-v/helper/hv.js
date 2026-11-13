@@ -15,6 +15,22 @@ const SCRIPT = join(__dirname, 'hv.ps1')
 const MARK = 'HVJSON:'
 const OUT_CAP = 4 * 1024 * 1024
 const counts = new Map()
+// PowerShell 7's own module folders: its user and Program Files ones and $PSHOME\Modules, but none of WindowsPowerShell's.
+const PS7_MODULES = /(?<!Windows)PowerShell\\(\d[^\\]*\\)?Modules\\?$/i
+
+/**
+ * The environment for a Windows PowerShell 5.1 child: this one, without PowerShell 7's folders in PSModulePath. A Node
+ * started from a PowerShell 7 window inherits them, and 5.1 then finds PS7's Microsoft.PowerShell.Security first and
+ * can't load it (Get-Acl, ConvertTo-SecureString and Get-AuthenticodeSignature all fail). The setup scripts and
+ * approve.ps1 drop them the same way for themselves, since a user may type their line in a PowerShell 7 window.
+ */
+function ps51Env(env = process.env) {
+  const out = {}
+  for (const [k, v] of Object.entries(env)) {
+    out[k] = k.toLowerCase() === 'psmodulepath' ? String(v).split(';').filter(p => p && !PS7_MODULES.test(p)).join(';') : v
+  }
+  return out
+}
 
 function crashPoint(when, op) {
   const want = process.env.HYPERV_MCP_CRASH_AT
@@ -41,7 +57,7 @@ function hv(op, args = {}, { timeoutMs = 120_000, onChild } = {}) {
     ? [process.execPath, [stub]]
     : ['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', SCRIPT]]
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, argv, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+    const child = spawn(cmd, argv, { env: ps51Env(), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
     if (onChild) onChild(child)
     let out = ''
     let err = ''
@@ -68,4 +84,4 @@ function hv(op, args = {}, { timeoutMs = 120_000, onChild } = {}) {
   })
 }
 
-module.exports = { hv, SCRIPT, MARK }
+module.exports = { hv, ps51Env, SCRIPT, MARK }
