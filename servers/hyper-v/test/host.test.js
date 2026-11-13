@@ -24,14 +24,22 @@ function compile(dir) {
 }
 
 /** A host in console mode for sc, on its own pipe name. Returns { child, pipe, exited, helperPids() }. */
-function startHost(sc, pipe) {
+async function startHost(sc, pipe) {
   const dir = path.join(sc.dir, `host-${pipe}-${Date.now()}`)
   compile(dir)
   const sid = execFileSync(path.join(process.env.WINDIR || 'C:\\Windows', 'System32', 'whoami.exe'), ['/user', '/fo', 'csv', '/nh'], { encoding: 'utf8' }).trim().split(',').at(-1).replace(/"/g, '')
   fs.writeFileSync(path.join(dir, 'host.config'), [
-    `node=${process.execPath}`, `helper=${path.join(__dirname, '..', 'helper', 'helper.js')}`, `stateDir=${sc.stateDir}`, `pipe=${pipe}`, `usersSid=${sid}`
+    `node=${process.execPath}`, `helper=${path.join(__dirname, '..', 'helper', 'helper.js')}`, `stateDir=${sc.stateDir}`, `pipe=${pipe}`, `usersSid=S-1-5-32-545;${sid}`
   ].join('\r\n'))
-  const child = spawn(path.join(dir, 'HvMcpHost.exe'), ['--console'], { env: sc.env, stdio: 'ignore', windowsHide: true })
+  // A freshly compiled exe can be held briefly by a virus scan: one retry, and the spawn error named if it persists.
+  let child
+  for (let attempt = 1; ; attempt++) {
+    child = spawn(path.join(dir, 'HvMcpHost.exe'), ['--console'], { env: sc.env, stdio: 'ignore', windowsHide: true })
+    const err = await new Promise(r => { child.once('spawn', () => r(null)); child.once('error', r) })
+    if (!err) break
+    if (attempt === 2) throw new Error(`can't start the host: ${err.message}`)
+    await new Promise(r => setTimeout(r, 2000))
+  }
   const exited = new Promise(r => child.on('exit', code => r(code)))
   const log = () => { try { return fs.readFileSync(path.join(sc.stateDir, 'host.log'), 'utf8') } catch { return '' } }
   return { child, pipe, exited, log, helperPids: () => [...log().matchAll(/helper started, pid (\d+)/g)].map(m => Number(m[1])) }
@@ -45,7 +53,7 @@ test('the host: a pipe client runs a VM; the helper killed mid-run takes its run
   const { h } = await withPool(sc, 1)
   await h.stop()
   const pipe = `hyperv-mcp-test-${process.pid}-a`
-  const host = startHost(sc, pipe)
+  const host = await startHost(sc, pipe)
   t.after(async () => { host.child.kill(); await host.exited })
   await waitFor(() => pipeExists(pipe), 20_000, 'the pipe')
   const env = { ...sc.env, HYPERV_MCP_ENABLED: '1', HYPERV_MCP_PIPE: pipe }
@@ -79,9 +87,9 @@ test('the host: killing it ends its helper (the job closes); a pipe name already
   const { h } = await withPool(sc, 1)
   await h.stop()
   const pipe = `hyperv-mcp-test-${process.pid}-b`
-  const host = startHost(sc, pipe)
+  const host = await startHost(sc, pipe)
   await waitFor(() => pipeExists(pipe), 20_000, 'the pipe')
-  const second = startHost(sc, pipe)
+  const second = await startHost(sc, pipe)
   assert.strictEqual(await second.exited, 3, 'a second host on the same pipe name refuses to start')
   assert.match(host.log(), /refusing to start: a pipe named .* already exists/)
   const [helperPid] = host.helperPids()
@@ -97,7 +105,7 @@ test('the host: a client line can\'t forge framing, and an over-long line closes
   const { h } = await withPool(sc, 1)
   await h.stop()
   const pipe = `hyperv-mcp-test-${process.pid}-c`
-  const host = startHost(sc, pipe)
+  const host = await startHost(sc, pipe)
   t.after(async () => { host.child.kill(); await host.exited })
   await waitFor(() => pipeExists(pipe), 20_000, 'the pipe')
   const env = { ...sc.env, HYPERV_MCP_ENABLED: '1', HYPERV_MCP_PIPE: pipe }

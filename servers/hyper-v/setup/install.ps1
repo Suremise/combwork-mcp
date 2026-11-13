@@ -73,8 +73,10 @@ Step "Node: $node ($(& $node -v))."
 # 3. The group of users who may use the helper, with -User in it.
 if (-not (Get-LocalGroup -Name $groupName -ErrorAction SilentlyContinue)) { New-LocalGroup -Name $groupName -Description 'May use the hyper-v MCP helper (its named pipe).' | Out-Null }
 if (-not (Get-LocalGroupMember -Name $groupName -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $User })) { Add-LocalGroupMember -Name $groupName -Member $User }
-$usersSid = (Get-LocalGroup -Name $groupName).SID.Value
-Step "Group '$groupName' holds $User (sign out and in again for a new membership to count)."
+$userSid = (New-Object Security.Principal.NTAccount $User).Translate([Security.Principal.SecurityIdentifier]).Value
+# The pipe admits the group and, directly, -User: a new group membership only counts after signing in again.
+$usersSid = "$((Get-LocalGroup -Name $groupName).SID.Value);$userSid"
+Step "Group '$groupName' holds $User; $User may also open the pipe directly (no need to sign in again)."
 
 # 4. The code, installed where only Administrators can write.
 New-Item -ItemType Directory -Force -Path $install | Out-Null

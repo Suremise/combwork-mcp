@@ -196,7 +196,10 @@ class Supervisor {
     sec.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null), PipeAccessRights.FullControl, AccessControlType.Allow));
     sec.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null), PipeAccessRights.FullControl, AccessControlType.Allow));
     sec.AddAccessRule(new PipeAccessRule(WindowsIdentity.GetCurrent().User, PipeAccessRights.FullControl, AccessControlType.Allow));
-    sec.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(cfg["usersSid"]), PipeAccessRights.ReadWrite & ~PipeAccessRights.CreateNewInstance, AccessControlType.Allow));
+    // usersSid: ';'-separated SIDs: the group, and the installing user directly (a new group membership only counts
+    // after the user signs in again).
+    foreach (var sid in cfg["usersSid"].Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries))
+      sec.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(sid.Trim()), PipeAccessRights.ReadWrite & ~PipeAccessRights.CreateNewInstance, AccessControlType.Allow));
     return sec;
   }
 

@@ -82,8 +82,9 @@ and test accounts.
      `%ProgramFiles%\hyperv-mcp`;
    - the service `HyperVMcp` on its virtual account `NT SERVICE\HyperVMcp`, which it adds to Hyper-V Administrators.
      The service is restarted after a failure (3 times a day, then left stopped);
-   - the local group **Hyper-V MCP Users**, with you in it (`-User` to name someone else). **Sign out and in again**
-     for the membership to count;
+   - the local group **Hyper-V MCP Users**, with you in it (`-User` to name someone else). Its members may open the
+     helper's pipe. Your own account is also given the pipe directly, so you needn't sign in again. Other users you
+     add to the group later must sign in again before their membership counts;
    - `%ProgramData%\hyperv-mcp` (the helper's state) and the disk folder, both readable only by SYSTEM,
      Administrators and the service. `policy.json` and `approvals\` in there are writable only by Administrators and
      SYSTEM;
