@@ -82,6 +82,9 @@ and test accounts.
    ```
    powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\combwork-mcp\servers\hyper-v\setup\install.ps1" -DiskFolder D:\hyperv-mcp
    ```
+   Run it with **Windows PowerShell 5.1** (`powershell`, as above), never PowerShell 7 (`pwsh`): setup's storage and ACL
+   routines need .NET Framework. Started from PowerShell 7, setup (and `uninstall.ps1` and `approve.ps1`) stops before
+   checking or changing anything, and prints the one line to run instead, with your arguments.
    It reports each step and can be run again (to update the helper or change the policy). It installs:
    - the helper's code, `approve.ps1` and the service host (compiled there by the in-box .NET Framework compiler) in
      `%ProgramFiles%\hyperv-mcp`;
@@ -542,6 +545,8 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
       teardown;
     - legacy storage refused unless admin-owned, unchanged unless confirmed, removed when confirmed;
   - `approve.ps1` refusing to run outside the install folder;
+  - setup, `uninstall.ps1` and `approve.ps1` under PowerShell 7 (where `pwsh` is installed) refused before anything
+    else, with the one 5.1 line to run, and setup under 5.1 going on past that check;
   - setup's helper file list holding every helper file (and the zip the whole helper folder), and its
     `-MaxSessionMinutes` check agreeing with the helper's.
 - `leases.test.js`:

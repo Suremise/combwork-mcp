@@ -11,6 +11,19 @@
 # The steps and their order, the record that lets an interrupted uninstall be finished by running it again with the same
 # options, and what may be deleted, are in teardown.ps1.
 param([switch]$KeepPool, [switch]$RemovePool, [string]$LegacyDiskFolder, [ValidateSet('Service', 'Direct')][string]$Mode = 'Service', [string]$User = [Security.Principal.WindowsIdentity]::GetCurrent().Name)
+# Windows PowerShell 5.1 only, refused before any check or change (MC-1506): it uses setup's storage and ACL routines, which need .NET Framework calls PowerShell 7 doesn't have. Run from PowerShell 7, an earlier setup
+# stopped the service, then failed part-way. The refusal prints the one line to run instead, with the same arguments.
+if ($PSVersionTable.PSEdition -ne 'Desktop') {
+  $again = @('powershell -NoProfile -ExecutionPolicy Bypass -File', "`"$PSCommandPath`"")
+  foreach ($k in $PSBoundParameters.Keys) {
+    $v = $PSBoundParameters[$k]
+    if ($v -is [Management.Automation.SwitchParameter]) { if ($v.IsPresent) { $again += "-$k" } }
+    elseif ($v -is [bool]) { $again += "-$k `$$($v.ToString().ToLower())" }
+    else { $again += "-$k " + ((@($v) | ForEach-Object { "`"$_`"" }) -join ',') }
+  }
+  [Console]::Error.WriteLine("This needs Windows PowerShell 5.1, not PowerShell $($PSVersionTable.PSVersion): nothing was checked or changed. Run it as one line in an admin Windows PowerShell:`n  $($again -join ' ')")
+  exit 1
+}
 $ErrorActionPreference = 'Stop'
 # Started from a PowerShell 7 window, this 5.1 inherits PS7's module folders and can't load its own Get-Acl: drop them.
 $env:PSModulePath = (($env:PSModulePath -split ';') | Where-Object { $_ -and $_ -notmatch '(?<!Windows)PowerShell\\(\d[^\\]*\\)?Modules\\?$' }) -join ';'
