@@ -760,6 +760,9 @@ class Helper {
     const vm = this.vmOf(lease)
     return this.vmLock(vm.vmId)(async () => {
       this.stillHeld(lease)
+      // Again inside the lock: a run queued behind an interactive one that restored the VM (or failed to, and
+      // quarantined it) must not reach the guest. Only a start or reset makes it running again.
+      if (!lease.running) throw new Error('The VM is not running (it was stopped or restored while this run waited): call vm_start or vm_reset first.')
       const interactive = session === 'interactive'
       if (interactive) {
         if (!lease.interactive) throw new Error("No one is logged on interactively in this VM: vm_start (or vm_reset) with interactive: 'user' or 'admin' first.")
@@ -811,6 +814,7 @@ class Helper {
     const match = glob !== undefined ? globMatcher(glob) : null
     return this.vmLock(vm.vmId)(async () => {
       this.stillHeld(lease)
+      if (!lease.running) throw new Error('The VM is not running (it was stopped or restored while this read waited): its C:\\out is gone.')
       const creds = this.creds()
       const listing = await this.hv('guest-list', { ...this.ident(vm), cred: creds.admin }, this.forLease(lease))
       this.stillHeld(lease)

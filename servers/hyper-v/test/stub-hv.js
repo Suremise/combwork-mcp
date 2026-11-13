@@ -195,6 +195,12 @@ function run(s, op, a) {
         if (a.runAs) throw new Error('an interactive run is the logged-on account\'s, not a runAs')
         const ib = { exitCode: 0, clean: true, timedOut: false, why: null, session: 'interactive', stdout: '', stdoutCut: false, stderr: '', stderrCut: false }
         if (s.interactiveThrows) { s.interactiveThrows = false; throw new Error('injected failure of the interactive run') }
+        // interactiveGate: the run says it is under way (interactiveReached), then waits for the test to open the gate.
+        if (s.interactiveGate) {
+          fs.writeFileSync(s.interactiveReached, 'reached')
+          while (!fs.existsSync(s.interactiveGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25)
+          Object.assign(s, load()) // the test may have set faults meanwhile: keep them when this call saves
+        }
         if (vm.loggedOn !== a.interactive.account) return { ...ib, exitCode: null, clean: false, timedOut: true, why: 'the task never started (is the account still logged on?), result 267011' }
         const [icmd, ...irest] = String(a.command).split(' ')
         if (icmd === 'sleep') return { ...ib, exitCode: null, clean: false, timedOut: true, why: `no exit within ${a.timeoutSec} s`, stdout: 'partial\r\n' }

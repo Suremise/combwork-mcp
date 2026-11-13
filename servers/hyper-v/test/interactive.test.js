@@ -8,7 +8,7 @@ const test = require('node:test')
 const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
-const { scratch, withPool } = require('./helpers')
+const { scratch, withPool, waitFor } = require('./helpers')
 const { server } = require('../client')
 
 const vmOf = (sc, name) => Object.values(sc.stub().vms).find(v => v.name === name)
@@ -111,6 +111,45 @@ test('an interactive run that doesn\'t finish cleanly restores the VM, after its
   const before = restores()
   assert.match((await s.call('vm_run', { command: 'sleep', timeoutSec: 1 })).text, /Timed out after 1 s: killed inside the guest by its PID/)
   assert.strictEqual(restores(), before)
+})
+
+test('a run queued behind an interactive run whose restore fails never reaches the guest', async t => {
+  // Overlapping requests on one connection (direct mode doesn't serialise them): an interactive run holds the VM's
+  // lock, a service-session run queues behind it, the interactive run times out and its restore fails (quarantined).
+  // The queued run must be refused inside the lock, not run in the still-running, unclean VM. In-process, as direct
+  // mode runs the helper (helper.js answers one connection's requests in turn, so it can't overlap them).
+  const sc = scratch('ia-queued')
+  const { h } = await withPool(sc, 1)
+  await h.stop()
+  const saved = { ...process.env }
+  Object.assign(process.env, { HYPERV_MCP_PS_STUB: sc.env.HYPERV_MCP_PS_STUB, HYPERV_MCP_STUB_STATE: sc.env.HYPERV_MCP_STUB_STATE, HYPERV_MCP_POLL_MS: '10', HYPERV_MCP_READY_WAIT_MS: '3000' })
+  const { Helper } = require('../helper/core')
+  const { hv } = require('../helper/hv')
+  const helper = new Helper({ stateDir: sc.stateDir, hv, checkApprovalAcl: false })
+  await helper.init()
+  t.after(() => { helper.close(); process.env = saved })
+  helper.connect('a', 1)
+  const vmName = /Leased (hvmcp-[0-9a-f]+)/.exec((await helper.request('a', 'acquire', { minutes: 30 })).text)[1]
+  await helper.request('a', 'start', { interactive: 'user' })
+  const reached = path.join(sc.dir, 'run.reached')
+  const gate = path.join(sc.dir, 'run.gate')
+  sc.patchStub(st => { st.interactiveGate = gate; st.interactiveReached = reached })
+  const first = helper.request('a', 'run', { command: 'sleep', as: 'user', session: 'interactive', timeoutSec: 1 })
+  await waitFor(() => fs.existsSync(reached), 15_000, 'the interactive run to hold the lock')
+  // Queued behind it: it passes the check before the lock, as the VM is still running now.
+  const second = helper.request('a', 'run', { command: 'echo queued' }).then(r => ({ r }), e => ({ e }))
+  sc.patchStub(st => { st.fail = { restore: 1 }; delete st.interactiveGate })
+  fs.writeFileSync(gate, '')
+  const r1 = await first
+  assert.match(r1.text, /didn't finish cleanly .*Restoring the VM to end what it started failed: CLEANUP FAILED/)
+  const r2 = await second
+  assert.ok(r2.e, `the queued run ran: ${r2.r?.text}`)
+  assert.match(r2.e.message, /The VM is not running \(it was stopped or restored while this run waited\)/)
+  const runs = sc.stub().calls.filter(x => x.op === 'guest-run')
+  assert.deepStrictEqual(runs.map(x => x.command), ['sleep'], 'only the interactive run reached the guest')
+  assert.match((await helper.request('a', 'status')).text, new RegExp(`${vmName}: .*QUARANTINED`))
+  // A read queued the same way is refused too.
+  await assert.rejects(helper.request('a', 'read_out', {}), /The VM is not running/)
 })
 
 test('the logon password goes to the guest on stdin only: never in a reply, the journal or the stub\'s call log', async t => {
