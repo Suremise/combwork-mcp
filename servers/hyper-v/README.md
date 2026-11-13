@@ -44,7 +44,7 @@ Hyper-V Administrators, so agents running as you can't drive Hyper-V directly.
 | Act on VMs it created: names start with the pool prefix (`hvmcp-`) **and** the VM id is in its journal **and** the VM is in its own folder. All three are checked, twice: in the helper and again in `hv.ps1`. | Touch any other VM, checkpoint, disk or switch: start, stop, change, delete or even name it. A VM renamed into the prefix still doesn't match an id. |
 | Create VMs, disks and one internal switch, **only** from a plan the user approved in an elevated prompt, and **within the policy** setup wrote (max VMs, cores per VM, total memory, disk per VM, disk folders, networking allowed). | Exceed the policy, whatever a plan or an approval says. Create an external switch or a NAT, or change any host setting: Hyper-V's settings, other switches, the firewall, Defender, features or services. |
 | Write only to its state folder (`%ProgramData%\hyperv-mcp`: the journal, plans, per-run staging under `runs\`, guest credentials) and the disk folders named at setup. | Write anywhere else on the host. Files read back from a guest are returned as data, never written to the host. |
-| Copy a build into a VM: the files of a folder that resolves, by real path, under your MCP roots, **copied** to `C:\build`. | Share or map any host folder into a guest: the guest never sees a live host path, so it can't change your files. Copy a build from outside your roots, or from your profile itself, its dot-folders (`~/.ssh`, `~/.claude`, …), `AppData` or its top folders, or anything under `AppData\Roaming`. Follow a link or junction in the build (they're skipped and named). |
+| Copy a build into a VM: the files of a folder that resolves, by real path, under your MCP roots or a build folder an admin named at setup, **copied** to `C:\build`. | Share or map any host folder into a guest: the guest never sees a live host path, so it can't change your files. Copy a build from outside your roots and the admin's build folders, or from your profile itself, its dot-folders (`~/.ssh`, `~/.claude`, …), `AppData` or its top folders, or anything under `AppData\Roaming`. Follow a link or junction in the build (they're skipped and named). |
 | Connect one VM to the pool's **internal** switch for one run, only when `vm_start` asks (`network: true`) and the policy allows it. | Give a guest the internet or your LAN. It's off by default: the adapter is disconnected, and the restore at stop puts it back. |
 | Reserve CPU for one run (`reserveCpu`, a percentage of the VM's cores), up to the policy's cap; reset at stop. | Reserve beyond the cap, or change a VM's CPU outside a run. |
 | Restore the clean checkpoint **by id** before every start, unconditionally, and at every stop and release, then check that the VM is Off, at that checkpoint, disconnected, with no reserve. Keep a VM unrestored for inspection **only when asked**, until its lease ends. | Start a run from anything but the clean checkpoint, or let one run's changes reach the next. A VM that can't be confirmed clean is **quarantined**: never leased until a restore confirms it. |
@@ -92,7 +92,7 @@ and test accounts.
      CPUs per VM (at most 8), half its memory in all, up to 4 VMs, 128 GB disks, networking allowed (internal switch
      only), unpinned ISOs refused. Override any of them: `-MaxVms`, `-MaxCoresPerVm`, `-MaxMemoryGB`,
      `-MaxDiskGBPerVm`, `-AllowNetwork $false`, `-MaxReservePercent`, `-MaxLeaseMinutes`, `-MaxBuildMB`,
-     `-AllowUnpinnedIso`.
+     `-AllowUnpinnedIso`. `-BuildRoot` names folders builds may also come from (see "Build folders set by an admin").
 
    It never enables a Windows feature or restarts the PC. If Hyper-V is off, it says how to turn it on and stops.
 3. Add the server to your client, with `HYPERV_MCP_ENABLED=1`:
@@ -108,7 +108,7 @@ and test accounts.
    }
    ```
    For a client that sends no MCP roots (Codex and the Copilot CLI today), add `"HYPERV_MCP_ROOTS_FROM_CWD": "1"`
-   or `HYPERV_MCP_ALLOWED_ROOTS` (see "Multiple projects"). The [top-level README](../../README.md#install) shows the
+   or `HYPERV_MCP_ALLOWED_ROOTS` (see "Multiple projects"), or have an admin name its build folders at setup. The [top-level README](../../README.md#install) shows the
    entry for each client's format.
 4. Build the pool: ask an agent to plan one (next section).
 
@@ -247,6 +247,29 @@ be inside the calling agent's project. The rules are windows-sandbox's, with thi
 - **A client that declares roots but doesn't answer** within 5 s is refused.
 - **Whatever the roots say**, your profile itself, its dot-folders, `AppData` and its top folders, and anything under
   `AppData\Roaming` are refused.
+
+### Build folders set by an admin
+
+Some projects stage builds outside their own folder, e.g. in `%LOCALAPPDATA%\<project>`. Rather than change each
+client's settings (Claude Code's `additionalDirectories`, Codex's `HYPERV_MCP_ALLOWED_ROOTS`), an admin can name such
+folders at setup:
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\combwork-mcp\servers\hyper-v\setup\install.ps1" -DiskFolder D:\hyperv-mcp -BuildRoot "C:\Users\you\AppData\Local\combwork-cli"
+```
+
+- A build may then come from your MCP roots **or** from inside one of these folders, for every client, with no client
+  settings. `HYPERV_MCP_ALLOWED_ROOTS` narrows only the client's roots, not these.
+- They're kept in `policy.json`, which only Administrators and SYSTEM can write, so an agent can't add to them or widen
+  them. The helper tells the server what they are (the server can't read `policy.json`).
+- Each must resolve, by real path, to the very folder named: one that is (or passes through) a link or junction isn't
+  used, so it can't be pointed somewhere else later. Your profile, its dot-folders, `AppData` and its top folders, and
+  `AppData\Roaming` are refused here too; a folder **inside** `AppData\Local` is fine. One that doesn't exist yet is
+  recorded and used once it exists. The build itself is checked by real path, and links in it are skipped, as usual.
+- Give each folder as a literal path, not `%LOCALAPPDATA%`: in an admin prompt run as another account, that's the other
+  account's folder. Setup refuses a drive root, a UNC path, `..`, and a link or junction on the way.
+- To change them, run setup again with the new list. A rerun replaces it: leave `-BuildRoot` out to clear it.
+- `vm_status` lists them, and says why any isn't used. A helper from before them reports none: run setup again.
 
 ## Configuration (`env`)
 
@@ -473,6 +496,9 @@ node --test test\units.test.js test\leases.test.js test\approvals.test.js test\r
   - the tools and the kill switch;
   - a build copied in, with links skipped, then read back, including images;
   - builds outside the roots, through a junction, or in the profile, refused;
+  - build folders set by an admin: used with no client roots and beside other roots; a root that is a junction, in
+    `AppData\Roaming` or missing isn't used; a junction out of one, and a folder outside both, refused; a helper from
+    before them;
   - pool tools without approval;
   - the lease ending when the server exits;
   - service mode without the helper.

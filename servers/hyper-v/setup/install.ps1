@@ -9,6 +9,9 @@
 #   - %ProgramData%\hyperv-mcp: the helper's state (only SYSTEM, Administrators and the service), with policy.json and
 #     approvals\ writable only by Administrators and SYSTEM;
 #   - the disk folder(s) for the pool's VMs (only SYSTEM, Administrators and the service).
+# -BuildRoot names folders builds may also come from, beside each client's MCP roots (e.g. a folder a project stages
+# builds in): recorded in policy.json, so agents can't add to them. Give each as a literal path, not %LOCALAPPDATA%,
+# which in an admin prompt can be another account's. A rerun replaces the list: leave -BuildRoot out to clear it.
 # Direct mode (-Mode Direct) installs no service: it adds -User to Hyper-V Administrators instead, so any program you
 # run, agents included, can drive Hyper-V without the server's rules. Read the README before choosing it.
 #
@@ -26,7 +29,8 @@ param(
   [int]$MaxReservePercent = 100,
   [int]$MaxLeaseMinutes = 240,
   [int]$MaxBuildMB = 2048,
-  [switch]$AllowUnpinnedIso
+  [switch]$AllowUnpinnedIso,
+  [string[]]$BuildRoot = @()
 )
 $ErrorActionPreference = 'Stop'
 # Started from a PowerShell 7 window, this 5.1 inherits PS7's module folders and can't load its own Get-Acl: drop them.
@@ -76,6 +80,19 @@ foreach ($d in $folders) {
   if ($d -notmatch '^[A-Za-z]:\\[^\\]+$') { throw "Disk folder $d must be a top-level folder on a local drive, such as D:\hyperv-mcp." }
   if ((New-Object IO.DriveInfo $d.Substring(0, 2)).DriveType -ne 'Fixed') { throw "Disk folder $d must be on a local fixed drive." }
 }
+# Build roots: absolute local folders, not a drive root, with no link or junction on the way (the server refuses one
+# that has: it must resolve to the very path named). Checked before anything changes; one that doesn't exist yet is kept.
+$buildRoots = @($BuildRoot | Where-Object { $_ } | ForEach-Object {
+  if ($_ -notmatch '^[A-Za-z]:\\' -or $_ -match '(^|\\)\.\.(\\|$)') { throw "Build root $_ must be an absolute local folder (X:\...) with no '..'." }
+  $b = [IO.Path]::GetFullPath($_).TrimEnd('\')
+  if ($b -notmatch '^[A-Za-z]:\\[^\\]') { throw "Build root $b must be a folder, not a drive root." }
+  for ($p = $b; $p -and $p.Length -gt 3; $p = Split-Path -Parent $p) {
+    $i = Get-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue
+    if ($i -and ($i.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Build root $b can't be used: $p is a link or junction." }
+  }
+  if (-not (Test-Path -LiteralPath $b -PathType Container)) { Write-Warning "Build root $b doesn't exist yet: it is recorded, and used once it exists." }
+  $b
+} | Select-Object -Unique)
 $pins = New-Object Collections.ArrayList
 $receipts = $null
 try {
@@ -174,6 +191,7 @@ $policy = [ordered]@{
   maxDiskGBPerVm = $MaxDiskGBPerVm; diskFolders = $folders; allowNetwork = $AllowNetwork
   maxReservePercent = $MaxReservePercent; maxLeaseMinutes = $MaxLeaseMinutes; maxBuildMB = $MaxBuildMB
   allowUnpinnedIso = [bool]$AllowUnpinnedIso
+  buildRoots = @($buildRoots)
 }
 $policyFile = Join-Path $state 'policy.json'
 Write-SecureFile $policyFile ($policy | ConvertTo-Json -Depth 4) @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=ReadAndExecute") $ADMINS
@@ -186,6 +204,7 @@ $bad = @(Test-ExclusiveAcl $state -Allowed $SYSTEM, $ADMINS, $runnerSid -Owners 
 foreach ($d in $folders) { $bad += @(Test-ExclusiveAcl $d -Allowed $SYSTEM, $ADMINS, $runnerSid -AllowPattern $script:HyperVGrantees) }
 if ($bad.Count) { throw "The helper's folders aren't as setup made them: $($bad -join '; ')" }
 Step "State in $state; VM disks in $($folders -join ', '); ACLs checked."
+Step "Build folders set by an admin (beside each client's MCP roots): $(if ($buildRoots.Count) { $buildRoots -join '; ' } else { 'none' })."
 Step ("Policy: up to {0} VMs, {1} cores each, {2} GB memory in all, {3} GB disks; network {4}; unpinned ISOs {5}." -f $policy.maxVms, $policy.maxCoresPerVm, ($policy.maxMemoryMBTotal / 1024), $policy.maxDiskGBPerVm, $(if ($AllowNetwork) { 'allowed (internal switch only)' } else { 'not allowed' }), $(if ($AllowUnpinnedIso) { 'allowed' } else { 'refused' }))
 
 # 8. Start.

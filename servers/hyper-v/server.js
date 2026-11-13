@@ -5,7 +5,8 @@
  *
  * This process runs as the user and holds no Hyper-V rights. It talks to the helper service over a named pipe
  * (helper/), which holds them and enforces every rule about VMs; this process only adds the rules about the user's own
- * files (which folders a build may come from: the client's MCP roots, by real path). In direct mode
+ * files (which folders a build may come from: the client's MCP roots, or folders an admin named in the helper's policy,
+ * by real path). In direct mode
  * (HYPERV_MCP_MODE=direct) the helper runs in this process instead, and the user must be in Hyper-V Administrators: see
  * the README for what that gives up.
  *
@@ -15,7 +16,7 @@ const fs = require('fs')
 const net = require('net')
 const { join, relative, sep } = require('path')
 const { createInterface } = require('readline')
-const { realDir, profileRefusal, rootsClient, allowedRoots } = require('./roots')
+const { isInside, realDir, profileRefusal, policyRootProblem, rootsClient, allowedRoots } = require('./roots')
 
 const VERSION = (() => {
   try {
@@ -117,18 +118,40 @@ async function buildRoots() {
 }
 
 /**
- * A build folder that really resolves under the allowed roots, and isn't the profile, a dot-folder or AppData. Throws
- * the reason. A path check by real path: it stops any path or link an agent passes.
+ * The build folders an admin named in the helper's policy (install.ps1 -BuildRoot), which the helper reports: only
+ * Administrators and SYSTEM can write policy.json, and this process can't read it. Each must really resolve to the
+ * path named (no link or junction on it) and not be the profile, a dot-folder or AppData, or it isn't used.
+ * Out: { usable, unusable: [reasons], note } with note set when they couldn't be had.
+ */
+async function adminRoots() {
+  let v
+  try { v = await helper.request('version') } catch (e) { return { usable: [], unusable: [], note: `unknown (${e.message})` } }
+  if (!Array.isArray(v?.data?.buildRoots)) return { usable: [], unusable: [], note: 'none (the helper predates them: run setup again to update it)' }
+  const usable = []
+  const unusable = []
+  for (const r of v.data.buildRoots) {
+    const why = typeof r === 'string' ? policyRootProblem(r) : 'it is not a path'
+    if (why) unusable.push(`"${r}" isn't used: ${why}`)
+    else usable.push(r)
+  }
+  return { usable, unusable, note: null }
+}
+const describeAdmin = a => a.note || `${a.usable.length ? a.usable.join('; ') : 'none'}${a.unusable.length ? ` (${a.unusable.join('; ')})` : ''}`
+const describeClient = r => r.refusal ? `none (${r.refusal})` : r.describe()
+
+/**
+ * A build folder that really resolves under the client's allowed roots or under a folder an admin named, and isn't the
+ * profile, a dot-folder or AppData. Throws the reason. A path check by real path: it stops any path or link an agent
+ * passes. HYPERV_MCP_ALLOWED_ROOTS narrows the client's roots only; the admin's folders stand on their own.
  */
 async function buildFolder(p) {
-  const allowed = await buildRoots()
-  if (allowed.refusal) throw new Error(`Build folder "${p}" can't be used: ${allowed.refusal}.`)
   let real
   try { real = realDir(p) } catch (e) { throw new Error(`Build folder "${p}": ${e.code === 'ENOENT' ? 'not found' : e.message}`) }
   const why = profileRefusal(real)
   if (why) throw new Error(`Build folder "${p}" can't be used: ${why}.`)
-  if (!allowed.allows(real)) throw new Error(`Build folder "${p}" is not under an allowed folder (${allowed.describe()}).`)
-  return real
+  const [allowed, admin] = await Promise.all([buildRoots(), adminRoots()])
+  if (allowed.allows(real) || admin.usable.some(r => isInside(real, r))) return real
+  throw new Error(`Build folder "${p}" can't be used: it is not under an allowed folder. Your MCP roots: ${describeClient(allowed)}. Build folders set by an admin: ${describeAdmin(admin)}.`)
 }
 
 /** The build's files, walked without following links (links and junctions are skipped and named). */
@@ -223,8 +246,8 @@ async function vmReadOut({ paths, glob, maxBytes = 256 * 1024, maxTotalBytes = 1
 async function status() {
   const lines = [`Mode: ${helper.describe()}. Server ${VERSION}${ENABLED ? '' : '; TURNED OFF (HYPERV_MCP_ENABLED is not 1)'}.`]
   try {
-    const allowed = await buildRoots()
-    lines.push(allowed.refusal ? `Builds: none allowed (${allowed.refusal}).` : `Builds may come from: ${allowed.describe()}.`)
+    const [allowed, admin] = await Promise.all([buildRoots(), adminRoots()])
+    lines.push(`Builds may come from your MCP roots: ${describeClient(allowed)}.`, `And from build folders set by an admin: ${describeAdmin(admin)}.`)
   } catch (e) { lines.push(`Builds: ${e.message}`) }
   try {
     const v = await helper.request('version')
@@ -249,7 +272,7 @@ const tools = [
     inputSchema: {
       type: 'object',
       properties: {
-        build: { type: 'string', description: 'A folder inside your project (your MCP roots) to copy in to C:\\build. Links are skipped.' },
+        build: { type: 'string', description: 'A folder inside your project (your MCP roots), or inside a build folder an admin set (vm_status lists them), to copy in to C:\\build. Links are skipped.' },
         network: { type: 'boolean', description: 'Connect to the pool\'s internal switch. Default false.' },
         reserveCpu: { type: 'number', description: 'Reserve this percentage of the VM\'s cores for timed runs (up to the policy\'s cap). Default 0.' }
       }

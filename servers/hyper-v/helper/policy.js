@@ -22,8 +22,16 @@ const DEFAULTS = {
   maxReservePercent: 100,
   maxLeaseMinutes: 240,
   maxBuildMB: 2048,
-  allowUnpinnedIso: false
+  allowUnpinnedIso: false,
+  buildRoots: []
 }
+
+const MAX_BUILD_ROOTS = 16
+/** Why a policy folder isn't an absolute local folder (not UNC, a device path, a drive root or with ".."), or null. */
+const folderProblem = f =>
+  typeof f !== 'string' || !/^[a-zA-Z]:[\\/]/.test(f) || f.split(/[\\/]/).includes('..') || win32.parse(f).root === win32.normalize(f)
+    ? 'must be an absolute local folder (X:\\...), not a drive root, with no ".."' : null
+const tidy = f => win32.normalize(f).replace(/\\+$/, '')
 
 const int = (v, lo, hi) => Number.isInteger(v) && v >= lo && v <= hi
 
@@ -43,6 +51,11 @@ function problems(p) {
   if (!int(p.maxLeaseMinutes, 5, 24 * 60)) out.push('maxLeaseMinutes must be 5-1440')
   if (!int(p.maxBuildMB, 1, 64 * 1024)) out.push('maxBuildMB must be 1-65536')
   if (typeof p.allowUnpinnedIso !== 'boolean') out.push('allowUnpinnedIso must be true or false')
+  // Build folders an admin named at setup (install.ps1 -BuildRoot): optional, so a policy from before it stays usable.
+  if (p.buildRoots !== undefined) {
+    if (!Array.isArray(p.buildRoots) || p.buildRoots.length > MAX_BUILD_ROOTS) out.push(`buildRoots must be a list of at most ${MAX_BUILD_ROOTS} folders`)
+    else for (const f of p.buildRoots) { const why = folderProblem(f); if (why) out.push(`build root "${f}" ${why}`) }
+  }
   return out
 }
 
@@ -54,7 +67,7 @@ function load(dir) {
   }
   const bad = problems(p)
   if (bad.length) throw new Error(`policy.json is not usable: ${bad.join('; ')}. Run setup again.`)
-  return Object.freeze({ ...p, diskFolders: Object.freeze(p.diskFolders.map(f => win32.normalize(f).replace(/\\+$/, ''))) })
+  return Object.freeze({ ...p, diskFolders: Object.freeze(p.diskFolders.map(tidy)), buildRoots: Object.freeze((p.buildRoots ?? []).map(tidy)) })
 }
 
 /**
