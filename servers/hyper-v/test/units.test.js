@@ -253,6 +253,14 @@ test('setup ACLs: earlier grants removed from a folder and what it holds; VM gra
   assert.strictEqual(a.innerUnchanged, true, 'refused before changing anything')
   assert.match(a.ancestorLink, /is a link or junction/)
   assert.strictEqual(a.ancestorUnchanged, true)
+  // Provenance: a forged state folder is refused before anything changes; fresh and already-secured ones are fine.
+  assert.match(a.evil, /already exists with contents setup didn't secure, so they can't be trusted .*Nothing was changed/)
+  assert.strictEqual(a.evilJournalUntouched, true)
+  assert.strictEqual(a.evilAclUntouched, true, 'refused untouched: no repair that would make it look trusted')
+  assert.match(a.evilOwned, /can't be trusted/, 'without the grant, its user-owned contents are still refused')
+  assert.strictEqual(a.missing, 'fresh')
+  assert.strictEqual(a.empty, 'fresh')
+  assert.strictEqual(a.good, 'trusted')
 })
 
 test('approve.ps1 runs only from the installed, admin-only folder', { skip: !windows }, () => {

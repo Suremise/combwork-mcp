@@ -99,8 +99,25 @@ function Test-ExclusiveAcl([string]$Path, [string[]]$Allowed, [string[]]$Writers
     }
     if ($Owners) {
       $owner = try { (New-Object Security.Principal.NTAccount $acl.Owner).Translate([Security.Principal.SecurityIdentifier]).Value } catch { $acl.Owner }
-      if ($Owners -notcontains $owner) { $out += "$($i.FullName) is owned by $($acl.Owner)" }
+      if ($Owners -notcontains $owner -and -not ($AllowPattern -and $owner -match $AllowPattern)) { $out += "$($i.FullName) is owned by $($acl.Owner)" }
     }
   }
   return $out
+}
+
+# Before setup changes anything: an existing folder whose contents the helper will trust (its journal, plans, approvals,
+# secrets, verified images) must already be as setup leaves it. That's the only proof its bytes were written by setup or
+# the helper, and not by someone who could write there before. Repairing its ACL would make forged contents look
+# trusted, so a folder that fails is refused untouched. A folder that is missing, or exists but is empty, has no
+# contents to trust: it is 'fresh', and setup may create or harden it. Returns 'fresh' or 'trusted'; throws otherwise.
+function Assert-TrustedOrFresh([string]$Path, [string[]]$Allowed, [string[]]$Writers = $Allowed, [string[]]$Owners, [string]$AllowPattern) {
+  Assert-NoReparse $Path
+  if (-not (Test-Path -LiteralPath $Path)) { return 'fresh' }
+  if (-not (Test-Path -LiteralPath $Path -PathType Container)) { throw "$Path exists but isn't a folder: move it aside, then run setup again." }
+  if (-not @(Get-ChildItem -LiteralPath $Path -Force).Count) { return 'fresh' }
+  $bad = @(Test-ExclusiveAcl $Path -Allowed $Allowed -Writers $Writers -Owners $Owners -AllowPattern $AllowPattern)
+  if ($bad.Count) {
+    throw "$Path already exists with contents setup didn't secure, so they can't be trusted ($($bad[0])$(if ($bad.Count -gt 1) { "; and $($bad.Count - 1) more" })). Nothing was changed. If it isn't yours, inspect it; then move it aside (any pool recorded in it can't be trusted) and run setup again."
+  }
+  return 'trusted'
 }

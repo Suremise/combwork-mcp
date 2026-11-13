@@ -50,4 +50,30 @@ $via = Join-Path $Dir 'via'
 try { Set-ExclusiveAcl (Join-Path $via 'x') @("$SYSTEM=FullControl"); $r.ancestorLink = 'accepted' } catch { $r.ancestorLink = $_.Exception.Message }
 $r.ancestorUnchanged = -not (Test-Path (Join-Path $target 'x'))
 
+# 4. Provenance (Assert-TrustedOrFresh, run by setup before any change): a state folder an ordinary user could write,
+# holding a forged recovery journal, a plan and an approval, is refused untouched; missing or empty folders are fresh;
+# a folder already as setup leaves it is trusted. $svc stands for the helper's account: not this user.
+$svc = 'S-1-5-80-1-2-3-4-5'
+$evil = Join-Path $Dir 'evil-state'
+New-Item -ItemType Directory -Force (Join-Path $evil 'approvals'), (Join-Path $evil 'plans') | Out-Null
+$journal = '{"t":"epoch","epoch":"' + ('e' * 32) + '"}' + "`n" + '{"t":"switch","phase":"removing","name":"foreign-internal","switchId":"foreign-switch-id","jobId":"j-1"}' + "`n"
+[IO.File]::WriteAllText((Join-Path $evil 'journal.jsonl'), $journal)
+Set-Content (Join-Path $evil 'plans\p-0000000000000000.json') '{}'
+Set-Content (Join-Path $evil 'approvals\p-0000000000000000.json') '{}'
+& icacls.exe $evil /grant '*S-1-5-32-545:(OI)(CI)M' | Out-Null
+try { [void](Assert-TrustedOrFresh $evil -Allowed $SYSTEM, $svc -Owners $SYSTEM, $svc); $r.evil = 'accepted' } catch { $r.evil = $_.Exception.Message }
+$r.evilJournalUntouched = [IO.File]::ReadAllText((Join-Path $evil 'journal.jsonl')) -eq $journal
+$r.evilAclUntouched = Has $evil $USERS
+# The same forged folder, even with the Users grant removed, is still not trusted: its contents are owned by this user.
+& icacls.exe $evil /remove:g '*S-1-5-32-545' /T | Out-Null
+try { [void](Assert-TrustedOrFresh $evil -Allowed $SYSTEM, $svc, $me -Writers $SYSTEM, $svc -Owners $SYSTEM, $svc); $r.evilOwned = 'accepted' } catch { $r.evilOwned = $_.Exception.Message }
+$r.missing = Assert-TrustedOrFresh (Join-Path $Dir 'not-there') -Allowed $SYSTEM -Owners $SYSTEM
+$empty = Join-Path $Dir 'empty'; New-Item -ItemType Directory -Force $empty | Out-Null
+& icacls.exe $empty /grant '*S-1-5-32-545:(OI)(CI)M' | Out-Null
+$r.empty = Assert-TrustedOrFresh $empty -Allowed $SYSTEM -Owners $SYSTEM
+$good = Join-Path $Dir 'good'
+Set-ExclusiveAcl $good @("$SYSTEM=FullControl", "$me=FullControl")
+Set-Content (Join-Path $good 'journal.jsonl') '{}'
+$r.good = Assert-TrustedOrFresh $good -Allowed $SYSTEM, $me -Owners $SYSTEM, $me
+
 [Console]::Out.WriteLine('RESULT:' + (ConvertTo-Json $r -Compress -Depth 4))

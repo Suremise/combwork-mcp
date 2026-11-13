@@ -53,6 +53,22 @@ if (-not (Get-Command Get-VM -ErrorAction SilentlyContinue) -or -not (Get-Servic
 if ((Get-Service vmms).Status -ne 'Running') { throw 'The Hyper-V Virtual Machine Management service (vmms) is not running: start it, or restart the PC, then run this again.' }
 Step 'Hyper-V is on.'
 
+# 1b. Before any change: the state folder and the disk folders, if they exist with contents, must already be as setup
+# leaves them, or their contents (journal, plans, approvals, secrets, verified images) can't be trusted, and setup stops
+# here with nothing changed. Missing or empty folders are fresh. The helper's account SID comes from sc.exe showsid,
+# which works before the service exists.
+$SYSTEM = 'S-1-5-18'; $ADMINS = 'S-1-5-32-544'; $USERS = 'S-1-5-32-545'
+$runnerSid = if ($Mode -eq 'Service') {
+  $line = (& sc.exe showsid $svc) | Where-Object { $_ -match 'SERVICE SID:\s*(S-1-5-80-[\d-]+)' } | Select-Object -First 1
+  if (-not $line) { throw "sc.exe showsid $svc gave no service SID." }
+  $Matches[1]
+} else { (New-Object Security.Principal.NTAccount $User).Translate([Security.Principal.SecurityIdentifier]).Value }
+$folders = @($DiskFolder | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') })
+foreach ($d in $folders) { if ([IO.Path]::GetPathRoot($d).TrimEnd('\') -eq $d) { throw "Disk folder $d is a drive root: name a folder, such as D:\hyperv-mcp." } }
+$stateIs = Assert-TrustedOrFresh $state -Allowed $SYSTEM, $ADMINS, $runnerSid -Owners $SYSTEM, $ADMINS, $runnerSid
+foreach ($d in $folders) { [void](Assert-TrustedOrFresh $d -Allowed $SYSTEM, $ADMINS, $runnerSid -Owners $SYSTEM, $ADMINS, $runnerSid -AllowPattern '^S-1-5-83-') }
+Step "State folder: $stateIs; disk folders checked."
+
 # 2. Node: must be admin-only writable, since the service runs it with Hyper-V rights.
 $node = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
 if (-not $node) { throw 'Node (18 or later) is not on PATH.' }
@@ -83,10 +99,11 @@ Step "Group '$groupName' holds $User; $User may also open the pipe directly (no 
 # restored by the next one's recovery), and the folder's ACL is made exclusive, and checked, before any code goes in.
 $existing = Get-Service $svc -ErrorAction SilentlyContinue
 if ($existing -and $existing.Status -ne 'Stopped') { Stop-Service $svc -Force; (Get-Service $svc).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(60)); Step "Service $svc stopped for the update." }
-$SYSTEM = 'S-1-5-18'; $ADMINS = 'S-1-5-32-544'; $USERS = 'S-1-5-32-545'
 Set-ExclusiveAcl $install @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$USERS=ReadAndExecute") -SetOwner
 $bad = @(Test-ExclusiveAcl $install -Allowed $SYSTEM, $ADMINS, $USERS -Writers $SYSTEM, $ADMINS -Owners $SYSTEM, $ADMINS)
 if ($bad.Count) { throw "$install isn't admin-only after setting its ACL: $($bad -join '; ')" }
+# Nothing earlier in it is kept: every file the service runs is copied fresh below (a stray file could be loaded instead).
+Get-ChildItem -LiteralPath $install -Force | Remove-Item -Recurse -Force
 foreach ($f in 'core.js', 'helper.js', 'hv.js', 'hv.ps1', 'images.js', 'iso.js', 'journal.js', 'paths.js', 'policy.js', 'unattend.js', 'approve.ps1') {
   Copy-Item -LiteralPath (Join-Path $src "helper\$f") -Destination (Join-Path $install $f) -Force
 }
@@ -118,15 +135,13 @@ $hvMembers = @(Get-LocalGroupMember -SID $HVADMINS -ErrorAction SilentlyContinue
 if ($hvMembers -notcontains $runner) { Add-LocalGroupMember -SID $HVADMINS -Member $runner }
 Step "$runner is in Hyper-V Administrators."
 
-# 6. The state folder and the disk folders, each with an ACL built from scratch (any earlier grant to anyone else is
-# removed, also on what they already hold), then checked. Done before the helper next reads them.
-$runnerSid = (New-Object Security.Principal.NTAccount $runner).Translate([Security.Principal.SecurityIdentifier]).Value
+# 6. The state folder and the disk folders (fresh, or already trusted by step 1b), each with an ACL built from scratch,
+# then checked. Done before the helper next reads them.
+if ((New-Object Security.Principal.NTAccount $runner).Translate([Security.Principal.SecurityIdentifier]).Value -ne $runnerSid) { throw "$runner's SID isn't the one checked in step 1b." }
 Set-ExclusiveAcl $state @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=Modify") -SetOwner
 $approvals = Join-Path $state 'approvals'
 Set-ExclusiveAcl $approvals @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=ReadAndExecute") -SetOwner
-$folders = @($DiskFolder | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') })
 foreach ($d in $folders) {
-  if ([IO.Path]::GetPathRoot($d).TrimEnd('\') -eq $d) { throw "Disk folder $d is a drive root: name a folder, such as D:\hyperv-mcp." }
   # Children keep Hyper-V's own grants to each VM's SID (S-1-5-83-...): a VM can't start without them.
   Set-ExclusiveAcl $d @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=FullControl") -SetOwner -ChildKeep '^S-1-5-83-'
 }
