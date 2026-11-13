@@ -301,6 +301,8 @@ class Helper {
         leaseId: `l-${hex(6)}`, vmId: vm.vmId, vmName: vm.vmName, connId, ownerConn: connId, pid: c.pid, ending: null, children: new Set(),
         acquiredAt: now, sessionEnd, deadline: Math.min(sessionEnd, now + Math.round(minutes * MINUTE_MS)), keepOnFailure: !!keepOnFailure,
         kept: false, running: false, failed: false, runs: 0, dirty: false, network: false, reserve: 0,
+        // interactive: the account logged on in the guest by this start ('user' or 'admin'), or null.
+        interactive: null,
         // What the helper knows of the guest's C:\build (vm_sync): the files it placed, by canonical key; gen moves on at
         // every start, sync and the lease's end (a plan from an earlier gen is stale); trusted is false while an apply
         // is unfinished or after one failed, when only a full sync or a reset may follow.
@@ -641,9 +643,10 @@ class Helper {
 
   // ---------- runs ----------
 
-  async start(connId, { network = false, reserveCpu = 0 } = {}) {
+  async start(connId, { network = false, reserveCpu = 0, interactive = false } = {}) {
     const lease = this.leaseOf(connId)
     const c = this.conns.get(connId)
+    if (![false, 'user', 'admin'].includes(interactive)) throw new Error("interactive must be false, 'user' or 'admin'")
     if (lease.kept) throw new Error(`${lease.vmName} is kept for inspection: vm_release it, then vm_acquire again (a release restores it).`)
     if (network && !this.policy.allowNetwork) throw new Error('The policy does not allow networking.')
     if (network && this.state.switch?.phase !== 'created') throw new Error('The pool has no internal switch: create the pool with network on to use networking.')
@@ -656,6 +659,7 @@ class Helper {
       const t0 = this.now()
       lease.running = false
       lease.failed = false
+      lease.interactive = null
       // C:\build is the clean checkpoint's (empty) once restored, then the build's: untrusted until the copy finishes,
       // so a failed start leaves no earlier record usable. Any sync plan is stale from here.
       const s = lease.sync
@@ -679,6 +683,13 @@ class Helper {
       const waited = await this.waitGuest(vm, creds.admin, READY_WAIT_MS, lease)
       if (waited === null) throw new Error(`${vm.vmName} started but its guest didn't answer within ${Math.round(READY_WAIT_MS / 1000)} s. vm_stop it and try again.`)
       this.stillHeld(lease)
+      let logon = ''
+      if (interactive) {
+        const ms = await this.logon(vm, lease, interactive, creds)
+        if (ms === null) throw new Error(`${vm.vmName} restarted to log ${creds[interactive].user} on, but no interactive session of it appeared within ${Math.round(READY_WAIT_MS / 1000)} s. vm_reset to try again.`)
+        lease.interactive = interactive
+        logon = `; ${creds[interactive].user} logged on interactively after a guest restart (${(ms / 1000).toFixed(1)} s): vm_run with session: 'interactive', as: '${interactive}' runs in its session`
+      }
       let build = 'no build'
       if (c.stage?.done) {
         const res = await this.hv('copy-in', { ...this.ident(vm), cred: creds.admin, userName: creds.user.user, source: c.stage.dir }, this.forLease(lease, 30 * 60_000))
@@ -689,8 +700,8 @@ class Helper {
       }
       s.trusted = true
       return {
-        text: `Started ${vm.vmName} from its clean checkpoint: restore ${((tRestore - t0) / 1000).toFixed(1)} s, guest ready after ${(waited / 1000).toFixed(1)} s; ${build}; network ${network ? `ON (internal switch ${this.state.switch.name})` : 'off'}; CPU reserve ${reserveCpu}%. C:\\out is empty. Deadline ${new Date(lease.deadline).toISOString()}.`,
-        data: { vm: vm.vmName, network: !!network, reserveCpu }
+        text: `Started ${vm.vmName} from its clean checkpoint: restore ${((tRestore - t0) / 1000).toFixed(1)} s, guest ready after ${(waited / 1000).toFixed(1)} s${logon}; ${build}; network ${network ? `ON (internal switch ${this.state.switch.name})` : 'off'}; CPU reserve ${reserveCpu}%. C:\\out is empty. Deadline ${new Date(lease.deadline).toISOString()}.`,
+        data: { vm: vm.vmName, network: !!network, reserveCpu, interactive }
       }
     })
   }
@@ -711,15 +722,35 @@ class Helper {
     return null
   }
 
+  /**
+   * vm_start's interactive logon: hv.ps1 'guest-logon' turns on autologon of the account (its password as the guest's LSA
+   * secret, wiped by the next restore) and restarts the guest; then waits, as the lease's, for a new boot with the
+   * account's explorer running in a session >= 1. Returns the ms it took, or null.
+   */
+  async logon(vm, lease, which, creds) {
+    const account = creds[which]
+    const before = await this.hv('guest-logon', { ...this.ident(vm), cred: creds.admin, logon: account }, this.forLease(lease, 120_000))
+    const t0 = this.now()
+    while (this.now() - t0 < READY_WAIT_MS) {
+      this.stillHeld(lease)
+      const r = await this.hv('guest-session', { ...this.ident(vm), cred: creds.admin, account: account.user }, this.forLease(lease, 60_000)).catch(() => null)
+      this.stillHeld(lease)
+      if (r && r.boot !== before.boot && Array.isArray(r.sessions) && r.sessions.length) return this.now() - t0
+      await sleep(POLL_MS)
+    }
+    return null
+  }
+
   creds() {
     const c = JSON.parse(fs.readFileSync(join(this.dir, 'secrets', 'guest.json'), 'utf8'))
     if (!c?.admin?.password || !c?.user?.password) throw new Error('the guest credentials are missing: the pool must be created again')
     return c
   }
 
-  async run(connId, { command, shell = 'cmd', as = 'admin', timeoutSec = 120, cwd } = {}) {
+  async run(connId, { command, shell = 'cmd', as = 'admin', timeoutSec = 120, cwd, session = 'service' } = {}) {
     const lease = this.leaseOf(connId)
     if (!lease.running) throw new Error('The VM is not running: call vm_start first.')
+    if (!['service', 'interactive'].includes(session)) throw new Error("session must be 'service' or 'interactive'")
     if (typeof command !== 'string' || !command.trim()) throw new Error('command is required')
     if (command.length > MAX_COMMAND) throw new Error(`command is over ${MAX_COMMAND} characters: put it in a script in the build`)
     if (!['cmd', 'powershell'].includes(shell)) throw new Error('shell must be cmd or powershell')
@@ -729,20 +760,40 @@ class Helper {
     const vm = this.vmOf(lease)
     return this.vmLock(vm.vmId)(async () => {
       this.stillHeld(lease)
+      const interactive = session === 'interactive'
+      if (interactive) {
+        if (!lease.interactive) throw new Error("No one is logged on interactively in this VM: vm_start (or vm_reset) with interactive: 'user' or 'admin' first.")
+        if (as !== lease.interactive) throw new Error(`The interactive session is ${lease.interactive === 'user' ? 'the standard user' : 'the admin'}'s: run it with as: '${lease.interactive}'.`)
+      }
       const n = ++lease.runs
       const creds = this.creds()
-      const r = await this.hv('guest-run', { ...this.ident(vm), cred: creds.admin, runAs: as === 'user' ? creds.user : null, n, command, shell, timeoutSec, cwd: cwd || 'C:\\build', cap: OUTPUT_CAP }, this.forLease(lease, (timeoutSec + 120) * 1000))
+      const args = {
+        ...this.ident(vm), cred: creds.admin, runAs: !interactive && as === 'user' ? creds.user : null, n, command, shell, timeoutSec, cwd: cwd || 'C:\\build', cap: OUTPUT_CAP,
+        interactive: interactive ? { account: creds[as].user, elevated: as === 'admin' } : null
+      }
+      let r
+      try {
+        r = await this.hv('guest-run', args, this.forLease(lease, (timeoutSec + 120) * 1000))
+      } catch (e) {
+        if (!interactive) throw e
+        this.stillHeld(lease) // an ending lease restores the VM itself
+        r = { exitCode: null, clean: false, why: e.message }
+      }
       const exit = Number.isInteger(r.exitCode) ? r.exitCode : null
       if (r.timedOut || exit !== 0) lease.failed = true
       const out = s => (typeof s === 'string' ? s : '').slice(0, OUTPUT_CAP)
+      // An interactive run that didn't finish cleanly isn't chased: the VM is restored, which ends whatever it started.
+      const restored = interactive && r.clean !== true ? await this.restoreAfterRun(lease, vm) : null
       const lines = [
-        r.timedOut
-          ? `Timed out after ${timeoutSec} s: ${r.killed ? 'killed inside the guest by its PID (taskkill /T /F).' : 'no PID recorded; vm_stop is the fallback.'}`
-          : `Exit code ${exit === null ? 'unknown' : exit}.`,
+        interactive
+          ? (restored ? `The interactive run didn't finish cleanly (${r.why || 'no exit code'}). ${restored}` : `Exit code ${exit} (in the interactive session).`)
+          : r.timedOut
+            ? `Timed out after ${timeoutSec} s: ${r.killed ? 'killed inside the guest by its PID (taskkill /T /F).' : 'no PID recorded; vm_stop is the fallback.'}`
+            : `Exit code ${exit === null ? 'unknown' : exit}.`,
         `--- stdout${r.stdoutCut ? ` (first ${OUTPUT_CAP} bytes)` : ''} ---`, out(r.stdout),
         `--- stderr${r.stderrCut ? ` (first ${OUTPUT_CAP} bytes)` : ''} ---`, out(r.stderr)
       ]
-      return { text: lines.join('\n'), isError: !!r.timedOut, data: { exitCode: exit, timedOut: !!r.timedOut } }
+      return { text: lines.join('\n'), isError: !!r.timedOut || !!restored, data: { exitCode: exit, timedOut: !!r.timedOut, session, ...(restored ? { restored: true } : {}) } }
     })
   }
 
@@ -789,6 +840,22 @@ class Helper {
     })
   }
 
+  /**
+   * After an interactive run that didn't finish cleanly: restores the VM (inside the VM's lock, which the run holds),
+   * as vm_stop does. Returns the text for the reply.
+   */
+  async restoreAfterRun(lease, vm) {
+    this.stillHeld(lease)
+    const r = await this.restore(vm)
+    lease.running = false
+    lease.interactive = null
+    lease.dirty = !r.ok
+    Object.assign(lease.sync, { gen: lease.sync.gen + 1, plan: null, trusted: false, record: new Map() })
+    return r.ok
+      ? `The VM was restored to its clean checkpoint, which ends everything the run started (C:\\out with it; its output above was read first): vm_start or vm_reset to go on.`
+      : `Restoring the VM to end what it started failed: ${r.text}`
+  }
+
   async stop(connId, { keep = false } = {}) {
     const lease = this.leaseOf(connId)
     const vm = this.vmOf(lease)
@@ -799,6 +866,7 @@ class Helper {
     }
     const r = await this.vmLock(vm.vmId)(() => { this.stillHeld(lease); return this.restore(vm) })
     lease.running = false
+    lease.interactive = null
     lease.dirty = !r.ok
     Object.assign(lease.sync, { gen: lease.sync.gen + 1, plan: null, trusted: false, record: new Map() })
     return { text: r.ok ? `Reverted: ${r.text}` : r.text, isError: !r.ok }
@@ -820,7 +888,7 @@ class Helper {
       const l = this.leases.get(v.vmId)
       const state = s.quarantined.has(v.vmId) ? `QUARANTINED (${s.quarantined.get(v.vmId)})`
         : v.removing ? 'removing' : !v.ready ? 'creating'
-          : l ? `leased${l.kept ? ', kept for inspection' : ''}${l.running ? ', running' : ''} until ${new Date(l.deadline).toISOString()} (session ends by ${new Date(l.sessionEnd).toISOString()})` : 'free'
+          : l ? `leased${l.kept ? ', kept for inspection' : ''}${l.running ? ', running' : ''}${l.interactive ? `, ${l.interactive === 'user' ? 'the standard user' : 'the admin'} logged on interactively` : ''} until ${new Date(l.deadline).toISOString()} (session ends by ${new Date(l.sessionEnd).toISOString()})` : 'free'
       return `- ${v.vmName}: ${v.cores} cores, ${v.memoryMB} MB, ${v.diskGB} GB disk; ${state}${v.vmId === mine ? ' (yours)' : ''}${expiry(v, this.now())}`
     })
     const img = [...s.images.values()].at(-1)
@@ -1145,7 +1213,7 @@ class Helper {
   }
 }
 
-const PROTOCOL = 'hyperv-mcp/2' // 2: renew, sync_plan, sync (MC-1497)
+const PROTOCOL = 'hyperv-mcp/3' // 2: renew, sync_plan, sync (MC-1497); 3: start's interactive, run's session (MC-1503)
 const EVAL_DAYS = 90
 const DAY_MS = 24 * 60 * 60 * 1000
 

@@ -34,7 +34,7 @@ const MANIFEST_BYTES = 1024 * 1024
 // The service host closes a connection whose request line is over 4 MB (HvMcpHost.cs MaxLine), and with it the lease:
 // a request that long is refused here instead, before it is sent.
 const MAX_LINE = 4 * 1024 * 1024 - 1024
-const PROTOCOL = 'hyperv-mcp/2'
+const PROTOCOL = 'hyperv-mcp/3'
 const splitList = v => String(v || '').split(';').map(s => s.trim()).filter(Boolean)
 
 const roots = rootsClient(m => process.stdout.write(JSON.stringify(m) + '\n'))
@@ -240,6 +240,19 @@ async function warm(op, args) {
   }
 }
 
+/**
+ * The interactive session (vm_start's interactive, vm_run's session) needs a helper that speaks this protocol: an older
+ * one would ignore the option and run in session 0. Asked once per server, and only when the option is used.
+ */
+let protocolOk = null
+async function needInteractive() {
+  if (protocolOk === null) {
+    const v = await helper.request('version')
+    protocolOk = v?.data?.protocol === PROTOCOL ? true : (v?.data?.protocol || 'an older protocol')
+  }
+  if (protocolOk !== true) throw new Error(`The helper speaks ${protocolOk}, and the interactive session needs ${PROTOCOL}: run setup again to update it (see the README, Setup).`)
+}
+
 // ---------- tools ----------
 
 const text = r => (typeof r === 'string' ? r : r?.text ?? '')
@@ -249,21 +262,22 @@ const text = r => (typeof r === 'string' ? r : r?.text ?? '')
 const session = { start: null, build: null }
 const skippedNote = list => list?.length ? `\nLinks skipped (never followed): ${list.slice(0, 20).join(', ')}${list.length > 20 ? ', …' : ''}` : ''
 
-async function vmStart({ build, network = false, reserveCpu = 0 } = {}) {
+async function vmStart({ build, network = false, reserveCpu = 0, interactive = false } = {}) {
+  if (interactive) await needInteractive()
   let staged = null
   if (build !== undefined) {
     if (typeof build !== 'string' || !build.trim()) throw new Error('build must be a folder path')
     staged = await stage(await buildFolder(build))
   }
-  const r = await helper.request('start', { network: !!network, reserveCpu })
-  if (!r.isError) { session.start = { network: !!network, reserveCpu }; session.build = build ?? null }
+  const r = await helper.request('start', { network: !!network, reserveCpu, ...(interactive ? { interactive } : {}) })
+  if (!r.isError) { session.start = { network: !!network, reserveCpu, interactive: interactive || false }; session.build = build ?? null }
   return { text: text(r) + skippedNote(staged?.skipped), isError: r.isError }
 }
 
 /** vm_reset: a start (restore first, always), with this session's last start's options and build unless given. */
-async function vmReset({ build, network, reserveCpu } = {}) {
-  const last = session.start || { network: false, reserveCpu: 0 }
-  return vmStart({ build: build ?? session.build ?? undefined, network: network ?? last.network, reserveCpu: reserveCpu ?? last.reserveCpu })
+async function vmReset({ build, network, reserveCpu, interactive } = {}) {
+  const last = session.start || { network: false, reserveCpu: 0, interactive: false }
+  return vmStart({ build: build ?? session.build ?? undefined, network: network ?? last.network, reserveCpu: reserveCpu ?? last.reserveCpu, interactive: interactive ?? last.interactive })
 }
 
 /**
@@ -356,7 +370,8 @@ const tools = [
       properties: {
         build: { type: 'string', description: 'A folder inside your project (your MCP roots), or inside a build folder an admin set (vm_status lists them), to copy in to C:\\build. Links are skipped.' },
         network: { type: 'boolean', description: 'Connect to the pool\'s internal switch. Default false.' },
-        reserveCpu: { type: 'number', description: 'Reserve this percentage of the VM\'s cores for timed runs (up to the policy\'s cap). Default 0.' }
+        reserveCpu: { type: 'number', description: 'Reserve this percentage of the VM\'s cores for timed runs (up to the policy\'s cap). Default 0.' },
+        interactive: { enum: [false, 'user', 'admin'], description: 'Log a guest account on interactively (autologon, then one guest restart), so vm_run with session: \'interactive\' can run in its desktop session: \'user\' (the standard user) or \'admin\'. For programs that need a real logged-on session (their own desktops, windows). Default false.' }
       }
     },
     run: vmStart
@@ -382,20 +397,21 @@ const tools = [
   },
   {
     name: 'vm_reset',
-    description: 'Back to a clean VM now: restores its clean checkpoint and starts it again (exactly vm_start), with the build copied in. Defaults to this session\'s last start\'s network and reserveCpu, and the build last started or synced.',
+    description: 'Back to a clean VM now: restores its clean checkpoint and starts it again (exactly vm_start), with the build copied in. Defaults to this session\'s last start\'s network, reserveCpu and interactive, and the build last started or synced.',
     inputSchema: {
       type: 'object',
       properties: {
         build: { type: 'string', description: 'Default: the build last started or synced in this session.' },
         network: { type: 'boolean' },
-        reserveCpu: { type: 'number' }
+        reserveCpu: { type: 'number' },
+        interactive: { enum: [false, 'user', 'admin'] }
       }
     },
     run: vmReset
   },
   {
     name: 'vm_run',
-    description: 'Run a command in the running VM and return its exit code, stdout and stderr (16 KB each). On a timeout the command is killed inside the guest by its PID. Runs as the guest\'s admin, or as its standard user.',
+    description: 'Run a command in the running VM and return its exit code, stdout and stderr (16 KB each). Runs as the guest\'s admin, or as its standard user. By default in session 0 (PowerShell Direct: no desktop; on a timeout it is killed by its PID). With session: \'interactive\' (after vm_start with interactive), in the logged-on account\'s desktop session instead; if such a run times out or doesn\'t finish cleanly, the VM is restored (its output is read first), which ends everything it started: vm_start or vm_reset to go on.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -403,11 +419,12 @@ const tools = [
         shell: { type: 'string', enum: ['cmd', 'powershell'], description: 'Default cmd.' },
         as: { type: 'string', enum: ['admin', 'user'], description: 'admin (default) or user (a standard user; C:\\build is read-only for it).' },
         timeoutSec: { type: 'number', description: '1-3600. Default 120.' },
-        cwd: { type: 'string', description: 'Guest working folder. Default C:\\build.' }
+        cwd: { type: 'string', description: 'Guest working folder. Default C:\\build.' },
+        session: { type: 'string', enum: ['service', 'interactive'], description: 'service (default): session 0, as today. interactive: the logged-on account\'s desktop session (as must name that account); a timeout there restores the VM.' }
       },
       required: ['command']
     },
-    run: pass('run')
+    run: async args => { if (args?.session === 'interactive') await needInteractive(); return pass('run')(args) }
   },
   {
     name: 'vm_read_out',
@@ -478,7 +495,7 @@ const tools = [
 
 const INSTRUCTIONS = [
   'Hyper-V tools give you a disposable Windows VM from a shared pool: vm_acquire, vm_start (with your build folder), vm_run, vm_read_out, vm_stop, then always vm_release.',
-  'Every start restores the VM\'s clean checkpoint. For a work session, keep the VM running instead: vm_sync copies only changed files into C:\\build, vm_reset gives a clean VM again, vm_renew extends the lease (within the policy). Several agents can each hold a VM at once; if none is free, wait and retry.',
+  'Every start restores the VM\'s clean checkpoint. For a work session, keep the VM running instead: vm_sync copies only changed files into C:\\build, vm_reset gives a clean VM again, vm_renew extends the lease (within the policy). Runs are in session 0 (no desktop) unless the VM was started with interactive (a guest account logged on): then vm_run with session: "interactive" runs in that desktop session, for programs that make their own desktops or windows. Several agents can each hold a VM at once; if none is free, wait and retry.',
   'Network is off unless you ask, and then only to an internal switch (no internet). Don\'t put real sign-ins, tokens or real CLIs in a VM.',
   'Write anything you want back to C:\\out inside, and read it with vm_read_out before vm_stop.',
   'pool_plan, pool_create, pool_resize and pool_remove change the pool: use them only when the user asks. The user approves each plan in an admin PowerShell; never run the approve line yourself.'
