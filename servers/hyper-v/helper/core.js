@@ -306,36 +306,97 @@ class Helper {
     return hits.size === 1 ? [...hits][0] : 'other'
   }
 
-  held(project) { return [...this.leases.values()].filter(l => l.project === project).length }
+  /**
+   * A VM's image: recorded by its create, or else recovered through its job's approved plan (the plan names the image
+   * its VMs were built from, and its digest was approved), or else 'legacy': never guessed. A legacy VM is Windows (no
+   * other kind existed before images were recorded); it serves a plain Windows acquire, never an exact image request.
+   */
+  imageOf(vm) {
+    const s = this.state
+    const i = s.intents.get(vm.intentId)
+    if (i?.image) return i.image
+    this.provenance ??= new Map()
+    if (this.provenance.has(vm.vmId)) return this.provenance.get(vm.vmId)
+    let sha = 'legacy'
+    const planId = i?.jobId && s.jobs.get(i.jobId)?.planId
+    if (planId && PLAN_ID_RE.test(planId)) {
+      try {
+        const plan = JSON.parse(fs.readFileSync(join(this.dir, 'plans', `${planId}.json`), 'utf8'))
+        if (/^[0-9a-f]{64}$/.test(plan?.image?.sha256 || '') && (plan.add || []).some(a => a.intentId === vm.intentId)) sha = plan.image.sha256
+      } catch { /* no plan file: legacy */ }
+    }
+    this.provenance.set(vm.vmId, sha)
+    return sha
+  }
+
+  osOf(vm) { const sha = this.imageOf(vm); return sha === 'legacy' ? 'windows' : (this.state.images.get(sha)?.os || 'windows') }
+
+  /** A verified image by its sha256 (or a unique prefix of 12 or more), or throws. */
+  verifiedImage(want) {
+    const w = String(want).toLowerCase()
+    if (!/^[0-9a-f]{12,64}$/.test(w)) throw new Error('image must be a verified image\'s SHA-256 (at least its first 12 hex digits): pool_status lists them.')
+    const hits = [...this.state.images.values()].filter(i => i.sha256.startsWith(w))
+    if (hits.length !== 1) throw new Error(hits.length ? `image ${want} matches more than one verified image: give more of its SHA-256.` : `No verified image ${want}: pool_status lists them.`)
+    return hits[0]
+  }
+
+  held(project, os) { return [...this.leases.values()].filter(l => l.project === project && (!os || l.os === os)).length }
+
+  /** Why this project may never have this kind (not "not now": its cap for the OS is 0, or the image isn't on its list), or null. */
+  notAllowed(project, want) {
+    const p = this.policy.projects.find(x => x.name === project)
+    if (!p) return null
+    if (p.maxVms?.[want.os] === 0) return `project ${project} may not use ${want.os} VMs`
+    if (want.image && p.images.length && !p.images.includes(want.image)) return `project ${project} may not use image ${want.image.slice(0, 12)}`
+    return null
+  }
+
+  /** The free VMs this project may take for this request: of its OS, of its image if asked, of its allowed images. */
+  candidates(project, want) {
+    const p = this.policy.projects.find(x => x.name === project)
+    return this.freeVms().filter(v => {
+      const img = this.imageOf(v)
+      if (this.osOf(v) !== want.os) return false
+      if (want.image && img !== want.image) return false
+      if (p?.images.length && !p.images.includes(img)) return false
+      return true
+    })
+  }
 
   /**
-   * Why a free VM can't go to this project now, or null. Its cap, then every other project's unmet reservation, which
-   * the free VMs must still cover after this one goes.
+   * Why a free VM can't go to this project for this request now, or null: its allowlist and its cap for the OS, then a
+   * VM of that kind, then every other project's unmet reservation for that OS, which the usable free VMs of the OS must
+   * still cover after this one goes (the image only narrows which VM is taken).
    */
-  blocked(project) {
+  blocked(project, want = { os: 'windows' }) {
+    const no = this.notAllowed(project, want)
+    if (no) return no
     const p = this.policy.projects.find(x => x.name === project)
-    if (p?.maxVms !== undefined && this.held(project) >= p.maxVms) return `project ${project} holds its cap of ${p.maxVms}`
-    const free = this.freeVms().length
-    if (!free) return 'none is free'
-    const owed = this.policy.projects.filter(q => q.name !== project).map(q => ({ q, n: Math.max(0, (q.reserveVms || 0) - this.held(q.name)) })).filter(x => x.n)
+    const cap = p?.maxVms?.[want.os]
+    if (cap !== undefined && this.held(project, want.os) >= cap) return `project ${project} holds its ${want.os} cap of ${cap}`
+    const mine = this.candidates(project, want)
+    if (!mine.length) return want.image ? `none of image ${want.image.slice(0, 12)} is free` : this.freeVms().some(v => this.osOf(v) === want.os) || want.os === 'windows' ? 'none is free' : `the pool has no free ${want.os} VM`
+    const freeOs = this.freeVms().filter(v => this.osOf(v) === want.os).length
+    const owed = this.policy.projects.filter(q => q.name !== project).map(q => ({ q, n: Math.max(0, (q.reserveVms?.[want.os] || 0) - this.held(q.name, want.os)) })).filter(x => x.n)
     const total = owed.reduce((a, x) => a + x.n, 0)
-    if (free - 1 < total) return `the free VM${free > 1 ? 's are' : ' is'} reserved for ${owed.map(x => x.q.name).join(', ')}`
+    if (freeOs - 1 < total) return `the free ${want.os} VM${freeOs > 1 ? 's are' : ' is'} reserved for ${owed.map(x => x.q.name).join(', ')}`
     return null
   }
 
   /** Makes the lease (under the pool lock): the first free VM, for this connection and project. */
-  grant(connId, project, minutes, keepOnFailure) {
+  grant(connId, project, minutes, keepOnFailure, want = { os: 'windows' }) {
     const c = this.conns.get(connId)
     if (!c) throw new Error('unknown connection')
-    const vm = this.freeVms()[0]
+    const vm = this.candidates(project, want)[0]
     const now = this.now()
     const sessionEnd = now + policyMod.sessionMinutes(this.policy) * MINUTE_MS
     const lease = {
       leaseId: `l-${hex(6)}`, vmId: vm.vmId, vmName: vm.vmName, connId, ownerConn: connId, pid: c.pid, ending: null, children: new Set(),
       acquiredAt: now, sessionEnd, deadline: Math.min(sessionEnd, now + Math.round(minutes * MINUTE_MS)), keepOnFailure: !!keepOnFailure,
       kept: false, running: false, failed: false, runs: 0, dirty: false, network: false, reserve: 0,
-      // project: pinned here, so a later change of the caller's roots never moves the lease or its count.
-      project,
+      // project: pinned here, so a later change of the caller's roots never moves the lease or its count; os and image:
+      // the VM's, for the per-OS shares.
+      project, os: this.osOf(vm), image: this.imageOf(vm),
       // interactive: the account logged on in the guest by this start ('user' or 'admin'), or null.
       interactive: null,
       // What the helper knows of the guest's C:\build (vm_sync): the files it placed, by canonical key; gen moves on at
@@ -346,8 +407,8 @@ class Helper {
     this.leases.set(vm.vmId, lease)
     c.vmId = vm.vmId
     this.armDeadline(lease)
-    const share = project === 'other' ? '' : ` for project ${project}`
-    return { text: `Leased ${vm.vmName} (lease ${lease.leaseId})${share} until ${new Date(lease.deadline).toISOString()}; vm_renew can extend it up to ${new Date(sessionEnd).toISOString()} (the policy's work-session cap). Call vm_start next; always vm_release when done.`, data: { lease: lease.leaseId, vm: vm.vmName, deadline: lease.deadline, sessionEnd, project } }
+    const share = `${project === 'other' ? '' : ` for project ${project}`}${this.osOf(vm) === 'windows' && !want.image ? '' : ` (${this.osOf(vm)}, image ${this.imageOf(vm).slice(0, 12)})`}`
+    return { text: `Leased ${vm.vmName} (lease ${lease.leaseId})${share} until ${new Date(lease.deadline).toISOString()}; vm_renew can extend it up to ${new Date(sessionEnd).toISOString()} (the policy's work-session cap). Call vm_start next; always vm_release when done.`, data: { lease: lease.leaseId, vm: vm.vmName, deadline: lease.deadline, sessionEnd, project, os: lease.os, image: lease.image } }
   }
 
   /** Settles an entry's waiting request once: with a result, or an error. Its token makes a late timer a no-op. */
@@ -375,10 +436,10 @@ class Helper {
     this.dropExpired()
     for (const e of [...this.queue]) {
       if (!this.freeVms().length) break
-      if (!e.pending || this.blocked(e.project)) continue
+      if (!e.pending || this.blocked(e.project, e.want)) continue
       this.queue = this.queue.filter(x => x !== e)
       let outcome
-      try { outcome = { result: this.grant(e.connId, e.project, e.minutes, e.keepOnFailure) } } catch (err) { outcome = { error: err } }
+      try { outcome = { result: this.grant(e.connId, e.project, e.minutes, e.keepOnFailure, e.want) } } catch (err) { outcome = { error: err } }
       this.settle(e, outcome)
     }
   }
@@ -406,7 +467,8 @@ class Helper {
    * the next call. A newer call from the same connection supersedes a waiting one. The pool lock is held only for these
    * decisions, never while waiting.
    */
-  async acquire(connId, { minutes = 60, keepOnFailure = false, wait = false, roots } = {}) {
+  async acquire(connId, { minutes = 60, keepOnFailure = false, wait = false, roots, os = 'windows', image } = {}) {
+    if (!OSES.includes(os)) throw new Error(`os must be ${OSES.join(' or ')}`)
     const step = await this.poolLock(async () => {
       if (this.quiesced) throw new Error('The helper is being uninstalled: no new leases.')
       const c = this.conns.get(connId)
@@ -416,16 +478,21 @@ class Helper {
       if (!Number.isFinite(minutes) || minutes < 1 || minutes > max) throw new Error(`minutes must be 1-${max} (the policy's maxLeaseMinutes).`)
       const s = this.state
       if (![...s.vms.values()].some(v => v.ready)) throw new Error('The pool has no VMs yet: ask the user to create one (pool_plan, then their approval, then pool_create).')
+      const want = { os, ...(image !== undefined ? { image: this.verifiedImage(image).sha256 } : {}) }
+      if (want.image && (this.state.images.get(want.image)?.os || 'windows') !== os) throw new Error(`image ${want.image.slice(0, 12)} is a ${this.state.images.get(want.image)?.os || 'windows'} image, not ${os}.`)
       this.dropExpired()
       let e = this.queue.find(x => x.connId === connId)
       if (e) this.settle(e, { error: new Error('Superseded by a newer vm_acquire from this connection.') })
+      // A kind this project may never have is refused at once, never queued.
+      const no = this.notAllowed(e ? e.project : this.projectOf(roots), want)
+      if (no) { if (e) this.queue = this.queue.filter(x => x !== e); throw new Error(`No VM for you: ${no}.`) }
       if (!wait) {
         this.drain()
         const project = e ? e.project : this.projectOf(roots)
-        const why = this.blocked(project)
+        const why = this.blocked(project, want)
         if (!why) {
           if (e) this.queue = this.queue.filter(x => x !== e)
-          return { result: this.grant(connId, project, minutes, keepOnFailure) }
+          return { result: this.grant(connId, project, minutes, keepOnFailure, want) }
         }
         const next = [...this.leases.values()].sort((a, b) => a.deadline - b.deadline)[0]
         const pool = `${s.vms.size} in the pool${s.quarantined.size ? `, ${s.quarantined.size} quarantined` : ''}${this.queue.length ? `, ${this.queue.length} waiting` : ''}`
@@ -435,7 +502,7 @@ class Helper {
         e = { connId, project: this.projectOf(roots), since: this.now(), expires: null, pending: null }
         this.queue.push(e)
       }
-      Object.assign(e, { minutes, keepOnFailure, expires: null })
+      Object.assign(e, { minutes, keepOnFailure, want, expires: null })
       const token = ++this.tokens
       const done = new Promise(resolve => {
         const timer = setTimeout(() => {
@@ -458,7 +525,7 @@ class Helper {
     if (out.result) return out.result
     // Waited WAIT_MS without a VM: the place is kept for the next call.
     return await this.poolLock(async () => {
-      const why = this.blocked(step.e.project) || 'none is free'
+      const why = this.blocked(step.e.project, step.e.want) || 'none is free'
       const i = this.queue.indexOf(step.e)
       return {
         text: `Still waiting for a VM (${why}): number ${i + 1} of ${this.queue.length} in line. Call vm_acquire with wait: true again within ${Math.round(KEEP_MS / 1000)} s to keep your place.`,
@@ -1057,12 +1124,16 @@ class Helper {
     this.dropExpired()
     const out = []
     if (this.policy.projects.length) {
-      const per = this.policy.projects.map(p => `${p.name} holds ${this.held(p.name)}${p.maxVms !== undefined ? ` of its cap of ${p.maxVms}` : ''}${p.reserveVms ? `, ${p.reserveVms} kept for it` : ''}`)
+      const per =this.policy.projects.map(p => {
+        const oses = [...new Set([...Object.keys(p.maxVms || {}), ...Object.keys(p.reserveVms || {}), ...[...this.leases.values()].filter(l => l.project === p.name).map(l => l.os)])]
+        const parts = (oses.length ? oses : ['windows']).map(os => `${this.held(p.name, os)} ${os}${p.maxVms?.[os] !== undefined ? ` of its cap of ${p.maxVms[os]}` : ''}${p.reserveVms?.[os] ? `, ${p.reserveVms[os]} kept for it` : ''}`)
+        return `${p.name} holds ${parts.join(', ')}${p.images.length ? ` (images ${p.images.map(i => i.slice(0, 12)).join(', ')} only)` : ''}`
+      })
       out.push(`Projects: ${per.join('; ')}; other holds ${this.held('other')}.`)
     }
     if (this.queue.length) {
       const now = this.now()
-      out.push(`Waiting in line: ${this.queue.map((e, i) => `${i + 1}. ${e.project}, ${Math.round((now - e.since) / 1000)} s${e.pending ? '' : ' (between calls)'}${this.blocked(e.project) ? ` (${this.blocked(e.project)})` : ''}`).join('; ')}.`)
+      out.push(`Waiting in line: ${this.queue.map((e, i) => `${i + 1}. ${e.project}${e.want && e.want.os !== 'windows' ? ` (${e.want.os})` : ''}, ${Math.round((now - e.since) / 1000)} s${e.pending ? '' : ' (between calls)'}${this.blocked(e.project, e.want) ? ` (${this.blocked(e.project, e.want)})` : ''}`).join('; ')}.`)
     }
     return out
   }
@@ -1075,7 +1146,8 @@ class Helper {
       const state = s.quarantined.has(v.vmId) ? `QUARANTINED (${s.quarantined.get(v.vmId)})`
         : v.removing ? 'removing' : !v.ready ? 'creating'
           : l ? `leased${l.kept ? ', kept for inspection' : ''}${l.running ? ', running' : ''}${l.interactive ? `, ${l.interactive === 'user' ? 'the standard user' : 'the admin'} logged on interactively` : ''} until ${new Date(l.deadline).toISOString()} (session ends by ${new Date(l.sessionEnd).toISOString()})` : 'free'
-      return `- ${v.vmName}: ${v.cores} cores, ${v.memoryMB} MB, ${v.diskGB} GB disk; ${state}${v.vmId === mine ? ' (yours)' : ''}${expiry(v, this.now())}`
+      const img = this.imageOf(v)
+      return `- ${v.vmName}: ${this.osOf(v)}, image ${img === 'legacy' ? 'unknown (made before images were recorded)' : img.slice(0, 12)}; ${v.cores} cores, ${v.memoryMB} MB, ${v.diskGB} GB disk; ${state}${v.vmId === mine ? ' (yours)' : ''}${expiry(v, this.now())}`
     })
     const img = [...s.images.values()].at(-1)
     const lines = [
@@ -1110,8 +1182,13 @@ class Helper {
     } else {
       if (op === 'create' && pool.length) throw new Error(`The pool already has ${pool.length} VM(s): use action "resize" (or "remove" first).`)
       if (op === 'resize' && !pool.length) throw new Error('There is no pool yet: use action "create".')
-      const like = pool.find(v => v.ready)
-      const n = args.vms ?? (op === 'create' ? Math.min(2, this.policy.maxVms) : pool.length)
+      // An image named by its SHA-256 (a verified one): create from it, or resize that image's group only. A resize with
+      // no image is the whole pool, as before; legacy VMs (image unknown) are in no image's group.
+      const groupImg = typeof args.image === 'string' ? this.verifiedImage(args.image) : null
+      const group = groupImg && op === 'resize' ? pool.filter(v => this.imageOf(v) === groupImg.sha256) : pool
+      const others = pool.filter(v => !group.includes(v))
+      const like = group.find(v => v.ready) || pool.find(v => v.ready)
+      const n = args.vms ?? (op === 'create' ? Math.min(2, this.policy.maxVms) : group.length)
       if (!Number.isInteger(n) || n < (op === 'create' ? 1 : 0) || n > this.policy.maxVms) throw new Error(`vms must be ${op === 'create' ? 1 : 0}-${this.policy.maxVms}`)
       const cores = args.cores ?? like?.cores ?? Math.max(1, Math.min(this.policy.maxCoresPerVm, Math.floor(facts.logicalCpus / 4)))
       const memoryMB = args.memoryGB !== undefined ? Math.round(args.memoryGB * 1024) : like?.memoryMB ?? Math.min(8192, Math.floor(this.policy.maxMemoryMBTotal / Math.max(1, n) / 2) * 2)
@@ -1120,21 +1197,22 @@ class Helper {
       const location = args.location ?? like?.folder?.replace(/\\pool\\i-[0-9a-f]{16}$/i, '') ?? folders.slice().sort((a, b) => b.freeGB - a.freeGB)[0]?.folder ?? this.policy.diskFolders[0]
       if (!this.policy.diskFolders.some(d => d.toLowerCase() === win32.normalize(location).replace(/\\+$/, '').toLowerCase())) throw new Error(`location must be one of the policy's disk folders: ${this.policy.diskFolders.join('; ')}`)
       const network = op === 'create' ? !!args.network : !!s.switch
-      const keep = pool.slice(0, Math.min(pool.length, n))
-      const add = Math.max(0, n - pool.length)
+      const keep = group.slice(0, Math.min(group.length, n))
+      const add = Math.max(0, n - group.length)
       plan.add = Array.from({ length: add }, () => {
         const intentId = `i-${hex(8)}`
         return { intentId, name: `${this.policy.prefix}-${hex(4)}`, folder: `${location}\\pool\\${intentId}`, cores, memoryMB, diskGB }
       })
-      plan.remove = pool.slice(n).map(v => ({ vmId: v.vmId, name: v.vmName, folder: v.folder }))
+      plan.remove = group.slice(n).map(v => ({ vmId: v.vmId, name: v.vmName, folder: v.folder }))
       plan.switch = op === 'create' && network ? `${this.policy.prefix}-internal` : null
-      const bad = policyMod.checkPool(this.policy, [...keep, ...plan.add], { network })
+      const bad = policyMod.checkPool(this.policy, [...others, ...keep, ...plan.add], { network })
       if (bad.length) throw new Error(`That plan is outside the policy: ${bad.join('; ')}.`)
       if (cores * 2 > facts.logicalCpus) throw new Error(`${cores} cores per VM is more than half this host's ${facts.logicalCpus} logical CPUs.`)
       const free = folders.find(f => f.folder.toLowerCase() === location.toLowerCase())?.freeGB ?? 0
       const need = plan.add.length * 40 + (plan.add.length ? 10 : 0)
       if (plan.add.length && free < need) throw new Error(`${location} has ${free} GB free; ${plan.add.length} new VM(s) need about ${need} GB (installed Windows plus checkpoints and the image).`)
-      if (plan.add.length) {
+      if (plan.add.length && groupImg) plan.image = pick(groupImg)
+      else if (plan.add.length) {
         const img = await this.planImage(args.image, location)
         if (!img.ready) return { text: img.text }
         plan.image = img.image
@@ -1304,7 +1382,7 @@ class Helper {
 
   async createVm(job, plan, a, label) {
     const step = t => { job.progress = `${label}: ${t}` }
-    this.journal.append({ t: 'intent', jobId: job.jobId, intentId: a.intentId, vmName: a.name, folder: a.folder, cores: a.cores, memoryMB: a.memoryMB, diskGB: a.diskGB })
+    this.journal.append({ t: 'intent', jobId: job.jobId, intentId: a.intentId, vmName: a.name, folder: a.folder, cores: a.cores, memoryMB: a.memoryMB, diskGB: a.diskGB, image: plan.image?.sha256 })
     if (!policyMod.underDiskFolder(this.policy, a.folder)) throw new Error('its folder is outside the policy')
     fs.mkdirSync(a.folder, { recursive: true })
     const creds = this.creds()
@@ -1403,8 +1481,9 @@ class Helper {
 
 const PROTOCOL = 'hyperv-mcp/3' // 2: renew, sync_plan, sync (MC-1497); 3: start's interactive, run's session (MC-1503)
 // Additive features since protocol 3, by name, so a server that asks for exactly hyperv-mcp/3 (hyper-v 1.2.0) keeps
-// working with this helper: 'projects' = projects, acquire's wait and roots, whoami (MC-1502).
-const FEATURES = ['projects']
+// working with this helper: 'projects' = projects, acquire's wait and roots, whoami; 'images' = image groups,
+// acquire's os and image, per-OS shares, a project's image allowlist (MC-1502).
+const FEATURES = ['projects', 'images']
 const EVAL_DAYS = 90
 const DAY_MS = 24 * 60 * 60 * 1000
 
@@ -1431,7 +1510,8 @@ function baselineProblem(f, vm) {
   return null
 }
 
-const pick = img => ({ sha256: img.sha256, size: img.size, edition: img.edition, build: img.build, pinned: img.pinned, source: img.source })
+const pick = img => ({ sha256: img.sha256, size: img.size, edition: img.edition, build: img.build, pinned: img.pinned, source: img.source, os: img.os || 'windows' })
+const OSES = ['windows', 'linux']
 
 function describePlan(plan, digest, approve) {
   const lines = [`Plan ${plan.id} (${plan.op}), valid for 30 minutes. Digest ${digest}; its first 6 characters are ${digest.slice(0, 6)}.`]

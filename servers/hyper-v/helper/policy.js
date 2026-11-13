@@ -30,6 +30,9 @@ const DEFAULTS = {
 const MAX_BUILD_ROOTS = 16
 const MAX_PROJECTS = 16
 const PROJECT_RE = /^[a-z][a-z0-9-]{0,31}$/
+const OSES = ['windows', 'linux']
+/** A project's cap or reservation as { os: n }: a plain number means Windows (the only kind before images had an OS). */
+const byOs = v => v === undefined ? undefined : typeof v === 'number' ? { windows: v } : v
 /** Why a policy folder isn't an absolute local folder (not UNC, a device path, a drive root or with ".."), or null. */
 const folderProblem = f =>
   typeof f !== 'string' || !/^[a-zA-Z]:[\\/]/.test(f) || f.split(/[\\/]/).includes('..') || win32.parse(f).root === win32.normalize(f)
@@ -74,11 +77,11 @@ function projectProblems(projects, maxVms) {
   if (!Array.isArray(projects) || projects.length > MAX_PROJECTS) return [`projects must be a list of at most ${MAX_PROJECTS}`]
   const names = new Set()
   const owned = [] // [folder (lower case), project]
-  let reserved = 0
+  const reserved = {} // by OS
   for (const [i, pr] of projects.entries()) {
     const at = `project ${typeof pr?.name === 'string' ? `"${pr.name}"` : i + 1}`
     if (!pr || typeof pr !== 'object' || Array.isArray(pr)) { out.push(`${at} must be an object`); continue }
-    const known = ['name', 'folders', 'maxVms', 'reserveVms', 'buildRoots']
+    const known = ['name', 'folders', 'maxVms', 'reserveVms', 'buildRoots', 'images']
     for (const k of Object.keys(pr)) if (!known.includes(k)) out.push(`${at}: unknown field "${k}"`)
     if (!PROJECT_RE.test(pr.name ?? '')) out.push(`${at}: name must be 1-32 lower-case letters, digits and -, starting with a letter`)
     else if (names.has(pr.name) || pr.name === 'other') out.push(`${at}: the name is taken${pr.name === 'other' ? ' ("other" is everyone outside the projects)' : ''}`)
@@ -93,15 +96,28 @@ function projectProblems(projects, maxVms) {
       }
       owned.push([n, pr.name])
     }
-    for (const k of ['maxVms', 'reserveVms']) if (pr[k] !== undefined && !int(pr[k], 0, 64)) out.push(`${at}: ${k} must be a whole number 0-64`)
-    if (int(pr.maxVms, 0, 64) && int(pr.reserveVms, 0, 64) && pr.reserveVms > pr.maxVms) out.push(`${at}: reserveVms (${pr.reserveVms}) is over its maxVms (${pr.maxVms})`)
-    if (int(pr.reserveVms, 0, 64)) reserved += pr.reserveVms
+    // maxVms and reserveVms: a whole number (Windows), or by OS: { "windows": 2, "linux": 1 }.
+    const shares = {}
+    for (const k of ['maxVms', 'reserveVms']) {
+      const v = pr[k]
+      if (v === undefined) continue
+      const ok = int(v, 0, 64) || (v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length && Object.entries(v).every(([os, n]) => OSES.includes(os) && int(n, 0, 64)))
+      if (!ok) out.push(`${at}: ${k} must be a whole number 0-64, or one per OS (${OSES.join(', ')}), such as { "windows": 2, "linux": 1 }`)
+      else shares[k] = byOs(v)
+    }
+    for (const os of OSES) {
+      const cap = shares.maxVms?.[os]
+      const res = shares.reserveVms?.[os]
+      if (cap !== undefined && res !== undefined && res > cap) out.push(`${at}: its ${os} reserveVms (${res}) is over its ${os} maxVms (${cap})`)
+      if (res) reserved[os] = (reserved[os] || 0) + res
+    }
+    if (pr.images !== undefined && (!Array.isArray(pr.images) || pr.images.length > 16 || pr.images.some(i => typeof i !== 'string' || !/^[0-9a-f]{64}$/i.test(i)))) out.push(`${at}: images must be a list of at most 16 image SHA-256s (64 hex digits)`)
     if (pr.buildRoots !== undefined) {
       if (!Array.isArray(pr.buildRoots) || pr.buildRoots.length > MAX_BUILD_ROOTS) out.push(`${at}: buildRoots must be a list of at most ${MAX_BUILD_ROOTS} folders`)
       else for (const f of pr.buildRoots) { const why = folderProblem(f); if (why) out.push(`${at}: build root "${f}" ${why}`) }
     }
   }
-  if (int(maxVms, 1, 64) && reserved > maxVms) out.push(`the projects reserve ${reserved} VMs in all, over the policy's maxVms (${maxVms})`)
+  for (const [os, n] of Object.entries(reserved)) if (int(maxVms, 1, 64) && n > maxVms) out.push(`the projects reserve ${n} ${os} VMs in all, over the policy's maxVms (${maxVms})`)
   return out
 }
 
@@ -114,8 +130,8 @@ function load(dir) {
   const bad = problems(p)
   if (bad.length) throw new Error(`policy.json is not usable: ${bad.join('; ')}. Run setup again.`)
   const projects = (p.projects ?? []).map(pr => Object.freeze({
-    name: pr.name, folders: Object.freeze(pr.folders.map(tidy)), maxVms: pr.maxVms, reserveVms: pr.reserveVms ?? 0,
-    buildRoots: Object.freeze((pr.buildRoots ?? []).map(tidy))
+    name: pr.name, folders: Object.freeze(pr.folders.map(tidy)), maxVms: byOs(pr.maxVms), reserveVms: byOs(pr.reserveVms) ?? {},
+    buildRoots: Object.freeze((pr.buildRoots ?? []).map(tidy)), images: Object.freeze((pr.images ?? []).map(i => i.toLowerCase()))
   }))
   return Object.freeze({ ...p, diskFolders: Object.freeze(p.diskFolders.map(tidy)), buildRoots: Object.freeze((p.buildRoots ?? []).map(tidy)), projects: Object.freeze(projects) })
 }

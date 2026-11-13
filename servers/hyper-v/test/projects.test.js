@@ -50,10 +50,10 @@ test('caps and reservations: cli 2 + mcp 1 on 3 VMs; a reservation is never give
   // The second free VM is the last one not kept for mcp: cli may take it (2 free, 1 owed to mcp).
   assert.match((await acquire(c2, { roots: [cli] })).text, /for project cli/)
   // cli is at its cap; the last VM is mcp's reservation, so "other" can't have it either.
-  assert.match((await acquire(c3, { roots: [cli] })).error, /^No VM for you now: project cli holds its cap of 2 \(3 in the pool\)/)
-  assert.match((await acquire(o1, { roots: [path.join(sc0.dir, 'web')] })).error, /^No VM for you now: the free VM is reserved for mcp/)
+  assert.match((await acquire(c3, { roots: [cli] })).error, /^No VM for you now: project cli holds its windows cap of 2 \(3 in the pool\)/)
+  assert.match((await acquire(o1, { roots: [path.join(sc0.dir, 'web')] })).error, /^No VM for you now: the free windows VM is reserved for mcp/)
   assert.match((await acquire(m1, { roots: [mcp] })).text, /for project mcp/)
-  assert.match(await status(c1), /Projects: cli holds 2 of its cap of 2; mcp holds 1 of its cap of 1, 1 kept for it; other holds 0\./)
+  assert.match(await status(c1), /Projects: cli holds 2 windows of its cap of 2; mcp holds 1 windows of its cap of 1, 1 kept for it; other holds 0\./)
   await h.stop()
 })
 
@@ -86,7 +86,7 @@ test('a waiter its project\'s cap blocks keeps its place; a later waiter of anot
   await o1.request('release')
   assert.match((await po).text, /^Leased /, 'other was served past the capped cli waiter')
   const r2 = await p2
-  assert.match(r2.text, /^Still waiting for a VM \(project cli holds its cap of 1\): number 1 of 1/, 'and cli kept its place')
+  assert.match(r2.text, /^Still waiting for a VM \(project cli holds its windows cap of 1\): number 1 of 1/, 'and cli kept its place')
   await h.stop()
 })
 
@@ -143,7 +143,7 @@ test('a lease keeps the project it was granted for: the cap counts it whatever i
   const [c1, c2] = [h.conn(1), h.conn(2)]
   assert.match((await acquire(c1, { roots: [cli] })).text, /for project cli/)
   assert.strictEqual((await c1.request('whoami', { roots: [path.join(sc0.dir, 'elsewhere')] })).data.project, 'other')
-  assert.match((await acquire(c2, { roots: [cli] })).error, /project cli holds its cap of 1/)
+  assert.match((await acquire(c2, { roots: [cli] })).error, /project cli holds its windows cap of 1/)
   await h.stop()
 })
 
@@ -245,7 +245,7 @@ test('the projects feature: this helper still reports hyperv-mcp/3 (so hyper-v 1
   const helper = await startHelper(sc)
   const v = await helper.conn(1).request('version')
   assert.strictEqual(v.data.protocol, 'hyperv-mcp/3')
-  assert.deepStrictEqual(v.data.features, ['projects'])
+  assert.deepStrictEqual(v.data.features, ['projects', 'images'])
   await helper.stop()
   const shim = path.join(sc.dir, 'older-core.js')
   fs.writeFileSync(shim, `const m = require(${JSON.stringify(path.join(__dirname, '..', 'helper', 'core.js'))})
@@ -281,7 +281,7 @@ test('setup\'s -ProjectsFile check uses the helper\'s own policy code, before an
   const bad = run(JSON.stringify([{ name: 'cli', folders: ['D:\\Dev'], reserveVms: 1, maxVms: 0 }, { name: 'cli', folders: ['D:\\Dev\\mcp'] }]))
   assert.notStrictEqual(bad.status, 0)
   const said = (bad.stdout + bad.stderr).replace(/\s+/g, ' ') // PowerShell wraps its error lines
-  assert.match(said, /The projects can't be used: project "cli": reserveVms \(1\) is over its maxVms \(0\); project "cli": the name is taken; project "cli": folder "D:\\Dev\\mcp" overlaps another of its folders .*Nothing was changed\./)
+  assert.match(said, /The projects can't be used: project "cli": its windows reserveVms \(1\) is over its windows maxVms \(0\); project "cli": the name is taken; project "cli": folder "D:\\Dev\\mcp" overlaps another of its folders .*Nothing was changed\./)
   const overlap = run(JSON.stringify([{ name: 'cli', folders: ['D:\\Dev'] }, { name: 'mcp', folders: ['D:\\Dev\\mcp'] }]))
   assert.match((overlap.stdout + overlap.stderr).replace(/\s+/g, ' '), /project "mcp": folder "D:\\Dev\\mcp" overlaps project "cli"'s \(one root must belong to one project\)/)
   const notJson = run('{ nope')
@@ -295,9 +295,9 @@ test('the policy\'s projects: names, numbers, overlaps and the reservations agai
   const ok = { ...base, projects: [{ name: 'cli', folders: [D('Dev', 'cli'), D('Dev', 'cli-wt')], maxVms: 2, reserveVms: 1 }, { name: 'mcp', folders: [D('Dev', 'mcp')], reserveVms: 2, buildRoots: [D('b')] }] }
   assert.deepStrictEqual(policy.problems(ok), [])
   const why = p => policy.problems({ ...base, projects: p }).join('\n')
-  assert.match(why([{ name: 'a', folders: [D('a')], reserveVms: 2 }, { name: 'b', folders: [D('b')], reserveVms: 2 }]), /the projects reserve 4 VMs in all, over the policy's maxVms \(3\)/)
-  assert.match(why([{ name: 'a', folders: [D('a')], maxVms: -1 }]), /maxVms must be a whole number 0-64/)
-  assert.match(why([{ name: 'a', folders: [D('a')], reserveVms: 1.5 }]), /reserveVms must be a whole number 0-64/)
+  assert.match(why([{ name: 'a', folders: [D('a')], reserveVms: 2 }, { name: 'b', folders: [D('b')], reserveVms: 2 }]), /the projects reserve 4 windows VMs in all, over the policy's maxVms \(3\)/)
+  assert.match(why([{ name: 'a', folders: [D('a')], maxVms: -1 }]), /maxVms must be a whole number 0-64, or one per OS/)
+  assert.match(why([{ name: 'a', folders: [D('a')], reserveVms: 1.5 }]), /reserveVms must be a whole number 0-64, or one per OS/)
   assert.match(why([{ name: 'other', folders: [D('a')] }]), /the name is taken \("other" is everyone outside the projects\)/)
   assert.match(why([{ name: 'A b', folders: [D('a')] }]), /name must be 1-32 lower-case letters/)
   assert.match(why([{ name: 'a', folders: [] }]), /folders must list 1-16 folders/)

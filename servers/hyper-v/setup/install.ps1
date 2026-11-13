@@ -233,8 +233,10 @@ $policy = [ordered]@{
   buildRoots = @($buildRoots)
 }
 if ($projects.Count) {
-  $reserved = ($projects | ForEach-Object { [int]$_.reserveVms } | Measure-Object -Sum).Sum
-  if ($reserved -gt $policy.maxVms) { throw "The projects reserve $reserved VMs in all, over the policy's maxVms ($($policy.maxVms))." }
+  # Again with this policy's maxVms, now known: the reservations, per OS, may not add up to more.
+  $why = (ConvertTo-Json -InputObject @($projects) -Depth 6 -Compress) | & $nodeCheck -e "const p = require(process.argv[1]); let t = ''; process.stdin.on('data', d => t += d).on('end', () => { process.stdout.write(p.projectProblems(JSON.parse(t), Number(process.argv[2])).join('; ')) })" (Join-Path $src 'helper\policy.js') $policy.maxVms
+  if ($LASTEXITCODE) { throw 'The projects check (node) failed.' }
+  if ($why) { throw "The projects can't be used: $why." }
   $policy.projects = @($projects)
 }
 if ($MaxSessionMinutes) { $policy.maxSessionMinutes = $MaxSessionMinutes }

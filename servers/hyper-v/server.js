@@ -388,13 +388,17 @@ const tools = [
       properties: {
         minutes: { type: 'number', description: 'Lease length, 1 to the policy\'s maximum (default 60).' },
         keepOnFailure: { type: 'boolean', description: 'If a run fails, vm_stop keeps the VM as it is for inspection until release or the deadline. Default false.' },
-        wait: { type: 'boolean', description: 'Wait in line for a VM (each call waits about 20 s; repeat it within 2 minutes to keep your place). Default false.' }
+        wait: { type: 'boolean', description: 'Wait in line for a VM (each call waits about 20 s; repeat it within 2 minutes to keep your place). Default false.' },
+        os: { type: 'string', enum: ['windows', 'linux'], description: 'The kind of VM. Default windows. (Linux VMs come with a Linux image in the pool.)' },
+        image: { type: 'string', description: 'Only a VM built from this image: its SHA-256, or its first 12+ hex digits (vm_status lists them). Default: any image of the OS your project may use.' }
       }
     },
-    run: async ({ minutes, keepOnFailure, wait } = {}) => {
+    run: async ({ minutes, keepOnFailure, wait, os, image } = {}) => {
       const p = await helperProtocol()
       if (wait) await needFeature('projects', 'waiting in line (wait: true)')
-      const args = { minutes, keepOnFailure, ...(p.features.includes('projects') ? { wait: !!wait, roots: await rootList() } : {}) }
+      // A filter the helper can't honour is refused before anything is sent: dropped, it could lease the wrong kind.
+      if (image !== undefined || (os !== undefined && os !== 'windows')) await needFeature('images', `asking for ${image !== undefined ? 'an image' : `a ${os} VM`}`)
+      const args = { minutes, keepOnFailure, ...(p.features.includes('projects') ? { wait: !!wait, roots: await rootList() } : {}), ...(p.features.includes('images') ? { os, image } : {}) }
       const r = await helper.request('acquire', args)
       return { text: text(r), isError: r?.isError }
     }
@@ -510,7 +514,7 @@ const tools = [
         diskGB: { type: 'number' },
         location: { type: 'string', description: 'One of the policy\'s disk folders.' },
         network: { type: 'boolean', description: 'create: also create an internal switch so runs can ask for networking. Default false.' },
-        image: { type: 'object', description: '{ iso: "<path to the ISO>" } or { download: "<https URL on microsoft.com>" }. Omit to use the image already verified.' }
+        image: { type: ['object', 'string'], description: 'A new image to check: { iso: "<path to the ISO>" } or { download: "<https URL on microsoft.com>" }. Or a verified image\'s SHA-256 (or its first 12+ hex digits): create from it, or resize only the VMs built from it (its group). Omit to use the newest verified image (and, for resize, the whole pool).' }
       }
     },
     run: pass('pool_plan')

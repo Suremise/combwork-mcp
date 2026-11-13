@@ -232,7 +232,7 @@ The pool is built from the **Windows 11 Enterprise evaluation** ISO. Microsoft's
 
 | Tool | What it does |
 |---|---|
-| `vm_acquire({ minutes=60, keepOnFailure=false, wait=false })` | Leases one VM to this session (one VM per session) until `vm_release`, its deadline (at most the policy's `maxLeaseMinutes`), or this server exiting. Without `wait`, it refuses when none is free for this session's project, saying why (none free, the project's cap, a VM kept for another project), when the next lease ends, and where it would stand in line. With `wait: true` it waits in line about 20 s, and a repeat call within 2 minutes keeps its place (see "Sharing the pool between projects"). |
+| `vm_acquire({ minutes=60, keepOnFailure=false, wait=false, os='windows', image? })` | Leases one VM of that OS (and image, when given) to this session (one VM per session) until `vm_release`, its deadline (at most the policy's `maxLeaseMinutes`), or this server exiting. Without `wait`, it refuses when none is free for this session's project, saying why (none free, the project's cap, a VM kept for another project), when the next lease ends, and where it would stand in line. With `wait: true` it waits in line about 20 s, and a repeat call within 2 minutes keeps its place (see "Sharing the pool between projects"). |
 | `vm_start({ build?, network=false, reserveCpu=0, interactive=false })` | Restores the clean checkpoint (always), applies this run's network and CPU reserve, and starts the VM. It waits for the guest, then copies `build` in to `C:\build` and leaves an empty `C:\out`. With `interactive: 'user'` (the standard user) or `'admin'`, it first logs that account on interactively: autologon, one guest restart (tens of seconds), then it waits for the account's desktop session (see "The interactive session"). Refused on a VM kept for inspection: release it, and acquire again. |
 | `vm_renew({ minutes=60 })` | Sets the lease's deadline to now + `minutes` (1 to the policy's `maxLeaseMinutes`), never past the work session's end: `maxSessionMinutes` after `vm_acquire` (`vm_status` shows both). Refused once the deadline has passed, even a moment before the helper ends the lease. |
 | `vm_sync({ build?, full=false, delete=true })` | Copies only the files that changed in `build` (default: the folder last started or synced) into the **running** guest's `C:\build`, without a restore: `C:\out`, installed software and anything else the runs left stay. The server hashes the folder (same roots checks as `vm_start`, every time; links skipped); the helper compares that with what it placed in `C:\build` and takes only the new or changed files, hashing them itself as they arrive. Files gone from the folder are removed unless `delete` is false. Only what the helper copied is tracked: if your runs changed `C:\build` themselves, use `full: true` (clears `C:\build`, copies everything) or `vm_reset`. After a sync fails, only those two are accepted. |
@@ -242,7 +242,7 @@ The pool is built from the **Windows 11 Enterprise evaluation** ISO. Microsoft's
 | `vm_stop({ keep=false })` | Turns the VM off and restores the clean checkpoint, then **verifies** it: Off, at the checkpoint (by id), adapter disconnected, reserve 0. It says "Reverted" only then. Otherwise **CLEANUP FAILED**, and the VM is quarantined. The lease stays. `keep` (or a failed run with `keepOnFailure`) leaves it as it is until release or the deadline. |
 | `vm_release()` | Restores the VM (as `vm_stop`) and ends the lease. |
 | `vm_status()` | The pool, every lease, your VM, any pool job, the policy, and where builds may come from. Works with the server turned off. |
-| `pool_plan({ action='create'\|'resize'\|'remove', vms?, cores?, memoryGB?, diskGB?, location?, network?, image? })` | Plans a pool change and changes nothing (see "Building the pool"). |
+| `pool_plan({ action='create'\|'resize'\|'remove', vms?, cores?, memoryGB?, diskGB?, location?, network?, image? })` | Plans a pool change and changes nothing (see "Building the pool"). `image` is a new ISO to check, or a verified image's SHA-256: build from it, or resize only its group (see "A pool from more than one image"). |
 | `pool_create` / `pool_resize` / `pool_remove({ planId })` | Carries out an approved plan in the background. |
 | `pool_status()` | The pool, the image, and any job or image check in progress. |
 
@@ -306,8 +306,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\combwork-mcp\ser
   whose roots are in no project, in several, or that sends none (an older server) is in **other**, which has no cap and
   no reservation: it shares what nobody reserved. One project's folder may not be inside, around or the same as another's.
 - **`maxVms`** caps how many VMs the project holds at once. **`reserveVms`** keeps that many for it: a free VM goes to
-  another project (or other) only while the free ones still cover every other project's unmet reservation. The
-  reservations can't add up to more than the policy's VMs.
+  another project (or other) only while the free ones still cover every other project's unmet reservation. Both are
+  **per OS**: a number means Windows, or give one per OS, such as `{ "windows": 2, "linux": 1 }`; the reservations of an
+  OS can't add up to more than the policy's VMs. A cap of 0 for an OS means the project may not use it.
+- **`images`** (optional) lists the images the project may use, by SHA-256. Left out, it may use every image of the OSes
+  it may use.
 - **`buildRoots`** are build folders for that project alone (beside its sessions' own roots). `-BuildRoot`'s folders stay
   everyone's. To move a folder from everyone to one project, update the agents' servers first: an older server sends no
   roots, so it only ever sees `-BuildRoot`'s.
@@ -321,6 +324,24 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\combwork-mcp\ser
 - A lease keeps the project it was granted for, whatever its session's roots say later.
 - `vm_status` shows each project's VMs against its cap and reservation, the line in order (and why each waiter is
   waiting), and the session's own project.
+
+### A pool from more than one image
+
+A pool can hold VMs built from several verified images, and so of several kinds: today Windows; Linux joins as an image
+kind through MC-1500's guest driver, with no change to the pool.
+- **Each VM records its image and OS** at its create. A VM made before that is given the image of the approved plan that
+  made it, which the helper still has; if that can't be proved, its image is **unknown** (`vm_status` says so). An
+  unknown-image VM is Windows: it serves a plain Windows `vm_acquire`, but never a request for an exact image, and no
+  image's group counts it. It's never guessed.
+- **Groups:** `pool_plan({ action: 'create' | 'resize', image: '<SHA-256 or its first 12+ hex digits>', vms })` builds
+  from that verified image, or sets that image's group of VMs to `vms` (adding from it, or removing its unleased VMs),
+  leaving the others alone. A `resize` without an image is the whole pool, as before.
+- **`vm_acquire({ os = 'windows', image? })`** takes only VMs of that OS, and of that image when given. A request for an
+  OS or image the session's project may not use is refused at once, never put in line. A waiter is only ever given a VM
+  of its own kind.
+- **Shares by OS:** caps and reservations count VMs of the request's OS. A reservation is covered by any usable free VM
+  of its OS: the image only narrows which one is taken.
+- **One VM per session**, as before: a project that needs Windows and Linux together uses two sessions (two agents).
 - Setup checks the file with the helper's own policy code before changing anything. A rerun without `-ProjectsFile`
   keeps the list; `-ProjectsFile none` clears it.
 - **It's advisory, like the roots it comes from:** it keeps honest agents from starving each other, not a determined one
@@ -353,9 +374,11 @@ The server and the helper speak a numbered protocol, and since protocol 3 the he
 names it, so a newer helper keeps serving older servers:
 - protocol 2: `vm_renew`, `vm_sync`, `vm_reset`;
 - protocol 3: `vm_start`'s `interactive` and `vm_run`'s `session`;
-- feature `projects` (protocol 3): projects, `vm_acquire`'s `wait` and a project's own build folders.
+- feature `projects` (protocol 3): projects, `vm_acquire`'s `wait` and a project's own build folders;
+- feature `images` (protocol 3): image groups, `vm_acquire`'s `os` and `image`, shares by OS, a project's image list.
+  The server sends no `vm_acquire` at all for an `image`, or an OS other than Windows, to a helper without it.
 
-The helper stays at protocol 3 for `projects` because hyper-v 1.2.0's server asks for exactly hyperv-mcp/3 before an
+The helper stays at protocol 3 for these features because hyper-v 1.2.0's server asks for exactly hyperv-mcp/3 before an
 interactive run: it keeps working with this helper. An older helper refuses each newer feature with "run setup again"
 rather than quietly ignoring it. A newer feature also needs the newer server: an agent's server loads at its start, so
 update the server (and restart the agent) as well as the helper.
@@ -565,7 +588,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\projects.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\projects.test.js test\images.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
 ```
 
 - `units.test.js`:
@@ -656,6 +679,13 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   serving the next waiter, and a newer call superseding an older one (in-process); a lease keeping its project; which
   project a session is in; through `server.js`, a project's own build folder refused to others, and a newer helper
   still serving this server; setup's projects check under Windows PowerShell 5.1; the policy's rules for projects.
+- `images.test.js`, a pool from more than one image (a stub "linux" kind, made only in the journal): groups by image
+  (a resize adding to or taking from one image's VMs only); `vm_acquire` by OS and image, one VM per session; VMs made
+  before images were recorded, recovered through their plans, or unknown when that can't be proved (a plain Windows
+  acquire takes one, an exact image never does, a group resize leaves them alone); shares by OS and the image list (a
+  project at its Windows cap still gets Linux, a Linux reservation kept, a forbidden OS or image refused, never queued);
+  a reservation covered by any free VM of its OS; a waiter never given another kind; and, through `server.js`, no
+  acquire at all sent to a helper without `images` for an image or Linux.
 - `approvals.test.js`:
   - unapproved plans;
   - forged approvals: another digest, operation or epoch, expired, a malformed nonce, another plan's id, a writable
