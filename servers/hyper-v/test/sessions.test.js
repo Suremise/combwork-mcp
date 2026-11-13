@@ -234,6 +234,63 @@ test('plans: a replaced, used or stale plan is refused, and its staging must be 
   assert.strictEqual(sc.stub().calls.filter(c => c.op === 'copy-in').length, 1, 'only the first start copied a build')
 })
 
+test('manifests in parts: bound to the lease and generation, taken once, capped per batch and in all', async t => {
+  const { sc, h, a, vm } = await session('sync-manifest-parts')
+  t.after(() => h.stop())
+  await startWith(a, { 'a.txt': 'A' })
+  await assert.rejects(a.request('manifest_add', { files: [] }), /manifest_begin first/)
+  await assert.rejects(a.request('sync_plan', {}), /no manifest/)
+  // In parts, then planned and applied as one manifest (aggregate checks included).
+  await a.request('manifest_begin')
+  await a.request('manifest_add', { files: manifest({ 'a.txt': 'A2' }) })
+  await a.request('manifest_add', { files: manifest({ 'b.txt': 'B' }) })
+  let plan = await a.request('sync_plan', {})
+  assert.deepStrictEqual(plan.data.need.sort(), ['a.txt', 'b.txt'])
+  await assert.rejects(a.request('sync_plan', {}), /no manifest/, 'taken once')
+  await a.request('manifest_begin')
+  await a.request('manifest_add', { files: manifest({ 'x.txt': 'X' }) })
+  await a.request('manifest_add', { files: manifest({ 'X.TXT': 'X' }) })
+  await assert.rejects(a.request('sync_plan', {}), /are the same file on Windows/, 'duplicates across batches')
+  // Stale after a start; capped per batch and in all.
+  await a.request('manifest_begin')
+  await a.request('start')
+  await assert.rejects(a.request('manifest_add', { files: [] }), /stale/)
+  await assert.rejects(a.request('sync_plan', {}), /no manifest|stale/)
+  await a.request('manifest_begin')
+  const many = n => Array.from({ length: n }, (_, i) => ({ path: `f${i}`, size: 0, sha256: sha('') }))
+  await assert.rejects(a.request('manifest_add', { files: many(5001) }), /at most 5000 entries per manifest_add/)
+  for (let i = 0; i < 20; i++) await a.request('manifest_add', { files: many(5000) })
+  await assert.rejects(a.request('manifest_add', { files: many(1) }), /more than 100000 files/)
+  // None of that touched the lease or the guest.
+  assert.match((await a.request('status')).text, new RegExp(`${vm}: .*leased, running`))
+  assert.strictEqual(sc.stub().calls.filter(c => c.op === 'sync-in').length, 0)
+})
+
+test('server.js refuses a request line over the host\'s 4 MB limit before sending it: the lease is untouched', async t => {
+  const sc = scratch('line-guard')
+  const { h } = await withPool(sc, 1)
+  t.after(() => h.stop())
+  const net = require('net')
+  const readline = require('readline')
+  // A pipe that answers like the helper and records every line's length (as the host would see it).
+  const pipe = `hyperv-mcp-test-guard-${process.pid}`
+  const lens = []
+  const srv = net.createServer(s => readline.createInterface({ input: s, crlfDelay: Infinity }).on('line', line => {
+    lens.push(line.length)
+    const m = JSON.parse(line)
+    s.write(JSON.stringify({ id: m.id, ok: true, result: { text: m.op === 'version' ? 'hyperv-mcp/2' : 'ok', data: m.op === 'version' ? { protocol: 'hyperv-mcp/2', buildRoots: [] } : {} } }) + '\n')
+  }))
+  await new Promise(r => srv.listen(`\\\\.\\pipe\\${pipe}`, r))
+  t.after(() => srv.close())
+  const s = server({ ...sc.env, HYPERV_MCP_ENABLED: '1', HYPERV_MCP_PIPE: pipe })
+  t.after(() => s.close())
+  const r = await s.call('vm_run', { command: 'x'.repeat(5 * 1024 * 1024) })
+  assert.strictEqual(r.isError, true)
+  assert.match(r.text, /over the helper's 4 MB line limit: it was not sent \(your lease is untouched\)/)
+  assert.ok(lens.every(n => n < 4 * 1024 * 1024), 'nothing over the limit reached the pipe')
+  assert.match((await s.call('vm_status')).text, /Mode: service/, 'the connection still works')
+})
+
 test('a failed sync leaves C:\\build untrusted: incremental syncs are refused until a full sync or a reset', async t => {
   const { sc, h, a, vm } = await session('sync-failed')
   t.after(() => h.stop())

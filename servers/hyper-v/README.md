@@ -361,7 +361,9 @@ disconnect restore and verify the VM, and kill whatever is in flight, a sync inc
 policy (each up to `maxLeaseMinutes`, all within `maxSessionMinutes` of the acquire, which setup refuses below one
 lease), and refused once the deadline has passed. A sync:
 - is planned against the helper's record of the files it placed in `C:\build` (by canonical Windows identity: case
-  and slashes don't count). A manifest naming one file twice, or a file and something inside it, is refused;
+  and slashes don't count). A manifest naming one file twice, or a file and something inside it, is refused. The
+  manifest goes to the helper in batches of at most 1 MB, whatever the build's size, and `server.js` never sends a
+  request line over the service host's 4 MB limit (one over it would close the connection, and with it the lease);
 - is bound to its lease and a generation that moves on at every start, reset, sync and the lease's end, so a replaced,
   used or stale plan is refused, and rechecked inside the VM's lock. Its staging must be exactly the plan's files,
   each once, with the size and SHA-256 the plan has: the helper hashes them as they arrive;
@@ -518,7 +520,9 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   - the build folder checked at every sync and reset (outside the roots, the profile, a junction, a root the client
     dropped); links in the build skipped;
   - the record: `delete: false` then `delete: true`; a full sync replacing it outright; file and folder transitions;
-  - manifests: unsafe paths, the same file twice by Windows identity, a file and its descendant;
+  - manifests: unsafe paths, the same file twice by Windows identity, a file and its descendant; sent in parts
+    (bound to the lease and generation, taken once, capped per batch and in all); a request line over 4 MB refused
+    by `server.js` before it is sent;
   - plans: replaced, used and stale (after a reset) refused; staging exactly the needed files (not another, not twice,
     not another size or content, none missing); a start never taking a plan's staging as its build;
   - a failed sync, a failed full sync and a failed start leaving `C:\build` untrusted until a full sync or a reset;
@@ -564,7 +568,9 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
     the respawned helper restores the VM before the pipe reopens;
   - the host killed: its helper dies too;
   - a pipe name already taken is refused;
-  - a client can't forge framing, and an over-long line closes only that connection.
+  - a client can't forge framing, and an over-long line closes only that connection;
+  - a `vm_sync` of 18000 files (a 4.6 MB manifest) through the real pipe: batched, the warm session and its lease
+    intact.
 
 **The trial** on a real host (not automated): setup, then `pool_plan` → approval → `pool_create` from the pinned 25H2
 ISO, then:

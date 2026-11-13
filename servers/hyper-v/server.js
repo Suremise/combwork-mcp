@@ -30,6 +30,10 @@ const MODE = process.env.HYPERV_MCP_MODE === 'direct' ? 'direct' : 'service'
 const PIPE = `\\\\.\\pipe\\${process.env.HYPERV_MCP_PIPE || 'hyperv-mcp'}`
 const MAX_BUILD_MB = Number(process.env.HYPERV_MCP_MAX_BUILD_MB || 2048)
 const CHUNK = 768 * 1024
+const MANIFEST_BYTES = 1024 * 1024
+// The service host closes a connection whose request line is over 4 MB (HvMcpHost.cs MaxLine), and with it the lease:
+// a request that long is refused here instead, before it is sent.
+const MAX_LINE = 4 * 1024 * 1024 - 1024
 const PROTOCOL = 'hyperv-mcp/2'
 const splitList = v => String(v || '').split(';').map(s => s.trim()).filter(Boolean)
 
@@ -93,11 +97,13 @@ function helperLink() {
   }))
   return {
     request: async (op, args) => {
-      const s = sock || await connect()
       const id = ++seq
+      const line = JSON.stringify({ id, op, args: args ?? {} })
+      if (Buffer.byteLength(line) > MAX_LINE) throw new Error(`The request ${op} is over the helper's 4 MB line limit: it was not sent (your lease is untouched).`)
+      const s = sock || await connect()
       return new Promise((resolve, reject) => {
         waiting.set(id, { resolve, reject })
-        s.write(JSON.stringify({ id, op, args: args ?? {} }) + '\n')
+        s.write(line + '\n')
       })
     },
     takeLost: () => { const l = lost; lost = null; return l },
@@ -270,8 +276,21 @@ async function vmSync({ build, full = false, delete: del = true } = {}) {
   if (typeof folder !== 'string' || !folder.trim()) throw new Error('build must be a folder path')
   const real = await buildFolder(folder)
   const { files, skipped } = walk(real)
-  const manifest = files.map(f => ({ path: f.rel, size: f.size, sha256: hashFile(f) }))
-  const plan = await warm('sync_plan', { files: manifest, full: !!full, delete: del !== false })
+  // The manifest goes in batches of at most MANIFEST_BYTES of JSON (and the helper's 5000 entries), never one line:
+  // the service host closes a connection whose line is over 4 MB, which would end the lease.
+  await warm('manifest_begin')
+  let batch = []
+  let size = 0
+  const flush = async () => { if (batch.length) await warm('manifest_add', { files: batch }); batch = []; size = 0 }
+  for (const f of files) {
+    const e = { path: f.rel, size: f.size, sha256: hashFile(f) }
+    const n = Buffer.byteLength(JSON.stringify(e)) + 1
+    if (batch.length && (size + n > MANIFEST_BYTES || batch.length >= 5000)) await flush()
+    batch.push(e)
+    size += n
+  }
+  await flush()
+  const plan = await warm('sync_plan', { full: !!full, delete: del !== false })
   const byPath = new Map(files.map(f => [f.rel.replace(/\//g, '\\'), f]))
   const needed = (plan.data?.need || []).map(p => byPath.get(p))
   if (needed.some(f => !f)) throw new Error('The helper asked for a file this walk doesn\'t have: call vm_sync again.')

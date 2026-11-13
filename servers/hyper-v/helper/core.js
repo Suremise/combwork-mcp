@@ -33,6 +33,7 @@ const INSTALL_WAIT_MS = Number(process.env.HYPERV_MCP_INSTALL_WAIT_MS || 90 * 60
 const POLL_MS = Number(process.env.HYPERV_MCP_POLL_MS || 3000)
 const RETRY_MS = Number(process.env.HYPERV_MCP_RETRY_MS || 5 * 60_000)
 const CHUNK_MAX = 1024 * 1024
+const MANIFEST_BATCH = 5000 // entries per manifest_add, at most (server.js sends batches of at most 1 MB of JSON)
 const MINUTE_MS = Number(process.env.HYPERV_MCP_MINUTE_MS || 60_000) // test-only: shorter lease minutes
 
 const hex = n => crypto.randomBytes(n).toString('hex')
@@ -511,8 +512,39 @@ class Helper {
    * what the helper placed in C:\build, and returns the plan: the files it needs (new or changed) and the ones to remove
    * (in the record, gone from the manifest; with delete, the default). full: everything, into a cleared C:\build.
    */
+  /**
+   * A manifest sent in parts (manifest_begin, then manifest_add batches), so no request line comes near the service
+   * host's 4 MB frame limit, whatever the build's size: a line over it closes the connection, which would end the lease.
+   * It is the connection's, bound to its lease and generation; sync_plan without `files` takes it (once).
+   */
+  manifestBegin(connId) {
+    const lease = this.leaseOf(connId)
+    const c = this.conns.get(connId)
+    c.manifest = { leaseId: lease.leaseId, gen: lease.sync.gen, files: [] }
+    return { text: 'manifest' }
+  }
+
+  manifestAdd(connId, { files } = {}) {
+    const lease = this.leaseOf(connId)
+    const m = this.conns.get(connId).manifest
+    if (!m) throw new Error('no manifest being sent: manifest_begin first')
+    if (m.leaseId !== lease.leaseId || m.gen !== lease.sync.gen) throw new Error('This manifest is stale (the VM was started, reset or synced since): call vm_sync again.')
+    if (!Array.isArray(files) || files.length > MANIFEST_BATCH) throw new Error(`files must be a list of at most ${MANIFEST_BATCH} entries per manifest_add`)
+    if (m.files.length + files.length > 100_000) { this.conns.get(connId).manifest = null; throw new Error('the build has more than 100000 files') }
+    for (const f of files) m.files.push(f && typeof f === 'object' ? { path: f.path, size: f.size, sha256: f.sha256 } : f)
+    return { text: 'ok', data: { files: m.files.length } }
+  }
+
   syncPlan(connId, { files, full = false, delete: del = true } = {}) {
     const lease = this.leaseOf(connId)
+    const conn = this.conns.get(connId)
+    if (files === undefined) {
+      const m = conn.manifest
+      conn.manifest = null
+      if (!m) throw new Error('no manifest: send one (manifest_begin, manifest_add) or pass files')
+      if (m.leaseId !== lease.leaseId || m.gen !== lease.sync.gen) throw new Error('This manifest is stale (the VM was started, reset or synced since): call vm_sync again.')
+      files = m.files
+    }
     if (lease.kept) throw new Error(`${lease.vmName} is kept for inspection: vm_release it first.`)
     if (!lease.running) throw new Error('The VM is not running: vm_start it first (a sync copies into the running guest).')
     if (!Array.isArray(files) || files.length > 100_000) throw new Error('files must be a list of at most 100000 entries')
@@ -1089,6 +1121,8 @@ class Helper {
       case 'status': return this.status(connId)
       case 'acquire': return this.acquire(connId, args)
       case 'renew': return this.renew(connId, args)
+      case 'manifest_begin': return this.manifestBegin(connId)
+      case 'manifest_add': return this.manifestAdd(connId, args)
       case 'sync_plan': return this.syncPlan(connId, args)
       case 'sync': return this.sync(connId, args)
       case 'stage_begin': return this.stageBegin(connId, args)
