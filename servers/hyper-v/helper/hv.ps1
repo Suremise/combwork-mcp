@@ -60,7 +60,8 @@ public static class HvMcpIsoWriter {
   [HvMcpIsoWriter]::Write($stream, $path)
 }
 
-# Runs one command inside the guest (as its admin, or as the standard user through a one-off scheduled task), with
+# Runs one command inside the guest, as whichever guest account the session belongs to (its admin, or its standard user:
+# see 'guest-run'), with
 # stdout and stderr redirected to C:\out\.run-<n>.*; on a timeout, kills its process tree by PID. Fixed text: the
 # command reaches the guest as data and is written to a script file there.
 $GuestRun = {
@@ -83,56 +84,13 @@ $GuestRun = {
     if ($t -match '^-?\d{1,10}$') { return [int]$t } else { return $null }
   }
   $timedOut = $false; $killed = $false; $procId = $null
-  if ($j.runAs) {
-    # The standard user runs through a one-off scheduled task, which needs "Log on as a batch job" (not granted to
-    # Users by default): granted here, inside this disposable guest only.
-    if (-not ('HvMcpLsa' -as [type])) {
-      Add-Type -TypeDefinition @'
-using System; using System.ComponentModel; using System.Runtime.InteropServices; using System.Security.Principal;
-public static class HvMcpLsa {
-  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct LSA_UNICODE_STRING { public ushort Length; public ushort MaximumLength; public string Buffer; }
-  [StructLayout(LayoutKind.Sequential)] struct LSA_OBJECT_ATTRIBUTES { public int Length; public IntPtr RootDirectory; public IntPtr ObjectName; public uint Attributes; public IntPtr SecurityDescriptor; public IntPtr SecurityQualityOfService; }
-  [DllImport("advapi32.dll")] static extern uint LsaOpenPolicy(IntPtr system, ref LSA_OBJECT_ATTRIBUTES attrs, uint access, out IntPtr handle);
-  [DllImport("advapi32.dll")] static extern uint LsaAddAccountRights(IntPtr handle, byte[] sid, LSA_UNICODE_STRING[] rights, uint count);
-  [DllImport("advapi32.dll")] static extern uint LsaClose(IntPtr handle);
-  [DllImport("advapi32.dll")] static extern int LsaNtStatusToWinError(uint status);
-  public static void Grant(string account, string right) {
-    var sid = (SecurityIdentifier)new NTAccount(account).Translate(typeof(SecurityIdentifier));
-    var b = new byte[sid.BinaryLength]; sid.GetBinaryForm(b, 0);
-    var attrs = new LSA_OBJECT_ATTRIBUTES(); IntPtr h;
-    uint st = LsaOpenPolicy(IntPtr.Zero, ref attrs, 0x000F0FFF, out h);
-    if (st != 0) throw new Win32Exception(LsaNtStatusToWinError(st));
-    try {
-      var r = new LSA_UNICODE_STRING { Buffer = right, Length = (ushort)(right.Length * 2), MaximumLength = (ushort)(right.Length * 2 + 2) };
-      st = LsaAddAccountRights(h, b, new[] { r }, 1);
-      if (st != 0) throw new Win32Exception(LsaNtStatusToWinError(st));
-    } finally { LsaClose(h); }
-  }
-}
-'@
-    }
-    [HvMcpLsa]::Grant([string]$j.runAs.user, 'SeBatchLogonRight')
-    $task = "hvmcp-run-$n"
-    $act = New-ScheduledTaskAction -Execute 'cmd.exe' -Argument "/d /c `"$wrapper`""
-    Register-ScheduledTask -TaskName $task -Action $act -User ([string]$j.runAs.user) -Password ([string]$j.runAs.password) -RunLevel Limited -Force | Out-Null
-    Start-ScheduledTask -TaskName $task
-    $deadline = (Get-Date).AddSeconds([int]$j.timeoutSec)
-    while ($null -eq (& $exitCode) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
-    if ($null -eq (& $exitCode)) {
-      $timedOut = $true
-      Stop-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue
-      $killed = ((Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue).State -ne 'Running')
-    }
-    Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
-  } else {
-    $p = Start-Process -FilePath 'cmd.exe' -ArgumentList "/d /c `"$wrapper`"" -PassThru -WindowStyle Hidden
-    $procId = $p.Id
-    if (-not $p.WaitForExit([int]$j.timeoutSec * 1000)) {
-      $timedOut = $true
-      # Through cmd, so taskkill's own messages can't become PowerShell errors; killed only once the process is gone.
-      & cmd.exe /d /c "taskkill /T /F /PID $procId >nul 2>&1"
-      $killed = $p.WaitForExit(10000)
-    }
+  $p = Start-Process -FilePath 'cmd.exe' -ArgumentList "/d /c `"$wrapper`"" -PassThru -WindowStyle Hidden
+  $procId = $p.Id
+  if (-not $p.WaitForExit([int]$j.timeoutSec * 1000)) {
+    $timedOut = $true
+    # Through cmd, so taskkill's own messages can't become PowerShell errors; killed only once the process is gone.
+    & cmd.exe /d /c "taskkill /T /F /PID $procId >nul 2>&1"
+    $killed = $p.WaitForExit(10000)
   }
   $read = {
     param($f)
@@ -302,8 +260,20 @@ try {
     }
     'guest-run' {
       $vm = Get-OwnVm $a
-      $j = @{ n = [int]$a.n; command = [string]$a.command; shell = [string]$a.shell; cwd = [string]$a.cwd; timeoutSec = [int]$a.timeoutSec; cap = [int]$a.cap; runAs = $a.runAs }
-      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestRun -ArgumentList $j
+      $j = @{ n = [int]$a.n; command = [string]$a.command; shell = [string]$a.shell; cwd = [string]$a.cwd; timeoutSec = [int]$a.timeoutSec; cap = [int]$a.cap }
+      $as = Cred $a.cred
+      if ($a.runAs) {
+        # As the guest's standard user: its own PowerShell Direct session, which (like any remote session) needs the
+        # account in Remote Management Users (S-1-5-32-580). Added here, as the guest's admin, inside this disposable guest
+        # only; a restore takes it away again.
+        $user = [string]$a.runAs.user
+        Invoke-Command -VMId $vm.Id -Credential $as -ScriptBlock {
+          param($u)
+          if (-not (Get-LocalGroupMember -SID 'S-1-5-32-580' | Where-Object { $_.Name -like "*\$u" })) { Add-LocalGroupMember -SID 'S-1-5-32-580' -Member $u }
+        } -ArgumentList $user
+        $as = Cred $a.runAs
+      }
+      Invoke-Command -VMId $vm.Id -Credential $as -ScriptBlock $GuestRun -ArgumentList $j
     }
     'guest-list' { $vm = Get-OwnVm $a; Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestList }
     'guest-read' {

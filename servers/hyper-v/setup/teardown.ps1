@@ -79,14 +79,15 @@ function Get-Inventory([string]$Path) {
 # Verifies one deletion target as it is now (its parents already pinned): not a link; owner in $RootOwners; contents
 # with only $Who (and per-VM SIDs) as owners and grantees. Returns its identity, or $null when it is missing.
 # The target's handle goes in $Pins (its own list, released just before the target is deleted).
-function Test-Target([string]$Path, [string[]]$RootOwners, [string[]]$Who, [Collections.ArrayList]$Pins) {
+# $AllowPattern: Hyper-V's own grantees, for a disk folder only (never the state folder).
+function Test-Target([string]$Path, [string[]]$RootOwners, [string[]]$Who, [Collections.ArrayList]$Pins, [string]$AllowPattern) {
   if (-not (Test-Path -LiteralPath $Path)) { return $null }
   $h = [HvMcpStorage]::Open($Path)
   [void]$Pins.Add($h)
   if ([HvMcpStorage]::Attributes($h) -band [HvMcpStorage]::FILE_ATTRIBUTE_REPARSE_POINT) { throw "$Path is a link or junction: refusing to delete through it. Nothing was changed." }
   $owner = Get-OwnerSid (Get-HandleSecurity $h)
   if ($RootOwners -notcontains $owner) { throw "$Path is owned by $owner, not Administrators or SYSTEM: it isn't setup's, so it won't be deleted. Nothing was changed." }
-  $bad = @(Test-ExclusiveAcl $Path -Allowed $Who -Owners $Who -AllowPattern $script:HyperVGrantees)
+  $bad = @(Test-ExclusiveAcl $Path -Allowed $Who -Owners $Who -AllowPattern $AllowPattern)
   if ($bad.Count) { throw "$Path isn't as setup and the helper leave it ($($bad[0])$(if ($bad.Count -gt 1) { "; and $($bad.Count - 1) more" })), so it won't be deleted. Nothing was changed." }
   return [HvMcpStorage]::Identity($h)
 }
@@ -106,6 +107,9 @@ function Invoke-Teardown {
   $boundary = { param($n) if ($Crash) { & $Crash $n } }
   $say = { param($m) if ($Ops.Say) { & $Ops.Say $m } }
   $legacy = [bool]$LegacyDiskFolder
+  $stateFull = [IO.Path]::GetFullPath($State).TrimEnd('\')
+  # Hyper-V's grantee pattern applies to disk folders only: anything but the state folder (and what it holds).
+  $patternFor = { param($p) if ($p -eq $stateFull -or $p.ToLowerInvariant().StartsWith($stateFull.ToLowerInvariant() + '\')) { $null } else { $script:HyperVGrantees } }
   $pins = New-Object Collections.ArrayList   # parents: held for the whole run
   $targetPins = @{}                          # each target's own handles (and its nested targets'), by target path
   $key = $null
@@ -156,7 +160,7 @@ function Invoke-Teardown {
         foreach ($p in $top) {
           Open-TrustedAncestors $p $Trusted $pins
           $targetPins[$p] = New-Object Collections.ArrayList
-          $id = Test-Target $p $RootOwners $Who $targetPins[$p]
+          $id = Test-Target $p $RootOwners $Who $targetPins[$p] (& $patternFor $p)
           if (-not $legacy) {
             $want = $receipts[$p.ToLowerInvariant()]
             if ($id -and $id -ne $want) { throw "$p isn't the folder setup created (its identity differs from its receipt): it won't be used or deleted. Nothing was changed." }
@@ -227,7 +231,7 @@ function Invoke-Teardown {
         if (-not $t.identity) { throw "$($t.path) appeared after the uninstall verified it as missing: it won't be used or deleted." }
         Open-TrustedAncestors $t.path $Trusted $pins
         $targetPins[$t.path] = New-Object Collections.ArrayList
-        $id = Test-Target $t.path $RootOwners $Who $targetPins[$t.path]
+        $id = Test-Target $t.path $RootOwners $Who $targetPins[$t.path] (& $patternFor $t.path)
         if ($id -ne $t.identity) { throw "$($t.path) isn't the folder the uninstall verified (its identity differs): it won't be used or deleted." }
       }
     }

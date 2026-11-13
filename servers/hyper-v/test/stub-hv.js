@@ -68,7 +68,17 @@ function run(s, op, a) {
       return { vmId: id }
     }
     case 'start-vm': { const vm = own(s, a); vm.state = 'Running'; vm.installed = !s.installNeverReady; return { started: true } }
-    case 'guest-ready': { const vm = own(s, a); return { ready: vm.state === 'Running' && vm.installed !== false } }
+    case 'guest-ready': {
+      const vm = own(s, a)
+      // readyGate: PowerShell Direct hangs (records its PID in readyPidFile, then waits for the gate file); notReady: the
+      // guest never answers.
+      if (s.readyGate) {
+        if (s.readyPidFile) fs.writeFileSync(s.readyPidFile, String(process.pid))
+        while (!fs.existsSync(s.readyGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25)
+      }
+      if (s.notReady) return { ready: false }
+      return { ready: vm.state === 'Running' && vm.installed !== false }
+    }
     case 'guest-setup': { const vm = own(s, a); vm.disk['C:\\build'] = ''; return { editionId: s.guestEdition ?? 'EnterpriseEval', build: '26200', ubr: 6584 } }
     case 'make-clean': {
       const vm = own(s, a)

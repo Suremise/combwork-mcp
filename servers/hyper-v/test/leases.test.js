@@ -47,9 +47,9 @@ test('the deadline ends a lease and restores the VM', async t => {
   const { h, admin } = await withPool(sc, 1)
   t.after(() => h.stop())
   const a = h.conn(10)
-  const vm = await leased(a, { minutes: 1 })
+  const vm = await leased(a, { minutes: 5 }) // 1.5 s here: time for the start, which a deadline would now cut short
   await a.request('start')
-  await waitFor(async () => /; free/.test((await admin.request('status')).text), 5000, 'the deadline')
+  await waitFor(async () => /; free/.test((await admin.request('status')).text), 8000, 'the deadline')
   assert.strictEqual(vmOf(sc, vm).state, 'Off')
   await assert.rejects(a.request('run', { command: 'echo x' }), /no VM: call vm_acquire/)
 })
@@ -369,4 +369,43 @@ test('a connection closing mid-run ends its lease at once: the in-flight run is 
   assert.ok(!fs.existsSync(marker), 'the run never finished')
   assert.strictEqual(vmOf(sc, vm).state, 'Off', 'restored')
   assert.ok((await run) instanceof Error || true)
+})
+
+test('a lease ending during vm_start (disconnect or deadline, guest hung or never ready) stops the start at once', async t => {
+  const path = require('path')
+  const fs = require('fs')
+  const alive = pid => { try { process.kill(pid, 0); return true } catch (e) { return e.code === 'EPERM' } }
+  for (const [what, setup, end] of [
+    ['disconnect, guest-ready hung', sc => sc.patchStub(s => { s.readyGate = path.join(sc.dir, 'gate'); s.readyPidFile = path.join(sc.dir, 'ready.pid') }), a => a.close()],
+    ['disconnect, guest never ready', sc => sc.patchStub(s => { s.notReady = true }), a => a.close()],
+    ['deadline, guest-ready hung', sc => sc.patchStub(s => { s.readyGate = path.join(sc.dir, 'gate'); s.readyPidFile = path.join(sc.dir, 'ready.pid') }), null]
+  ]) {
+    const sc = scratch('start-cancel')
+    sc.env.HYPERV_MCP_MINUTE_MS = '1500'
+    sc.env.HYPERV_MCP_READY_WAIT_MS = '600000' // the start would otherwise wait 10 minutes
+    const { h, admin } = await withPool(sc, 1)
+    try {
+      const a = h.conn(10)
+      const vm = await leased(a, { minutes: 1 }) // deadline 1.5 s
+      setup(sc)
+      // A build is staged, so a copy-in would follow readiness if the start went on.
+      await a.request('stage_begin'); await a.request('stage_file', { path: 'x.txt', size: 1 }); await a.request('stage_chunk', { data: Buffer.from('x').toString('base64') }); await a.request('stage_end')
+      const started = a.request('start').catch(e => e)
+      await waitFor(() => sc.stub().calls.some(c => c.op === 'guest-ready'), 10_000, 'the start to reach readiness')
+      const t0 = Date.now()
+      if (end) end(a)
+      await waitFor(async () => /; free/.test((await admin.request('status')).text), 15_000, `${what}: the lease to end without the start's 10-minute wait`)
+      assert.ok(Date.now() - t0 < 15_000, what)
+      const pidFile = path.join(sc.dir, 'ready.pid')
+      if (fs.existsSync(pidFile)) await waitFor(() => !alive(Number(fs.readFileSync(pidFile, 'utf8'))), 10_000, `${what}: the hung guest-ready to be killed`)
+      const r = await started
+      if (!end) assert.match(String(r && r.message), /ended while the request waited/, `${what}: the start fails`)
+      const later = sc.stub().calls.map(c => c.op)
+      assert.ok(!later.includes('copy-in'), `${what}: no copy-in after the lease ended (${later.slice(-6)})`)
+      assert.strictEqual(vmOf(sc, vm).state, 'Off', `${what}: restored`)
+    } finally {
+      try { fs.writeFileSync(path.join(sc.dir, 'gate'), 'open') } catch { }
+      await h.stop()
+    }
+  }
 })

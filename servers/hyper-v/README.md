@@ -390,7 +390,8 @@ work as usual.
 - Output is capped at 16 KB per stream for `vm_run`, and `vm_read_out` at 256 KB per file and 1 MB per call by default.
   Write big results to a file in `C:\out` and read it in parts.
 - There's no interactive desktop or screenshots yet: commands run over PowerShell Direct, as the admin, or as the
-  standard user through a one-off scheduled task.
+  standard user in its own PowerShell Direct session. For that, the guest's admin adds the user to the guest's Remote
+  Management Users group first, inside that throwaway guest only.
 - Windows guests only. The evaluation expires after 90 days (see "Rebuilding").
 
 ## Tests

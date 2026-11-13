@@ -218,8 +218,16 @@ class Helper {
    * restored, or has been handed to someone else.
    */
   /** hv options that register the operation's PowerShell with the lease, so ending the lease can kill it. */
+  // One registered after the lease began ending (missed by endLease's one-time kill) is killed at once.
   forLease(lease, timeoutMs = 120_000) {
-    return { timeoutMs, onChild: ch => { lease.children.add(ch); ch.on('exit', () => lease.children.delete(ch)) } }
+    return {
+      timeoutMs,
+      onChild: ch => {
+        if (lease.ending) { try { ch.kill() } catch { /* gone */ } return }
+        lease.children.add(ch)
+        ch.on('exit', () => lease.children.delete(ch))
+      }
+    }
   }
 
   stillHeld(lease) {
@@ -408,18 +416,23 @@ class Helper {
       const r = await this.restore(vm) // unconditionally, before every run
       if (!r.ok) { lease.dirty = true; throw new Error(`${r.text} The start was refused.`) }
       const tRestore = this.now()
+      // Every stage of a start is the lease's: its Hyper-V calls are registered with it (ending the lease kills them), and
+      // each stage first checks the lease still holds, so nothing more starts once it has ended.
+      this.stillHeld(lease)
       const sw = network ? this.state.switch : null
-      await this.hv('configure-start', { ...this.ident(vm), switchName: sw ? sw.name : null, switchId: sw ? sw.switchId : null, reserve: reserveCpu })
+      await this.hv('configure-start', { ...this.ident(vm), switchName: sw ? sw.name : null, switchId: sw ? sw.switchId : null, reserve: reserveCpu }, this.forLease(lease))
       lease.running = true
       lease.dirty = true
       lease.network = !!network
       lease.reserve = reserveCpu
       const creds = this.creds()
-      const waited = await this.waitGuest(vm, creds.admin, READY_WAIT_MS)
+      const waited = await this.waitGuest(vm, creds.admin, READY_WAIT_MS, lease)
       if (waited === null) throw new Error(`${vm.vmName} started but its guest didn't answer within ${Math.round(READY_WAIT_MS / 1000)} s. vm_stop it and try again.`)
+      this.stillHeld(lease)
       let build = 'no build'
       if (c.stage?.done) {
         const res = await this.hv('copy-in', { ...this.ident(vm), cred: creds.admin, userName: creds.user.user, source: c.stage.dir }, this.forLease(lease, 30 * 60_000))
+        this.stillHeld(lease)
         build = `build copied in to C:\\build (${c.stage.files} files, ${c.stage.bytes} bytes${res.ms ? `, ${(res.ms / 1000).toFixed(1)} s` : ''})`
         this.dropStage(c)
       }
@@ -430,10 +443,16 @@ class Helper {
     })
   }
 
-  async waitGuest(vm, cred, ms) {
+  /**
+   * Polls until the guest answers over PowerShell Direct. For a leased start (lease given), each poll is the lease's (an
+   * ending lease kills it) and the loop stops as soon as the lease ends. The pool install's wait has no lease.
+   */
+  async waitGuest(vm, cred, ms, lease = null) {
     const t0 = this.now()
     while (this.now() - t0 < ms) {
-      const r = await this.hv('guest-ready', { ...this.ident(vm), cred }).catch(() => null)
+      if (lease) this.stillHeld(lease)
+      const r = await this.hv('guest-ready', { ...this.ident(vm), cred }, lease ? this.forLease(lease, 60_000) : undefined).catch(() => null)
+      if (lease) this.stillHeld(lease)
       if (r?.ready) return this.now() - t0
       await sleep(POLL_MS)
     }
@@ -491,6 +510,7 @@ class Helper {
       this.stillHeld(lease)
       const creds = this.creds()
       const listing = await this.hv('guest-list', { ...this.ident(vm), cred: creds.admin }, this.forLease(lease))
+      this.stillHeld(lease)
       const files = (Array.isArray(listing.files) ? listing.files : []).filter(f => f && typeof f.path === 'string' && Number.isFinite(f.size)).slice(0, 1000)
       const skipped = Array.isArray(listing.skipped) ? listing.skipped.slice(0, 50).map(String) : []
       if (!want.length && !match) {

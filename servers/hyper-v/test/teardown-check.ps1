@@ -246,4 +246,14 @@ $jt2 = Join-Path $f.base 'jt2'; New-Item -ItemType Directory -Force $jt2 | Out-N
 $r.resumeTampered = Try-Run $f 'keep'
 $r.resumeTamperedQuiet = (& $sideEffects $f) -eq 0 -and (Phase $f) -eq 'verified'
 
+# 12. Hyper-V's grantee pattern is for disk folders only: the same capability-SID grant inside the state folder is
+# refused (the VM disks in the fixture carry it, and are accepted).
+$f = New-Fixture
+$j = Join-Path $f.state 'journal.jsonl'
+$acl = Get-Acl -LiteralPath $j
+$acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier 'S-1-15-3-1024-2268835264-3721307629-241982045-173645152-1490879176-104643441-2915960892-1612460704'), 'FullControl', 'Allow')))
+Set-Acl -LiteralPath $j -AclObject $acl
+$r.capabilityInState = Try-Run $f
+$r.capabilityInStateQuiet = $null -eq (Phase $f) -and (Test-Path $f.state)
+
 [Console]::Out.WriteLine('RESULT:' + (ConvertTo-Json $r -Compress -Depth 6))

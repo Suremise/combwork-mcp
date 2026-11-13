@@ -348,4 +348,6 @@ test('uninstall teardown (non-elevated, fakes): verified targets only; resumable
   // A resumed run re-verifies before acting (quiesce writes into the state folder).
   assert.match(a.resumeCrash, /CRASH:after:record/)
   assert.match(a.resumeTampered, /isn't as setup and the helper leave it/); assert.strictEqual(a.resumeTamperedQuiet, true)
+  // Hyper-V's grantee pattern is for disk folders only.
+  assert.match(a.capabilityInState, /isn't as setup and the helper leave it/); assert.strictEqual(a.capabilityInStateQuiet, true)
 })
