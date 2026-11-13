@@ -112,6 +112,9 @@ One installed server serves every project: the build folder must be inside the p
 - **Whatever the roots say**, the user profile itself (or a folder containing it), its dot-folders, `AppData` and its
   top folders, anything under `AppData\Roaming`, and the server's out folders are refused. A root that is one of them is dropped, and the reply says so.
 - `sandbox_status` says where the allowed folders came from, and lists them.
+- **No folders set by an admin.** Unlike hyper-v (`install.ps1 -BuildRoot`), this server has no elevated setup and no
+  file only admins can write, so every allowed folder comes from the client or the settings above. A project that
+  stages builds outside its folder adds that folder to its client's roots (e.g. Claude Code's `additionalDirectories`).
 
 ## Tools
 

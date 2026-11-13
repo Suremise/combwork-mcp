@@ -55,6 +55,18 @@ function profileRefusal(real, home = os.homedir()) {
   return null
 }
 
+/**
+ * Why a folder an admin named (e.g. hyper-v's policy buildRoots) can't be used as a root now, or null. It must exist as
+ * a folder, really resolve to the very path named (no link, junction or other reparse point anywhere on it, so a user
+ * process can't retarget it), and pass profileRefusal.
+ */
+function policyRootProblem(p, home = os.homedir()) {
+  let real
+  try { real = realDir(p) } catch (e) { return e.code === 'ENOENT' ? "it doesn't exist" : `it can't be used (${e.message})` }
+  if (norm(real) !== norm(p)) return `it is or passes through a link or junction (it resolves to "${real}")`
+  return profileRefusal(real, home)
+}
+
 /** The local folders in a roots/list result: file: URIs only, decoded, de-duplicated. Anything else is ignored. */
 function parseRoots(result) {
   const out = new Map()
@@ -159,4 +171,4 @@ function allowedRoots({ client = { declared: false }, env = [], cwd = null, name
   return result('none', [], null, `This client sent no MCP roots, so no folder is allowed. Set ${names.env} to the folders to allow, or ${names.cwd} to use the folder the client starts the server in`)
 }
 
-module.exports = { isInside, realDir, profileRefusal, parseRoots, rootsClient, allowedRoots }
+module.exports = { isInside, realDir, profileRefusal, policyRootProblem, parseRoots, rootsClient, allowedRoots }

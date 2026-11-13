@@ -7,6 +7,8 @@ const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
 const { execFileSync } = require('child_process')
+const net = require('net')
+const readline = require('readline')
 const { scratch, withPool, startHelper, seedImage } = require('./helpers')
 const { server } = require('../client')
 
@@ -103,4 +105,68 @@ test('service mode without the helper: a clear refusal naming setup', async t =>
   assert.strictEqual(r.isError, true)
   assert.match(r.text, /helper service isn't running \(no pipe .*Has setup been run\?/)
   assert.match((await s.call('vm_status')).text, /Mode: service/)
+})
+
+// Build folders an admin named (policy.json buildRoots, by install.ps1 -BuildRoot): used beside the client's roots, by
+// real path, for a client with no roots (as Codex) and one with other roots (as Claude Code); a root that is a junction,
+// or in the profile's AppData\Roaming, isn't used; nothing outside both is allowed.
+test('admin-set build folders: beside the client\'s roots, by real path; a junction or AppData root isn\'t used', async t => {
+  const sc = scratch('admin-roots')
+  const staging = path.join(sc.dir, 'staging')
+  const roaming = path.join(sc.dir, 'home', 'AppData', 'Roaming', 'builds')
+  for (const d of [path.join(staging, 'run1'), roaming]) fs.mkdirSync(d, { recursive: true })
+  fs.writeFileSync(path.join(staging, 'run1', 'setup.exe'), 'MZ-staged')
+  let jroot = path.join(sc.dir, 'jroot')
+  let escape = path.join(staging, 'escape')
+  try { execFileSync('cmd.exe', ['/c', 'mklink', '/J', jroot, path.join(sc.dir, 'outside')], { stdio: 'ignore' }) } catch { jroot = null }
+  try { execFileSync('cmd.exe', ['/c', 'mklink', '/J', escape, path.join(sc.dir, 'outside')], { stdio: 'ignore' }) } catch { escape = null }
+  const file = path.join(sc.stateDir, 'policy.json')
+  const missing = path.join(sc.dir, 'not-yet')
+  fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), buildRoots: [staging, roaming, missing, ...(jroot ? [jroot] : [])] }))
+  const { h } = await withPool(sc, 1)
+  await h.stop()
+  const env = { ...sc.env, HYPERV_MCP_ENABLED: '1', HYPERV_MCP_MODE: 'direct', USERPROFILE: path.join(sc.dir, 'home') }
+
+  const codex = server(env) // no roots, no settings
+  t.after(() => codex.close())
+  const st = (await codex.call('vm_status')).text
+  assert.match(st, /And from build folders set by an admin: .*staging/)
+  assert.match(st, /builds" isn't used: it is in AppData\\Roaming/)
+  assert.match(st, /not-yet" isn't used: it doesn't exist/)
+  if (jroot) assert.match(st, /jroot" isn't used: it is or passes through a link or junction/)
+  await codex.call('vm_acquire')
+  assert.match((await codex.call('vm_start', { build: path.join(staging, 'run1') })).text, /build copied in to C:\\build \(1 files?, 9 bytes/)
+  const refused = await codex.call('vm_start', { build: path.join(sc.dir, 'outside') })
+  assert.match(refused.text, /can't be used: it is not under an allowed folder\. Your MCP roots: none \(.*\)\. Build folders set by an admin: .*staging/)
+  if (escape) assert.match((await codex.call('vm_start', { build: escape })).text, /is not under an allowed folder/)
+  if (jroot) assert.match((await codex.call('vm_start', { build: jroot })).text, /is not under an allowed folder/)
+  assert.match((await codex.call('vm_start', { build: roaming })).text, /can't be used: it is in AppData\\Roaming/)
+  await codex.call('vm_release')
+
+  const claude = server(env, { roots: [sc.builds] }) // its own roots, unchanged
+  t.after(() => claude.close())
+  await claude.call('vm_acquire')
+  assert.match((await claude.call('vm_start', { build: path.join(staging, 'run1') })).text, /build copied in/)
+  assert.match((await claude.call('vm_start', { build: path.join(sc.builds, 'app') })).text, /build copied in/)
+  // HYPERV_MCP_ALLOWED_ROOTS narrows the client's roots, not the admin's folders.
+  const narrowed = server({ ...env, HYPERV_MCP_ALLOWED_ROOTS: path.join(sc.builds, 'app') }, { roots: [sc.builds] })
+  t.after(() => narrowed.close())
+  assert.match((await narrowed.call('vm_status')).text, /narrowed by HYPERV_MCP_ALLOWED_ROOTS[\s\S]*And from build folders set by an admin: .*staging/)
+})
+
+test('a helper from before admin-set build folders: none are used, and status says to rerun setup', async t => {
+  const sc = scratch('old-helper')
+  const pipe = `hyperv-mcp-test-old-${process.pid}`
+  const old = net.createServer(s => readline.createInterface({ input: s }).on('line', line => {
+    const m = JSON.parse(line)
+    const reply = m.op === 'version' ? { ok: true, result: { text: 'hyperv-mcp/1', data: { protocol: 'hyperv-mcp/1' } } }
+      : m.op === 'status' ? { ok: true, result: { text: 'Pool: no VMs.' } } : { ok: false, error: `unknown operation ${m.op}` }
+    s.write(JSON.stringify({ id: m.id, ...reply }) + '\n')
+  }))
+  await new Promise(r => old.listen(`\\\\.\\pipe\\${pipe}`, r))
+  t.after(() => old.close())
+  const s = server({ ...sc.env, HYPERV_MCP_ENABLED: '1', HYPERV_MCP_PIPE: pipe, USERPROFILE: path.join(sc.dir, 'home') })
+  t.after(() => s.close())
+  assert.match((await s.call('vm_status')).text, /set by an admin: none \(the helper predates them: run setup again/)
+  assert.match((await s.call('vm_start', { build: path.join(sc.dir, 'outside') })).text, /not under an allowed folder.*predates them/)
 })

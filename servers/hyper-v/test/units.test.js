@@ -150,6 +150,13 @@ test('policy: problems named; disk folders strictly inside; caps', () => {
   assert.match(policy.problems({ ...p, diskFolders: ['\\\\server\\share\\x'] }).join(), /absolute local folder/)
   assert.match(policy.problems({ ...p, prefix: 'Bad-Prefix' }).join(), /prefix/)
   assert.match(policy.problems({ ...p, maxDiskGBPerVm: 32 }).join(), /needs 64 GB/)
+  // Build roots an admin named: optional (a policy from before them stays usable), absolute local folders only.
+  const { buildRoots: _, ...old } = p
+  assert.deepStrictEqual(policy.problems(old), [])
+  assert.deepStrictEqual(policy.problems({ ...p, buildRoots: ['C:\\Users\\u\\AppData\\Local\\combwork-cli\\'] }), [])
+  for (const b of ['C:\\', '\\\\server\\share\\x', '\\\\?\\C:\\x', 'relative\\x', 'C:\\a\\..\\b', 42]) assert.match(policy.problems({ ...p, buildRoots: [b] }).join(), /build root .* must be an absolute local folder/, String(b))
+  assert.match(policy.problems({ ...p, buildRoots: 'C:\\x' }).join(), /buildRoots must be a list/)
+  assert.match(policy.problems({ ...p, buildRoots: Array(17).fill('C:\\x') }).join(), /at most 16/)
   for (const f of ['D:\\hyperv-mcp\\pool\\i-1', 'd:\\HYPERV-MCP\\x']) assert.ok(policy.underDiskFolder(p, f), f)
   for (const f of ['D:\\hyperv-mcp', 'D:\\hyperv-mcp-evil\\x', 'D:\\hyperv-mcp\\..\\x', 'C:\\x', 'relative\\x', 42]) assert.ok(!policy.underDiskFolder(p, f), String(f))
   const vm = { cores: 2, memoryMB: 4096, diskGB: 64, folder: 'D:\\hyperv-mcp\\pool\\i-1' }
@@ -389,4 +396,32 @@ test('uninstall teardown (non-elevated, fakes): verified targets only; resumable
   assert.match(a.resumeTampered, /isn't as setup and the helper leave it/); assert.strictEqual(a.resumeTamperedQuiet, true)
   // Hyper-V's grantee pattern is for disk folders only.
   assert.match(a.capabilityInState, /isn't as setup and the helper leave it/); assert.strictEqual(a.capabilityInStateQuiet, true)
+})
+
+// install.ps1's -BuildRoot checks, run as setup runs them (the block itself, cut from the script, not elevated): they
+// refuse what the helper's policy check would (more than 16, a drive root, '..'), before setup changes anything.
+test('setup: -BuildRoot is refused as the policy would, before anything changes', { skip: !windows }, () => {
+  const { spawnSync } = require('child_process')
+  const src = fs.readFileSync(path.join(__dirname, '..', 'setup', 'install.ps1'), 'utf8')
+  const block = /^\$buildRoots = @\(\$BuildRoot[\s\S]*?^if \(\$buildRoots\.Count -gt 16\).*$/m.exec(src)
+  assert.ok(block, 'the -BuildRoot block is in install.ps1')
+  const sc = scratch('setup-buildroots')
+  const file = path.join(sc.dir, 'buildroots.ps1')
+  fs.writeFileSync(file, `param([string[]]$BuildRoot = @())\n$ErrorActionPreference = 'Stop'\n${block[0]}\nConvertTo-Json -Compress @{ buildRoots = @($buildRoots) }\n`)
+  const run = roots => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', `& '${file}' -BuildRoot ${roots.map(r => `'${r}'`).join(',')} 3>$null`], { encoding: 'utf8', env: ps51Env() })
+  const many = n => Array.from({ length: n }, (_, i) => path.join(sc.dir, `root-${i}`))
+  const sixteen = run([...many(16), path.join(sc.dir, 'root-0') + '\\'])
+  assert.strictEqual(sixteen.status, 0, sixteen.stderr)
+  const written = JSON.parse(sixteen.stdout.trim()).buildRoots
+  assert.strictEqual(written.length, 16, 'a repeat (with a trailing \\) counts once')
+  assert.deepStrictEqual(policy.problems({ ...policy.DEFAULTS, diskFolders: ['D:\\hv'], buildRoots: written }), [])
+  const seventeen = run(many(17))
+  assert.notStrictEqual(seventeen.status, 0)
+  assert.match(seventeen.stderr + seventeen.stdout, /At most 16 build roots: 17 were given/)
+  assert.match(policy.problems({ ...policy.DEFAULTS, diskFolders: ['D:\\hv'], buildRoots: many(17) }).join(), /at most 16/)
+  for (const bad of ['C:\\', 'relative', path.join(sc.dir, 'a') + '\\..\\b']) {
+    const r = run([bad])
+    assert.notStrictEqual(r.status, 0, bad)
+    assert.match(r.stderr + r.stdout, /Build root .* must be/, bad)
+  }
 })
