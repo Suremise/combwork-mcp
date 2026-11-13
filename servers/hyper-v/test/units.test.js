@@ -333,4 +333,17 @@ test('uninstall teardown (non-elevated, fakes): verified targets only; resumable
   assert.match(a.legacyNotAdmin, /is owned by S-1-5-21-.*Nothing was changed/); assert.strictEqual(a.legacyNotAdminNoKey, true)
   assert.match(a.legacyDeclined, /not confirmed: nothing was changed/); assert.strictEqual(a.legacyDeclinedUnchanged, true)
   assert.strictEqual(a.legacyConfirmed, 'ok'); assert.match(a.legacyInventory, /^DELETE .*: \d+ file\(s\)/); assert.strictEqual(a.legacyGone, true)
+  // The service started again after 'stopped' (reboot, Start-Service): stopped again before the first deletion; and after
+  // 'storage-removed': stopped before it is deleted.
+  assert.match(a.restartCrash, /CRASH:after:phase:stopped/); assert.strictEqual(a.restartRerun, 'ok')
+  assert.strictEqual(a.restartOrder, 'stop,deleting,delete-service,rights,group'); assert.strictEqual(a.restartGone, true)
+  assert.match(a.restart2Crash, /CRASH:after:phase:storage-removed/); assert.strictEqual(a.restart2Rerun, 'ok')
+  assert.strictEqual(a.restart2Order, 'stop,delete-service,rights,group'); assert.strictEqual(a.restart2Gone, true)
+  // Keep mode verifies the storage too: refusals with no side effect at all.
+  assert.match(a.keepLegacyNotAdmin, /is owned by S-1-5-21-/); assert.strictEqual(a.keepLegacyNotAdminQuiet, true)
+  assert.match(a.keepJunction, /isn't as setup and the helper leave it/); assert.strictEqual(a.keepJunctionQuiet, true)
+  assert.match(a.keepMismatch, /identity differs from its receipt/); assert.strictEqual(a.keepMismatchQuiet, true)
+  // A resumed run re-verifies before acting (quiesce writes into the state folder).
+  assert.match(a.resumeCrash, /CRASH:after:record/)
+  assert.match(a.resumeTampered, /isn't as setup and the helper leave it/); assert.strictEqual(a.resumeTamperedQuiet, true)
 })

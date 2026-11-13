@@ -135,14 +135,15 @@ function Invoke-Teardown {
           return
         }
       }
-      # ---- Phase 1: verify, changing nothing. ----
+      # ---- Phase 1: verify, changing nothing. In both modes: keep mode deletes nothing, but the helper's state is
+      # still read and written as admin (quiesce), so it must be the verified storage too. ----
       $targets = @()
-      if ($Mode -eq 'remove') {
+      if ($true) {
         $paths = @()
         if ($legacy) {
           $paths = @($State, $LegacyDiskFolder) # its location policy (a top-level folder on a fixed drive) is uninstall.ps1's
         } else {
-          if (-not $key) { throw 'There are no storage receipts (setup''s records of the folders it created), so nothing is known to be setup''s: no storage will be deleted. For an install made by an older setup, name its disk folder with -LegacyDiskFolder. Nothing was changed.' }
+          if (-not $key) { throw 'There are no storage receipts (setup''s records of the folders it created), so nothing is known to be setup''s: no storage will be used or deleted. For an install made by an older setup, name its disk folder with -LegacyDiskFolder. Nothing was changed.' }
           $rk = $key.OpenSubKey('Storage')
           $receipts = @{}
           if ($rk) { foreach ($n in $rk.GetValueNames()) { $receipts[$n] = $rk.GetValue($n) }; $rk.Dispose() }
@@ -158,7 +159,7 @@ function Invoke-Teardown {
           $id = Test-Target $p $RootOwners $Who $targetPins[$p]
           if (-not $legacy) {
             $want = $receipts[$p.ToLowerInvariant()]
-            if ($id -and $id -ne $want) { throw "$p isn't the folder setup created (its identity differs from its receipt): it won't be deleted. Nothing was changed." }
+            if ($id -and $id -ne $want) { throw "$p isn't the folder setup created (its identity differs from its receipt): it won't be used or deleted. Nothing was changed." }
           }
           $targets += [pscustomobject]@{ path = $p; identity = $id }
         }
@@ -172,6 +173,11 @@ function Invoke-Teardown {
               if ([HvMcpStorage]::Identity($h) -ne $receipts[$p.ToLowerInvariant()]) { throw "$p isn't the folder setup created (its identity differs from its receipt). Nothing was changed." }
             }
           }
+        }
+        # The state folder, which quiesce reads and writes as admin, must be one of the verified targets.
+        $stateFull = [IO.Path]::GetFullPath($State).TrimEnd('\')
+        if ((Test-Path -LiteralPath $stateFull) -and -not ($targets | Where-Object { $_.path -eq $stateFull -and $_.identity })) {
+          throw "$stateFull isn't among the verified storage (no receipt for it): it won't be used. Nothing was changed."
         }
       }
       $helper = & $Ops.HelperStatus
@@ -212,6 +218,27 @@ function Invoke-Teardown {
     $phase = [array]::IndexOf($script:PHASES, $rec.phase)
     $advance = { param($p) $rec.phase = $p; Write-Teardown $key $rec; & $boundary "after:phase:$p" }
 
+    # On a resumed run, phase 1 didn't run here: re-verify every recorded target that still exists (its parents pinned,
+    # not a link, owners and grants setup's, the identity recorded) before anything acts on it, quiesce's state writes
+    # included. A target that is gone is done.
+    if ($targetPins.Count -eq 0) {
+      foreach ($t in @($rec.targets)) {
+        if (-not (Test-Path -LiteralPath $t.path)) { continue }
+        if (-not $t.identity) { throw "$($t.path) appeared after the uninstall verified it as missing: it won't be used or deleted." }
+        Open-TrustedAncestors $t.path $Trusted $pins
+        $targetPins[$t.path] = New-Object Collections.ArrayList
+        $id = Test-Target $t.path $RootOwners $Who $targetPins[$t.path]
+        if ($id -ne $t.identity) { throw "$($t.path) isn't the folder the uninstall verified (its identity differs): it won't be used or deleted." }
+      }
+    }
+    # The service must be stopped (or gone) before storage or components are touched, on every run: a record proves
+    # earlier work, not the service's state now (a reboot, or Start-Service, may have started it again).
+    $ensureStopped = {
+      $s = & $Ops.ServiceState
+      if ($s -eq 'running') { & $boundary 'before:stop'; & $Ops.StopService; & $boundary 'after:stop'; $s = & $Ops.ServiceState }
+      if ($s -ne 'stopped' -and $s -ne 'missing') { throw "The service is $s, not stopped: the uninstall stopped." }
+    }
+
     # ---- Phase 2: the pool, through the helper (quiesce; the approved exact-plan remove). ----
     if ($phase -lt 1) {
       $helper = & $Ops.HelperStatus
@@ -234,14 +261,13 @@ function Invoke-Teardown {
 
     # ---- Phase 3: stop the service (it stays registered, and the install folder stays). ----
     if ($phase -lt 2) {
-      $s = & $Ops.ServiceState
-      if ($s -eq 'running') { & $boundary 'before:stop'; & $Ops.StopService; & $boundary 'after:stop'; $s = & $Ops.ServiceState }
-      if ($s -ne 'stopped' -and $s -ne 'missing') { throw "The service is $s, not stopped: the uninstall stopped." }
+      & $ensureStopped
       & $advance 'stopped'
     }
 
     # ---- Phase 4: storage (remove mode): each recorded target, re-verified by identity, deleted without following links. ----
     if ($phase -lt 3) {
+      & $ensureStopped # again, on every run: it may have been started since the phase was recorded
       if ($Mode -eq 'remove') {
         foreach ($t in $rec.targets) {
           if (-not (Test-Path -LiteralPath $t.path)) { continue } # done (or never there)
@@ -267,6 +293,7 @@ function Invoke-Teardown {
 
     # ---- Phase 5: the service, its rights, the group, the install folder. ----
     if ($phase -lt 4) {
+      & $ensureStopped # a running service is stopped before it is deleted
       $s = & $Ops.ServiceState
       if ($s -ne 'missing') { & $boundary 'before:delete-service'; & $Ops.DeleteService; & $boundary 'after:delete-service'; if ((& $Ops.ServiceState) -ne 'missing') { throw 'The service is still registered after its deletion: the uninstall stopped.' } }
       & $Ops.RemoveRights; & $boundary 'after:rights'

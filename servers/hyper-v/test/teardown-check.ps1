@@ -192,4 +192,49 @@ $r.legacyConfirmed = Try-Run $f 'remove' $null $f.disk
 $r.legacyInventory = $f.sys.inventory -join ' | '
 $r.legacyGone = Gone $f
 
+# 9. The service started again after 'stopped' (a reboot, or Start-Service), then a rerun: it is stopped again before
+# the first deletion. And after 'storage-removed': stopped before it is deleted.
+$f = New-Fixture
+$r.restartCrash = Try-Run $f 'remove' 'after:phase:stopped'
+$f.sys.service = 'running'; $f.sys.helper = $true
+$mark = $f.sys.calls.Count
+$script:hookAt = 'before:delete:' + [IO.Path]::GetFullPath($f.state); $script:hookDo = { [void]$f.sys.calls.Add('deleting') }.GetNewClosure()
+$r.restartRerun = Try-Run $f
+$later = @($f.sys.calls | Select-Object -Skip $mark | Where-Object { $_ -ne 'state' })
+$r.restartOrder = $later -join ','
+$r.restartGone = Gone $f
+$f = New-Fixture
+$r.restart2Crash = Try-Run $f 'remove' 'after:phase:storage-removed'
+$f.sys.service = 'running'
+$mark = $f.sys.calls.Count
+$r.restart2Rerun = Try-Run $f
+$r.restart2Order = (@($f.sys.calls | Select-Object -Skip $mark | Where-Object { $_ -ne 'state' })) -join ','
+$r.restart2Gone = Gone $f
+
+# 10. Keep mode verifies the storage too, and acts on nothing it refuses: an untrusted legacy owner, a junction in the
+# state folder, a receipt mismatch. No side-effect callback runs.
+$sideEffects = { param($f) @($f.sys.calls | Where-Object { $_ -ne 'state' }).Count }
+$f = New-Legacy
+$r.keepLegacyNotAdmin = Try-Run $f 'keep' $null $f.disk @($SYSTEM, $ADMINS)
+$r.keepLegacyNotAdminQuiet = (& $sideEffects $f) -eq 0 -and -not $HKCU.OpenSubKey($f.keyPath)
+$f = New-Fixture
+$jt = Join-Path $f.base 'jt'; New-Item -ItemType Directory -Force $jt | Out-Null
+& cmd.exe /c mklink /J (Join-Path $f.state 'approvals\escape') $jt | Out-Null
+$r.keepJunction = Try-Run $f 'keep'
+$r.keepJunctionQuiet = (& $sideEffects $f) -eq 0 -and $null -eq (Phase $f)
+$f = New-Fixture
+Remove-Item -LiteralPath $f.state -Recurse -Force
+[void][HvMcpStorage]::CreateSecure($f.state, $sec.GetSecurityDescriptorBinaryForm())
+$r.keepMismatch = Try-Run $f 'keep'
+$r.keepMismatchQuiet = (& $sideEffects $f) -eq 0 -and $null -eq (Phase $f)
+
+# 11. A resumed run re-verifies before acting: a junction slipped into the state folder after the record is refused
+# before quiesce writes there.
+$f = New-Fixture
+$r.resumeCrash = Try-Run $f 'keep' 'after:record'
+$jt2 = Join-Path $f.base 'jt2'; New-Item -ItemType Directory -Force $jt2 | Out-Null
+& cmd.exe /c mklink /J (Join-Path $f.state 'approvals\escape') $jt2 | Out-Null
+$r.resumeTampered = Try-Run $f 'keep'
+$r.resumeTamperedQuiet = (& $sideEffects $f) -eq 0 -and (Phase $f) -eq 'verified'
+
 [Console]::Out.WriteLine('RESULT:' + (ConvertTo-Json $r -Compress -Depth 6))

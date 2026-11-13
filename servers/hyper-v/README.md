@@ -360,7 +360,8 @@ Choose one:
   DELETE. Their present permissions prove nothing about their history, so your confirmation is the authority;
 - without that evidence, nothing is deleted. `policy.json` is never a source of what to delete.
 
-Nothing is ever deleted through a link.
+Nothing is ever deleted through a link. `-KeepPool` verifies the storage the same way, though it deletes nothing:
+quiesce reads and writes the helper's state as admin, so anything it would refuse to delete, it also refuses to use.
 
 **In what order:**
 1. Verify everything, changing nothing, and write a record.
@@ -370,6 +371,10 @@ Nothing is ever deleted through a link.
 3. Stop the service. It stays registered, and the code stays.
 4. Delete the storage. A leftover in `pool\` stops here, with the service only stopped.
 5. Remove the service, its rights, the group and the code.
+
+Every run, including a resumed one, re-checks the recorded storage before acting on it. It also confirms (or makes)
+the service stopped right before steps 4 and 5: the record proves earlier work, not that the service hasn't been
+started again since.
 6. Remove the receipts, the install's id and the record.
 
 **Interrupted?** Run it again with the same options: it resumes from its record (`HKLM\SOFTWARE\hyperv-mcp`). That
