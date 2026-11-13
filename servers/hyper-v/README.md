@@ -237,7 +237,7 @@ The pool is built from the **Windows 11 Enterprise evaluation** ISO. Microsoft's
 | `vm_renew({ minutes=60 })` | Sets the lease's deadline to now + `minutes` (1 to the policy's `maxLeaseMinutes`), never past the work session's end: `maxSessionMinutes` after `vm_acquire` (`vm_status` shows both). Refused once the deadline has passed, even a moment before the helper ends the lease. |
 | `vm_sync({ build?, full=false, delete=true })` | Copies only the files that changed in `build` (default: the folder last started or synced) into the **running** guest's `C:\build`, without a restore: `C:\out`, installed software and anything else the runs left stay. The server hashes the folder (same roots checks as `vm_start`, every time; links skipped); the helper compares that with what it placed in `C:\build` and takes only the new or changed files, hashing them itself as they arrive. Files gone from the folder are removed unless `delete` is false. Only what the helper copied is tracked: if your runs changed `C:\build` themselves, use `full: true` (clears `C:\build`, copies everything) or `vm_reset`. After a sync fails, only those two are accepted. |
 | `vm_reset({ build?, network?, reserveCpu?, interactive? })` | A clean VM now: exactly `vm_start` (restore first, verified), with this session's last start's `network`, `reserveCpu` and `interactive` and its last build unless given. |
-| `vm_run({ command, shell='cmd'\|'powershell', as='admin'\|'user', timeoutSec=120, cwd='C:\build', session='service'\|'interactive' })` | Runs in the guest. stdout and stderr go to `C:\out\.run-<n>.*`, and the reply has the exit code and 16 KB of each. `as: 'user'` runs as the standard user, for whom `C:\build` is read-only. `session: 'service'` (the default) runs in session 0 over PowerShell Direct; on a timeout, the command is killed inside by its PID (`taskkill /T /F`). `session: 'interactive'` runs in the desktop session `vm_start`'s `interactive` logged on, as that account (`as` must name it), through a watcher started in that session at logon (`hvadmin` elevated, `hvuser` a standard user). If it times out or doesn't finish cleanly, its output so far is returned and the VM is restored, which ends everything it started; `vm_start` or `vm_reset` goes on. |
+| `vm_run({ command, shell='cmd'\|'powershell', as='admin'\|'user', timeoutSec=120, cwd='C:\build', session='service'\|'interactive' })` | Runs in the guest. stdout and stderr go to `C:\out\.run-<n>.*`, and the reply has the exit code and 16 KB of each. `as: 'user'` runs as the standard user, for whom `C:\build` is read-only. `session: 'service'` (the default) runs in session 0; on a timeout, the command is killed inside by its PID (`taskkill /T /F`), only while that PID is still the run's process (its creation time). A run is started in one short PowerShell Direct call and its exit file then polled with short calls (see "Long runs"), so it may take as long as `timeoutSec` allows. `session: 'interactive'` runs in the desktop session `vm_start`'s `interactive` logged on, as that account (`as` must name it), through a watcher started in that session at logon (`hvadmin` elevated, `hvuser` a standard user). If it times out or doesn't finish cleanly, its output so far is returned and the VM is restored, which ends everything it started; `vm_start` or `vm_reset` goes on. |
 | `vm_read_out({ paths?, glob?, maxBytes=256 KB, maxTotalBytes=1 MB, base64=false })` | Files from the guest's `C:\out`, read in the guest and capped while reading, returned as data. Paths are relative and checked before the call (no `..`, drives, UNC or device paths, streams or device names). `glob` is matched against a listing. Links are skipped. With neither, it lists. Text as text, PNG/JPEG as images. Read before `vm_stop`, which discards them. |
 | `vm_stop({ keep=false })` | Turns the VM off and restores the clean checkpoint, then **verifies** it: Off, at the checkpoint (by id), adapter disconnected, reserve 0. It says "Reverted" only then. Otherwise **CLEANUP FAILED**, and the VM is quarantined. The lease stays. `keep` (or a failed run with `keepOnFailure`) leaves it as it is until release or the deadline. |
 | `vm_release()` | Restores the VM (as `vm_stop`) and ends the lease. |
@@ -573,6 +573,14 @@ work as usual.
   logged on can run there. There are no screenshots.
 - An interactive run that times out restores the VM (see "The interactive session"): give such runs a generous
   `timeoutSec`.
+- **Long runs:** since the September 2025 Windows updates, PowerShell Direct ends any single call after 10 minutes, with
+  "The Hyper-V socket target process has ended" ([PowerShell #26176](https://github.com/PowerShell/PowerShell/issues/26176)).
+  So no run holds a call open: it is started (or, in the interactive session, published to the session's watcher) in
+  one short call, then its exit file is polled with short calls (every second at first, then every few seconds) until
+  it's there or `timeoutSec` passes. A poll that fails is retried within that same deadline. A process started from a
+  call goes on after the call ends. **Copies are still single calls:** `vm_start`'s build copy and `vm_sync` each copy in
+  one call, so one that takes more than about 10 minutes (a big build on a slow host) ends with that same error, and
+  `C:\build` is then untrusted until a full sync or a reset. `maxBuildMB` limits bytes, not time.
 - Windows guests only. The evaluation expires after 90 days (see "Rebuilding").
 - A sync tracks only what the helper copied into `C:\build`. A run that changes `C:\build` itself isn't seen; a
   file renamed only in case on the host keeps its old spelling in the guest. `full: true` or `vm_reset` puts either
@@ -585,7 +593,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\projects.test.js test\images.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\projects.test.js test\images.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
 ```
 
 - `units.test.js`:
@@ -684,6 +692,11 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   project at its Windows cap still gets Linux, a forbidden OS or image refused, never queued); a waiter never given
   another kind; and, through `server.js`, no
   acquire at all sent to a helper without `images` for an image or Linux.
+- `runs.test.js`, runs started then polled: a run spanning many polls; one that finished before its start could read
+  its creation time (finished, not a failed start); a timeout killed by PID, and a reused PID never killed; failed polls
+  retried within the one deadline; nothing sent to the guest once the lease ends. And `hv.ps1`'s own kill, run with
+  Windows PowerShell 5.1 on this machine's processes: the run's own process killed and confirmed, a process with
+  another creation time or no recorded identity never killed, one already gone reported gone.
 - `approvals.test.js`:
   - unapproved plans;
   - forged approvals: another digest, operation or epoch, expired, a malformed nonce, another plan's id, a writable

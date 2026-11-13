@@ -39,6 +39,8 @@ const MINUTE_MS = Number(process.env.HYPERV_MCP_MINUTE_MS || 60_000) // test-onl
 // vm_acquire's queue (MC-1502): one request waits at most WAIT_MS (under a client's 60 s tool timeout), and a place in
 // line is kept KEEP_MS after a wait ends without a VM, for the caller's next vm_acquire. Test-only overrides.
 const WAIT_MS = Number(process.env.HYPERV_MCP_WAIT_MS || 20_000)
+// One PowerShell Direct call's bound for a run's start, poll or kill (MC-1510: never near the transport's 10 minutes).
+const CALL_MS = 60_000
 const KEEP_MS = Number(process.env.HYPERV_MCP_KEEP_MS || 120_000)
 
 const hex = n => crypto.randomBytes(n).toString('hex')
@@ -999,18 +1001,35 @@ class Helper {
       }
       const n = ++lease.runs
       const creds = this.creds()
-      const args = {
-        ...this.ident(vm), cred: creds.admin, runAs: !interactive && as === 'user' ? creds.user : null, n, command, shell, timeoutSec, cwd: cwd || 'C:\\build', cap: OUTPUT_CAP,
-        interactive: interactive ? { account: creds[as].user } : null
+      const args = { ...this.ident(vm), cred: creds.admin, n, command, shell, cwd: cwd || 'C:\\build', cap: OUTPUT_CAP }
+      // Started (or published), then polled with short calls against one deadline (MC-1510): no PowerShell Direct call is
+      // held for the run, since one call ends after 10 minutes.
+      const deadline = this.now() + timeoutSec * 1000
+      let started = null
+      if (interactive) {
+        try {
+          await this.hv('guest-run-publish', args, this.forLease(lease, CALL_MS))
+        } catch (e) {
+          this.stillHeld(lease) // an ending lease restores the VM itself
+          started = { lost: e.message } // unproven: restored below, never chased
+        }
+      } else {
+        started = await this.hv('guest-run-start', { ...args, runAs: as === 'user' ? creds.user : null }, this.forLease(lease, CALL_MS))
       }
-      let r
-      try {
-        r = await this.hv('guest-run', args, this.forLease(lease, (timeoutSec + 120) * 1000))
-      } catch (e) {
-        if (!interactive) throw e
-        this.stillHeld(lease) // an ending lease restores the VM itself
-        r = { exitCode: null, clean: false, why: e.message }
-      }
+      const polled = started?.lost ? { result: null, last: null } : await this.pollRun(lease, vm, creds, n, deadline)
+      let r = polled.result
+      if (!interactive && !r) {
+        // Timed out: killed by its PID only if that PID is still the run's process (its recorded creation time), then
+        // a last read of its output.
+        this.stillHeld(lease)
+        const k = await this.hv('guest-run-kill', { ...this.ident(vm), cred: creds.admin, pid: started.pid, started: started.started }, this.forLease(lease, CALL_MS)).catch(e => ({ killed: false, why: e.message }))
+        this.stillHeld(lease)
+        const last = await this.hv('guest-run-poll', { ...this.ident(vm), cred: creds.admin, n, cap: OUTPUT_CAP }, this.forLease(lease, CALL_MS)).catch(() => null)
+        r = last?.done && k.gone ? last : { ...(last || {}), exitCode: null, timedOut: true, killed: !!k.killed, killWhy: k.why }
+      } else if (interactive && !r) {
+        const pending = polled.last?.pending
+        r = { ...(polled.last || {}), exitCode: null, clean: false, timedOut: !started?.lost, why: started?.lost ? `its request wasn't confirmed (${started.lost})` : pending ? 'the session\'s watcher never took the run (is the account still logged on?)' : `no exit within ${timeoutSec} s` }
+      } else if (interactive) r = { ...r, clean: true }
       const exit = Number.isInteger(r.exitCode) ? r.exitCode : null
       if (r.timedOut || exit !== 0) lease.failed = true
       const out = s => (typeof s === 'string' ? s : '').slice(0, OUTPUT_CAP)
@@ -1020,13 +1039,34 @@ class Helper {
         interactive
           ? (restored ? `The interactive run didn't finish cleanly (${r.why || 'no exit code'}). ${restored}` : `Exit code ${exit} (in the interactive session).`)
           : r.timedOut
-            ? `Timed out after ${timeoutSec} s: ${r.killed ? 'killed inside the guest by its PID (taskkill /T /F).' : 'no PID recorded; vm_stop is the fallback.'}`
+            ? `Timed out after ${timeoutSec} s: ${r.killed ? 'killed inside the guest by its PID (taskkill /T /F).' : `not confirmed killed${r.killWhy ? ` (${r.killWhy})` : ''}; vm_stop is the fallback.`}`
             : `Exit code ${exit === null ? 'unknown' : exit}.`,
         `--- stdout${r.stdoutCut ? ` (first ${OUTPUT_CAP} bytes)` : ''} ---`, out(r.stdout),
         `--- stderr${r.stderrCut ? ` (first ${OUTPUT_CAP} bytes)` : ''} ---`, out(r.stderr)
       ]
       return { text: lines.join('\n'), isError: !!r.timedOut || !!restored, data: { exitCode: exit, timedOut: !!r.timedOut, session, ...(restored ? { restored: true } : {}) } }
     })
+  }
+
+  /**
+   * Polls a started run's exit file with short calls until it is there or the deadline passes: { result (or null), last
+   * poll }. One
+   * deadline for the run: a poll that fails (the socket ending, a blip) is retried within it, never extending it. The
+   * lease is checked before every call, and ending it kills the call in flight, so nothing is sent after it ends.
+   */
+  async pollRun(lease, vm, creds, n, deadline) {
+    const t0 = this.now()
+    let last = null
+    for (;;) {
+      this.stillHeld(lease)
+      const left = deadline - this.now()
+      if (left <= 0) return { result: null, last }
+      await sleep(Math.min(left, this.now() - t0 < 10_000 ? Math.min(1000, POLL_MS) : POLL_MS))
+      this.stillHeld(lease)
+      const r = await this.hv('guest-run-poll', { ...this.ident(vm), cred: creds.admin, n, cap: OUTPUT_CAP }, this.forLease(lease, CALL_MS)).catch(() => null)
+      if (r) last = r
+      if (r?.done) return { result: r, last }
+    }
   }
 
   async readOut(connId, { paths, glob, maxBytes = 256 * 1024, maxTotalBytes = 1024 * 1024 } = {}) {

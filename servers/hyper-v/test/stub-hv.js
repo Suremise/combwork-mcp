@@ -198,48 +198,77 @@ function run(s, op, a) {
       vm.sessionChecks = (vm.sessionChecks || 0) + 1
       return r
     }
-    case 'guest-run': {
+    // Runs (MC-1510): started (session 0) or published (interactive) in one call, then polled; a timeout's kill by PID.
+    // A run's outcome is worked out when it finishes, by its command: "sleep" never finishes; "slow <k>" finishes on its
+    // k-th poll; "fast" has finished before its start could read its creation time; "hang <file> <ms> <pid file>" blocks
+    // the poll that finishes it (its PID recorded) for ms, then writes the file: a killed poll never does.
+    // state.killMismatch: the PID at the kill is no longer the run's process; state.interactiveGate: the publish waits.
+    case 'guest-run-start':
+    case 'guest-run-publish': {
       const vm = own(s, a)
       if (vm.state !== 'Running') throw new Error('the VM is not running')
-      if (a.interactive) {
-        if (a.runAs) throw new Error('an interactive run is the logged-on account\'s, not a runAs')
-        const ib = { exitCode: 0, clean: true, timedOut: false, why: null, session: 'interactive', stdout: '', stdoutCut: false, stderr: '', stderrCut: false }
+      const interactive = op === 'guest-run-publish'
+      if (interactive) {
         if (s.interactiveThrows) { s.interactiveThrows = false; throw new Error('injected failure of the interactive run') }
-        // interactiveGate: the run says it is under way (interactiveReached), then waits for the test to open the gate.
         if (s.interactiveGate) {
           fs.writeFileSync(s.interactiveReached, 'reached')
           while (!fs.existsSync(s.interactiveGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25)
           Object.assign(s, load()) // the test may have set faults meanwhile: keep them when this call saves
         }
-        if (vm.loggedOn !== a.interactive.account || !vm.watcher) return { ...ib, exitCode: null, clean: false, timedOut: true, why: 'the session\'s watcher never took the run (is the account still logged on?)' }
-        const [icmd, ...irest] = String(a.command).split(' ')
-        if (icmd === 'sleep') return { ...ib, exitCode: null, clean: false, timedOut: true, why: `no exit within ${a.timeoutSec} s`, stdout: 'partial\r\n' }
-        if (icmd === 'whoami') return { ...ib, stdout: `${a.interactive.account} session 1${vm.elevated ? ' elevated' : ''}` }
-        if (icmd === 'killwatcher') { vm.watcher = false; return ib }
-        if (icmd === 'exit') return { ...ib, exitCode: Number(irest[0]) }
-        if (icmd === 'write') { vm.disk[`C:\\out\\${irest[0]}`] = Buffer.from(irest.slice(1).join(' ')).toString('base64'); return ib }
-        if (icmd === 'logoff') { vm.loggedOn = null; return ib }
-        return { ...ib, exitCode: 9009, stderr: `'${icmd}' is not recognized` }
+        if (!vm.logons?.length) throw new Error('no interactive logon in this guest (no watcher)')
       }
-      const [cmd, ...rest] = String(a.command).split(' ')
+      vm.runs ??= {}
+      // An interactive run is taken by the session's watcher: its account then, if the watcher is there.
+      vm.runs[a.n] = { command: String(a.command), interactive, as: interactive ? null : (a.runAs ? a.runAs.user : 'admin'), polls: 0, taken: interactive ? (vm.watcher ? vm.loggedOn : null) : true }
+      if (interactive) return { published: true }
+      return { pid: 4000 + a.n, started: String(a.command) === 'fast' ? null : `2026-11-13T00:00:${String(a.n).padStart(2, '0')}.0000000Z` }
+    }
+    case 'guest-run-poll': {
+      const vm = own(s, a)
+      if (vm.state !== 'Running') throw new Error('the VM is not running')
+      const run = vm.runs?.[a.n]
+      if (!run) throw new Error(`no run ${a.n}`)
+      run.polls++
+      if (run.result) return run.result
+      const blank = { stdout: '', stdoutCut: false, stderr: '', stderrCut: false }
+      if (!run.taken || (run.interactive && (vm.loggedOn !== run.taken || !vm.watcher))) return { ...blank, done: false, pending: run.interactive }
+      const [cmd, ...rest] = run.command.split(' ')
+      if (run.killed || cmd === 'sleep') return { ...blank, stdout: 'partial\r\n', done: false, pending: false }
+      if (cmd === 'slow' && run.polls < Number(rest[0])) return { ...blank, done: false, pending: false }
       const put = (p, t) => { vm.disk[p.includes(':') ? p : `C:\\out\\${p}`] = Buffer.from(t).toString('base64') }
-      const base = { exitCode: 0, timedOut: false, killed: false, stdout: '', stdoutCut: false, stderr: '', stderrCut: false, as: a.runAs ? a.runAs.user : 'admin' }
-      if (cmd === 'echo') return { ...base, stdout: rest.join(' ') + '\r\n' }
-      if (cmd === 'exit') return { ...base, exitCode: Number(rest[0]) }
-      if (cmd === 'sleep') return { ...base, exitCode: null, timedOut: true, killed: true }
-      if (cmd === 'write') { put(rest[0], rest.slice(1).join(' ')); return base }
-      if (cmd === 'cat') { const v = vm.disk[rest[0]]; return v === undefined ? { ...base, exitCode: 1 } : { ...base, stdout: Buffer.from(v, 'base64').toString() } }
-      if (cmd === 'check') return { ...base, exitCode: vm.disk[rest[0]] !== undefined ? 0 : 1 }
-      if (cmd === 'whoami') return { ...base, stdout: base.as }
-      if (cmd === 'big') return { ...base, stdout: 'x'.repeat(a.cap), stdoutCut: true }
-      if (cmd === 'shutdown') { vm.state = 'Off'; return base }
+      const ok = (o = {}) => { run.result = { ...blank, done: true, exitCode: 0, ...o }; return run.result }
       if (cmd === 'hang') { // a long run: records its PID (rest[2]), and if it is ever let finish, leaves a marker (rest[0])
         if (rest[2]) fs.writeFileSync(rest[2], String(process.pid))
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(rest[1] || 4000))
         fs.writeFileSync(rest[0], 'finished')
-        return base
+        return ok()
       }
-      return { ...base, exitCode: 9009, stderr: `'${cmd}' is not recognized` }
+      if (run.interactive) {
+        const who = run.taken
+        if (cmd === 'whoami') return ok({ stdout: `${who} session 1${vm.elevated ? ' elevated' : ''}` })
+        if (cmd === 'killwatcher') { vm.watcher = false; return ok() }
+        if (cmd === 'logoff') { vm.loggedOn = null; return ok() }
+      }
+      if (cmd === 'echo') return ok({ stdout: rest.join(' ') + '\r\n' })
+      if (cmd === 'exit') return ok({ exitCode: Number(rest[0]) })
+      if (cmd === 'fast' || cmd === 'slow') return ok({ stdout: `${cmd} done\r\n` })
+      if (cmd === 'write') { put(rest[0], rest.slice(1).join(' ')); return ok() }
+      if (cmd === 'cat') { const v = vm.disk[rest[0]]; return v === undefined ? ok({ exitCode: 1 }) : ok({ stdout: Buffer.from(v, 'base64').toString() }) }
+      if (cmd === 'check') return ok({ exitCode: vm.disk[rest[0]] !== undefined ? 0 : 1 })
+      if (cmd === 'whoami') return ok({ stdout: run.as })
+      if (cmd === 'big') return ok({ stdout: 'x'.repeat(a.cap), stdoutCut: true })
+      if (cmd === 'shutdown') { vm.state = 'Off'; return ok() }
+      return ok({ exitCode: 9009, stderr: `'${cmd}' is not recognized` })
+    }
+    case 'guest-run-kill': {
+      const vm = own(s, a)
+      const run = Object.entries(vm.runs || {}).find(([n]) => 4000 + Number(n) === a.pid)?.[1]
+      s.kills = [...(s.kills || []), { pid: a.pid, started: a.started }]
+      if (!run || run.result) return { killed: false, gone: true }
+      if (!a.started) return { killed: false, why: 'its identity was never recorded' }
+      if (s.killMismatch) return { killed: false, why: `PID ${a.pid} is no longer the run's process (it exited and the PID was reused)` }
+      run.killed = true
+      return { killed: true }
     }
     case 'guest-list': {
       const vm = own(s, a)

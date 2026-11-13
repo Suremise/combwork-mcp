@@ -66,7 +66,7 @@ test('a watcher that has gone: the run is never taken, and the VM is restored', 
   await s.call('vm_start', { interactive: 'user' })
   await s.call('vm_run', { command: 'killwatcher', as: 'user', session: 'interactive' })
   const r0 = vmOf(sc, vm).restores
-  const r = await s.call('vm_run', { command: 'whoami', as: 'user', session: 'interactive' })
+  const r = await s.call('vm_run', { command: 'whoami', as: 'user', session: 'interactive', timeoutSec: 2 })
   assert.ok(r.isError)
   assert.match(r.text, /didn't finish cleanly \(the session's watcher never took the run .*The VM was restored/)
   assert.strictEqual(vmOf(sc, vm).restores, r0 + 1)
@@ -132,11 +132,11 @@ test('an interactive run that doesn\'t finish cleanly restores the VM, after its
   // A run that never starts (the account logged off meanwhile), and a failure of the run itself: restored too.
   await s.call('vm_run', { command: 'logoff', as: 'user', session: 'interactive' })
   r0 = restores()
-  assert.match((await s.call('vm_run', { command: 'whoami', as: 'user', session: 'interactive' })).text, /didn't finish cleanly \(the session's watcher never took the run \(is the account still logged on\?\)/)
+  assert.match((await s.call('vm_run', { command: 'whoami', as: 'user', session: 'interactive', timeoutSec: 2 })).text, /didn't finish cleanly \(the session's watcher never took the run \(is the account still logged on\?\)/)
   assert.strictEqual(restores(), r0 + 1)
   await s.call('vm_reset')
   sc.patchStub(st => { st.interactiveThrows = true })
-  assert.match((await s.call('vm_run', { command: 'whoami', as: 'user', session: 'interactive' })).text, /didn't finish cleanly \(guest-run: injected failure of the interactive run\)\. The VM was restored/)
+  assert.match((await s.call('vm_run', { command: 'whoami', as: 'user', session: 'interactive' })).text, /didn't finish cleanly \(its request wasn't confirmed \(guest-run-publish: injected failure of the interactive run\)\)\. The VM was restored/)
   assert.strictEqual(restores(), r0 + 3)
   // A session-0 run's timeout is as before: killed by its PID, no restore.
   await s.call('vm_reset')
@@ -177,7 +177,7 @@ test('a run queued behind an interactive run whose restore fails never reaches t
   const r2 = await second
   assert.ok(r2.e, `the queued run ran: ${r2.r?.text}`)
   assert.match(r2.e.message, /The VM is not running \(it was stopped or restored while this run waited\)/)
-  const runs = sc.stub().calls.filter(x => x.op === 'guest-run')
+  const runs = sc.stub().calls.filter(x => x.op === 'guest-run-start' || x.op === 'guest-run-publish')
   assert.deepStrictEqual(runs.map(x => x.command), ['sleep'], 'only the interactive run reached the guest')
   assert.match((await helper.request('a', 'status')).text, new RegExp(`${vmName}: .*QUARANTINED`))
   // A read queued the same way is refused too.
