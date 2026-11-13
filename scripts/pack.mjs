@@ -24,7 +24,13 @@ export const SERVERS = {
     ['meta.json'], ['README.md'], ['combwork-mcp.example.json']
   ],
   // It goes in as the example, to be checked before it is turned on: TRILIUM_URL is the user's own Trilium.
-  trilium: [['server.js'], ['meta.json'], ['README.md'], ['combwork-mcp.example.json']]
+  trilium: [['server.js'], ['meta.json'], ['README.md'], ['combwork-mcp.example.json']],
+  // It goes in as the example, to be checked before it is turned on: it needs its helper service set up first. The
+  // helper's code and the setup scripts ship too: setup installs the helper from them.
+  'hyper-v': [
+    ['server.js'], ['roots.js'], ['client.js'], ['helper'], ['setup'],
+    ['meta.json'], ['README.md'], ['combwork-mcp.example.json']
+  ]
 }
 // The definition names Combwork reads in a zip (its MCP_ZIP_DEFINITIONS, from Combwork 1.1.0).
 const DEFINITIONS = ['combwork-mcp.json', 'combwork-mcp.example.json']

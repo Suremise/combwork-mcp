@@ -1,0 +1,15 @@
+{
+  "version": "1.0.0",
+  "description": "Disposable Hyper-V test VMs from a pool: several agents at once, each run from a clean checkpoint.",
+  "tags": ["testing", "windows", "hyper-v", "vm"],
+  "requires": {
+    "os": ["windows"],
+    "windows": {
+      "editions": ["Pro", "Enterprise", "Education"],
+      "minBuild": 22000,
+      "features": ["Hyper-V"]
+    },
+    "node": ">=18",
+    "apps": ["Its helper service, set up once in an admin PowerShell (setup\\install.ps1)", "A Windows 11 Enterprise evaluation ISO for the pool's VMs"]
+  }
+}
