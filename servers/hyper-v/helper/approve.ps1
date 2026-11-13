@@ -8,6 +8,15 @@
 #
 # It runs only from %ProgramFiles%\hyperv-mcp (admin-only writable), dot-sources nothing and uses only in-box cmdlets.
 param([Parameter(Mandatory = $true)][string]$Plan)
+# Windows PowerShell 5.1 only (MC-1506), refused before any check or change:
+# every elevated line of this server's is Windows PowerShell's, and this is
+# only tested there.
+# Run from PowerShell 7, an earlier setup stopped the service, then failed part-way. The refusal says how to run it
+# under 5.1, with the arguments used (they aren't rebuilt here: -File can't carry every type).
+if ($PSVersionTable.PSEdition -ne 'Desktop') {
+  [Console]::Error.WriteLine("This needs Windows PowerShell 5.1, not PowerShell $($PSVersionTable.PSVersion): nothing was checked or changed. Run it again in an admin Windows PowerShell, as one line, with the same arguments you used:`n  powershell -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" <the same arguments>")
+  exit 1
+}
 $ErrorActionPreference = 'Stop'
 # Started from a PowerShell 7 window, this 5.1 inherits PS7's module folders and can't load its own Get-Acl: drop them.
 $env:PSModulePath = (($env:PSModulePath -split ';') | Where-Object { $_ -and $_ -notmatch '(?<!Windows)PowerShell\\(\d[^\\]*\\)?Modules\\?$' }) -join ';'
