@@ -218,3 +218,39 @@ m.Helper.prototype.request = async function (connId, op, args) {
   await s.call('vm_start')
   assert.match((await s.call('vm_run', { command: 'whoami', as: 'user', session: 'interactive' })).text, /needs hyperv-mcp\/3/)
 })
+
+test('a VM whose start just failed is leased last: a retry gets another free VM; noted when all have failed; a good start clears it', async t => {
+  const sc = scratch('ia-failed-last')
+  const { h } = await withPool(sc, 2)
+  await h.stop()
+  const env = { ...sc.env, HYPERV_MCP_ENABLED: '1', HYPERV_MCP_MODE: 'direct', USERPROFILE: path.join(sc.dir, 'home') }
+  const s = server(env, { roots: [sc.builds] })
+  t.after(() => s.close())
+  const leased = r => /Leased (hvmcp-[0-9a-f]+)/.exec(r.text)?.[1]
+  const lineOf = async vm => (await s.call('vm_status')).text.split('\n').find(l => l.startsWith(`- ${vm}:`))
+  const failStart = async () => {
+    sc.patchStub(st => { st.logonNeverAppears = true })
+    const r = await s.call('vm_start', { interactive: 'admin' })
+    sc.patchStub(st => { st.logonNeverAppears = false })
+    assert.ok(r.isError)
+    assert.match(r.text, /no interactive session of it appeared .*vm_release and vm_acquire for another VM/)
+    await s.call('vm_release')
+  }
+  const first = leased(await s.call('vm_acquire', { minutes: 30 }))
+  await failStart()
+  assert.match(await lineOf(first), /; free; .*its last start failed at \S+ \(no interactive session of hvadmin appeared within \d+ s\)$/)
+  // The retry gets the other VM, though the failed one is first in the pool.
+  const other = leased(await s.call('vm_acquire', { minutes: 30 }))
+  assert.ok(other && other !== first)
+  await failStart()
+  // Both failed: the one that failed longest ago is leased, with a note.
+  const again = await s.call('vm_acquire', { minutes: 30 })
+  assert.strictEqual(leased(again), first)
+  assert.match(again.text, /Note: its last start failed at .*; every free VM that fitted had a failed start, and this one's was the longest ago\./)
+  // A service start doesn't clear an interactive failure; an interactive start does.
+  assert.ok(!(await s.call('vm_start')).isError)
+  assert.match(await lineOf(first), /its last start failed/)
+  assert.ok(!(await s.call('vm_start', { interactive: 'admin' })).isError)
+  assert.doesNotMatch(await lineOf(first), /last start failed/)
+  assert.match(await lineOf(other), /its last start failed/)
+})

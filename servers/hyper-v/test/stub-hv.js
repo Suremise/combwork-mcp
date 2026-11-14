@@ -17,6 +17,11 @@
  * off, "killwatcher" ends the watcher, and state.interactiveThrows makes the next one fail outright.
  * Faults (state.fail): { "<op>": n } fails the next n calls of op; restoreLeaves: { switchName, reserve, state } makes
  * restore leave that behind; signatureBad: true; aclBad: "<why>"; installNeverReady: true.
+ * Licences (MC-1513): facts reports the Default Switch unless noDefaultSwitch. guest-activate connects the adapter to
+ * "Default Switch" (each VM's onlineCount counts it), then answers state.activation (default: licensed, 90 days left)
+ * and disconnects; activateDies: it fails with the adapter still connected (a killed call); activateStaysConnected: it
+ * answers but leaves it connected (disconnected: false). guest-licence answers state.licence (default: status 1).
+ * net-off turns the VM off and disconnects it (fail it with fail['net-off']).
  */
 const fs = require('fs')
 const crypto = require('crypto')
@@ -62,7 +67,19 @@ const facts = vm => ({ vmId: vm.id, state: vm.state, parentCheckpointId: vm.pare
 
 function run(s, op, a) {
   switch (op) {
-    case 'facts': return { hyperv: true, logicalCpus: 16, memoryMB: 65536, folders: (a.folders || []).map(folder => ({ folder, freeGB: s.freeGB ?? 500 })) }
+    case 'facts': return { hyperv: true, logicalCpus: 16, memoryMB: 65536, folders: (a.folders || []).map(folder => ({ folder, freeGB: s.freeGB ?? 500 })), defaultSwitch: !s.noDefaultSwitch }
+    case 'guest-activate': {
+      const vm = own(s, a)
+      if (s.noDefaultSwitch) throw new Error('this host has no Default Switch')
+      vm.switchName = 'Default Switch'
+      vm.onlineCount = (vm.onlineCount || 0) + 1
+      if (s.activateDies) throw new Error('injected: the activation call died')
+      const r = { status: 1, graceMinutes: 90 * 24 * 60, evalEnd: null, channel: 'Retail:TB:Eval', error: null, ...(s.activation || {}) }
+      if (!s.activateStaysConnected) vm.switchName = null
+      return { ...r, disconnected: !vm.switchName }
+    }
+    case 'guest-licence': { own(s, a); return { status: 1, graceMinutes: 0, evalEnd: null, channel: 'Retail', error: null, ...(s.licence || {}) } }
+    case 'net-off': { const vm = own(s, a); vm.state = 'Off'; vm.switchName = null; return { offline: true } }
     case 'find-vm': {
       const hits = Object.values(s.vms).filter(v => v.name === a.name && under(v.location, a.folder))
       return { vmId: hits[0]?.id ?? null }
@@ -320,7 +337,13 @@ function run(s, op, a) {
       if (mine.length) { delete s.switches[mine[0][0]]; return { removed: true } }
       return { gone: true, foreign: !!s.switches[a.name] }
     }
-    case 'make-iso': fs.writeFileSync(a.out, 'iso'); return { out: a.out }
+    case 'make-iso': {
+      // The answer file it carries, kept (in the stub's state only) so tests can check the image index and key.
+      const answer = join(a.source, 'autounattend.xml')
+      if (fs.existsSync(answer)) s.answers = [...(s.answers || []), fs.readFileSync(answer, 'utf8').replace(/<Password>[\s\S]*?<\/Password>/g, '<Password>(not kept)</Password>')]
+      fs.writeFileSync(a.out, 'iso')
+      return { out: a.out }
+    }
     case 'signatures': return { files: a.files.map(f => ({ file: f, ok: !s.signatureBad, why: s.signatureBad ? 'signature NotSigned' : null })) }
     case 'approval-acl': return { ok: !s.aclBad, why: s.aclBad || null }
     default: throw new Error(`unknown operation '${op}'`)

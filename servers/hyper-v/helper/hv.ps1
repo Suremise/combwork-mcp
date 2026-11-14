@@ -263,6 +263,25 @@ public static class HvLsa {
   @{ boot = $boot }
 }
 
+# The guest's Windows licence (MC-1513): with $activate, Activate() first, retried while the network comes up (about
+# 4 minutes in all), then the licence read back: LicenseStatus (1 = licensed), GracePeriodRemaining (minutes; for a
+# timebased evaluation, what is left of it) and EvaluationEndDate (when Windows reports one).
+$GuestLicence = {
+  param($activate)
+  $q = "ApplicationID='55c92734-d682-4d71-983e-d6ec3f16059f' AND PartialProductKey IS NOT NULL"
+  $err = $null
+  if ($activate) {
+    for ($i = 0; $i -lt 5; $i++) {
+      try { Invoke-CimMethod -InputObject (Get-CimInstance SoftwareLicensingProduct -Filter $q | Select-Object -First 1) -MethodName Activate -ErrorAction Stop | Out-Null; $err = $null; break }
+      catch { $err = $_.Exception.Message; Start-Sleep 45 }
+    }
+  }
+  $p = Get-CimInstance SoftwareLicensingProduct -Filter $q | Select-Object -First 1
+  $end = $null
+  if ($p.EvaluationEndDate -and $p.EvaluationEndDate.Year -gt 1601) { $end = $p.EvaluationEndDate.ToUniversalTime().ToString('o') }
+  @{ status = [int]$p.LicenseStatus; graceMinutes = [int]$p.GracePeriodRemaining; evalEnd = $end; channel = [string]$p.ProductKeyChannel; error = $err }
+}
+
 # The guest's boot time and the sessions (>= 1) in which the account's watcher runs: its interactive logon, ready for runs.
 $GuestSession = {
   param($u)
@@ -271,6 +290,10 @@ $GuestSession = {
     $_.SessionId -ge 1 -and $_.CommandLine -match 'C:\\hvmcp\\agent\.ps1' -and (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User -eq $u } | ForEach-Object { [int]$_.SessionId })
   @{ boot = $boot; sessions = $ids }
 }
+
+# Windows' built-in NAT switch (fixed id). Used only by a build's one approved online step (guest-activate) and by
+# net-off; no start ever connects it (configure-start takes only the pool's internal switch).
+$DEFAULT_SWITCH = 'c08cb7b8-9b3c-408e-8e30-5e16a3aeb444'
 
 $MS_ROOTS = @('3B1EFD3A66EA28B16697394703A72CA340A05BD5', '8F43288AD272F3103B6FB1428485EA3014C0BCFE') # Microsoft Root CA 2010, 2011
 $ADMIN_SIDS = @('S-1-5-18', 'S-1-5-32-544') # SYSTEM, Administrators
@@ -288,6 +311,7 @@ try {
       @{
         hyperv = [bool](Get-Command Get-VM -ErrorAction SilentlyContinue) -and ((Get-Service vmms -ErrorAction SilentlyContinue).Status -eq 'Running')
         logicalCpus = [int]$cs.NumberOfLogicalProcessors; memoryMB = [int]($cs.TotalPhysicalMemory / 1MB); folders = $folders
+        defaultSwitch = [bool](Get-VMSwitch -Id $DEFAULT_SWITCH -ErrorAction SilentlyContinue)
       }
     }
     'find-vm' {
@@ -403,6 +427,36 @@ try {
       $vm = Get-OwnVm $a
       $agent = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'guest-agent.ps1'))
       Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestLogon -ArgumentList ([string]$a.logon.user), ([string]$a.logon.password), ([bool]$a.elevated), $agent
+    }
+    'guest-licence' {
+      $vm = Get-OwnVm $a
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestLicence -ArgumentList $false
+    }
+    'guest-activate' {
+      # The build's one online step (MC-1513): the adapter on the Default Switch only for this call, disconnected in the
+      # finally; disconnected is reported only once no adapter shows a switch. If this process is killed first, the
+      # helper's net-off does it.
+      $vm = Get-OwnVm $a
+      $sw = Get-VMSwitch -Id $DEFAULT_SWITCH -ErrorAction SilentlyContinue
+      if (-not $sw) { throw "this host has no Default Switch (id $DEFAULT_SWITCH): Windows can't be activated online from here" }
+      $r = $null
+      try {
+        Get-VMNetworkAdapter -VM $vm | Connect-VMNetworkAdapter -VMSwitch $sw
+        $r = Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestLicence -ArgumentList $true
+      } finally {
+        Get-VMNetworkAdapter -VM $vm | Disconnect-VMNetworkAdapter
+      }
+      $left = @(Get-VMNetworkAdapter -VM $vm | Where-Object { $_.SwitchName -or ($_.SwitchId -and $_.SwitchId -ne [guid]::Empty) })
+      @{ status = $r.status; graceMinutes = $r.graceMinutes; evalEnd = $r.evalEnd; channel = $r.channel; error = $r.error; disconnected = ($left.Count -eq 0) }
+    }
+    'net-off' {
+      # After a failed or killed online step: the guest off, then every adapter disconnected, verified.
+      $vm = Get-OwnVm $a
+      if ($vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -Force -ErrorAction SilentlyContinue }
+      Get-VMNetworkAdapter -VM $vm | Disconnect-VMNetworkAdapter
+      $left = @(Get-VMNetworkAdapter -VM $vm | Where-Object { $_.SwitchName -or ($_.SwitchId -and $_.SwitchId -ne [guid]::Empty) })
+      if ($left.Count) { throw 'its network adapter is still connected' }
+      @{ offline = $true }
     }
     'guest-session' {
       $vm = Get-OwnVm $a

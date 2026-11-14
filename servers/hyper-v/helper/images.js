@@ -12,6 +12,10 @@
  *   must name the expected edition and build. These are consistency checks: install.wim has no signature of its own,
  *   so they don't authenticate its contents. The hash and origin do.
  * - The guest's own report after the install is a sanity check only (guestReportProblem), never verification.
+ * - **One edition per ISO** (MC-1513): the Windows 11 Enterprise evaluation, or a non-evaluation x64 Enterprise,
+ *   Professional or Education image the user supplies (unpinned: setup's -AllowUnpinnedIso for a local file). A
+ *   multi-edition ISO needs { edition } on its first check; the record keeps that edition and its index, and a later
+ *   request for another edition of the same ISO is refused, so a verified image's identity never changes.
  */
 const fs = require('fs')
 const https = require('https')
@@ -26,7 +30,8 @@ const PINNED = {
     name: 'Windows 11 Enterprise Evaluation 25H2 (26200.6584.250915-1905), en-us, x64'
   }
 }
-const EDITIONS = ['EnterpriseEval']
+const EVAL = 'EnterpriseEval'
+const EDITIONS = [EVAL, 'Enterprise', 'Professional', 'Education']
 // HYPERV_MCP_MIN_ISO_BYTES: test-only, so the tests can use small fixture images.
 const minSize = () => Number(process.env.HYPERV_MCP_MIN_ISO_BYTES || 1024 ** 3)
 const MAX_SIZE = 16 * 1024 ** 3
@@ -92,7 +97,8 @@ function localIso(p, ownDirs) {
  * existing: true when that image is already verified.
  */
 async function prepare({ want, dir, hv, policy, known, ownDirs = [], progress = () => {} }) {
-  if (!want || typeof want !== 'object' || (!want.iso === !want.download)) throw new Error('image must be { iso: "<path>" } or { download: "<https URL on microsoft.com>" }')
+  if (!want || typeof want !== 'object' || (!want.iso === !want.download)) throw new Error('image must be { iso: "<path>" } or { download: "<https URL on microsoft.com>" }, with edition when the ISO holds several')
+  if (want.edition !== undefined && !EDITIONS.includes(want.edition)) throw new Error(`image.edition must be one of ${EDITIONS.join(', ')}`)
   fs.mkdirSync(dir, { recursive: true })
   const tmp = join(dir, `incoming-${crypto.randomBytes(6).toString('hex')}.iso`)
   const source = want.iso ? 'local' : 'download'
@@ -101,7 +107,12 @@ async function prepare({ want, dir, hv, policy, known, ownDirs = [], progress = 
     const input = want.iso ? fs.createReadStream(localIso(want.iso, [...ownDirs, dir])) : await download(want.download)
     const { sha256, size } = await copyHashing(input, tmp, progress)
     const lower = sha256.toLowerCase()
-    if (known?.has(lower) && fs.existsSync(known.get(lower).file)) { fs.rmSync(tmp, { force: true }); return { ...known.get(lower), existing: true } }
+    if (known?.has(lower) && fs.existsSync(known.get(lower).file)) {
+      fs.rmSync(tmp, { force: true })
+      const rec = known.get(lower)
+      if (want.edition && want.edition !== rec.edition) throw new Error(`this ISO is recorded as ${rec.edition}; another edition from the same ISO isn't supported: use another ISO`)
+      return { ...rec, existing: true }
+    }
     const pin = PINNED[sha256]
     if (pin && pin.size !== size) throw new Error('the image matches a pinned hash but not its size')
     if (!pin && source === 'local' && !policy.allowUnpinnedIso) {
@@ -113,14 +124,18 @@ async function prepare({ want, dir, hv, policy, known, ownDirs = [], progress = 
     fs.rmSync(join(dir, `check-${lower.slice(0, 12)}`), { recursive: true, force: true })
     const badSig = (sig.files || []).filter(f => !f.ok)
     if (!sig.files?.length || badSig.length) throw new Error(`the ISO's setup files are not validly signed by Microsoft: ${badSig.map(f => `${f.file}: ${f.why}`).join('; ') || 'no answer'}`)
-    const imgs = look.images.filter(i => EDITIONS.includes(i.editionId) && i.arch === 9)
-    if (imgs.length !== 1) throw new Error(`the ISO should hold one x64 ${EDITIONS.join('/')} image; it holds ${look.images.map(i => `${i.editionId} (arch ${i.arch})`).join(', ')}`)
+    const fits = look.images.filter(i => EDITIONS.includes(i.editionId) && i.arch === 9)
+    const imgs = want.edition ? fits.filter(i => i.editionId === want.edition) : fits
+    const holds = look.images.map(i => `${i.editionId} (arch ${i.arch})`).join(', ')
+    if (want.edition && imgs.length !== 1) throw new Error(`the ISO should hold one x64 ${want.edition} image; it holds ${holds}`)
+    if (!imgs.length) throw new Error(`the ISO should hold an x64 ${EDITIONS.join('/')} image; it holds ${holds}`)
+    if (imgs.length > 1) throw new Error(`the ISO holds several editions (${imgs.map(i => i.editionId).join(', ')}): pass image { ..., edition: "<one of them>" }`)
     const img = imgs[0]
     const build = `${img.build}.${img.spBuild}`
     if (pin && (pin.edition !== img.editionId || pin.build !== build)) throw new Error(`the pinned image should be ${pin.edition} ${pin.build}, but its metadata says ${img.editionId} ${build}`)
     const file = join(dir, `${lower}.iso`)
     fs.renameSync(tmp, file)
-    return { sha256: lower, size, file, source, edition: img.editionId, build, imageIndex: img.index, pinned: !!pin }
+    return { sha256: lower, size, file, source, edition: img.editionId, build, imageIndex: img.index, pinned: !!pin, evaluation: img.editionId === EVAL }
   } finally {
     fs.rmSync(tmp, { force: true })
   }
@@ -134,4 +149,4 @@ function guestReportProblem(g, img) {
   return null
 }
 
-module.exports = { prepare, guestReportProblem, allowedUrl, localIso, PINNED }
+module.exports = { prepare, guestReportProblem, allowedUrl, localIso, PINNED, EDITIONS, EVAL }

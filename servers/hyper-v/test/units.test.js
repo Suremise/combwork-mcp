@@ -12,7 +12,7 @@ const images = require('../helper/images')
 const policy = require('../helper/policy')
 const { Journal } = require('../helper/journal')
 const { ps51Env } = require('../helper/hv')
-const { canonical, baselineProblem, expiry } = require('../helper/core')
+const { canonical, baselineProblem, expiry, licenceOf } = require('../helper/core')
 const { autounattend } = require('../helper/unattend')
 const { hv } = require('../helper/hv')
 
@@ -112,7 +112,7 @@ test('images: an unpinned local ISO is refused unless the policy allows it, and 
   assert.strictEqual(again.existing, true)
 })
 
-test('images: bad signatures, the wrong edition, and the helper\'s own folders are refused', { skip: !windows }, async () => {
+test('images: bad signatures, an edition not supported, and the helper\'s own folders are refused', { skip: !windows }, async () => {
   const sc = scratch('images-bad')
   process.env.HYPERV_MCP_MIN_ISO_BYTES = '1'
   const pol = { allowUnpinnedIso: true }
@@ -120,13 +120,38 @@ test('images: bad signatures, the wrong edition, and the helper\'s own folders a
   const bad = async (op, a) => ({ files: a.files.map(file => ({ file, ok: false, why: 'signature NotSigned' })) })
   const f = await udf(sc, 'img', goodFiles())
   await assert.rejects(images.prepare({ want: { iso: f }, dir: path.join(sc.disks, 'i1'), hv: bad, policy: pol }), /not validly signed by Microsoft: .*NotSigned/)
-  const pro = await udf(sc, 'pro', { ...goodFiles(), 'sources/install.wim': wim([{ edition: 'Professional', build: 26200, sp: 1 }]) })
-  await assert.rejects(images.prepare({ want: { iso: pro }, dir: path.join(sc.disks, 'i2'), hv: ok, policy: pol }), /should hold one x64 EnterpriseEval image; it holds Professional/)
+  const home = await udf(sc, 'home', { ...goodFiles(), 'sources/install.wim': wim([{ edition: 'Core', build: 26200, sp: 1 }]) })
+  await assert.rejects(images.prepare({ want: { iso: home }, dir: path.join(sc.disks, 'i2'), hv: ok, policy: pol }), /should hold an x64 EnterpriseEval\/Enterprise\/Professional\/Education image; it holds Core/)
+  await assert.rejects(images.prepare({ want: { iso: f, edition: 'Core' }, dir: path.join(sc.disks, 'i2'), hv: ok, policy: pol }), /edition must be one of/)
   const arm = await udf(sc, 'arm', { ...goodFiles(), 'sources/install.wim': wim([{ edition: 'EnterpriseEval', build: 26200, sp: 1, arch: 12 }]) })
   await assert.rejects(images.prepare({ want: { iso: arm }, dir: path.join(sc.disks, 'i3'), hv: ok, policy: pol }), /arch 12/)
   await assert.rejects(images.prepare({ want: { iso: f }, dir: path.join(sc.disks, 'i4'), hv: ok, policy: pol, ownDirs: [sc.dir] }), /helper's own folders/)
   await assert.rejects(images.prepare({ want: { iso: 'relative.iso' }, dir: path.join(sc.disks, 'i5'), hv: ok, policy: pol }), /absolute local path/)
   await assert.rejects(images.prepare({ want: { iso: f, download: 'https://x.microsoft.com/a.iso' }, dir: path.join(sc.disks, 'i6'), hv: ok, policy: pol }), /must be \{ iso/)
+})
+
+test('images: one edition per ISO (MC-1513): a multi-edition ISO needs edition; its record keeps it; another edition of it is refused', { skip: !windows }, async () => {
+  const sc = scratch('images-editions')
+  process.env.HYPERV_MCP_MIN_ISO_BYTES = '1'
+  const pol = { allowUnpinnedIso: true }
+  const ok = async (op, a) => ({ files: a.files.map(file => ({ file, ok: true })) })
+  const multi = await udf(sc, 'multi', { ...goodFiles(), 'sources/install.wim': wim([{ edition: 'Core', build: 26200, sp: 1 }, { edition: 'Professional', build: 26200, sp: 1 }, { edition: 'Enterprise', build: 26200, sp: 1 }]) })
+  const dir = path.join(sc.disks, 'images')
+  await assert.rejects(images.prepare({ want: { iso: multi }, dir, hv: ok, policy: pol }), /holds several editions \(Professional, Enterprise\): pass image \{ \.\.\., edition/)
+  const pro = await images.prepare({ want: { iso: multi, edition: 'Professional' }, dir, hv: ok, policy: pol })
+  assert.deepStrictEqual([pro.edition, pro.imageIndex, pro.evaluation], ['Professional', 2, false])
+  const known = new Map([[pro.sha256, pro]])
+  await assert.rejects(images.prepare({ want: { iso: multi, edition: 'Enterprise' }, dir, hv: ok, policy: pol, known }), /recorded as Professional; another edition from the same ISO isn't supported/)
+  assert.deepStrictEqual([known.get(pro.sha256).edition, known.get(pro.sha256).imageIndex], ['Professional', 2], 'the record is unchanged')
+  for (const want of [{ iso: multi, edition: 'Professional' }, { iso: multi }]) {
+    const again = await images.prepare({ want, dir, hv: ok, policy: pol, known })
+    assert.deepStrictEqual([again.existing, again.edition, again.imageIndex], [true, 'Professional', 2])
+  }
+  const one = await udf(sc, 'one', { ...goodFiles(), 'sources/install.wim': wim([{ edition: 'Education', build: 26200, sp: 1 }]) })
+  const edu = await images.prepare({ want: { iso: one }, dir, hv: ok, policy: pol })
+  assert.deepStrictEqual([edu.edition, edu.imageIndex, edu.evaluation], ['Education', 1, false])
+  const ev = await images.prepare({ want: { iso: await udf(sc, 'ev', goodFiles()) }, dir: path.join(sc.disks, 'ev'), hv: ok, policy: pol })
+  assert.strictEqual(ev.evaluation, true)
 })
 
 test('images: downloads only over https from microsoft.com hosts', async () => {
@@ -227,18 +252,54 @@ test('answer file: values escaped, names checked', () => {
   assert.match(x, /<Value>a&lt;b&gt;&amp;&quot;&apos;c<\/Value>/)
   assert.ok(!x.includes('a<b>'))
   assert.match(x, /<Key>\/IMAGE\/INDEX<\/Key><Value>1<\/Value>/)
+  assert.doesNotMatch(x, /ProductKey/)
+  const keyed = autounattend({ computerName: 'HVMCP-1234', creds, imageIndex: 3, productKey: 'ABCDE-FGHIJ-KLMNO-PQRST-UVWXY' })
+  assert.match(keyed, /<Key>\/IMAGE\/INDEX<\/Key><Value>3<\/Value>/)
+  // The activation key: Shell-Setup's ProductKey in the specialize pass (the one Microsoft names for a MAK), once;
+  // windowsPE's UserData carries none (the image index picks the edition).
+  const specialize = keyed.slice(keyed.indexOf('<settings pass="specialize">'), keyed.indexOf('<settings pass="oobeSystem">'))
+  const shell = specialize.slice(specialize.indexOf('name="Microsoft-Windows-Shell-Setup"'), specialize.indexOf('</component>', specialize.indexOf('name="Microsoft-Windows-Shell-Setup"')))
+  assert.match(shell, /<ProductKey>ABCDE-FGHIJ-KLMNO-PQRST-UVWXY<\/ProductKey>/)
+  assert.strictEqual(keyed.split('ABCDE-FGHIJ-KLMNO-PQRST-UVWXY').length, 2, 'the key appears once')
+  assert.match(keyed, /<UserData><AcceptEula>true<\/AcceptEula><\/UserData>/)
+  assert.throws(() => autounattend({ computerName: 'OK', creds, productKey: 'abc<de' }), /product key/)
+  assert.throws(() => autounattend({ computerName: 'OK', creds, imageIndex: 0 }), /image index/)
   assert.throws(() => autounattend({ computerName: 'bad name<', creds }), /computer name/)
   assert.throws(() => autounattend({ computerName: 'OK', creds: { ...creds, user: { user: 'x y', password: 'p' } } }), /user account/)
 })
 
-test('the 90-day evaluation: a warning from 14 days before, counted from the clean checkpoint', () => {
+test('the licence note (MC-1513): an evaluation\'s days left from its recorded end, a warning from 14 days, ended; an own copy; unknown for older VMs', () => {
   const day = 24 * 60 * 60 * 1000
   const t0 = Date.parse('2026-11-13T00:00:00Z')
-  const vm = { readyAt: new Date(t0).toISOString() }
-  assert.strictEqual(expiry(vm, t0 + 75 * day), '')
-  assert.match(expiry(vm, t0 + 80 * day), /expires in about 10 day\(s\)/)
-  assert.match(expiry(vm, t0 + 91 * day), /has expired/)
+  const vm = { readyAt: new Date(t0).toISOString(), licence: { kind: 'evaluation', expiresAt: new Date(t0 + 90 * day).toISOString() } }
+  assert.match(expiry(vm, t0 + 1 * day), /; Windows evaluation, 89 days left \(until 2027-02-11\)$/)
+  assert.match(expiry(vm, t0 + 80 * day), /WARNING: its Windows evaluation ends in about 10 day\(s\), on 2027-02-11: ask the user to rebuild the pool/)
+  assert.match(expiry(vm, t0 + 90 * day - 30 * 60_000), /evaluation ends 2027-02-11T00:00:00.000Z: it is no longer leased; the pool needs a rebuild/)
+  assert.match(expiry(vm, t0 + 91 * day), /evaluation ended 2027-02-11T00:00:00.000Z/)
+  assert.strictEqual(expiry({ ...vm, licence: { kind: 'own', activated: true, status: 1 } }, t0), '; own copy of Windows, activated')
+  assert.strictEqual(expiry({ ...vm, licence: { kind: 'own', activated: false, status: 5 } }, t0), '; own copy of Windows, not activated (licence status 5)')
+  assert.match(expiry({ readyAt: vm.readyAt }, t0 + 91 * day), /^; licence unknown \(built before Windows activation was recorded/)
   assert.strictEqual(expiry({}, t0), '')
+})
+
+test('a build\'s licence (MC-1513): an evaluation must be licensed with at least 85 days, its end the earlier of the guest\'s two fields; an own copy as it is', () => {
+  const day = 24 * 60 * 60 * 1000
+  const now = Date.parse('2026-11-14T00:00:00Z')
+  const at = d => new Date(now + d * day).toISOString()
+  assert.deepStrictEqual(licenceOf({ status: 1, graceMinutes: 90 * 1440 }, true, now), { kind: 'evaluation', expiresAt: at(90) })
+  assert.deepStrictEqual(licenceOf({ status: 1, graceMinutes: 90 * 1440, evalEnd: at(88) }, true, now), { kind: 'evaluation', expiresAt: at(88) }, 'the earlier end')
+  assert.deepStrictEqual(licenceOf({ status: 1, graceMinutes: 0, evalEnd: at(86) }, true, now), { kind: 'evaluation', expiresAt: at(86) })
+  assert.throws(() => licenceOf({ status: 1, graceMinutes: 84 * 1440 + 1000 }, true, now), /only 84 day\(s\) left \(at least 85 needed\)/)
+  assert.throws(() => licenceOf({ status: 5, graceMinutes: 0, error: 'no route' }, true, now), /didn't activate \(licence status 5: no route\)/)
+  assert.throws(() => licenceOf({ status: 1, graceMinutes: 0, evalEnd: null }, true, now), /no evaluation period/)
+  // A real end date that has passed (or is now) fails closed, whatever the grace figure says.
+  assert.throws(() => licenceOf({ status: 1, graceMinutes: 90 * 1440, evalEnd: at(-1) }, true, now), /end date, 2026-11-13T00:00:00.000Z, has already passed/)
+  assert.throws(() => licenceOf({ status: 1, graceMinutes: 90 * 1440, evalEnd: at(0) }, true, now), /has already passed/)
+  assert.throws(() => licenceOf({ status: 1, graceMinutes: 0, evalEnd: at(-1) }, true, now), /has already passed/)
+  // An absent or unreadable date is ignored (hv.ps1 sends none for Windows' 1601 sentinel).
+  assert.deepStrictEqual(licenceOf({ status: 1, graceMinutes: 90 * 1440, evalEnd: 'not a date' }, true, now), { kind: 'evaluation', expiresAt: at(90) })
+  assert.deepStrictEqual(licenceOf({ status: 1 }, false, now), { kind: 'own', activated: true, status: 1 })
+  assert.deepStrictEqual(licenceOf({ status: 5 }, false, now), { kind: 'own', activated: false, status: 5 })
 })
 
 test('setup storage and ACLs (non-elevated): grants removed; VM grants kept; links refused; secure creation, receipts, parents, pins', { skip: !windows }, () => {

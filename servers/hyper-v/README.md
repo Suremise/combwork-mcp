@@ -48,7 +48,7 @@ Hyper-V Administrators, so agents running as you can't drive Hyper-V directly.
 | Create VMs, disks and one internal switch, **only** from a plan the user approved in an elevated prompt, and **within the policy** setup wrote (max VMs, cores per VM, total memory, disk per VM, disk folders, networking allowed). | Exceed the policy, whatever a plan or an approval says. Create an external switch or a NAT, or change any host setting: Hyper-V's settings, other switches, the firewall, Defender, features or services. |
 | Write only to its state folder (`%ProgramData%\hyperv-mcp`: the journal, plans, per-run staging under `runs\`, guest credentials) and the disk folders named at setup. | Write anywhere else on the host. Files read back from a guest are returned as data, never written to the host. |
 | Copy a build into a VM: the files of a folder that resolves, by real path, under your MCP roots or a build folder an admin named at setup, **copied** to `C:\build`. | Share or map any host folder into a guest: the guest never sees a live host path, so it can't change your files. Copy a build from outside your roots and the admin's build folders, or from your profile itself, its dot-folders (`~/.ssh`, `~/.claude`, …), `AppData` or its top folders, or anything under `AppData\Roaming`. Follow a link or junction in the build (they're skipped and named). |
-| Connect one VM to the pool's **internal** switch for one run, only when `vm_start` asks (`network: true`) and the policy allows it. | Give a guest the internet or your LAN. It's off by default: the adapter is disconnected, and the restore at stop puts it back. |
+| Connect one VM to the pool's **internal** switch for one run, only when `vm_start` asks (`network: true`) and the policy allows it. | Give a running guest the internet or your LAN. It's off by default: the adapter is disconnected, and the restore at stop puts it back. The one exception is at build, not run: a new VM goes online once, through Windows' Default Switch, to activate Windows, when the plan you approved says so (see "Windows licences"). |
 | Reserve CPU for one run (`reserveCpu`, a percentage of the VM's cores), up to the policy's cap; reset at stop. | Reserve beyond the cap, or change a VM's CPU outside a run. |
 | Restore the clean checkpoint **by id** before every start, unconditionally, and at every stop and release, then check that the VM is Off, at that checkpoint, disconnected, with no reserve. Keep a VM unrestored for inspection **only when asked**, until its lease ends. | Start a VM from anything but the clean checkpoint, or let one lease's changes reach the next. A VM that can't be confirmed clean is **quarantined**: never leased until a restore confirms it. |
 | Keep a leased VM running for a **work session**: several runs in one guest, with `vm_sync` copying changed files into its `C:\build` (no restore between them), and the lease renewed up to the policy's `maxLeaseMinutes` at a time and `maxSessionMinutes` in all. | Carry anything past the lease: release, the deadline and the session's connection closing all restore and verify it as above. Write anywhere in the guest but `C:\build` and its own staging folder when syncing, or follow a link or junction there. |
@@ -103,7 +103,9 @@ and test accounts.
      (a work session's cap for `vm_renew`: 5-1440 and at least `-MaxLeaseMinutes`; left out, 480 or
      `-MaxLeaseMinutes` if that is more), `-MaxBuildMB`, `-AllowUnpinnedIso`. `-BuildRoot` names folders builds may also
      come from (see "Build folders set by an admin"). `-ProjectsFile` names the projects that share the pool fairly (see
-     "Sharing the pool between projects").
+     "Sharing the pool between projects"). `-ProductKeyFile` names a file holding a Windows product key for VMs built
+     from your own (non-evaluation) image (see "Windows licences"); a rerun without it keeps the key, and
+     `-ProductKeyFile none` removes it.
 
    It never enables a Windows feature or restarts the PC. If Hyper-V is off, it says how to turn it on and stops.
 3. Add the server to your client, with `HYPERV_MCP_ENABLED=1`:
@@ -196,17 +198,47 @@ approval → change**:
    approval and the policy again, then runs the change in the background (`pool_status` shows it). Creating a VM
    installs Windows unattended, with no network:
    - about 20–40 minutes each, one VM at a time, so the host's CPU isn't flooded;
-   - then the guest set-up, a sanity check of the installed edition and build, and the clean checkpoint, taken with the
-     VM off.
+   - then the guest set-up, a sanity check of the installed edition and build, Windows' activation when the plan says
+     so (see "Windows licences"), and the clean checkpoint, taken with the VM off and its adapter disconnected.
 
-**Rebuilding.** An evaluation install expires 90 days after it was made, and `pool_status` warns 14 days before. Plan
-a `remove`, then a new `create` from a fresh image, each approved the same way. **Teardown** is the same `remove`, and
-only VMs with no lease can be removed.
+**Rebuilding.** An evaluation VM lasts about 90 days from its activation at build; `vm_status` and `pool_status` show
+the days left and warn 14 days before. Plan a `remove`, then a new `create`, each approved the same way. **Teardown** is
+the same `remove`, and only VMs with no lease can be removed.
+
+### Windows licences
+
+Each VM records its Windows licence when it is built, and `vm_status`, `pool_status` and setup show it.
+
+- **The evaluation** (the default image). Unactivated, it lasts only about a day: after that, Windows logs any
+  interactive user off within seconds and shuts the guest down every hour. So each evaluation VM is **activated online
+  once, as it is built**:
+  - its plan says so, and your approval covers it: "each new VM goes online once, through Windows' Default Switch, to
+    activate Windows";
+  - only for that step: the adapter is connected to the Default Switch (Windows' own NAT switch, so nothing new on the
+    host's network), Windows is activated, and the adapter is disconnected and checked before the clean checkpoint;
+  - the build fails unless Windows comes back licensed with at least 85 days left; the end date it reports is recorded,
+    and never recomputed or extended (no re-arm, no clock changes);
+  - if the step fails, the VM is turned off and disconnected, then removed; if that fails too, `pool_status` warns that
+    it may still be online, and the helper retries every few minutes and at its next start;
+  - no start ever uses the Default Switch: runs only ever get the pool's internal switch.
+  A host without the Default Switch can't build evaluation VMs (setup says whether it has one). Within an hour of its
+  end, a VM is no longer leased, and leases and renewals never run past it. VMs built before licences were recorded
+  show "licence unknown": rebuild them to record it.
+- **Your own copy**: a non-evaluation Windows 11 x64 ISO (Enterprise, Professional or Education), for a project that has
+  a licence. A local one is unpinned, so setup needs `-AllowUnpinnedIso` and its plan says "NOT AUTHENTICATED". Its
+  product key comes from setup's `-ProductKeyFile` (a file, so it's never on a command line): it's stored in the
+  helper's secrets folder, readable only by SYSTEM, Administrators and the helper, and written only into that build's
+  answer file, which is deleted after the build. It is never in a reply, a plan, the journal or the log. Such a VM stays
+  offline unless its plan asks for the activation step (`pool_plan({ ..., activate: true })`); either way its licence
+  is shown, and it has no expiry to track.
+- **Both in one pool:** the licence belongs to the image, and each VM records its image (see "A pool from more than one
+  image"), so evaluation and own-copy VMs can share a pool, and each project's `images` list decides which it may use.
 
 ### The image
 
-The pool is built from the **Windows 11 Enterprise evaluation** ISO. Microsoft's
-[Evaluation Center](https://www.microsoft.com/evalcenter/evaluate-windows-11-enterprise) offers it.
+The pool is built from the **Windows 11 Enterprise evaluation** ISO, which Microsoft's
+[Evaluation Center](https://www.microsoft.com/evalcenter/evaluate-windows-11-enterprise) offers, or from your own
+non-evaluation Windows 11 ISO (see "Windows licences").
 
 - **What authenticates it is where its bytes came from, and only that:**
   - **Pinned:** a SHA-256 in the server's table of known images. Today that's the 25H2 image,
@@ -222,7 +254,10 @@ The pool is built from the **Windows 11 Enterprise evaluation** ISO. Microsoft's
 - **Before anything runs it**, the helper reads the copy itself, without mounting it (a small bounded UDF reader):
   - `setup.exe` and `sources\setup.exe` must have valid Authenticode signatures from Microsoft Corporation, chaining to
     a Microsoft root (Root Certificate Authority 2010 or 2011, by thumbprint);
-  - `sources\install.wim`'s metadata must name one x64 `EnterpriseEval` image, with the build the pin expects.
+  - `sources\install.wim`'s metadata must name an x64 `EnterpriseEval`, `Enterprise`, `Professional` or `Education`
+    image, with the build the pin expects. An ISO holding several of them needs `image: { iso, edition }`. **One edition
+    per ISO:** the first check records that edition and its index, the plan binds them, the build installs exactly
+    that one, and asking for another edition of the same ISO is refused.
 
   These are **consistency checks**: `install.wim` has no signature of its own, so they don't authenticate its
   contents. The hash and where it came from do.
@@ -242,7 +277,7 @@ The pool is built from the **Windows 11 Enterprise evaluation** ISO. Microsoft's
 | `vm_stop({ keep=false })` | Turns the VM off and restores the clean checkpoint, then **verifies** it: Off, at the checkpoint (by id), adapter disconnected, reserve 0. It says "Reverted" only then. Otherwise **CLEANUP FAILED**, and the VM is quarantined. The lease stays. `keep` (or a failed run with `keepOnFailure`) leaves it as it is until release or the deadline. |
 | `vm_release()` | Restores the VM (as `vm_stop`) and ends the lease. |
 | `vm_status()` | The pool, every lease, your VM, any pool job, the policy, and where builds may come from. Works with the server turned off. |
-| `pool_plan({ action='create'\|'resize'\|'remove', vms?, cores?, memoryGB?, diskGB?, location?, network?, image? })` | Plans a pool change and changes nothing (see "Building the pool"). `image` is a new ISO to check, or a verified image's SHA-256: build from it, or resize only its group (see "A pool from more than one image"). |
+| `pool_plan({ action='create'\|'resize'\|'remove', vms?, cores?, memoryGB?, diskGB?, location?, network?, image?, activate? })` | Plans a pool change and changes nothing (see "Building the pool"). `image` is a new ISO to check (`{ iso \| download, edition? }`), or a verified image's SHA-256: build from it, or resize only its group (see "A pool from more than one image"). An evaluation image's plan always activates Windows online once per new VM; `activate: true` asks the same for your own copy (see "Windows licences"). |
 | `pool_create` / `pool_resize` / `pool_remove({ planId })` | Carries out an approved plan in the background. |
 | `pool_status()` | The pool, the image, and any job or image check in progress. |
 
@@ -581,7 +616,8 @@ work as usual.
   call goes on after the call ends. **Copies are still single calls:** `vm_start`'s build copy and `vm_sync` each copy in
   one call, so one that takes more than about 10 minutes (a big build on a slow host) ends with that same error, and
   `C:\build` is then untrusted until a full sync or a reset. `maxBuildMB` limits bytes, not time.
-- Windows guests only. The evaluation expires after 90 days (see "Rebuilding").
+- Windows guests only. An evaluation VM lasts about 90 days from its activation at build (see "Windows licences").
+  Building from a ready-made VHDX isn't supported: an own copy comes from an ISO.
 - A sync tracks only what the helper copied into `C:\build`. A run that changes `C:\build` itself isn't seen; a
   file renamed only in case on the host keeps its old spelling in the guest. `full: true` or `vm_reset` puts either
   right. State across a guest reboot within a session isn't specially kept (a reboot is the guest's own business).
@@ -593,7 +629,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\projects.test.js test\images.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\projects.test.js test\images.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
 ```
 
 - `units.test.js`:
@@ -676,8 +712,15 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   restored); refusals (nobody logged on, another account, bad values, a logon that never
   appears); `vm_reset` keeping `interactive`, a stop logging nobody on, a sync across the logon; an interactive run that
   times out, never starts or fails restoring the VM after its output is read (a session-0 timeout still doesn't); the
-  password never in a reply, the journal or a log; and a helper that predates the protocol refused before anything
-  runs.
+  password never in a reply, the journal or a log; a helper that predates the protocol refused before anything
+  runs; and a VM whose start just failed leased last (another free VM first; a note when all have failed; cleared by a
+  good start).
+- `licence.test.js`, Windows licences: an evaluation build online once (journalled), disconnected before its
+  checkpoint, its end recorded and kept across restarts, starts and resets, and no start using the Default Switch; a
+  failed, short or still-connected activation (net-off, then the rollback); a failed cleanup left flagged and finished
+  by recovery or the retry; no Default Switch; an own copy built offline with its bound edition, or with the product key
+  only in its answer file (never in a reply, plan, journal, log or the stub's calls); a plan made before activation
+  refused; leases and renewals capped at an evaluation's end, and none in its last hour; an older VM's licence unknown.
 - `projects.test.js`, sharing the pool: one shared pool with no projects; caps (one project at its cap refused while
   another still gets its VM); the line, first come first served, a capped waiter passed over keeping its place, an abandoned
   wait never given a VM and its place expiring, a repeat call keeping its place, a disconnect leaving it, a resize

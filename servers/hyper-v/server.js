@@ -503,7 +503,7 @@ const tools = [
   },
   {
     name: 'pool_plan',
-    description: 'Plan a pool change from the host\'s CPUs, memory and disks and the policy: create, resize or remove. Only when the user asks for a pool change. Changes nothing: it returns the exact plan and the one line the USER runs in an admin PowerShell to approve it; never run that line yourself. The first create also needs an image (the Windows 11 Enterprise evaluation ISO), checked before anything runs it.',
+    description: 'Plan a pool change from the host\'s CPUs, memory and disks and the policy: create, resize or remove. Only when the user asks for a pool change. Changes nothing: it returns the exact plan and the one line the USER runs in an admin PowerShell to approve it; never run that line yourself. The first create also needs an image (the Windows 11 Enterprise evaluation ISO, or a non-evaluation Windows 11 ISO the user supplies), checked before anything runs it. An evaluation image is activated online once as each VM is built (the plan says so), and lasts about 90 days from then.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -514,7 +514,8 @@ const tools = [
         diskGB: { type: 'number' },
         location: { type: 'string', description: 'One of the policy\'s disk folders.' },
         network: { type: 'boolean', description: 'create: also create an internal switch so runs can ask for networking. Default false.' },
-        image: { type: ['object', 'string'], description: 'A new image to check: { iso: "<path to the ISO>" } or { download: "<https URL on microsoft.com>" }. Or a verified image\'s SHA-256 (or its first 12+ hex digits): create from it, or resize only the VMs built from it (its group). Omit to use the newest verified image (and, for resize, the whole pool).' }
+        activate: { type: 'boolean', description: 'A non-evaluation image: also activate Windows online once as each VM is built (the plan says so). Default false (it stays offline; its licence is shown). An evaluation image is always activated.' },
+        image: { type: ['object', 'string'], description: 'A new image to check: { iso: "<path to the ISO>" } or { download: "<https URL on microsoft.com>" }, with edition: "Enterprise" | "Professional" | "Education" | "EnterpriseEval" when the ISO holds several (one edition per ISO). Or a verified image\'s SHA-256 (or its first 12+ hex digits): create from it, or resize only the VMs built from it (its group). Omit to use the newest verified image (and, for resize, the whole pool).' }
       }
     },
     run: pass('pool_plan')
