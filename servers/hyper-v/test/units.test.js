@@ -255,7 +255,13 @@ test('answer file: values escaped, names checked', () => {
   assert.doesNotMatch(x, /ProductKey/)
   const keyed = autounattend({ computerName: 'HVMCP-1234', creds, imageIndex: 3, productKey: 'ABCDE-FGHIJ-KLMNO-PQRST-UVWXY' })
   assert.match(keyed, /<Key>\/IMAGE\/INDEX<\/Key><Value>3<\/Value>/)
-  assert.match(keyed, /<UserData><AcceptEula>true<\/AcceptEula><ProductKey><Key>ABCDE-FGHIJ-KLMNO-PQRST-UVWXY<\/Key><WillShowUI>Never<\/WillShowUI><\/ProductKey><\/UserData>/)
+  // The activation key: Shell-Setup's ProductKey in the specialize pass (the one Microsoft names for a MAK), once;
+  // windowsPE's UserData carries none (the image index picks the edition).
+  const specialize = keyed.slice(keyed.indexOf('<settings pass="specialize">'), keyed.indexOf('<settings pass="oobeSystem">'))
+  const shell = specialize.slice(specialize.indexOf('name="Microsoft-Windows-Shell-Setup"'), specialize.indexOf('</component>', specialize.indexOf('name="Microsoft-Windows-Shell-Setup"')))
+  assert.match(shell, /<ProductKey>ABCDE-FGHIJ-KLMNO-PQRST-UVWXY<\/ProductKey>/)
+  assert.strictEqual(keyed.split('ABCDE-FGHIJ-KLMNO-PQRST-UVWXY').length, 2, 'the key appears once')
+  assert.match(keyed, /<UserData><AcceptEula>true<\/AcceptEula><\/UserData>/)
   assert.throws(() => autounattend({ computerName: 'OK', creds, productKey: 'abc<de' }), /product key/)
   assert.throws(() => autounattend({ computerName: 'OK', creds, imageIndex: 0 }), /image index/)
   assert.throws(() => autounattend({ computerName: 'bad name<', creds }), /computer name/)
@@ -286,6 +292,12 @@ test('a build\'s licence (MC-1513): an evaluation must be licensed with at least
   assert.throws(() => licenceOf({ status: 1, graceMinutes: 84 * 1440 + 1000 }, true, now), /only 84 day\(s\) left \(at least 85 needed\)/)
   assert.throws(() => licenceOf({ status: 5, graceMinutes: 0, error: 'no route' }, true, now), /didn't activate \(licence status 5: no route\)/)
   assert.throws(() => licenceOf({ status: 1, graceMinutes: 0, evalEnd: null }, true, now), /no evaluation period/)
+  // A real end date that has passed (or is now) fails closed, whatever the grace figure says.
+  assert.throws(() => licenceOf({ status: 1, graceMinutes: 90 * 1440, evalEnd: at(-1) }, true, now), /end date, 2026-11-13T00:00:00.000Z, has already passed/)
+  assert.throws(() => licenceOf({ status: 1, graceMinutes: 90 * 1440, evalEnd: at(0) }, true, now), /has already passed/)
+  assert.throws(() => licenceOf({ status: 1, graceMinutes: 0, evalEnd: at(-1) }, true, now), /has already passed/)
+  // An absent or unreadable date is ignored (hv.ps1 sends none for Windows' 1601 sentinel).
+  assert.deepStrictEqual(licenceOf({ status: 1, graceMinutes: 90 * 1440, evalEnd: 'not a date' }, true, now), { kind: 'evaluation', expiresAt: at(90) })
   assert.deepStrictEqual(licenceOf({ status: 1 }, false, now), { kind: 'own', activated: true, status: 1 })
   assert.deepStrictEqual(licenceOf({ status: 5 }, false, now), { kind: 'own', activated: false, status: 5 })
 })

@@ -1643,17 +1643,20 @@ function expiry(vm, now) {
 
 /**
  * What a build's licence step read, as recorded (MC-1513). An evaluation must be licensed (status 1) with at least
- * EVAL_MIN_DAYS left; its end is the earlier of now + GracePeriodRemaining and EvaluationEndDate (when real), never
- * recomputed later. An own copy is recorded as it is, activated or not (no expiry).
+ * EVAL_MIN_DAYS left; its end is the earlier of now + GracePeriodRemaining and EvaluationEndDate, never recomputed later.
+ * Only an absent or unreadable date is ignored (hv.ps1 sends none for Windows' 1601 sentinel): a real end date that
+ * has passed fails the build, never giving way to the grace figure. An own copy is recorded as it is (no expiry).
  */
 function licenceOf(r, evaluation, now) {
   if (!r || typeof r !== 'object') throw new Error('the guest reported no licence')
   const status = Number(r.status)
   if (!evaluation) return { kind: 'own', activated: status === 1, status }
-  const ends = [Number(r.graceMinutes) > 0 ? now + Number(r.graceMinutes) * 60_000 : NaN, r.evalEnd ? Date.parse(r.evalEnd) : NaN].filter(t => Number.isFinite(t) && t > now)
+  const evalEnd = r.evalEnd ? Date.parse(r.evalEnd) : NaN
+  const ends = [Number(r.graceMinutes) > 0 ? now + Number(r.graceMinutes) * 60_000 : NaN, evalEnd].filter(Number.isFinite)
   if (status !== 1) throw new Error(`Windows didn't activate (licence status ${status}${r.error ? `: ${r.error}` : ''})`)
   if (!ends.length) throw new Error('Windows activated but reported no evaluation period')
   const end = Math.min(...ends)
+  if (end <= now) throw new Error(`the evaluation's end date, ${new Date(end).toISOString()}, has already passed`)
   const days = Math.floor((end - now) / DAY_MS)
   if (days < EVAL_MIN_DAYS) throw new Error(`the evaluation activated with only ${days} day(s) left (at least ${EVAL_MIN_DAYS} needed)`)
   return { kind: 'evaluation', expiresAt: new Date(end).toISOString() }

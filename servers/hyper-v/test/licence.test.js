@@ -149,7 +149,7 @@ test('an own copy with the pool\'s product key: the key only in the answer file;
   assert.match(plan.text, /- activation: each new VM goes online once/)
   assert.match(line, /create finished/)
   assert.strictEqual(calls(sc, 'guest-activate').length, 1)
-  assert.match(sc.stub().answers.at(-1), new RegExp(`<ProductKey><Key>${KEY}</Key>`))
+  assert.match(sc.stub().answers.at(-1), new RegExp(`<settings pass="specialize">[\\s\\S]*name="Microsoft-Windows-Shell-Setup"[\\s\\S]*<ProductKey>${KEY}</ProductKey>[\\s\\S]*<settings pass="oobeSystem">`))
   assert.match(await status(admin), /; own copy of Windows, activated/)
   // Nowhere else: not in replies, the plans, the journal, the helper's log, or the calls the stub saw.
   const everything = [plan.text, line, await status(admin), JSON.stringify(sc.stub().calls)]

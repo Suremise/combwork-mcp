@@ -1,9 +1,12 @@
 /**
  * The unattended install's media: autounattend.xml for Windows Setup (found on the second DVD), for a Generation 2 VM
  * with Secure Boot and a vTPM. It partitions disk 0 for UEFI, installs the image index the approved plan bound (images.js
- * picks one edition per ISO), with the pool's product key for a non-evaluation image when the plan says so, creates a guest admin and a standard user with the helper's random passwords, skips OOBE, and keeps
+ * picks one edition per ISO), creates a guest admin and a standard user with the helper's random passwords, skips OOBE, and keeps
  * Windows Update off (the VM has no network anyway). The media sits in the VM's own folder and is deleted once the
  * clean checkpoint is taken; guest-setup deletes Setup's copies inside the guest.
+ * The pool's product key, for a non-evaluation image when the plan says so, goes in Microsoft-Windows-Shell-Setup's
+ * ProductKey in the specialize pass: the key Windows installs and activates with (the one Microsoft names for a MAK).
+ * The edition is chosen by the image index, so windowsPE's UserData carries no key.
  */
 const fs = require('fs')
 const { join } = require('path')
@@ -54,10 +57,11 @@ ${component('Microsoft-Windows-Setup', 'windowsPE', `      <DiskConfiguration>
           <InstallTo><DiskID>0</DiskID><PartitionID>3</PartitionID></InstallTo>
         </OSImage>
       </ImageInstall>
-      <UserData><AcceptEula>true</AcceptEula>${productKey ? `<ProductKey><Key>${esc(productKey)}</Key><WillShowUI>Never</WillShowUI></ProductKey>` : ''}</UserData>`)}
+      <UserData><AcceptEula>true</AcceptEula></UserData>`)}
   </settings>
   <settings pass="specialize">
-${component('Microsoft-Windows-Shell-Setup', 'specialize', `      <ComputerName>${esc(computerName)}</ComputerName>
+${component('Microsoft-Windows-Shell-Setup', 'specialize', `      <ComputerName>${esc(computerName)}</ComputerName>${productKey ? `
+      <ProductKey>${esc(productKey)}</ProductKey>` : ''}
       <TimeZone>${esc(timeZone)}</TimeZone>`)}
 ${component('Microsoft-Windows-Deployment', 'specialize', `      <RunSynchronous>
 ${run(1, 'reg add HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\WindowsUpdate\\AU /v NoAutoUpdate /t REG_DWORD /d 1 /f')}
