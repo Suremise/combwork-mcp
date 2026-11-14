@@ -60,92 +60,100 @@ public static class HvMcpIsoWriter {
   [HvMcpIsoWriter]::Write($stream, $path)
 }
 
-# Runs one command inside the guest, as whichever guest account the session belongs to (its admin, or its standard user:
-# see 'guest-run'), with
-# stdout and stderr redirected to C:\out\.run-<n>.*; on a timeout, kills its process tree by PID. Fixed text: the
-# command reaches the guest as data and is written to a script file there, in $j.dir: C:\hvmcp for the admin, and
-# C:\hvmcp\user for the standard user (after an interactive logon, C:\hvmcp is read-only for users: see $GuestLogon).
-$GuestRun = {
-  param($j)
-  $ErrorActionPreference = 'Stop'
+# vm_run (MC-1510): a run is started in one short PowerShell Direct call and then polled with short calls, never held
+# in one call: since the September 2025 updates PowerShell Direct ends any single call after 10 minutes ("The Hyper-V
+# socket target process has ended"; PowerShell issue #26176). A process started from a call outlives it (checked on the
+# pool's guests, as the admin and the standard user). The command reaches the guest as data, written to a script file.
+# The wrapper redirects stdout and stderr to C:\out\.run-<n>.*, then writes the exit code aside and moves it into
+# place, so it is read whole or not at all.
+$RunFiles = {
+  param($j, $dir)
   $n = [int]$j.n
-  $dir = [string]$j.dir; New-Item -ItemType Directory -Force -Path $dir | Out-Null
-  $base = "C:\out\.run-$n"
-  $ext = if ($j.shell -eq 'powershell') { 'ps1' } else { 'cmd' }
-  $script = "$dir\run-$n.$ext"
-  [IO.File]::WriteAllText($script, [string]$j.command, (New-Object Text.UTF8Encoding $false))
-  $inner = if ($ext -eq 'ps1') { "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$script`"" } else { "cmd.exe /d /c `"$script`"" }
-  $wrapper = "$dir\wrap-$n.cmd"
-  # The exit code is written with the redirection first: "echo 0> file" would redirect handle 0 (cmd treats a digit
-  # before > as a handle number) and leave the file empty.
-  [IO.File]::WriteAllText($wrapper, "@echo off`r`ncd /d `"$($j.cwd)`" 2>nul`r`n$inner > `"$base.stdout.txt`" 2> `"$base.stderr.txt`"`r`n> `"$base.exit`" echo %ERRORLEVEL%`r`n", (New-Object Text.ASCIIEncoding))
-  Remove-Item "$base.exit" -ErrorAction SilentlyContinue
-  $exitCode = {
-    try { $t = [IO.File]::ReadAllText("$base.exit").Trim() } catch { return $null }
-    if ($t -match '^-?\d{1,10}$') { return [int]$t } else { return $null }
-  }
-  $timedOut = $false; $killed = $false; $procId = $null
-  $p = Start-Process -FilePath 'cmd.exe' -ArgumentList "/d /c `"$wrapper`"" -PassThru -WindowStyle Hidden
-  $procId = $p.Id
-  if (-not $p.WaitForExit([int]$j.timeoutSec * 1000)) {
-    $timedOut = $true
-    # Through cmd, so taskkill's own messages can't become PowerShell errors; killed only once the process is gone.
-    & cmd.exe /d /c "taskkill /T /F /PID $procId >nul 2>&1"
-    $killed = $p.WaitForExit(10000)
-  }
-  $read = {
-    param($f)
-    if (-not (Test-Path -LiteralPath $f)) { return @('', $false) }
-    $fs = [IO.File]::Open($f, 'Open', 'Read', 'ReadWrite')
-    try { $len = [Math]::Min($fs.Length, [long]$j.cap); $b = New-Object byte[] $len; [void]$fs.Read($b, 0, $len); return @([Text.Encoding]::UTF8.GetString($b), ($fs.Length -gt $len)) } finally { $fs.Close() }
-  }
-  $o = & $read "$base.stdout.txt"; $e = & $read "$base.stderr.txt"
-  $code = & $exitCode
-  @{ exitCode = $code; timedOut = $timedOut; killed = $killed; stdout = $o[0]; stdoutCut = $o[1]; stderr = $e[0]; stderrCut = $e[1] }
-}
-
-# vm_run with session 'interactive' (MC-1503, MC-1504): the command runs in the logged-on account's own desktop session.
-# PowerShell Direct can't put a process there, and Task Scheduler won't start one there on the first autologon (MC-1504's
-# trial), so the watcher guest-logon started in that session at logon (guest-agent.ps1) runs it. This writes the script
-# and the wrapper (as $GuestRun's, but the exit code is written aside and moved into place, so it is read whole or not
-# at all), then publishes the request req\<n>.go by renaming a finished req\<n>.tmp; the watcher claims it and starts
-# the wrapper. Only that exit file within timeoutSec is a clean finish (clean = $true). Anything else (a timeout, no
-# watcher to claim it, an error here) is unclean: nothing is done to prove the run's processes ended, because the
-# helper then restores the VM, which ends them all. Run as the guest's admin.
-$GuestRunInteractive = {
-  param($j)
-  $ErrorActionPreference = 'Stop'
-  $n = [int]$j.n
-  $dir = 'C:\hvmcp'; $req = "$dir\req"
-  if (-not (Test-Path -LiteralPath "$dir\agent.ps1")) { throw 'no interactive logon in this guest (no watcher)' }
-  $base = "C:\out\.run-$n"
+  New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  $base = "$(if ($j.out) { [string]$j.out } else { 'C:\out' })\.run-$n" # $j.out: the tests' own folder; the helper never sets it
   $ext = if ($j.shell -eq 'powershell') { 'ps1' } else { 'cmd' }
   $script = "$dir\run-$n.$ext"
   [IO.File]::WriteAllText($script, [string]$j.command, (New-Object Text.UTF8Encoding $false))
   $inner = if ($ext -eq 'ps1') { "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$script`"" } else { "cmd.exe /d /c `"$script`"" }
   foreach ($f in "$base.exit", "$base.exit.tmp") { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+  # The exit code is written with the redirection first: "echo 0> file" would redirect handle 0 (cmd treats a digit
+  # before > as a handle number) and leave the file empty.
   [IO.File]::WriteAllText("$dir\wrap-$n.cmd", "@echo off`r`ncd /d `"$($j.cwd)`" 2>nul`r`n$inner > `"$base.stdout.txt`" 2> `"$base.stderr.txt`"`r`n> `"$base.exit.tmp`" echo %ERRORLEVEL%`r`nmove /y `"$base.exit.tmp`" `"$base.exit`" >nul`r`n", (New-Object Text.ASCIIEncoding))
-  [IO.File]::WriteAllText("$req\$n.tmp", 'run')
-  [IO.File]::Move("$req\$n.tmp", "$req\$n.go")
-  $code = $null; $why = $null
-  $deadline = (Get-Date).AddSeconds([int]$j.timeoutSec)
-  while ($null -eq $code -and (Get-Date) -lt $deadline) {
-    Start-Sleep -Milliseconds 200
-    $t = $null
-    try { $t = [IO.File]::ReadAllText("$base.exit").Trim() } catch {}
-    if ($t -match '^-?\d{1,10}$') { $code = [int]$t }
-  }
-  if ($null -eq $code) {
-    $why = if (Test-Path -LiteralPath "$req\$n.go") { "the session's watcher never took the run (is the account still logged on?)" } else { "no exit within $($j.timeoutSec) s" }
-  }
+  "$dir\wrap-$n.cmd"
+}
+
+# A session-0 run's start, as the run's own account (its admin, or its standard user in its own PowerShell Direct
+# session): the files, then the wrapper with Start-Process. Returns its PID and its creation time, read from the started
+# process's own handle; a process that has already exited has no creation time to read: the exit file then decides.
+$GuestRunStart = {
+  param($j, $files)
+  $ErrorActionPreference = 'Stop'
+  $wrapper = & ([scriptblock]::Create($files)) $j ([string]$j.dir)
+  $p = Start-Process -FilePath 'cmd.exe' -ArgumentList "/d /c `"$wrapper`"" -PassThru -WindowStyle Hidden
+  # The PID and the creation time are read while the object still holds the process (Windows PowerShell's Id is null
+  # once it is disposed), then it is disposed.
+  $id = $p.Id
+  $started = $null
+  try {
+    try { [void]$p.Handle; $started = $p.StartTime.ToUniversalTime().ToString('o') } catch { }
+  } finally { try { $p.Dispose() } catch { } }
+  @{ pid = $id; started = $started }
+}
+
+# A run's poll, as the guest's admin: the capped output so far, and the exit file, read whole: done with its exit code,
+# or still running (and, for an interactive run, whether its request still waits for the session's watcher).
+$GuestRunPoll = {
+  param($j)
+  $n = [int]$j.n
+  $base = "$(if ($j.out) { [string]$j.out } else { 'C:\out' })\.run-$n"
+  $code = $null
+  try { $t = [IO.File]::ReadAllText("$base.exit").Trim(); if ($t -match '^-?\d{1,10}$') { $code = [int]$t } } catch { }
   $read = {
     param($f)
     if (-not (Test-Path -LiteralPath $f)) { return @('', $false) }
     $fs = [IO.File]::Open($f, 'Open', 'Read', 'ReadWrite')
     try { $len = [Math]::Min($fs.Length, [long]$j.cap); $b = New-Object byte[] $len; [void]$fs.Read($b, 0, $len); return @([Text.Encoding]::UTF8.GetString($b), ($fs.Length -gt $len)) } finally { $fs.Close() }
   }
+  # The output so far either way: a run that times out or is restored still shows what it wrote.
   $o = & $read "$base.stdout.txt"; $e = & $read "$base.stderr.txt"
-  @{ exitCode = $code; clean = ($null -ne $code); timedOut = ($null -eq $code); why = $why; session = 'interactive'; stdout = $o[0]; stdoutCut = $o[1]; stderr = $e[0]; stderrCut = $e[1] }
+  $out = @{ stdout = $o[0]; stdoutCut = $o[1]; stderr = $e[0]; stderrCut = $e[1] }
+  if ($null -eq $code) { return $out + @{ done = $false; pending = (Test-Path -LiteralPath "C:\hvmcp\req\$n.go") } }
+  $out + @{ done = $true; exitCode = $code }
+}
+
+# A session-0 run's kill at its timeout, as the guest's admin. The process is opened and its native handle taken first,
+# and kept until the end: while it is open, the PID can't be reused. Only a process whose creation time is the one its
+# start recorded is killed (its tree, by taskkill), and the kill is confirmed on that handle. A process already gone,
+# or with another creation time (exited and its PID reused), or with no recorded identity, is never killed: the exit
+# file decides.
+$GuestRunKill = {
+  param($j)
+  $p = $null
+  try { $p = [Diagnostics.Process]::GetProcessById([int]$j.pid) } catch { return @{ killed = $false; gone = $true } }
+  try {
+    try { [void]$p.Handle } catch { return @{ killed = $false; gone = $true } }
+    if (-not $j.started) { return @{ killed = $false; why = 'its identity was never recorded' } }
+    $now = $null
+    try { $now = $p.StartTime.ToUniversalTime().ToString('o') } catch { return @{ killed = $false; gone = $true } }
+    if ($now -ne [string]$j.started) { return @{ killed = $false; why = "PID $($j.pid) is no longer the run's process (it exited and the PID was reused)" } }
+    & cmd.exe /d /c "taskkill /T /F /PID $([int]$j.pid) >nul 2>&1"
+    @{ killed = $p.WaitForExit(10000) }
+  } finally { $p.Dispose() }
+}
+
+# An interactive run's publish (MC-1503, MC-1504), as the guest's admin: the files in C:\hvmcp, then the request
+# req\<n>.go, renamed from a finished .tmp, for the logged-on session's watcher (guest-agent.ps1), which claims it and
+# starts the wrapper in its session. The helper then polls for the exit file; no exit file by the deadline means the
+# VM is restored (Darren's "exit file or restore").
+$GuestRunPublish = {
+  param($j, $files)
+  $ErrorActionPreference = 'Stop'
+  if (-not (Test-Path -LiteralPath 'C:\hvmcp\agent.ps1')) { throw 'no interactive logon in this guest (no watcher)' }
+  [void](& ([scriptblock]::Create($files)) $j 'C:\hvmcp')
+  $n = [int]$j.n
+  [IO.File]::WriteAllText("C:\hvmcp\req\$n.tmp", 'run')
+  [IO.File]::Move("C:\hvmcp\req\$n.tmp", "C:\hvmcp\req\$n.go")
+  @{ published = $true }
 }
 
 # Lists C:\out (files only; links and other reparse points skipped, never followed).
@@ -401,29 +409,35 @@ try {
       if ($vm.State -ne 'Running') { throw 'the VM is not running' }
       Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestSession -ArgumentList ([string]$a.account)
     }
-    'guest-run' {
+    'guest-run-start' {
+      # A session-0 run, started (MC-1510): as the admin, or as the standard user in its own PowerShell Direct session,
+      # which (like any remote session) needs the account in Remote Management Users (S-1-5-32-580): added here, as the
+      # guest's admin, inside this disposable guest only; a restore takes it away again.
       $vm = Get-OwnVm $a
-      if ($a.interactive) {
-        # In the logged-on account's own session (vm_start interactive), through its watcher: published as the guest's
-        # admin, over PowerShell Direct.
-        $j = @{ n = [int]$a.n; command = [string]$a.command; shell = [string]$a.shell; cwd = [string]$a.cwd; timeoutSec = [int]$a.timeoutSec; cap = [int]$a.cap }
-        Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestRunInteractive -ArgumentList $j
-      } else {
-        $j = @{ n = [int]$a.n; command = [string]$a.command; shell = [string]$a.shell; cwd = [string]$a.cwd; timeoutSec = [int]$a.timeoutSec; cap = [int]$a.cap; dir = $(if ($a.runAs) { 'C:\hvmcp\user' } else { 'C:\hvmcp' }) }
-        $as = Cred $a.cred
-        if ($a.runAs) {
-          # As the guest's standard user: its own PowerShell Direct session, which (like any remote session) needs the
-          # account in Remote Management Users (S-1-5-32-580). Added here, as the guest's admin, inside this disposable guest
-          # only; a restore takes it away again.
-          $user = [string]$a.runAs.user
-          Invoke-Command -VMId $vm.Id -Credential $as -ScriptBlock {
-            param($u)
-            if (-not (Get-LocalGroupMember -SID 'S-1-5-32-580' | Where-Object { $_.Name -like "*\$u" })) { Add-LocalGroupMember -SID 'S-1-5-32-580' -Member $u }
-          } -ArgumentList $user
-          $as = Cred $a.runAs
-        }
-        Invoke-Command -VMId $vm.Id -Credential $as -ScriptBlock $GuestRun -ArgumentList $j
+      $j = @{ n = [int]$a.n; command = [string]$a.command; shell = [string]$a.shell; cwd = [string]$a.cwd; dir = $(if ($a.runAs) { 'C:\hvmcp\user' } else { 'C:\hvmcp' }) }
+      $as = Cred $a.cred
+      if ($a.runAs) {
+        $user = [string]$a.runAs.user
+        Invoke-Command -VMId $vm.Id -Credential $as -ScriptBlock {
+          param($u)
+          if (-not (Get-LocalGroupMember -SID 'S-1-5-32-580' | Where-Object { $_.Name -like "*\$u" })) { Add-LocalGroupMember -SID 'S-1-5-32-580' -Member $u }
+        } -ArgumentList $user
+        $as = Cred $a.runAs
       }
+      Invoke-Command -VMId $vm.Id -Credential $as -ScriptBlock $GuestRunStart -ArgumentList $j, $RunFiles.ToString()
+    }
+    'guest-run-publish' {
+      $vm = Get-OwnVm $a
+      $j = @{ n = [int]$a.n; command = [string]$a.command; shell = [string]$a.shell; cwd = [string]$a.cwd }
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestRunPublish -ArgumentList $j, $RunFiles.ToString()
+    }
+    'guest-run-poll' {
+      $vm = Get-OwnVm $a
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestRunPoll -ArgumentList @{ n = [int]$a.n; cap = [int]$a.cap }
+    }
+    'guest-run-kill' {
+      $vm = Get-OwnVm $a
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestRunKill -ArgumentList @{ pid = [int]$a.pid; started = $a.started }
     }
     'guest-list' { $vm = Get-OwnVm $a; Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestList }
     'guest-read' {
