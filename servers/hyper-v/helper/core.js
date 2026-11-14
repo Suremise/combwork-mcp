@@ -107,6 +107,9 @@ class Helper {
     this.lastJob = null
     this.quiesced = false
     this.pendingCleanup = new Set() // staging folders that couldn't be removed yet (retried; swept at every start)
+    // vmId -> { at, why, interactive }: the VM's last start failed after its restore (its guest didn't answer, or the
+    // interactive logon never appeared). Free VMs without one are leased first; a good start clears it (MC-1513).
+    this.startFailed = new Map()
     // vm_acquire's FIFO queue: { connId, project, since, minutes, keepOnFailure, pending: { token, settle } | null,
     // expires }. An entry is active while one of its requests is waiting (pending), and only an active one is given a VM.
     this.queue = []
@@ -356,16 +359,26 @@ class Helper {
     return null
   }
 
-  /** The free VMs this project may take for this request: of its OS, of its image if asked, of its allowed images. */
+  /**
+   * The free VMs this project may take for this request: of its OS, of its image if asked, of its allowed images. Those
+   * whose last start failed come last, the longest ago first, so a retry gets another VM when one fits (MC-1513).
+   */
   candidates(project, want) {
     const p = this.policy.projects.find(x => x.name === project)
+    const failedAt = v => this.startFailed.get(v.vmId)?.at ?? 0
     return this.freeVms().filter(v => {
       const img = this.imageOf(v)
       if (this.osOf(v) !== want.os) return false
       if (want.image && img !== want.image) return false
       if (p?.images.length && !p.images.includes(img)) return false
       return true
-    })
+    }).sort((a, b) => failedAt(a) - failedAt(b))
+  }
+
+  /** A VM's failed last start, for the lease text and vm_status, or ''. */
+  failedNote(vm) {
+    const f = this.startFailed.get(vm.vmId)
+    return f ? `its last start failed at ${new Date(f.at).toISOString()} (${f.why})` : ''
   }
 
   /**
@@ -408,7 +421,8 @@ class Helper {
     c.vmId = vm.vmId
     this.armDeadline(lease)
     const share = `${project === 'other' ? '' : ` for project ${project}`}${this.osOf(vm) === 'windows' && !want.image ? '' : ` (${this.osOf(vm)}, image ${this.imageOf(vm).slice(0, 12)})`}`
-    return { text: `Leased ${vm.vmName} (lease ${lease.leaseId})${share} until ${new Date(lease.deadline).toISOString()}; vm_renew can extend it up to ${new Date(sessionEnd).toISOString()} (the policy's work-session cap). Call vm_start next; always vm_release when done.`, data: { lease: lease.leaseId, vm: vm.vmName, deadline: lease.deadline, sessionEnd, project, os: lease.os, image: lease.image } }
+    const failed = this.failedNote(vm)
+    return { text: `Leased ${vm.vmName} (lease ${lease.leaseId})${share} until ${new Date(lease.deadline).toISOString()}; vm_renew can extend it up to ${new Date(sessionEnd).toISOString()} (the policy's work-session cap). Call vm_start next; always vm_release when done.${failed ? ` Note: ${failed}; every free VM that fitted had a failed start, and this one's was the longest ago.` : ''}`, data: { lease: lease.leaseId, vm: vm.vmName, deadline: lease.deadline, sessionEnd, project, os: lease.os, image: lease.image } }
   }
 
   /** Settles an entry's waiting request once: with a result, or an error. Its token makes a late timer a no-op. */
@@ -901,6 +915,8 @@ class Helper {
       // Every stage of a start is the lease's: its Hyper-V calls are registered with it (ending the lease kills them), and
       // each stage first checks the lease still holds, so nothing more starts once it has ended.
       this.stillHeld(lease)
+      // The guest not answering, or its logon not appearing, is the VM's failure (unless the lease ended meanwhile).
+      const failed = why => { if (this.leases.get(lease.vmId) === lease && !lease.ending) this.startFailed.set(vm.vmId, { at: this.now(), why, interactive: !!interactive }) }
       const sw = network ? this.state.switch : null
       await this.hv('configure-start', { ...this.ident(vm), switchName: sw ? sw.name : null, switchId: sw ? sw.switchId : null, reserve: reserveCpu }, this.forLease(lease))
       lease.running = true
@@ -909,15 +925,17 @@ class Helper {
       lease.reserve = reserveCpu
       const creds = this.creds()
       const waited = await this.waitGuest(vm, creds.admin, READY_WAIT_MS, lease)
-      if (waited === null) throw new Error(`${vm.vmName} started but its guest didn't answer within ${Math.round(READY_WAIT_MS / 1000)} s. vm_stop it and try again.`)
+      if (waited === null) { failed(`its guest didn't answer within ${Math.round(READY_WAIT_MS / 1000)} s`); throw new Error(`${vm.vmName} started but its guest didn't answer within ${Math.round(READY_WAIT_MS / 1000)} s. vm_reset to try again, or vm_release and vm_acquire for another VM (one whose start failed is leased last).`) }
       this.stillHeld(lease)
       let logon = ''
       if (interactive) {
         const ms = await this.logon(vm, lease, interactive, creds)
-        if (ms === null) throw new Error(`${vm.vmName} restarted to log ${creds[interactive].user} on, but no interactive session of it appeared within ${Math.round(READY_WAIT_MS / 1000)} s. vm_reset to try again.`)
+        if (ms === null) { failed(`no interactive session of ${creds[interactive].user} appeared within ${Math.round(READY_WAIT_MS / 1000)} s`); throw new Error(`${vm.vmName} restarted to log ${creds[interactive].user} on, but no interactive session of it appeared within ${Math.round(READY_WAIT_MS / 1000)} s. vm_reset to try again, or vm_release and vm_acquire for another VM (one whose start failed is leased last).`) }
         lease.interactive = interactive
         logon = `; ${creds[interactive].user} logged on interactively after a guest restart (${(ms / 1000).toFixed(1)} s): vm_run with session: 'interactive', as: '${interactive}' runs in its session`
       }
+      // A good start clears a failure, an interactive one only by an interactive start.
+      if (interactive || !this.startFailed.get(vm.vmId)?.interactive) this.startFailed.delete(vm.vmId)
       let build = 'no build'
       if (c.stage?.done) {
         const res = await this.hv('copy-in', { ...this.ident(vm), cred: creds.admin, userName: creds.user.user, source: c.stage.dir }, this.forLease(lease, 30 * 60_000))
@@ -1187,7 +1205,8 @@ class Helper {
         : v.removing ? 'removing' : !v.ready ? 'creating'
           : l ? `leased${l.kept ? ', kept for inspection' : ''}${l.running ? ', running' : ''}${l.interactive ? `, ${l.interactive === 'user' ? 'the standard user' : 'the admin'} logged on interactively` : ''} until ${new Date(l.deadline).toISOString()} (session ends by ${new Date(l.sessionEnd).toISOString()})` : 'free'
       const img = this.imageOf(v)
-      return `- ${v.vmName}: ${this.osOf(v)}, image ${img === 'legacy' ? 'unknown (made before images were recorded)' : img.slice(0, 12)}; ${v.cores} cores, ${v.memoryMB} MB, ${v.diskGB} GB disk; ${state}${v.vmId === mine ? ' (yours)' : ''}${expiry(v, this.now())}`
+      const failed = this.failedNote(v)
+      return `- ${v.vmName}: ${this.osOf(v)}, image ${img === 'legacy' ? 'unknown (made before images were recorded)' : img.slice(0, 12)}; ${v.cores} cores, ${v.memoryMB} MB, ${v.diskGB} GB disk; ${state}${v.vmId === mine ? ' (yours)' : ''}${expiry(v, this.now())}${failed ? `; ${failed}` : ''}`
     })
     const img = [...s.images.values()].at(-1)
     const lines = [
