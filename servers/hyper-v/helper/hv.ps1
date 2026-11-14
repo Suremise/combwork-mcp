@@ -70,7 +70,7 @@ $RunFiles = {
   param($j, $dir)
   $n = [int]$j.n
   New-Item -ItemType Directory -Force -Path $dir | Out-Null
-  $base = "C:\out\.run-$n"
+  $base = "$(if ($j.out) { [string]$j.out } else { 'C:\out' })\.run-$n" # $j.out: the tests' own folder; the helper never sets it
   $ext = if ($j.shell -eq 'powershell') { 'ps1' } else { 'cmd' }
   $script = "$dir\run-$n.$ext"
   [IO.File]::WriteAllText($script, [string]$j.command, (New-Object Text.UTF8Encoding $false))
@@ -90,10 +90,14 @@ $GuestRunStart = {
   $ErrorActionPreference = 'Stop'
   $wrapper = & ([scriptblock]::Create($files)) $j ([string]$j.dir)
   $p = Start-Process -FilePath 'cmd.exe' -ArgumentList "/d /c `"$wrapper`"" -PassThru -WindowStyle Hidden
+  # The PID and the creation time are read while the object still holds the process (Windows PowerShell's Id is null
+  # once it is disposed), then it is disposed.
+  $id = $p.Id
   $started = $null
-  try { [void]$p.Handle; $started = $p.StartTime.ToUniversalTime().ToString('o') } catch { }
-  try { $p.Dispose() } catch { }
-  @{ pid = $p.Id; started = $started }
+  try {
+    try { [void]$p.Handle; $started = $p.StartTime.ToUniversalTime().ToString('o') } catch { }
+  } finally { try { $p.Dispose() } catch { } }
+  @{ pid = $id; started = $started }
 }
 
 # A run's poll, as the guest's admin: the capped output so far, and the exit file, read whole: done with its exit code,
@@ -101,7 +105,7 @@ $GuestRunStart = {
 $GuestRunPoll = {
   param($j)
   $n = [int]$j.n
-  $base = "C:\out\.run-$n"
+  $base = "$(if ($j.out) { [string]$j.out } else { 'C:\out' })\.run-$n"
   $code = $null
   try { $t = [IO.File]::ReadAllText("$base.exit").Trim(); if ($t -match '^-?\d{1,10}$') { $code = [int]$t } } catch { }
   $read = {

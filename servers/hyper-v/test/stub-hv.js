@@ -203,11 +203,14 @@ function run(s, op, a) {
     // k-th poll; "fast" has finished before its start could read its creation time; "hang <file> <ms> <pid file>" blocks
     // the poll that finishes it (its PID recorded) for ms, then writes the file: a killed poll never does.
     // state.killMismatch: the PID at the kill is no longer the run's process; state.interactiveGate: the publish waits.
+    // state.startDelayMs / publishDelayMs: a slow start or publish; state.pollDelayOnceMs: the next poll hangs that long.
     case 'guest-run-start':
     case 'guest-run-publish': {
       const vm = own(s, a)
       if (vm.state !== 'Running') throw new Error('the VM is not running')
       const interactive = op === 'guest-run-publish'
+      const slow = interactive ? s.publishDelayMs : s.startDelayMs
+      if (slow) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, slow)
       if (interactive) {
         if (s.interactiveThrows) { s.interactiveThrows = false; throw new Error('injected failure of the interactive run') }
         if (s.interactiveGate) {
@@ -228,6 +231,13 @@ function run(s, op, a) {
       if (vm.state !== 'Running') throw new Error('the VM is not running')
       const run = vm.runs?.[a.n]
       if (!run) throw new Error(`no run ${a.n}`)
+      if (s.pollDelayOnceMs) {
+        const ms = s.pollDelayOnceMs
+        s.pollDelayOnceMs = 0
+        save(s) // the next poll doesn't hang
+        if (s.pollPidFile) fs.writeFileSync(s.pollPidFile, String(process.pid))
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
+      }
       run.polls++
       if (run.result) return run.result
       const blank = { stdout: '', stdoutCut: false, stderr: '', stderrCut: false }

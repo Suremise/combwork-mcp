@@ -41,6 +41,9 @@ const MINUTE_MS = Number(process.env.HYPERV_MCP_MINUTE_MS || 60_000) // test-onl
 const WAIT_MS = Number(process.env.HYPERV_MCP_WAIT_MS || 20_000)
 // One PowerShell Direct call's bound for a run's start, poll or kill (MC-1510: never near the transport's 10 minutes).
 const CALL_MS = 60_000
+// A poll's least bound however little of the run is left, and the bound of a timeout's cleanup (the kill, a last read).
+const MIN_POLL_MS = Number(process.env.HYPERV_MCP_MIN_POLL_MS || 5_000)
+const CLEANUP_MS = 15_000
 const KEEP_MS = Number(process.env.HYPERV_MCP_KEEP_MS || 120_000)
 
 const hex = n => crypto.randomBytes(n).toString('hex')
@@ -1002,9 +1005,8 @@ class Helper {
       const n = ++lease.runs
       const creds = this.creds()
       const args = { ...this.ident(vm), cred: creds.admin, n, command, shell, cwd: cwd || 'C:\\build', cap: OUTPUT_CAP }
-      // Started (or published), then polled with short calls against one deadline (MC-1510): no PowerShell Direct call is
-      // held for the run, since one call ends after 10 minutes.
-      const deadline = this.now() + timeoutSec * 1000
+      // Started (or published), then polled with short calls against one deadline, counted from the start's reply
+      // (MC-1510): no PowerShell Direct call is held for the run, since one call ends after 10 minutes.
       let started = null
       if (interactive) {
         try {
@@ -1016,15 +1018,16 @@ class Helper {
       } else {
         started = await this.hv('guest-run-start', { ...args, runAs: as === 'user' ? creds.user : null }, this.forLease(lease, CALL_MS))
       }
+      const deadline = this.now() + timeoutSec * 1000
       const polled = started?.lost ? { result: null, last: null } : await this.pollRun(lease, vm, creds, n, deadline)
       let r = polled.result
       if (!interactive && !r) {
         // Timed out: killed by its PID only if that PID is still the run's process (its recorded creation time), then
-        // a last read of its output.
+        // a last read of its output. Both are cleanup after the run's own budget, each bounded by CLEANUP_MS.
         this.stillHeld(lease)
-        const k = await this.hv('guest-run-kill', { ...this.ident(vm), cred: creds.admin, pid: started.pid, started: started.started }, this.forLease(lease, CALL_MS)).catch(e => ({ killed: false, why: e.message }))
+        const k = await this.hv('guest-run-kill', { ...this.ident(vm), cred: creds.admin, pid: started.pid, started: started.started }, this.forLease(lease, CLEANUP_MS)).catch(e => ({ killed: false, why: e.message }))
         this.stillHeld(lease)
-        const last = await this.hv('guest-run-poll', { ...this.ident(vm), cred: creds.admin, n, cap: OUTPUT_CAP }, this.forLease(lease, CALL_MS)).catch(() => null)
+        const last = await this.hv('guest-run-poll', { ...this.ident(vm), cred: creds.admin, n, cap: OUTPUT_CAP }, this.forLease(lease, CLEANUP_MS)).catch(() => null)
         r = last?.done && k.gone ? last : { ...(last || {}), exitCode: null, timedOut: true, killed: !!k.killed, killWhy: k.why }
       } else if (interactive && !r) {
         const pending = polled.last?.pending
@@ -1050,20 +1053,22 @@ class Helper {
 
   /**
    * Polls a started run's exit file with short calls until it is there or the deadline passes: { result (or null), last
-   * poll }. One
-   * deadline for the run: a poll that fails (the socket ending, a blip) is retried within it, never extending it. The
-   * lease is checked before every call, and ending it kills the call in flight, so nothing is sent after it ends.
+   * poll }. There is always at least one poll, so a run that has already finished is seen however slow its start was.
+   * One deadline for the run: a poll that fails (the socket ending, a blip) is retried within it, never extending it;
+   * each poll is bounded by what is left of it (at least MIN_POLL_MS). The lease is checked before every call, and
+   * ending it kills the call in flight, so nothing is sent after it ends.
    */
   async pollRun(lease, vm, creds, n, deadline) {
     const t0 = this.now()
     let last = null
-    for (;;) {
+    for (let polls = 0; ; polls++) {
       this.stillHeld(lease)
       const left = deadline - this.now()
-      if (left <= 0) return { result: null, last }
-      await sleep(Math.min(left, this.now() - t0 < 10_000 ? Math.min(1000, POLL_MS) : POLL_MS))
+      if (left <= 0 && polls > 0) return { result: null, last }
+      if (polls > 0 || left > 0) await sleep(Math.max(0, Math.min(left, this.now() - t0 < 10_000 ? Math.min(1000, POLL_MS) : POLL_MS)))
       this.stillHeld(lease)
-      const r = await this.hv('guest-run-poll', { ...this.ident(vm), cred: creds.admin, n, cap: OUTPUT_CAP }, this.forLease(lease, CALL_MS)).catch(() => null)
+      const bound = Math.max(MIN_POLL_MS, Math.min(CALL_MS, deadline - this.now()))
+      const r = await this.hv('guest-run-poll', { ...this.ident(vm), cred: creds.admin, n, cap: OUTPUT_CAP }, this.forLease(lease, bound)).catch(() => null)
       if (r) last = r
       if (r?.done) return { result: r, last }
     }
