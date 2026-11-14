@@ -194,7 +194,6 @@ test('hv.ps1\'s start, for real: a running command\'s PID and creation time (rea
 $j = @{ n = 1; command = 'ping -n 120 127.0.0.1 >nul'; shell = 'cmd'; cwd = $Cwd; dir = $Dir; out = $Out }
 $s = & $GuestRunStart $j $RunFiles.ToString()
 ConvertTo-Json -InputObject $s -Compress
-Start-Sleep -Milliseconds 500
 ConvertTo-Json -InputObject (& $GuestRunPoll @{ n = 1; cap = 1024; out = $Out }) -Compress
 ConvertTo-Json -InputObject (& $GuestRunKill @{ pid = $s.pid; started = $s.started }) -Compress`)
   const [started, poll, killed] = g.run()
