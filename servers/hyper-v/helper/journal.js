@@ -6,11 +6,16 @@
  *
  * Records (t = type):
  *   epoch     { epoch }                                   first record; a fresh state gets a fresh random epoch
- *   image     { sha256, size, file, source, edition, build, pinned }   a verified image in the helper's own folder
+ *   image     { sha256, size, file, source, edition, build, imageIndex, pinned, evaluation }   a verified image in the
+ *             helper's own folder, with its one edition (older records: evaluation when edition is EnterpriseEval)
  *   job       { jobId, op, planId, nonce }                a pool change began; its approval's nonce is now used
  *   intent    { jobId, intentId, vmName, folder, cores, memoryMB, diskGB }   about to create this VM, in this folder
  *   created   { intentId, vmId }                          New-VM returned this id
- *   ready     { intentId, vmId, cleanCheckpointId }       installed, set up, clean checkpoint taken
+ *   online    { intentId }                                about to connect this unfinished VM to the Default Switch
+ *                                                         to activate Windows (the approved plan's one online step)
+ *   offline   { intentId }                                its adapter confirmed disconnected again
+ *   ready     { intentId, vmId, cleanCheckpointId, licence }   installed, set up, clean checkpoint taken; licence:
+ *             { kind: 'evaluation', expiresAt } or { kind: 'own', activated, status } (absent: built before MC-1513)
  *   rolledBack{ intentId }                                an unfinished create was undone
  *   removing  { jobId, vmId }                             about to remove this VM
  *   removed   { vmId }
@@ -108,7 +113,9 @@ class Journal {
         case 'image': s.images.set(r.sha256, r); break
         case 'job': s.jobs.set(r.jobId, { ...r, ended: false }); if (r.nonce) s.usedNonces.add(r.nonce); break
         case 'jobEnd': { const j = s.jobs.get(r.jobId); if (j) Object.assign(j, { ended: true, ok: r.ok, note: r.note }); break }
-        case 'intent': s.intents.set(r.intentId, { ...r, vmId: null, done: false }); break
+        case 'intent': s.intents.set(r.intentId, { ...r, vmId: null, done: false, online: false, offline: false }); break
+        case 'online': { const i = s.intents.get(r.intentId); if (i) i.online = true; break }
+        case 'offline': { const i = s.intents.get(r.intentId); if (i) i.offline = true; break }
         case 'created': {
           const i = s.intents.get(r.intentId)
           if (!i) break
@@ -118,7 +125,7 @@ class Journal {
         }
         case 'ready': {
           const vm = s.vms.get(r.vmId)
-          if (vm) Object.assign(vm, { ready: true, cleanCheckpointId: r.cleanCheckpointId, readyAt: r.at })
+          if (vm) Object.assign(vm, { ready: true, cleanCheckpointId: r.cleanCheckpointId, readyAt: r.at, licence: r.licence ?? null })
           const i = s.intents.get(r.intentId)
           if (i) i.done = true
           break

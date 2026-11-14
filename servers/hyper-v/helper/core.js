@@ -33,6 +33,11 @@ const INSTALL_WAIT_MS = Number(process.env.HYPERV_MCP_INSTALL_WAIT_MS || 90 * 60
 const POLL_MS = Number(process.env.HYPERV_MCP_POLL_MS || 3000)
 const LOGON_STABLE_MS = Number(process.env.HYPERV_MCP_LOGON_STABLE_MS || 10_000) // test-only override
 const RETRY_MS = Number(process.env.HYPERV_MCP_RETRY_MS || 5 * 60_000)
+// The build's one online step (MC-1513): its call's bound, and net-off's after a failure.
+const ACTIVATE_MS = Number(process.env.HYPERV_MCP_ACTIVATE_MS || 8 * 60_000)
+const NET_OFF_MS = 60_000
+const EVAL_MIN_DAYS = 85 // a fresh evaluation build must have at least this long left (90 nominal)
+const EVAL_LAST_MS = 60 * 60_000 // an evaluation VM with less than this left is no longer leased
 const CHUNK_MAX = 1024 * 1024
 const MANIFEST_BATCH = 5000 // entries per manifest_add, at most (server.js sends batches of at most 1 MB of JSON)
 const MINUTE_MS = Number(process.env.HYPERV_MCP_MINUTE_MS || 60_000) // test-only: shorter lease minutes
@@ -201,6 +206,14 @@ class Helper {
     const found = intent.vmId
       ? { vmId: intent.vmId }
       : await this.hv('find-vm', { name: intent.vmName, folder: intent.folder })
+    // A VM left in the build's online step (journalled online, never offline): off and disconnected first, verified;
+    // the removal is tried even if that fails (a removed VM is on no network either).
+    if (found?.vmId && intent.online && !intent.offline) {
+      try {
+        await this.hv('net-off', { vmId: found.vmId, name: intent.vmName, folder: intent.folder }, { timeoutMs: NET_OFF_MS })
+        this.journal.append({ t: 'offline', intentId: intent.intentId })
+      } catch (e) { this.log(`net-off of ${intent.vmName} failed (${e.message}): removing it anyway`) }
+    }
     if (found?.vmId) await this.hv('remove-vm', { vmId: found.vmId, name: intent.vmName, folder: intent.folder })
     this.removeFolder(intent.folder)
     this.journal.append({ t: 'rolledBack', intentId: intent.intentId })
@@ -291,10 +304,14 @@ class Helper {
     return vm
   }
 
-  /** The VMs that can be leased now: ready, not removing, not quarantined, not leased. */
+  /**
+   * The VMs that can be leased now: ready, not removing, not quarantined, not leased, and not an evaluation within
+   * EVAL_LAST_MS of its recorded end (MC-1513: it would log users off and shut down hourly).
+   */
   freeVms() {
     const s = this.state
-    return [...s.vms.values()].filter(v => v.ready && !v.removing && !s.quarantined.has(v.vmId) && !this.leases.has(v.vmId))
+    const now = this.now()
+    return [...s.vms.values()].filter(v => v.ready && !v.removing && !s.quarantined.has(v.vmId) && !this.leases.has(v.vmId) && (evalEnd(v) ?? Infinity) - now >= EVAL_LAST_MS)
   }
 
   // ---------- projects, fair share and the queue (MC-1502) ----------
@@ -402,7 +419,9 @@ class Helper {
     if (!c) throw new Error('unknown connection')
     const vm = this.candidates(project, want)[0]
     const now = this.now()
-    const sessionEnd = now + policyMod.sessionMinutes(this.policy) * MINUTE_MS
+    // An evaluation VM's lease never runs past its recorded end: the work session is capped there too.
+    const licenceEnd = evalEnd(vm)
+    const sessionEnd = Math.min(now + policyMod.sessionMinutes(this.policy) * MINUTE_MS, licenceEnd ?? Infinity)
     const lease = {
       leaseId: `l-${hex(6)}`, vmId: vm.vmId, vmName: vm.vmName, connId, ownerConn: connId, pid: c.pid, ending: null, children: new Set(),
       acquiredAt: now, sessionEnd, deadline: Math.min(sessionEnd, now + Math.round(minutes * MINUTE_MS)), keepOnFailure: !!keepOnFailure,
@@ -422,7 +441,8 @@ class Helper {
     this.armDeadline(lease)
     const share = `${project === 'other' ? '' : ` for project ${project}`}${this.osOf(vm) === 'windows' && !want.image ? '' : ` (${this.osOf(vm)}, image ${this.imageOf(vm).slice(0, 12)})`}`
     const failed = this.failedNote(vm)
-    return { text: `Leased ${vm.vmName} (lease ${lease.leaseId})${share} until ${new Date(lease.deadline).toISOString()}; vm_renew can extend it up to ${new Date(sessionEnd).toISOString()} (the policy's work-session cap). Call vm_start next; always vm_release when done.${failed ? ` Note: ${failed}; every free VM that fitted had a failed start, and this one's was the longest ago.` : ''}`, data: { lease: lease.leaseId, vm: vm.vmName, deadline: lease.deadline, sessionEnd, project, os: lease.os, image: lease.image } }
+    const cap = licenceEnd !== null && sessionEnd === licenceEnd ? `its Windows evaluation's end` : `the policy's work-session cap`
+    return { text: `Leased ${vm.vmName} (lease ${lease.leaseId})${share} until ${new Date(lease.deadline).toISOString()}; vm_renew can extend it up to ${new Date(sessionEnd).toISOString()} (${cap}). Call vm_start next; always vm_release when done.${failed ? ` Note: ${failed}; every free VM that fitted had a failed start, and this one's was the longest ago.` : ''}`, data: { lease: lease.leaseId, vm: vm.vmName, deadline: lease.deadline, sessionEnd, project, os: lease.os, image: lease.image } }
   }
 
   /** Settles an entry's waiting request once: with a result, or an error. Its token makes a late timer a no-op. */
@@ -568,7 +588,9 @@ class Helper {
     if (!Number.isFinite(minutes) || minutes < 1 || minutes > max) throw new Error(`minutes must be 1-${max} (the policy's maxLeaseMinutes).`)
     const want = now + Math.round(minutes * MINUTE_MS)
     if (want > lease.sessionEnd) {
-      throw new Error(`That is past this work session's end, ${new Date(lease.sessionEnd).toISOString()} (the policy's maxSessionMinutes, ${policyMod.sessionMinutes(this.policy)} min from vm_acquire): at most ${Math.floor((lease.sessionEnd - now) / MINUTE_MS)} minutes now. Nothing was changed.`)
+      const vm = this.state.vms.get(lease.vmId)
+      const why = vm && evalEnd(vm) === lease.sessionEnd ? `${lease.vmName}'s Windows evaluation ends then` : `the policy's maxSessionMinutes, ${policyMod.sessionMinutes(this.policy)} min from vm_acquire`
+      throw new Error(`That is past this work session's end, ${new Date(lease.sessionEnd).toISOString()} (${why}): at most ${Math.floor((lease.sessionEnd - now) / MINUTE_MS)} minutes now. Nothing was changed.`)
     }
     lease.deadline = want
     this.armDeadline(lease)
@@ -639,6 +661,13 @@ class Helper {
   /** Retries quarantined VMs that nobody holds. */
   async retryQuarantined() {
     for (const dir of [...this.pendingCleanup]) this.removeStaging(dir)
+    // A build whose rollback failed while it may still be online: retried here, not only at the next start.
+    await this.poolLock(async () => {
+      if (this.job) return
+      for (const i of this.state.intents.values()) {
+        if (!i.done && i.online && !i.offline) await this.rollBack(i).catch(e => this.log(`rollback of ${i.vmName} (it may still be online) failed: ${e.message}; retried later`))
+      }
+    }).catch(() => {})
     for (const vmId of this.state.quarantined.keys()) {
       const vm = this.state.vms.get(vmId)
       if (vm && vm.ready && !vm.removing && !this.leases.has(vmId)) await this.vmLock(vmId)(() => this.restore(vm)).catch(() => {})
@@ -1217,6 +1246,8 @@ class Helper {
       this.imageJob ? `Image: ${this.imageJob.progress}` : this.lastImage ? `Image: ${this.lastImage}` : null,
       this.quiesced ? `Quiesced for uninstall: no new leases${this.quiesced.allowRemove ? '; only an approved remove of the pool' : '; no pool changes'}.` : null,
       this.recovery?.length ? `At start-up: ${this.recovery.join(' ')}` : null,
+      ...[...s.intents.values()].filter(i => !i.done && i.online && !i.offline).map(i => `WARNING: ${i.vmName} may still be online (its build's activation step didn't finish): it is being removed, retried every few minutes.`),
+      `Product key for non-evaluation images (install.ps1 -ProductKeyFile): ${this.productKey() ? 'set' : 'none'}.`,
       `Policy: up to ${this.policy.maxVms} VMs, ${this.policy.maxCoresPerVm} cores each, ${this.policy.maxMemoryMBTotal} MB in all, ${this.policy.maxDiskGBPerVm} GB disks, in ${this.policy.diskFolders.join('; ')}; network ${this.policy.allowNetwork ? 'allowed (internal switch only)' : 'not allowed'}; CPU reserve up to ${this.policy.maxReservePercent}%; leases up to ${this.policy.maxLeaseMinutes} min at a time, renewable to ${policyMod.sessionMinutes(this.policy)} min per work session${this.policy.maxSessionMinutes === undefined ? ' (the default)' : ''}.`,
       `Build folders set by an admin (install.ps1 -BuildRoot): ${this.policy.buildRoots.length ? this.policy.buildRoots.join('; ') : 'none'}.`
     ]
@@ -1275,6 +1306,16 @@ class Helper {
         const img = await this.planImage(args.image, location)
         if (!img.ready) return { text: img.text }
         plan.image = img.image
+      }
+      if (plan.add.length) {
+        // The build's one online step, bound here (MC-1513): an evaluation image always (it lasts about a day
+        // unactivated); an own copy only when asked. Nothing else ever connects the Default Switch.
+        const evaluation = plan.image.evaluation
+        if (evaluation && args.activate === false) throw new Error('An evaluation image must be activated online once when each VM is built (unactivated, it stops allowing interactive logons after about a day): leave activate out.')
+        const online = evaluation || args.activate === true
+        if (online && !facts.defaultSwitch) throw new Error(`This host has no Default Switch, so Windows can't be activated online when a VM is built${evaluation ? ' (an evaluation image needs that)' : ''}.`)
+        plan.activation = online ? 'online-once' : 'none'
+        plan.productKey = !evaluation && !!this.productKey()
       }
       if (!plan.add.length && !plan.remove.length) throw new Error(`The pool already has ${pool.length} VM(s): nothing to change.`)
     }
@@ -1342,7 +1383,11 @@ class Helper {
         const bad = policyMod.checkPool(this.policy, [...after, ...plan.add], { network: !!plan.switch || !!s.switch })
         if (bad.length) throw new Error(`Plan ${planId} is outside the policy now: ${bad.join('; ')}.`)
         if (op === 'create' && s.vms.size) throw new Error('The pool is no longer empty: make a new plan.')
-        if (!s.images.has(plan.image?.sha256)) throw new Error('The plan\'s image is no longer verified: make a new plan.')
+        const rec = s.images.get(plan.image?.sha256)
+        if (!rec) throw new Error('The plan\'s image is no longer verified: make a new plan.')
+        if (rec.edition !== plan.image.edition || (rec.imageIndex ?? 1) !== (plan.image.imageIndex ?? 1)) throw new Error('The plan\'s image edition no longer matches its record: make a new plan.')
+        if (isEval(plan.image) && plan.activation !== 'online-once') throw new Error(`Plan ${planId} doesn't activate its evaluation image (it was made before activation was planned): make a new plan.`)
+        if (plan.productKey && !this.productKey()) throw new Error(`Plan ${planId} uses the pool's product key, but setup holds none now: make a new plan.`)
       }
       const jobId = `j-${hex(6)}`
       this.journal.append({ t: 'job', jobId, op, planId, nonce })
@@ -1447,7 +1492,7 @@ class Helper {
     const creds = this.creds()
     step('writing its answer file')
     const media = join(a.folder, 'setup-media')
-    require('./unattend').writeMedia(media, { computerName: a.name.toUpperCase().slice(0, 15), creds })
+    require('./unattend').writeMedia(media, { computerName: a.name.toUpperCase().slice(0, 15), creds, imageIndex: plan.image.imageIndex ?? 1, productKey: plan.productKey ? this.productKey() : null })
     const unattendIso = join(a.folder, 'unattend.iso')
     await this.hv('make-iso', { source: media, out: unattendIso, label: 'HVMCP' })
     const img = this.state.images.get(plan.image.sha256)
@@ -1463,6 +1508,8 @@ class Helper {
     const g = await this.hv('guest-setup', { ...this.ident(vm), cred: creds.admin, userName: creds.user.user }, { timeoutMs: 15 * 60_000 })
     const why = images.guestReportProblem(g, img)
     if (why) throw new Error(`the guest's sanity check failed: ${why}`)
+    step(plan.activation === 'online-once' ? 'activating Windows online (network on for this step only)' : 'reading its Windows licence (offline)')
+    const licence = await this.licenceStep(vm, a, plan, creds)
     step('shutting down and taking the clean checkpoint')
     const cp = await this.hv('make-clean', { ...this.ident(vm) }, { timeoutMs: 15 * 60_000 })
     fs.rmSync(media, { recursive: true, force: true })
@@ -1470,7 +1517,34 @@ class Helper {
     const facts = await this.hv('restore', { ...this.ident(vm), checkpointId: cp.checkpointId })
     const bad = baselineProblem(facts, { ...vm, cleanCheckpointId: cp.checkpointId })
     if (bad) throw new Error(`its clean baseline doesn't verify: ${bad}`)
-    this.journal.append({ t: 'ready', intentId: a.intentId, vmId: vm.vmId, cleanCheckpointId: cp.checkpointId })
+    this.journal.append({ t: 'ready', intentId: a.intentId, vmId: vm.vmId, cleanCheckpointId: cp.checkpointId, licence })
+  }
+
+  /**
+   * The build's licence step (MC-1513). With the plan's 'online-once': journalled online, then hv.ps1 'guest-activate'
+   * (the adapter on the Default Switch for that call only, disconnected in its finally and verified), then journalled
+   * offline. A failure, a timeout or an unconfirmed disconnection throws, and the rollback does net-off first. Without
+   * it, the licence is only read, offline. An evaluation must come back licensed with at least EVAL_MIN_DAYS left.
+   */
+  async licenceStep(vm, a, plan, creds) {
+    let r
+    if (plan.activation === 'online-once') {
+      this.journal.append({ t: 'online', intentId: a.intentId })
+      try { r = await this.hv('guest-activate', { ...this.ident(vm), cred: creds.admin }, { timeoutMs: ACTIVATE_MS }) } catch (e) { throw new Error(`activating Windows online failed: ${e.message}`) }
+      if (!r?.disconnected) throw new Error('its network adapter could not be confirmed disconnected after activating Windows')
+      this.journal.append({ t: 'offline', intentId: a.intentId })
+    } else {
+      r = await this.hv('guest-licence', { ...this.ident(vm), cred: creds.admin }, { timeoutMs: 120_000 })
+    }
+    return licenceOf(r, isEval(plan.image), this.now())
+  }
+
+  /** The pool's product key (setup's -ProductKeyFile), or null. Never in a reply, plan, journal or log. */
+  productKey() {
+    try {
+      const k = JSON.parse(fs.readFileSync(join(this.dir, 'secrets', 'product-key.json'), 'utf8').replace(/^\uFEFF/, ''))?.key
+      return typeof k === 'string' && require('./unattend').KEY_RE.test(k) ? k : null
+    } catch { return null }
   }
 
   // ---------- uninstall ----------
@@ -1543,17 +1617,46 @@ const PROTOCOL = 'hyperv-mcp/3' // 2: renew, sync_plan, sync (MC-1497); 3: start
 // working with this helper: 'projects' = projects, acquire's wait and roots, whoami; 'images' = image groups,
 // acquire's os and image, per-OS shares, a project's image allowlist (MC-1502).
 const FEATURES = ['projects', 'images']
-const EVAL_DAYS = 90
 const DAY_MS = 24 * 60 * 60 * 1000
 
-/** A warning when a VM's evaluation install is within 14 days of its 90 (counted from its clean checkpoint), or ''. */
+/** An evaluation VM's recorded end (ms), or null: an own copy, or a VM built before licences were recorded. */
+function evalEnd(vm) {
+  return vm.licence?.kind === 'evaluation' ? Date.parse(vm.licence.expiresAt) : null
+}
+
+/**
+ * A VM's licence for vm_status and pool_status (MC-1513): an evaluation's days left from its recorded end (a warning
+ * from 14 days before; past EVAL_LAST_MS before it, it is no longer leased), an own copy's activation, or unknown for a
+ * VM built before licences were recorded. '' for a VM not yet ready.
+ */
 function expiry(vm, now) {
-  if (!vm.readyAt) return ''
-  const left = Math.floor((Date.parse(vm.readyAt) + EVAL_DAYS * DAY_MS - now) / DAY_MS)
-  if (left > 14) return ''
-  return left > 0
-    ? `. WARNING: its Windows evaluation expires in about ${left} day(s): ask the user to rebuild the pool (plan a remove, then a create).`
-    : '. WARNING: its Windows evaluation has expired: ask the user to rebuild the pool (plan a remove, then a create).'
+  const l = vm.licence
+  if (!l) return vm.readyAt ? '; licence unknown (built before Windows activation was recorded: an unactivated evaluation stops allowing interactive logons about a day after its build; a rebuild records it)' : ''
+  if (l.kind === 'own') return l.activated ? '; own copy of Windows, activated' : `; own copy of Windows, not activated (licence status ${l.status})`
+  const end = Date.parse(l.expiresAt)
+  const date = new Date(end).toISOString().slice(0, 10)
+  const left = Math.floor((end - now) / DAY_MS)
+  if (end - now < EVAL_LAST_MS) return `. Its Windows evaluation ${end <= now ? 'ended' : 'ends'} ${new Date(end).toISOString()}: it is no longer leased; the pool needs a rebuild (plan a remove, then a create; the user approves each)`
+  if (left <= 14) return `. WARNING: its Windows evaluation ends in about ${left} day(s), on ${date}: ask the user to rebuild the pool (plan a remove, then a create)`
+  return `; Windows evaluation, ${left} days left (until ${date})`
+}
+
+/**
+ * What a build's licence step read, as recorded (MC-1513). An evaluation must be licensed (status 1) with at least
+ * EVAL_MIN_DAYS left; its end is the earlier of now + GracePeriodRemaining and EvaluationEndDate (when real), never
+ * recomputed later. An own copy is recorded as it is, activated or not (no expiry).
+ */
+function licenceOf(r, evaluation, now) {
+  if (!r || typeof r !== 'object') throw new Error('the guest reported no licence')
+  const status = Number(r.status)
+  if (!evaluation) return { kind: 'own', activated: status === 1, status }
+  const ends = [Number(r.graceMinutes) > 0 ? now + Number(r.graceMinutes) * 60_000 : NaN, r.evalEnd ? Date.parse(r.evalEnd) : NaN].filter(t => Number.isFinite(t) && t > now)
+  if (status !== 1) throw new Error(`Windows didn't activate (licence status ${status}${r.error ? `: ${r.error}` : ''})`)
+  if (!ends.length) throw new Error('Windows activated but reported no evaluation period')
+  const end = Math.min(...ends)
+  const days = Math.floor((end - now) / DAY_MS)
+  if (days < EVAL_MIN_DAYS) throw new Error(`the evaluation activated with only ${days} day(s) left (at least ${EVAL_MIN_DAYS} needed)`)
+  return { kind: 'evaluation', expiresAt: new Date(end).toISOString() }
 }
 
 /** Why restored facts aren't the clean baseline, or null. */
@@ -1569,7 +1672,8 @@ function baselineProblem(f, vm) {
   return null
 }
 
-const pick = img => ({ sha256: img.sha256, size: img.size, edition: img.edition, build: img.build, pinned: img.pinned, source: img.source, os: img.os || 'windows' })
+const isEval = img => img.evaluation ?? img.edition === images.EVAL
+const pick = img => ({ sha256: img.sha256, size: img.size, edition: img.edition, build: img.build, imageIndex: img.imageIndex ?? 1, evaluation: isEval(img), pinned: img.pinned, source: img.source, os: img.os || 'windows' })
 const OSES = ['windows', 'linux']
 
 function describePlan(plan, digest, approve) {
@@ -1578,7 +1682,10 @@ function describePlan(plan, digest, approve) {
   for (const r of plan.remove || []) lines.push(`- remove ${r.name} and its folder ${r.folder}`)
   if (plan.switch) lines.push(`- create the internal switch ${plan.switch} (host and guests only; no internet, no LAN)`)
   if (plan.removeSwitch) lines.push(`- remove the switch ${plan.removeSwitch}`)
-  if (plan.image) lines.push(`- image: ${plan.image.edition} build ${plan.image.build}, SHA-256 ${plan.image.sha256} (${plan.image.pinned ? 'pinned: a known Microsoft download' : plan.image.source === 'download' ? 'downloaded by the helper over HTTPS from Microsoft' : 'NOT AUTHENTICATED: a local file you chose to trust'})`)
+  if (plan.image) lines.push(`- image: ${plan.image.edition}${plan.image.imageIndex > 1 ? ` (index ${plan.image.imageIndex})` : ''} build ${plan.image.build}, SHA-256 ${plan.image.sha256} (${plan.image.pinned ? 'pinned: a known Microsoft download' : plan.image.source === 'download' ? 'downloaded by the helper over HTTPS from Microsoft' : 'NOT AUTHENTICATED: a local file you chose to trust'})`)
+  if (plan.activation === 'online-once') lines.push('- activation: each new VM goes online once, through Windows\' Default Switch, to activate Windows; it is disconnected (verified) before its clean checkpoint, and no start ever uses that switch')
+  else if (plan.add?.length) lines.push('- activation: none (each new VM stays offline; its licence is read and shown)')
+  if (plan.add?.length && plan.image && !plan.image.evaluation) lines.push(`- product key: ${plan.productKey ? 'the pool\'s (set by install.ps1 -ProductKeyFile), written only into the answer file' : 'none'}`)
   lines.push(`Host: ${plan.host.logicalCpus} logical CPUs, ${plan.host.memoryMB} MB.`)
   lines.push('', 'Nothing is changed until the user approves this exact plan, in an admin PowerShell (one UAC prompt):', approve,
     'It shows the plan from the helper\'s own record and asks for the 6 characters above. Then call ' + `pool_${plan.op}({ planId: "${plan.id}" }).`,
@@ -1586,4 +1693,4 @@ function describePlan(plan, digest, approve) {
   return lines.join('\n')
 }
 
-module.exports = { Helper, canonical, baselineProblem, expiry, keyOf, ancestorClash, PLAN_ID_RE, PROTOCOL }
+module.exports = { Helper, canonical, baselineProblem, expiry, licenceOf, keyOf, ancestorClash, PLAN_ID_RE, PROTOCOL }

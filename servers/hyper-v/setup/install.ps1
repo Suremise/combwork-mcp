@@ -19,6 +19,10 @@
 # projects"): each { name, folders, maxVms?, images?, buildRoots? }. It is checked by the helper's own policy code
 # before anything changes, and copied into policy.json. Left out, a rerun keeps the current list; -ProjectsFile none
 # clears it.
+# -ProductKeyFile names a file holding a Windows product key (XXXXX-XXXXX-XXXXX-XXXXX-XXXXX) for VMs built from a
+# non-evaluation image (README, "The image"): checked here, then stored in the state's secrets folder, readable only by
+# SYSTEM, Administrators and the helper; it goes only into such a build's answer file. A file, so the key is never on
+# a command line. Left out, a rerun keeps the current key; -ProductKeyFile none removes it.
 # -MaxSessionMinutes caps a work session (vm_renew can extend a lease up to it, from vm_acquire): 5-1440 and at least
 # -MaxLeaseMinutes. Left out, the helper uses 480 (or -MaxLeaseMinutes, if that is more).
 # It is idempotent: run it again to update the helper or change the policy. It keeps an existing pool and its state.
@@ -38,7 +42,8 @@ param(
   [int]$MaxBuildMB = 2048,
   [switch]$AllowUnpinnedIso,
   [string[]]$BuildRoot = @(),
-  [string]$ProjectsFile = ''
+  [string]$ProjectsFile = '',
+  [string]$ProductKeyFile = ''
 )
 # Windows PowerShell 5.1 only (MC-1506), refused before any check or change:
 # setup's storage and ACL routines use .NET Framework calls that PowerShell 7
@@ -122,6 +127,12 @@ elseif ($ProjectsFile) {
 } else {
   $current = Join-Path $state 'policy.json'
   if (Test-Path -LiteralPath $current) { try { $projects = @((Get-Content -Raw -LiteralPath $current | ConvertFrom-Json).projects | Where-Object { $_ }) } catch { $projects = @() } }
+}
+# The product key (MC-1513): read and checked here, before anything changes; written in step 7. Never printed.
+$productKey = $null
+if ($ProductKeyFile -and $ProductKeyFile -ne 'none') {
+  try { $productKey = (Get-Content -Raw -LiteralPath $ProductKeyFile).Trim().ToUpperInvariant() } catch { throw "-ProductKeyFile $ProductKeyFile can't be read: $($_.Exception.Message)" }
+  if ($productKey -notmatch '^[A-Z0-9]{5}(-[A-Z0-9]{5}){4}$') { throw "-ProductKeyFile $ProductKeyFile doesn't hold one product key (five groups of five letters or digits, joined by hyphens)." }
 }
 # The pool's VM limit, worked out here (read-only), before anything changes: -MaxVms, or a quarter of the host's
 # logical CPUs (1-4). Step 7 writes this same value.
@@ -247,6 +258,13 @@ if ($projects.Count) { $policy.projects = @($projects) } # checked, against this
 if ($MaxSessionMinutes) { $policy.maxSessionMinutes = $MaxSessionMinutes }
 $policyFile = Join-Path $state 'policy.json'
 Write-SecureFile $policyFile ($policy | ConvertTo-Json -Depth 4) @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=ReadAndExecute") $ADMINS
+$keyFile = Join-Path (Join-Path $state 'secrets') 'product-key.json'
+if ($productKey) {
+  New-Item -ItemType Directory -Force -Path (Join-Path $state 'secrets') | Out-Null
+  Write-SecureFile $keyFile (ConvertTo-Json -InputObject @{ key = $productKey } -Compress) @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=ReadAndExecute") $ADMINS
+} elseif ($ProductKeyFile -eq 'none' -and (Test-Path -LiteralPath $keyFile)) { Remove-Item -LiteralPath $keyFile -Force }
+$keyLine = $(if (Test-Path -LiteralPath $keyFile) { 'set (used only for VMs built from a non-evaluation image)' } else { 'none' })
+$defaultSwitch = [bool](Get-VMSwitch -Id 'c08cb7b8-9b3c-408e-8e30-5e16a3aeb444' -ErrorAction SilentlyContinue)
 
 # The result, checked: only SYSTEM, Administrators and the helper's account have any access to the state; only the
 # first two can write policy.json and approvals\; the disk folders also allow Hyper-V's per-VM SIDs.
@@ -258,6 +276,8 @@ if ($bad.Count) { throw "The helper's folders aren't as setup made them: $($bad 
 Step "State in $state; VM disks in $($folders -join ', '); ACLs checked."
 Step "Build folders set by an admin (beside each client's MCP roots): $(if ($buildRoots.Count) { $buildRoots -join '; ' } else { 'none' })."
 Step "Projects sharing the pool: $projectsLine."
+Step "Product key (-ProductKeyFile): $keyLine."
+Step $(if ($defaultSwitch) { "Default Switch: present. Each evaluation VM goes online through it once, when it is built, to activate Windows (about 90 days from then); no start uses it." } else { "Default Switch: absent. Evaluation VMs can't be activated here, so pools need a non-evaluation image (an own copy, built offline)." })
 Step ("Policy: up to {0} VMs, {1} cores each, {2} GB memory in all, {3} GB disks; network {4}; unpinned ISOs {5}; leases up to {6} min, work sessions up to {7} min." -f $policy.maxVms, $policy.maxCoresPerVm, ($policy.maxMemoryMBTotal / 1024), $policy.maxDiskGBPerVm, $(if ($AllowNetwork) { 'allowed (internal switch only)' } else { 'not allowed' }), $(if ($AllowUnpinnedIso) { 'allowed' } else { 'refused' }), $MaxLeaseMinutes, $(if ($MaxSessionMinutes) { $MaxSessionMinutes } else { [Math]::Max($MaxLeaseMinutes, 480) }))
 
 # 8. Start.
@@ -271,6 +291,21 @@ if ($Mode -eq 'Service') {
   if (-not (PipeOpen)) { throw "The helper didn't open its pipe within 5 minutes: see $state\host.log and $state\helper.log." }
   Step 'The helper is running.'
 }
+# The pool's licences (MC-1513), read from the journal without writing it, by the helper's own code.
+$licScript = @'
+const fs = require('fs'), path = require('path')
+const [inst, st] = process.argv.slice(1)
+const file = path.join(st, 'journal.jsonl')
+if (!fs.existsSync(file)) { console.log('no pool yet'); process.exit(0) }
+const { Journal } = require(path.join(inst, 'journal.js'))
+const { expiry } = require(path.join(inst, 'core.js'))
+const j = new Journal(st)
+j.records = fs.readFileSync(file, 'utf8').split(/\r?\n/).filter(l => l.trim()).map(l => { try { return JSON.parse(l) } catch { return null } }).filter(Boolean)
+const vms = [...j.state().vms.values()].filter(v => v.ready)
+console.log(vms.length ? vms.map(v => v.vmName + expiry(v, Date.now())).join(' | ') : 'no VMs yet')
+'@
+try { $lic = (& $node -e $licScript $install $state 2>&1) -join ' ' } catch { $lic = "couldn't be read ($($_.Exception.Message))" }
+Step "The pool's VMs and their Windows licences: $lic"
 } finally {
   # Every handle setup opened (the pinned parents and storage folders), and the receipts key, on every path out.
   Close-Pins $pins

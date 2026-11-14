@@ -238,7 +238,7 @@ test('a VM whose start just failed is leased last: a retry gets another free VM;
   }
   const first = leased(await s.call('vm_acquire', { minutes: 30 }))
   await failStart()
-  assert.match(await lineOf(first), /; free; its last start failed at \S+ \(no interactive session of hvadmin appeared within \d+ s\)$/)
+  assert.match(await lineOf(first), /; free; .*its last start failed at \S+ \(no interactive session of hvadmin appeared within \d+ s\)$/)
   // The retry gets the other VM, though the failed one is first in the pool.
   const other = leased(await s.call('vm_acquire', { minutes: 30 }))
   assert.ok(other && other !== first)
