@@ -340,8 +340,20 @@ $GuestLogonUndo = {
 # account is logged on, the newest AppX deployment event, its installed packages (a hash of their names and status),
 # and its busy first-logon workers (OneDriveSetup, or a SystemApps, UserOOBEBroker or WebView2 process that started
 # within the quiet window). Any failed query throws: the helper takes it as unknown, never as idle.
+# MC-1520: an account's AppContainer profile counts from raw facts, pure so the tests run it. A location that is
+# readable but absent counts 0 (a first profile may have none yet); an unloaded classes store, an unknown profile path or
+# a failed enumeration is $null (unknown: the helper never takes it as quiet).
+$ProfileCounts = {
+  param($r)
+  $mappings = $null
+  if ($r.classesLoaded) { if ($r.mappingsKey -eq 'missing') { $mappings = 0 } elseif ($r.mappingsKey -eq 'present') { $mappings = [int]$r.mappingsCount } }
+  $packages = $null
+  if ($r.profilePath) { if ($r.packagesDir -eq 'missing') { $packages = 0 } elseif ($r.packagesDir -eq 'present') { $packages = [int]$r.packagesCount } }
+  @{ mappings = $mappings; packagesDirs = $packages }
+}
+
 $GuestProvisioned = {
-  param($u, $quietMs)
+  param($u, $quietMs, $countsText)
   $ErrorActionPreference = 'Stop'
   $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
   $last = $null
@@ -353,7 +365,25 @@ $GuestProvisioned = {
   $procs = @(Get-Process -IncludeUserName | Where-Object { $_.SessionId -ge 1 -and $_.UserName -like "*\$u" })
   $since = (Get-Date).AddMilliseconds(-[int]$quietMs)
   $busy = @($procs | Where-Object { $_.Name -eq 'OneDriveSetup' -or ((($_.Path -like 'C:\Windows\SystemApps\*') -or ($_.Name -in 'UserOOBEBroker', 'msedgewebview2')) -and $_.StartTime -gt $since) } | ForEach-Object { $_.Name })
-  @{ boot = $boot; user = ($procs.Count -gt 0); lastEvent = $last; count = $pk.Count; inventory = $inventory; busy = $busy }
+  # MC-1520: the account's own AppContainer profiles (its classes store by SID, its profile by SID: never this session's
+  # HKCU), as CB1's census counts them for the logged-on user.
+  $raw = @{ classesLoaded = $false; mappingsKey = 'error'; mappingsCount = 0; profilePath = $null; packagesDir = 'error'; packagesCount = 0 }
+  try {
+    $sid = [string](Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True AND Name='$u'").SID
+    if ($sid) {
+      $classes = "Registry::HKEY_USERS\${sid}_Classes"
+      $raw.classesLoaded = Test-Path -LiteralPath $classes
+      $mk = "$classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings"
+      try { if (Test-Path -LiteralPath $mk) { $raw.mappingsCount = @(Get-ChildItem -LiteralPath $mk -ErrorAction Stop).Count; $raw.mappingsKey = 'present' } else { $raw.mappingsKey = 'missing' } } catch { $raw.mappingsKey = 'error' }
+      $raw.profilePath = [string](Get-CimInstance Win32_UserProfile -Filter "SID='$sid'").LocalPath
+      if ($raw.profilePath) {
+        $pd = Join-Path $raw.profilePath 'AppData\Local\Packages'
+        try { if (Test-Path -LiteralPath $pd) { $raw.packagesCount = @(Get-ChildItem -LiteralPath $pd -Directory -Force -ErrorAction Stop).Count; $raw.packagesDir = 'present' } else { $raw.packagesDir = 'missing' } } catch { $raw.packagesDir = 'error' }
+      }
+    }
+  } catch { }
+  $counts = & ([scriptblock]::Create($countsText)) $raw
+  @{ boot = $boot; user = ($procs.Count -gt 0); lastEvent = $last; count = $pk.Count; inventory = $inventory; busy = $busy; mappings = $counts.mappings; packagesDirs = $counts.packagesDirs }
 }
 
 # MC-1519 (the user's decision): the test work folders excluded from Defender's scanning (an ExclusionPath: real-time
@@ -582,7 +612,7 @@ try {
     }
     'guest-provisioned' {
       $vm = Get-OwnVm $a
-      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestProvisioned -ArgumentList ([string]$a.account), ([int]$a.quietMs)
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestProvisioned -ArgumentList ([string]$a.account), ([int]$a.quietMs), $ProfileCounts.ToString()
     }
     'guest-defender' {
       $vm = Get-OwnVm $a

@@ -348,3 +348,24 @@ $events = @(1..15 | ForEach-Object { [pscustomobject]@{ Id = 4600 + $_; TimeCrea
   assert.ok(!JSON.stringify(out).includes('secret'))
   assert.deepStrictEqual(out[1], [])
 })
+
+// MC-1520: hv.ps1's own $ProfileCounts, run for real: a readable but absent location counts 0; an unloaded classes
+// store, an unknown profile path or a failed enumeration is null (unknown); otherwise the count.
+const COUNTS_BLOCK = (() => { const s = HV_PS.indexOf('\n$ProfileCounts = {'); const e = s < 0 ? -1 : HV_PS.indexOf('\n}\n', s + 1); return e < 0 ? null : HV_PS.slice(s + 1, e + 3) })()
+
+test('AppContainer counts (MC-1520), for real: absent is 0, unloaded or failed is unknown, else the count', { skip: process.platform !== 'win32' || !COUNTS_BLOCK }, () => {
+  const cases = [
+    ['@{ classesLoaded = $true; mappingsKey = \'present\'; mappingsCount = 38; profilePath = \'C:\\Users\\hvadmin\'; packagesDir = \'present\'; packagesCount = 65 }', { mappings: 38, packagesDirs: 65 }],
+    ['@{ classesLoaded = $true; mappingsKey = \'missing\'; mappingsCount = 0; profilePath = \'C:\\Users\\hvuser\'; packagesDir = \'missing\'; packagesCount = 0 }', { mappings: 0, packagesDirs: 0 }],
+    ['@{ classesLoaded = $false; mappingsKey = \'missing\'; mappingsCount = 0; profilePath = \'C:\\Users\\hvuser\'; packagesDir = \'present\'; packagesCount = 3 }', { mappings: null, packagesDirs: 3 }],
+    ['@{ classesLoaded = $true; mappingsKey = \'error\'; mappingsCount = 0; profilePath = $null; packagesDir = \'error\'; packagesCount = 0 }', { mappings: null, packagesDirs: null }],
+    ['@{ classesLoaded = $true; mappingsKey = \'present\'; mappingsCount = 5; profilePath = \'C:\\Users\\hvadmin\'; packagesDir = \'error\'; packagesCount = 9 }', { mappings: 5, packagesDirs: null }]
+  ]
+  const sc = scratch('profile-counts')
+  const file = path.join(sc.dir, 'counts.ps1')
+  fs.writeFileSync(file, `${COUNTS_BLOCK}\n${cases.map(([r]) => `'OUT:' + (ConvertTo-Json -InputObject (& $ProfileCounts ${r}) -Compress)`).join('\n')}\n`)
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: ps51Env(), timeout: 60_000 })
+  const out = r.stdout.split(/\r?\n/).filter(l => l.startsWith('OUT:')).map(l => JSON.parse(l.slice(4)))
+  assert.strictEqual(out.length, cases.length, r.stdout + r.stderr)
+  cases.forEach(([, want], i) => assert.deepStrictEqual({ mappings: out[i].mappings, packagesDirs: out[i].packagesDirs }, want, `case ${i + 1}`))
+})

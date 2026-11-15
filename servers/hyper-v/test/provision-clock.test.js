@@ -34,7 +34,7 @@ function fake({ watcher = () => true, probe = () => ({}), diagFails = false } = 
     calls.push({ op, at: t, timeoutMs: opts?.timeoutMs, account: a.account || a.logon?.user })
     if (op === 'guest-logon') { const before = `b${logons}`; logons++; account = a.logon.user; t += 10; return { boot: before } }
     if (op === 'guest-session') { t += 5; const w = watcher(account, logons, t); return { boot: `b${logons}`, sessions: w ? [1] : [], user: true, armed: true } }
-    if (op === 'guest-provisioned') { t += 5; return { boot: `b${logons}`, user: true, inventory: 'x', lastEvent: null, busy: [], count: 1, ...probe(a.account, logons, t) } }
+    if (op === 'guest-provisioned') { t += 5; return { boot: `b${logons}`, user: true, inventory: 'x', lastEvent: null, busy: [], count: 1, mappings: 60, packagesDirs: 25, ...probe(a.account, logons, t) } }
     if (op === 'guest-logon-diag') { t += 5; if (diagFails) throw new Error('injected: the diagnosis failed'); return { uptime: 42, logs: {}, processes: [], autoAdminLogon: '1', watcher: false, message: 'dropped' } }
     throw new Error(`unexpected ${op}`)
   }

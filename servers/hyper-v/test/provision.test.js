@@ -138,3 +138,19 @@ test('a failed build logon whose diagnosis fails (MC-1520): recorded as unavaila
   assert.match(line, /create finished: .*hvadmin's logon attempt 1 failed: .*diagnostics unavailable\)/)
   assert.deepStrictEqual(sc.journal().find(r => r.t === 'ready').profiles.hvadmin.attempts[0].diag, { unavailable: true })
 })
+
+// MC-1520 part 4: the account's AppContainer profiles in the quiet test, and the named per-account budget.
+test('quiet waits for the account\'s AppContainer counts to stop changing (MC-1520); they\'re recorded; the plan names the budget', async t => {
+  const { sc, plan, line } = await build(t, 'prov-counts', { profileGrow: 4 })
+  assert.match(line, /create finished/)
+  assert.match(plan.text, /each account within \d+ min \(a logon attempt up to \d+ min, then \d+ min of observed quiet, one retry if needed\)/)
+  for (const who of ['hvadmin', 'hvuser']) assert.ok(vms(sc)[0].provisioned.filter(a => a === who).length >= 6, `${who}: 4 changing samples, then quiet`)
+  const p = sc.journal().find(r => r.t === 'ready').profiles
+  assert.deepStrictEqual([p.hvadmin.mappings, p.hvadmin.packagesDirs, p.hvuser.mappings, p.hvuser.packagesDirs], [64, 29, 64, 29])
+})
+
+test('an unknown AppContainer count (MC-1520) is never quiet: it starts the window over, and the build still settles', async t => {
+  const { sc, line } = await build(t, 'prov-counts-unknown', { profileUnknownAt: 2 })
+  assert.match(line, /create finished/)
+  assert.ok(vms(sc)[0].provisioned.filter(a => a === 'hvadmin').length >= 4)
+})

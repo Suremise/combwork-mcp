@@ -37,9 +37,9 @@ const POLL_MS = Number(process.env.HYPERV_MCP_POLL_MS || 3000)
 const LOGON_STABLE_MS = Number(process.env.HYPERV_MCP_LOGON_STABLE_MS || 10_000) // test-only override
 // The build's profile provisioning (MC-1516): an account's first-logon work is taken as done after PROVISION_QUIET_MS
 // of consecutive good, idle samples (PROVISION_POLL_MS apart), within PROVISION_WAIT_MS. Test-only overrides.
-const PROVISION_QUIET_MS = Number(process.env.HYPERV_MCP_PROVISION_QUIET_MS || 2 * 60_000)
+const PROVISION_QUIET_MS = Number(process.env.HYPERV_MCP_PROVISION_QUIET_MS || 4 * 60_000) // MC-1520: 4 min, a trial value
 const PROVISION_POLL_MS = Number(process.env.HYPERV_MCP_PROVISION_POLL_MS || 15_000)
-const PROVISION_WAIT_MS = Number(process.env.HYPERV_MCP_PROVISION_WAIT_MS || 20 * 60_000)
+const PROVISION_WAIT_MS = Number(process.env.HYPERV_MCP_PROVISION_WAIT_MS || 30 * 60_000) // MC-1520: 30 min per account (the user's scope decision)
 // MC-1520: a build-time logon attempt waits up to BUILD_LOGON_WAIT_MS (within the account's deadline), leaving room for
 // one retry; one that is still waiting at LOGON_SNAPSHOT_MS (the runtime limit) gets a read-only diagnostic snapshot.
 const BUILD_LOGON_WAIT_MS = Number(process.env.HYPERV_MCP_BUILD_LOGON_WAIT_MS || 15 * 60_000)
@@ -1612,7 +1612,7 @@ class Helper {
       const attempts = [] // MC-1520: each attempt's outcome, a slow one's snapshot and a failed one's diagnosis
       for (let attempt = 1; ; attempt++) {
         if (this.now() >= deadline) throw provisionLate(name)
-        step(`logging ${name} on${attempt > 1 ? ' (again)' : ''}`)
+        step(`logging ${name} on${attempt > 1 ? ' (again)' : ''} (${name}'s budget: ${Math.max(0, Math.round((deadline - this.now()) / 60_000))} of ${Math.round(PROVISION_WAIT_MS / 60_000)} min left)`)
         // MC-1520: a read-only snapshot of the guest when the attempt is slow, and before the undo when it failed.
         const diag = async () => {
           const left = deadline - this.now()
@@ -1644,7 +1644,7 @@ class Helper {
           this.log(`${vm.vmName}: ${name}'s build logon attempt ${attempt} failed (${why}; ${diagLine(failed)})`)
         }
         await this.undoLogon(vm, creds)
-        if (!why) { out[name] = { logonMs: o.ms, quietMs: quiet.ms, packages: quiet.count, inventory: quiet.inventory, attempts }; break }
+        if (!why) { out[name] = { logonMs: o.ms, quietMs: quiet.ms, packages: quiet.count, inventory: quiet.inventory, mappings: quiet.mappings, packagesDirs: quiet.packagesDirs, attempts }; break }
         if (attempt >= 2) throw new Error(`provisioning ${name}'s profile failed twice: ${why} (${diagLine(failed)})`)
       }
     }
@@ -1668,12 +1668,13 @@ class Helper {
       const r = await this.hv('guest-provisioned', { ...this.ident(vm), cred: creds.admin, account, quietMs: PROVISION_QUIET_MS }, { timeoutMs: Math.max(1, Math.min(120_000, left)) }).catch(() => null)
       if (this.now() >= deadline) break
       if (r && (r.boot !== boot || r.user === false)) return { lost: true }
-      const good = !!r && r.user === true && typeof r.inventory === 'string' && Array.isArray(r.busy)
-      const busy = !good || r.busy.length > 0 || (last && (r.lastEvent !== last.lastEvent || r.inventory !== last.inventory))
+      // MC-1520: the account's AppContainer profile counts too: unknown (null) is never good, and a change is busy.
+      const good = !!r && r.user === true && typeof r.inventory === 'string' && Array.isArray(r.busy) && Number.isInteger(r.mappings) && Number.isInteger(r.packagesDirs)
+      const busy = !good || r.busy.length > 0 || (last && (r.lastEvent !== last.lastEvent || r.inventory !== last.inventory || r.mappings !== last.mappings || r.packagesDirs !== last.packagesDirs))
       if (good) last = r
       if (busy) quietSince = null
       else if (quietSince === null) quietSince = this.now()
-      if (!busy && this.now() - quietSince >= PROVISION_QUIET_MS) return { ms: this.now() - t0, count: r.count, inventory: r.inventory }
+      if (!busy && this.now() - quietSince >= PROVISION_QUIET_MS) return { ms: this.now() - t0, count: r.count, inventory: r.inventory, mappings: r.mappings, packagesDirs: r.packagesDirs }
       await sleep(Math.min(PROVISION_POLL_MS, Math.max(0, deadline - this.now())))
     }
     throw provisionLate(account)
@@ -1912,7 +1913,7 @@ function describePlan(plan, digest, approve) {
   if (plan.removeSwitch) lines.push(`- remove the switch ${plan.removeSwitch}`)
   if (plan.image) lines.push(`- image: ${plan.image.edition}${plan.image.imageIndex > 1 ? ` (index ${plan.image.imageIndex})` : ''} build ${plan.image.build}, SHA-256 ${plan.image.sha256} (${plan.image.pinned ? 'pinned: a known Microsoft download' : plan.image.source === 'download' ? 'downloaded by the helper over HTTPS from Microsoft' : 'NOT AUTHENTICATED: a local file you chose to trust'})`)
   if (plan.add?.length) lines.push(`- Defender: the test work folders ${DEFENDER_EXCLUSIONS.join(', ')} are excluded from Defender's scanning (real-time and scheduled scans) in the guest image; Defender stays on otherwise`)
-  if (plan.add?.length) lines.push('- provisioning: each new VM logs hvadmin and hvuser on interactively once (offline), waits for Windows\' first-logon setup to finish, then turns autologon off and resets UAC and the watcher\'s start before its clean checkpoint')
+  if (plan.add?.length) lines.push(`- provisioning: each new VM logs hvadmin and hvuser on interactively once (offline), waits for Windows' first-logon setup to finish, then turns autologon off and resets UAC and the watcher's start before its clean checkpoint; each account within ${Math.round(PROVISION_WAIT_MS / 60_000)} min (a logon attempt up to ${Math.round(BUILD_LOGON_WAIT_MS / 60_000)} min, then ${Math.round(PROVISION_QUIET_MS / 60_000)} min of observed quiet, one retry if needed)`)
   if (plan.activation === 'online-once') lines.push('- activation: each new VM goes online once, through Windows\' Default Switch, to activate Windows; it is disconnected (verified) before its clean checkpoint, and no start ever uses that switch')
   else if (plan.add?.length) lines.push('- activation: none (each new VM stays offline; its licence is read and shown)')
   if (plan.add?.length && plan.image && !plan.image.evaluation) lines.push(`- product key: ${plan.productKey ? 'the pool\'s (set by install.ps1 -ProductKeyFile), written only into the answer file' : 'none'}`)

@@ -120,7 +120,11 @@ function run(s, op, a) {
       if (s.provisionFailAt === k) throw new Error('injected: the provisioning probe failed')
       if (s.provisionLoseOnce === k) { delete s.provisionLoseOnce; vm.loggedOn = null }
       const busy = s.provisionNever || k <= (s.provisionBusy || 0) || k === s.provisionBusyAt ? ['OneDriveSetup'] : []
-      return { boot: `boot-${vm.boot || 0}`, user: vm.loggedOn === a.account, lastEvent: '2026-11-15T00:00:00.000Z', count: 42, inventory: 'cafe', busy }
+      // MC-1520: the account's AppContainer counts: grow for profileGrow samples (one per sample), unknown at sample
+      // profileUnknownAt.
+      const grow = Math.min(k, s.profileGrow || 0)
+      const unknown = s.profileUnknownAt === k
+      return { boot: `boot-${vm.boot || 0}`, user: vm.loggedOn === a.account, lastEvent: '2026-11-15T00:00:00.000Z', count: 42, inventory: 'cafe', busy, mappings: unknown ? null : 60 + grow, packagesDirs: unknown ? null : 25 + grow }
     }
     case 'guest-licence': { own(s, a); return { status: 1, graceMinutes: 0, evalEnd: null, channel: 'Retail', error: null, ...(s.licence || {}) } }
     case 'net-off': { const vm = own(s, a); vm.state = 'Off'; vm.switchName = null; return { offline: true } }
