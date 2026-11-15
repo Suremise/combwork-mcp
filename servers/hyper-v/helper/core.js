@@ -551,7 +551,8 @@ class Helper {
       const max = this.policy.maxLeaseMinutes
       if (!Number.isFinite(minutes) || minutes < 1 || minutes > max) throw new Error(`minutes must be 1-${max} (the policy's maxLeaseMinutes).`)
       const s = this.state
-      if (![...s.vms.values()].some(v => v.ready)) throw new Error('The pool has no VMs yet: ask the user to create one (pool_plan, then their approval, then pool_create).')
+      // A named VM that exists is served (or refused with its state, or waited for) even while none is ready (MC-1523).
+      if (named === undefined && ![...s.vms.values()].some(v => v.ready)) throw new Error('The pool has no VMs yet: ask the user to create one (pool_plan, then their approval, then pool_create).')
       let want
       if (named !== undefined) {
         // MC-1523: one VM by name, for trials and censuses. The request becomes that VM's own OS and image; an os or

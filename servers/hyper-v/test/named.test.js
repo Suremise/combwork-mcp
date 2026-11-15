@@ -9,6 +9,7 @@ const fs = require('fs')
 const path = require('path')
 const { scratch, startHelper, withPool, approve, waitFor } = require('./helpers')
 const { server } = require('../client')
+process.env.HYPERV_MCP_WAIT_MS = '200' // the in-process (bare) helper's bounded wait; started helpers get their own env
 const { Helper } = require('../helper/core')
 
 const A = 'ab'.repeat(32) // seeded by withPool: Windows
@@ -119,10 +120,9 @@ test('named, with projects: the cap still applies; a legacy VM is refused at onc
   fs.rmSync(path.join(sc.stateDir, 'plans', `${lines.find(r => r.t === 'job' && r.op === 'create').planId}.json`))
   const h2 = await startHelper(sc, SLOW)
   const [m1, o1, a2] = [h2.conn(1), h2.conn(2), h2.conn(98)]
-  const t0 = Date.now()
+  // A queued wait would answer "Still waiting…" (or be superseded), never this refusal; and no entry is left in line.
   const r = await acquire(m1, { roots: [mcp], vm: v2, wait: true })
   assert.match(r.error, new RegExp(`^No VM for you: project mcp may not use ${v2}: its image is unknown \\(made before images were recorded\\)`))
-  assert.ok(Date.now() - t0 < 3000, 'refused at once, not after a wait')
   assert.doesNotMatch(await status(a2), /Waiting in line/)
   // A project with no image list (other) may still name a legacy VM.
   assert.match((await acquire(o1, { vm: v2 })).text, new RegExp(`^Leased ${v2} `))
@@ -181,6 +181,51 @@ test('named VM states (bare helper): quarantined, being created, being removed, 
   assert.strictEqual(h.blocked('other', want), 'hvmcp-11111111 is in its Windows evaluation\'s last hour')
   state.vms.clear()
   assert.strictEqual(h.blocked('other', want), 'hvmcp-11111111 is no longer in the pool')
+})
+
+/** A bare helper running core.js's own acquire, queue and drain on one VM, with no ready VM unless set. */
+function bare() {
+  const h = Object.create(Helper.prototype)
+  const vm = { vmId: 'v1', vmName: 'hvmcp-22222222', intentId: 'i1', ready: false, cores: 2, memoryMB: 4096, diskGB: 64 }
+  const state = { vms: new Map([['v1', vm]]), quarantined: new Map(), intents: new Map([['i1', { image: A }]]), images: new Map([[A, { sha256: A, os: 'windows' }]]), jobs: new Map() }
+  h.journal = { state: () => state }
+  h.now = () => Date.now()
+  h.policy = { projects: [], maxLeaseMinutes: 240, buildRoots: [] }
+  Object.assign(h, { leases: new Map(), startFailed: new Map(), conns: new Map([[1, { pid: 1 }], [2, { pid: 2 }]]), queue: [], tokens: 0, timers: new Set(), quiesced: null })
+  h.poolLock = fn => fn()
+  h.armDeadline = () => {}
+  return { h, vm, state }
+}
+
+test('named, acquire path (bare helper): a sole VM still being created is refused with that state, not "no VMs yet"; waited for, then granted', async () => {
+  const { h, vm } = bare()
+  await assert.rejects(h.acquire(1, { minutes: 30 }), /The pool has no VMs yet/, 'unnamed: the guard stays')
+  await assert.rejects(h.acquire(1, { minutes: 30, vm: 'hvmcp-99999999' }), /^Error: No VM named hvmcp-99999999 in the pool/)
+  await assert.rejects(h.acquire(1, { minutes: 30, vm: vm.vmName }), /^Error: No VM for you now: hvmcp-22222222 is being created \(1 in the pool\)/)
+  const p = h.acquire(1, { minutes: 30, vm: vm.vmName, wait: true })
+  await new Promise(r => setImmediate(r))
+  assert.strictEqual(h.queue.length, 1, 'in line')
+  assert.ok(h.queue[0].pending, 'waiting now')
+  assert.strictEqual(h.queue[0].want.vm, vm.vmName)
+  vm.ready = true
+  h.drain() // the create finished
+  const r = await p
+  assert.match(r.text, /^Leased hvmcp-22222222 /)
+  assert.strictEqual(h.queue.length, 0)
+})
+
+test('named, acquire path (bare helper): the waited-for VM leaves the pool: the wait says so, drain never throws, nothing else is leased', async () => {
+  const { h, vm, state } = bare()
+  const other = { ...vm, vmId: 'v2', vmName: 'hvmcp-33333333', intentId: 'i1', ready: true }
+  const p = h.acquire(1, { minutes: 30, vm: vm.vmName, wait: true })
+  await new Promise(r => setImmediate(r))
+  assert.strictEqual(h.queue.length, 1)
+  state.vms.delete('v1')
+  state.vms.set('v2', other) // another VM comes free meanwhile
+  assert.doesNotThrow(() => h.drain())
+  const r = await p // the bounded wait (200 ms here) ends without a VM
+  assert.match(r.text, /^Still waiting for a VM \(hvmcp-22222222 is no longer in the pool\): number 1 of 1 in line/)
+  assert.strictEqual(h.leases.size, 0, 'never fell back to hvmcp-33333333')
 })
 
 test('server.js: vm is refused before anything is sent to a helper without the named feature', async t => {
