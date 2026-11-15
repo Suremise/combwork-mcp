@@ -268,7 +268,7 @@ non-evaluation Windows 11 ISO (see "Windows licences").
 | Tool | What it does |
 |---|---|
 | `vm_acquire({ minutes=60, keepOnFailure=false, wait=false, os='windows', image? })` | Leases one VM of that OS (and image, when given) to this session (one VM per session) until `vm_release`, its deadline (at most the policy's `maxLeaseMinutes`), or this server exiting. Without `wait`, it refuses when none is free for this session's project, saying why (none free, the project's cap, a VM kept for another project), when the next lease ends, and where it would stand in line. With `wait: true` it waits in line about 20 s, and a repeat call within 2 minutes keeps its place (see "Sharing the pool between projects"). |
-| `vm_start({ build?, network=false, reserveCpu=0, interactive=false })` | Restores the clean checkpoint (always), applies this run's network and CPU reserve, and starts the VM. It waits for the guest, then copies `build` in to `C:\build` and leaves an empty `C:\out`. With `interactive: 'user'` (the standard user) or `'admin'`, it first logs that account on interactively: autologon, one guest restart (tens of seconds), then it waits for the account's desktop session (see "The interactive session"). Refused on a VM kept for inspection: release it, and acquire again. |
+| `vm_start({ build?, network=false, reserveCpu=0, interactive=false })` | Restores the clean checkpoint (always), applies this run's network and CPU reserve, and starts the VM. It waits for the guest, then copies `build` in to `C:\build` and leaves an empty `C:\out`. With `interactive: 'user'` (the standard user) or `'admin'`, it first logs that account on interactively: autologon, one guest restart, then it waits up to 10 minutes for the account's desktop session (often 2–4 minutes on a first logon; see "The interactive session"). Refused on a VM kept for inspection: release it, and acquire again. |
 | `vm_renew({ minutes=60 })` | Sets the lease's deadline to now + `minutes` (1 to the policy's `maxLeaseMinutes`), never past the work session's end: `maxSessionMinutes` after `vm_acquire` (`vm_status` shows both). Refused once the deadline has passed, even a moment before the helper ends the lease. |
 | `vm_sync({ build?, full=false, delete=true })` | Copies only the files that changed in `build` (default: the folder last started or synced) into the **running** guest's `C:\build`, without a restore: `C:\out`, installed software and anything else the runs left stay. The server hashes the folder (same roots checks as `vm_start`, every time; links skipped); the helper compares that with what it placed in `C:\build` and takes only the new or changed files, hashing them itself as they arrive. Files gone from the folder are removed unless `delete` is false. Only what the helper copied is tracked: if your runs changed `C:\build` themselves, use `full: true` (clears `C:\build`, copies everything) or `vm_reset`. After a sync fails, only those two are accepted. |
 | `vm_reset({ build?, network?, reserveCpu?, interactive? })` | A clean VM now: exactly `vm_start` (restore first, verified), with this session's last start's `network`, `reserveCpu` and `interactive` and its last build unless given. |
@@ -525,15 +525,20 @@ there (0x8007045A, `ERROR_DLL_INIT_FAILED`). A logged-on user's session (1 or mo
   - `'admin'`: **`hvadmin`, elevated.** UAC's Admin Approval Mode is turned off in the guest (`EnableLUA` 0), so the
     admin's session gets a full token with no prompt. That guest has UAC off until its next restore.
   - Winlogon autologon of that account (the first-logon animation and privacy questions off), and a **watcher**
-    (`helper\guest-agent.ps1`, copied to `C:\hvmcp\agent.ps1`) that an HKLM `Run` entry starts at logon, in that
-    account's own session.
+    (`helper\guest-agent.ps1`, copied to `C:\hvmcp\agent.ps1`) that Winlogon starts at logon, in that account's own
+    session, from its `Userinit` list. Windows' own list (`C:\Windows\system32\userinit.exe,`) gets exactly the
+    watcher added, by absolute paths; any other list is refused before anything changes. (An HKLM `Run` entry, used
+    before, waits for a new desktop to settle: minutes on a first logon.)
   - `C:\hvmcp` is made admin-only (Users may read and run), so no user can change the watcher or a wrapper it starts.
     `C:\hvmcp\user` is where the standard user's session-0 runs stage their scripts, and the watcher never runs anything
     from there. `C:\hvmcp\req` is where runs are requested, writable by the logged-on account so its watcher can take
     them.
-  - Then the helper waits, as the lease's, for a new boot with the account's watcher in a session of 1 or more, seen
-    twice 10 s apart on the same boot: the guest may restart once more by itself after an autologon. That's a readiness
-    check, not a guarantee. A later restart just means the next run isn't taken, and the VM is restored (below).
+  - Then the helper waits, as the lease's, up to 10 minutes, for a new boot with the account's watcher in a session of
+    1 or more, seen twice 10 s apart on the same boot: the guest may restart once more by itself after an autologon.
+    That's a readiness check, not a guarantee. A later restart just means the next run isn't taken, and the VM is
+    restored (below). If the account logs on and Windows then logs the session off again (and so turns autologon off),
+    the start fails at once and says so; one that logs on but whose watcher never starts says that instead. Either
+    marks the VM's start as failed, so `vm_acquire` gives another free VM first.
   - A restart keeps the guest's disk, so a work session's sync record stays right. The clean checkpoint isn't changed:
     every start without `interactive` is as before, and a restore (stop, release, the deadline, `vm_reset`) logs nobody
     on and turns UAC back on.

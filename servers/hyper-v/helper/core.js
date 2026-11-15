@@ -29,6 +29,9 @@ const PLAN_TTL_MS = 30 * 60_000
 const OUTPUT_CAP = 16 * 1024
 const MAX_COMMAND = 8000
 const READY_WAIT_MS = Number(process.env.HYPERV_MCP_READY_WAIT_MS || 5 * 60_000)
+// The interactive logon's own wait (MC-1518): a guest restart, the logon and the watcher starting in its session; a
+// first logon from the clean checkpoint runs Windows' per-user first-logon work and can take several minutes.
+const LOGON_WAIT_MS = Number(process.env.HYPERV_MCP_LOGON_WAIT_MS || 10 * 60_000)
 const INSTALL_WAIT_MS = Number(process.env.HYPERV_MCP_INSTALL_WAIT_MS || 90 * 60_000)
 const POLL_MS = Number(process.env.HYPERV_MCP_POLL_MS || 3000)
 const LOGON_STABLE_MS = Number(process.env.HYPERV_MCP_LOGON_STABLE_MS || 10_000) // test-only override
@@ -958,8 +961,14 @@ class Helper {
       this.stillHeld(lease)
       let logon = ''
       if (interactive) {
-        const ms = await this.logon(vm, lease, interactive, creds)
-        if (ms === null) { failed(`no interactive session of ${creds[interactive].user} appeared within ${Math.round(READY_WAIT_MS / 1000)} s`); throw new Error(`${vm.vmName} restarted to log ${creds[interactive].user} on, but no interactive session of it appeared within ${Math.round(READY_WAIT_MS / 1000)} s. vm_reset to try again, or vm_release and vm_acquire for another VM (one whose start failed is leased last).`) }
+        const who = creds[interactive].user
+        const o = await this.logon(vm, lease, interactive, creds)
+        const again = 'vm_reset to try again, or vm_release and vm_acquire for another VM (one whose start failed is leased last).'
+        const wait = Math.round(LOGON_WAIT_MS / 1000)
+        if (o.loggedOff) { failed(`${who} logged on, then Windows logged the session off`); throw new Error(`${vm.vmName} logged ${who} on (after ${(o.after / 1000).toFixed(1)} s), but Windows logged the session off again before its watcher started, and turned autologon off. ${again}`) }
+        if (o.ms === undefined && o.user) { failed(`${who} logged on, but its watcher didn't start within ${wait} s`); throw new Error(`${vm.vmName} logged ${who} on, but its session's watcher didn't start within ${wait} s. ${again}`) }
+        if (o.ms === undefined) { failed(`no interactive session of ${who} appeared within ${wait} s`); throw new Error(`${vm.vmName} restarted to log ${who} on, but no interactive session of it appeared within ${wait} s. ${again}`) }
+        const ms = o.ms
         lease.interactive = interactive
         logon = `; ${creds[interactive].user} logged on interactively after a guest restart (${(ms / 1000).toFixed(1)} s): vm_run with session: 'interactive', as: '${interactive}' runs in its session`
       }
@@ -1002,24 +1011,34 @@ class Helper {
    * secret, wiped by the next restore), installs the session's watcher (guest-agent.ps1) to start at logon, turns UAC's
    * Admin Approval Mode off for the admin (so its session is elevated), and restarts the guest. Then it waits, as the
    * lease's, for a new boot with the account's watcher running in a session >= 1, seen twice LOGON_STABLE_MS apart on the
-   * same boot: the guest may restart once more by itself after an autologon (MC-1504's trial). Returns the ms, or null.
+   * same boot: the guest may restart once more by itself after an autologon (MC-1504's trial). Up to LOGON_WAIT_MS.
+   * MC-1518: it also notes the account logged on at all, per boot (a new boot other than before's; a boot change starts
+   * over). Only an answered probe on that same boot saying the account is gone and autologon is no longer armed (Winlogon
+   * clears it at a logoff) ends the wait early, as "logged off"; a failed probe is never evidence. Returns { ms }, or
+   * { loggedOff: true, after } (ms from the start of the wait to its logon being seen), or { user } once the wait is up.
    */
   async logon(vm, lease, which, creds) {
     const account = creds[which]
     const before = await this.hv('guest-logon', { ...this.ident(vm), cred: creds.admin, logon: account, elevated: which === 'admin' }, this.forLease(lease, 120_000))
     const t0 = this.now()
     let seen = null // { boot, at }: the watcher first seen on this boot
-    while (this.now() - t0 < READY_WAIT_MS) {
+    let user = null // { boot, at }: the account first seen logged on, on this boot
+    while (this.now() - t0 < LOGON_WAIT_MS) {
       this.stillHeld(lease)
       const r = await this.hv('guest-session', { ...this.ident(vm), cred: creds.admin, account: account.user }, this.forLease(lease, 60_000)).catch(() => null)
       this.stillHeld(lease)
+      if (r && r.boot !== before.boot) {
+        if (user && user.boot !== r.boot) user = null
+        if (r.user === true && !user) user = { boot: r.boot, at: this.now() - t0 }
+        if (user && r.user === false && r.armed === false) return { loggedOff: true, after: user.at }
+      }
       if (r && r.boot !== before.boot && Array.isArray(r.sessions) && r.sessions.length) {
-        if (seen?.boot === r.boot && this.now() - seen.at >= LOGON_STABLE_MS) return this.now() - t0
+        if (seen?.boot === r.boot && this.now() - seen.at >= LOGON_STABLE_MS) return { ms: this.now() - t0 }
         if (seen?.boot !== r.boot) seen = { boot: r.boot, at: this.now() }
       } else seen = null
       await sleep(POLL_MS)
     }
-    return null
+    return { user: !!user }
   }
 
   creds() {

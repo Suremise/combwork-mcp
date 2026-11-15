@@ -200,7 +200,16 @@ function run(s, op, a) {
       const before = `boot-${vm.boot || 0}`
       vm.boot = (vm.boot || 0) + 1 // the restart: the disk (C:\build, C:\out) stays
       vm.loggedOn = s.logonNeverAppears ? null : a.logon.user
-      vm.watcher = !s.logonNeverAppears // the Run entry starts it in the session
+      vm.armed = true // AutoAdminLogon
+      // The watcher (Userinit starts it in the session). MC-1518's cases: watcherLate: n session checks before it starts;
+      // watcherNever: never; logonThenLogoff: n checks, then Windows logs the session off and clears autologon;
+      // restartBeforeWatcher: the guest restarts once by itself while logged on (one check logged off, still armed), then
+      // logs on again and the watcher starts. sessionFailAt: the k-th session check fails (a transient probe).
+      vm.watcher = !s.logonNeverAppears && !s.watcherNever && !s.watcherLate && !s.logonThenLogoff && !s.restartBeforeWatcher
+      vm.watcherIn = s.watcherLate || 0
+      vm.logoffIn = s.logonThenLogoff || 0
+      vm.restartPending = !!s.restartBeforeWatcher
+      vm.sessionChecks = 0
       vm.elevated = !!a.elevated // EnableLUA 0: the admin's session is elevated
       vm.logons = [...(vm.logons || []), { user: a.logon.user, elevated: !!a.elevated }]
       if (s.extraRestart) vm.extraRestartPending = true
@@ -209,10 +218,15 @@ function run(s, op, a) {
     case 'guest-session': {
       const vm = own(s, a)
       if (vm.state !== 'Running') throw new Error('the VM is not running')
-      // extraRestart: the guest restarts once more by itself after the watcher was first seen (MC-1504's trial).
-      const r = { boot: `boot-${vm.boot || 0}`, sessions: vm.loggedOn === a.account && vm.watcher ? [1] : [] }
-      if (vm.extraRestartPending && r.sessions.length) { vm.extraRestartPending = false; vm.boot++ }
       vm.sessionChecks = (vm.sessionChecks || 0) + 1
+      if (s.sessionFailAt && vm.sessionChecks === s.sessionFailAt) throw new Error('injected: the session probe failed')
+      if (vm.relogonIn > 0 && --vm.relogonIn === 0) { vm.loggedOn = a.account; vm.watcher = true }
+      if (vm.watcherIn > 0 && --vm.watcherIn === 0) vm.watcher = true
+      if (vm.logoffIn > 0 && --vm.logoffIn === 0) { vm.loggedOn = null; vm.armed = false }
+      // extraRestart: the guest restarts once more by itself after the watcher was first seen (MC-1504's trial).
+      const r = { boot: `boot-${vm.boot || 0}`, sessions: vm.loggedOn === a.account && vm.watcher ? [1] : [], user: !!vm.loggedOn && vm.loggedOn === a.account, armed: vm.armed !== false }
+      if (vm.extraRestartPending && r.sessions.length) { vm.extraRestartPending = false; vm.boot++ }
+      if (vm.restartPending && r.user) { vm.restartPending = false; vm.boot++; vm.loggedOn = null; vm.relogonIn = 2 }
       return r
     }
     // Runs (MC-1510): started (session 0) or published (interactive) in one call, then polled; a timeout's kill by PID.

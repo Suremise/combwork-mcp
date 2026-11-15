@@ -412,7 +412,7 @@ const tools = [
         build: { type: 'string', description: 'A folder inside your project (your MCP roots), or inside a build folder an admin set (vm_status lists them), to copy in to C:\\build. Links are skipped.' },
         network: { type: 'boolean', description: 'Connect to the pool\'s internal switch. Default false.' },
         reserveCpu: { type: 'number', description: 'Reserve this percentage of the VM\'s cores for timed runs (up to the policy\'s cap). Default 0.' },
-        interactive: { enum: [false, 'user', 'admin'], description: 'Log a guest account on interactively (autologon, then one guest restart), so vm_run with session: \'interactive\' can run in its desktop session: \'user\' (the standard user, UAC on) or \'admin\' (the guest admin, elevated: UAC is off in that guest until its next restore). For programs that need a real logged-on session (their own desktops, windows). Default false.' }
+        interactive: { enum: [false, 'user', 'admin'], description: 'Log a guest account on interactively (autologon, then one guest restart; the start waits up to 10 minutes for its session), so vm_run with session: \'interactive\' can run in its desktop session: \'user\' (the standard user, UAC on) or \'admin\' (the guest admin, elevated: UAC is off in that guest until its next restore). For programs that need a real logged-on session (their own desktops, windows). Default false.' }
       }
     },
     run: vmStart

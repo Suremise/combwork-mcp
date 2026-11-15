@@ -1,6 +1,6 @@
 # The interactive session's watcher (MC-1504). guest-logon copies it into the guest as C:\hvmcp\agent.ps1 and starts it
-# at every logon through an HKLM Run entry, so it runs in the logged-on account's own session (elevated for an admin
-# logon, where UAC's Admin Approval Mode is off). It does one thing: for each request <root>\req\<n>.go the helper
+# at every logon from Winlogon's Userinit list (MC-1518), so it runs in the logged-on account's own session (elevated
+# for an admin logon, where UAC's Admin Approval Mode is off). It does one thing: for each request <root>\req\<n>.go the helper
 # publishes, it claims the request by creating <n>.claimed with CreateNew (only one claimant can ever win it; a rename
 # wasn't enough: with two watchers, a test saw a request run twice), removes the .go, then starts <root>\wrap-<n>.cmd, the
 # run's wrapper the helper wrote first. Nothing is kept in memory, so a restarted watcher never runs a request again: a
