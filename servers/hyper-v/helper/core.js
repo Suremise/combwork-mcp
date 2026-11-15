@@ -392,6 +392,22 @@ class Helper {
     if (!p) return null
     if (p.maxVms?.[want.os] === 0) return `project ${project} may not use ${want.os} VMs`
     if (want.image && p.images.length && !p.images.includes(want.image)) return `project ${project} may not use image ${want.image.slice(0, 12)}`
+    // MC-1523: a named VM made before images were recorded (legacy) can't be on an image allowlist.
+    if (want.vm && want.vmImage === 'legacy' && p.images.length) return `project ${project} may not use ${want.vm}: its image is unknown (made before images were recorded), so it isn't on the project's image list`
+    return null
+  }
+
+  /** MC-1523: why the named VM isn't free now (it isn't among the candidates), or null if it is. Never throws. */
+  namedWhy(name) {
+    const s = this.state
+    const v = [...s.vms.values()].find(x => x.vmName === name)
+    if (!v) return `${name} is no longer in the pool`
+    if (s.quarantined.has(v.vmId)) return `${name} is quarantined (${s.quarantined.get(v.vmId)})`
+    if (v.removing) return `${name} is being removed`
+    if (!v.ready) return `${name} is being created`
+    const l = this.leases.get(v.vmId)
+    if (l) return `${name} is leased until ${new Date(l.deadline).toISOString()}`
+    if ((evalEnd(v) ?? Infinity) - this.now() < EVAL_LAST_MS) return `${name} is in its Windows evaluation's last hour`
     return null
   }
 
@@ -405,6 +421,7 @@ class Helper {
     return this.freeVms().filter(v => {
       const img = this.imageOf(v)
       if (this.osOf(v) !== want.os) return false
+      if (want.vm && v.vmName !== want.vm) return false
       if (want.image && img !== want.image) return false
       if (p?.images.length && !p.images.includes(img)) return false
       return true
@@ -429,6 +446,7 @@ class Helper {
     const cap = p?.maxVms?.[want.os]
     if (cap !== undefined && this.held(project, want.os) >= cap) return `project ${project} holds its ${want.os} cap of ${cap}`
     if (this.candidates(project, want).length) return null
+    if (want.vm) return this.namedWhy(want.vm) || `${want.vm} is not free`
     return want.image ? `none of image ${want.image.slice(0, 12)} is free` : this.freeVms().some(v => this.osOf(v) === want.os) || want.os === 'windows' ? 'none is free' : `the pool has no free ${want.os} VM`
   }
 
@@ -520,8 +538,11 @@ class Helper {
    * the next call. A newer call from the same connection supersedes a waiting one. The pool lock is held only for these
    * decisions, never while waiting.
    */
-  async acquire(connId, { minutes = 60, keepOnFailure = false, wait = false, roots, os = 'windows', image } = {}) {
-    if (!OSES.includes(os)) throw new Error(`os must be ${OSES.join(' or ')}`)
+  async acquire(connId, { minutes = 60, keepOnFailure = false, wait = false, roots, os: osAsked, image, vm: named } = {}) {
+    // MC-1523: an omitted os stays omitted until a named VM is resolved (its own OS then); unnamed, it means windows.
+    if (osAsked !== undefined && !OSES.includes(osAsked)) throw new Error(`os must be ${OSES.join(' or ')}`)
+    if (named !== undefined && (typeof named !== 'string' || !named || named.length > 64)) throw new Error('vm must be a VM name from vm_status.')
+    const os = osAsked ?? 'windows'
     const step = await this.poolLock(async () => {
       if (this.quiesced) throw new Error('The helper is being uninstalled: no new leases.')
       const c = this.conns.get(connId)
@@ -531,8 +552,21 @@ class Helper {
       if (!Number.isFinite(minutes) || minutes < 1 || minutes > max) throw new Error(`minutes must be 1-${max} (the policy's maxLeaseMinutes).`)
       const s = this.state
       if (![...s.vms.values()].some(v => v.ready)) throw new Error('The pool has no VMs yet: ask the user to create one (pool_plan, then their approval, then pool_create).')
-      const want = { os, ...(image !== undefined ? { image: this.verifiedImage(image).sha256 } : {}) }
-      if (want.image && (this.state.images.get(want.image)?.os || 'windows') !== os) throw new Error(`image ${want.image.slice(0, 12)} is a ${this.state.images.get(want.image)?.os || 'windows'} image, not ${os}.`)
+      let want
+      if (named !== undefined) {
+        // MC-1523: one VM by name, for trials and censuses. The request becomes that VM's own OS and image; an os or
+        // image given as well must agree with it. It is then served like any other: the same caps, allowlists and line.
+        const target = [...s.vms.values()].find(v => v.vmName === named)
+        if (!target) throw new Error(`No VM named ${named} in the pool (vm_status lists them).`)
+        const tOs = this.osOf(target)
+        const tImg = this.imageOf(target)
+        if (osAsked !== undefined && osAsked !== tOs) throw new Error(`${named} is a ${tOs} VM, not ${osAsked}.`)
+        if (image !== undefined && this.verifiedImage(image).sha256 !== tImg) throw new Error(`${named} wasn't built from image ${String(image).slice(0, 12)}${tImg === 'legacy' ? ' (its image is unknown: made before images were recorded)' : ` (its image is ${tImg.slice(0, 12)})`}.`)
+        want = { os: tOs, ...(tImg !== 'legacy' ? { image: tImg } : {}), vm: named, vmImage: tImg }
+      } else {
+        want = { os, ...(image !== undefined ? { image: this.verifiedImage(image).sha256 } : {}) }
+        if (want.image && (this.state.images.get(want.image)?.os || 'windows') !== os) throw new Error(`image ${want.image.slice(0, 12)} is a ${this.state.images.get(want.image)?.os || 'windows'} image, not ${os}.`)
+      }
       this.dropExpired()
       let e = this.queue.find(x => x.connId === connId)
       if (e) this.settle(e, { error: new Error('Superseded by a newer vm_acquire from this connection.') })
@@ -1281,7 +1315,7 @@ class Helper {
     }
     if (this.queue.length) {
       const now = this.now()
-      out.push(`Waiting in line: ${this.queue.map((e, i) => `${i + 1}. ${e.project}${e.want && e.want.os !== 'windows' ? ` (${e.want.os})` : ''}, ${Math.round((now - e.since) / 1000)} s${e.pending ? '' : ' (between calls)'}${this.blocked(e.project, e.want) ? ` (${this.blocked(e.project, e.want)})` : ''}`).join('; ')}.`)
+      out.push(`Waiting in line: ${this.queue.map((e, i) => `${i + 1}. ${e.project}${e.want && e.want.os !== 'windows' ? ` (${e.want.os})` : ''}${e.want?.vm ? ` (for ${e.want.vm})` : ''}, ${Math.round((now - e.since) / 1000)} s${e.pending ? '' : ' (between calls)'}${this.blocked(e.project, e.want) ? ` (${this.blocked(e.project, e.want)})` : ''}`).join('; ')}.`)
     }
     return out
   }
@@ -1310,7 +1344,8 @@ class Helper {
       ...[...s.intents.values()].filter(i => !i.done && i.online && !i.offline).map(i => `WARNING: ${i.vmName} may still be online (its build's activation step didn't finish): it is being removed, retried every few minutes.`),
       `Product key for non-evaluation images (install.ps1 -ProductKeyFile): ${this.productKey() ? 'set' : 'none'}.`,
       `Policy: up to ${this.policy.maxVms} VMs, ${this.policy.maxCoresPerVm} cores each, ${this.policy.maxMemoryMBTotal} MB in all, ${this.policy.maxDiskGBPerVm} GB disks, in ${this.policy.diskFolders.join('; ')}; network ${this.policy.allowNetwork ? 'allowed (internal switch only)' : 'not allowed'}; CPU reserve up to ${this.policy.maxReservePercent}%; leases up to ${this.policy.maxLeaseMinutes} min at a time, renewable to ${policyMod.sessionMinutes(this.policy)} min per work session${this.policy.maxSessionMinutes === undefined ? ' (the default)' : ''}.`,
-      `Build folders set by an admin (install.ps1 -BuildRoot): ${this.policy.buildRoots.length ? this.policy.buildRoots.join('; ') : 'none'}.`
+      `Build folders set by an admin (install.ps1 -BuildRoot): ${this.policy.buildRoots.length ? this.policy.buildRoots.join('; ') : 'none'}.`,
+      'vm_acquire\'s vm names one VM: for trials and censuses on a specific VM, not for normal use (it waits in line like any other request, for that VM only).'
     ]
     return { text: lines.filter(Boolean).join('\n'), data: { vms: s.vms.size, job: this.job ? this.job.op : null, epoch: this.journal.epoch, connections: this.conns.size, lastJob: this.lastJob } }
   }
@@ -1797,7 +1832,8 @@ const PROTOCOL = 'hyperv-mcp/3' // 2: renew, sync_plan, sync (MC-1497); 3: start
 // Additive features since protocol 3, by name, so a server that asks for exactly hyperv-mcp/3 (hyper-v 1.2.0) keeps
 // working with this helper: 'projects' = projects, acquire's wait and roots, whoami; 'images' = image groups,
 // acquire's os and image, per-OS shares, a project's image allowlist (MC-1502).
-const FEATURES = ['projects', 'images']
+// 'named' = acquire's vm, one VM by name (MC-1523).
+const FEATURES = ['projects', 'images', 'named']
 const DAY_MS = 24 * 60 * 60 * 1000
 
 /**

@@ -390,15 +390,17 @@ const tools = [
         keepOnFailure: { type: 'boolean', description: 'If a run fails, vm_stop keeps the VM as it is for inspection until release or the deadline. Default false.' },
         wait: { type: 'boolean', description: 'Wait in line for a VM (each call waits about 20 s; repeat it within 2 minutes to keep your place). Default false.' },
         os: { type: 'string', enum: ['windows', 'linux'], description: 'The kind of VM. Default windows. (Linux VMs come with a Linux image in the pool.)' },
-        image: { type: 'string', description: 'Only a VM built from this image: its SHA-256, or its first 12+ hex digits (vm_status lists them). Default: any image of the OS your project may use.' }
+        image: { type: 'string', description: 'Only a VM built from this image: its SHA-256, or its first 12+ hex digits (vm_status lists them). Default: any image of the OS your project may use.' },
+        vm: { type: 'string', description: 'One particular VM, by its name from vm_status: for trials and censuses on a specific VM, not for normal use (leave it out and the pool picks). Refused, saying why, when that VM isn\'t free for you; with wait: true it waits in line for that VM only.' }
       }
     },
-    run: async ({ minutes, keepOnFailure, wait, os, image } = {}) => {
+    run: async ({ minutes, keepOnFailure, wait, os, image, vm } = {}) => {
       const p = await helperProtocol()
       if (wait) await needFeature('projects', 'waiting in line (wait: true)')
       // A filter the helper can't honour is refused before anything is sent: dropped, it could lease the wrong kind.
       if (image !== undefined || (os !== undefined && os !== 'windows')) await needFeature('images', `asking for ${image !== undefined ? 'an image' : `a ${os} VM`}`)
-      const args = { minutes, keepOnFailure, ...(p.features.includes('projects') ? { wait: !!wait, roots: await rootList() } : {}), ...(p.features.includes('images') ? { os, image } : {}) }
+      if (vm !== undefined) await needFeature('named', 'asking for a VM by name (vm)')
+      const args = { minutes, keepOnFailure, ...(p.features.includes('projects') ? { wait: !!wait, roots: await rootList() } : {}), ...(p.features.includes('images') ? { os, image } : {}), ...(vm !== undefined ? { vm } : {}) }
       const r = await helper.request('acquire', args)
       return { text: text(r), isError: r?.isError }
     }

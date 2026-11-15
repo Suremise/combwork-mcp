@@ -303,7 +303,7 @@ non-evaluation Windows 11 ISO (see "Windows licences").
 
 | Tool | What it does |
 |---|---|
-| `vm_acquire({ minutes=60, keepOnFailure=false, wait=false, os='windows', image? })` | Leases one VM of that OS (and image, when given) to this session (one VM per session) until `vm_release`, its deadline (at most the policy's `maxLeaseMinutes`), or this server exiting. Without `wait`, it refuses when none is free for this session's project, saying why (none free, the project's cap, a VM kept for another project), when the next lease ends, and where it would stand in line. With `wait: true` it waits in line about 20 s, and a repeat call within 2 minutes keeps its place (see "Sharing the pool between projects"). |
+| `vm_acquire({ minutes=60, keepOnFailure=false, wait=false, os='windows', image?, vm? })` | Leases one VM of that OS (and image, when given; or the VM named by `vm`, for trials, see "One VM by name") to this session (one VM per session) until `vm_release`, its deadline (at most the policy's `maxLeaseMinutes`), or this server exiting. Without `wait`, it refuses when none is free for this session's project, saying why (none free, the project's cap, a VM kept for another project), when the next lease ends, and where it would stand in line. With `wait: true` it waits in line about 20 s, and a repeat call within 2 minutes keeps its place (see "Sharing the pool between projects"). |
 | `vm_start({ build?, network=false, reserveCpu=0, interactive=false })` | Restores the clean checkpoint (always), applies this run's network and CPU reserve, and starts the VM. It waits for the guest, then copies `build` in to `C:\build` and leaves an empty `C:\out`. With `interactive: 'user'` (the standard user) or `'admin'`, it first logs that account on interactively: autologon, one guest restart, then it waits up to 10 minutes for the account's desktop session (often 2–4 minutes on a first logon; see "The interactive session"). Refused on a VM kept for inspection: release it, and acquire again. |
 | `vm_renew({ minutes=60 })` | Sets the lease's deadline to now + `minutes` (1 to the policy's `maxLeaseMinutes`), never past the work session's end: `maxSessionMinutes` after `vm_acquire` (`vm_status` shows both). Refused once the deadline has passed, even a moment before the helper ends the lease. |
 | `vm_sync({ build?, full=false, delete=true })` | Copies only the files that changed in `build` (default: the folder last started or synced) into the **running** guest's `C:\build`, without a restore: `C:\out`, installed software and anything else the runs left stay. The server hashes the folder (same roots checks as `vm_start`, every time; links skipped); the helper compares that with what it placed in `C:\build` and takes only the new or changed files, hashing them itself as they arrive. Files gone from the folder are removed unless `delete` is false. Only what the helper copied is tracked: if your runs changed `C:\build` themselves, use `full: true` (clears `C:\build`, copies everything) or `vm_reset`. After a sync fails, only those two are accepted. |
@@ -390,6 +390,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\combwork-mcp\ser
   place is kept for 2 minutes: the next call resumes it. A VM goes only to a session that is waiting right then, never
   to one that stopped calling. A newer call from the same session takes over an older one, and closing the session
   leaves the line. Without `wait`, `vm_acquire` never jumps the line: waiting sessions are served first.
+- **One VM by name (MC-1523):** `vm_acquire({ vm: 'hvmcp-…' })` asks for that VM only. It is for trials and censuses on
+  a specific VM (a newly built one, say), not for normal use: leave it out and the pool picks. The request takes that
+  VM's own OS and image (an `os` or `image` given as well must agree, or it's refused), and keeps every rule above: the
+  project's cap and image list (a VM the project may never have is refused at once, never queued), and the line. A
+  named VM that isn't free is refused with its state (leased until when, quarantined, being created or removed, in its
+  evaluation's last hour); with `wait: true` the request stands in line like any other, is granted only that VM, and
+  an earlier waiter still gets it first. It never falls back to another VM. Needs a helper with the `named` feature
+  (setup updates it).
 - A lease keeps the project it was granted for, whatever its session's roots say later.
 - `vm_status` shows each project's VMs against its caps, the line in order (and why each waiter is
   waiting), and the session's own project.
@@ -672,7 +680,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
 ```
 
 - `units.test.js`:
@@ -799,6 +807,12 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   project at its Windows cap still gets Linux, a forbidden OS or image refused, never queued); a waiter never given
   another kind; and, through `server.js`, no
   acquire at all sent to a helper without `images` for an image or Linux.
+- `named.test.js`, `vm_acquire({ vm })` (MC-1523): that VM leased rather than the pool's pick; an unknown name, a
+  leased VM (with its deadline), the project's cap and contradictory `os`/`image` refused; a legacy VM refused at once
+  to a project with an image list (never queued); the VM's own OS when `os` is left out, plain acquires still Windows;
+  with `wait: true`, the release granting it, an earlier unnamed waiter served first, and a later one served past a
+  named waiter, which never falls back; the named VM's states (quarantined, being created or removed, its evaluation's
+  last hour, gone) said without throwing; and, through `server.js`, no acquire sent to a helper without `named`.
 - `runs.test.js`, runs started then polled: a run spanning many polls; one that finished before its start could read
   its creation time (finished, not a failed start); a timeout killed by PID, and a reused PID never killed; failed polls
   retried within the one deadline; nothing sent to the guest once the lease ends. And `hv.ps1`'s own kill, run with
