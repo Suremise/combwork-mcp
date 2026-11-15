@@ -164,8 +164,12 @@ test('images: downloads only over https from microsoft.com hosts', async () => {
 test('images: the pinned 25H2 image', () => {
   const pin = images.PINNED.A61ADEAB895EF5A4DB436E0A7011C92A2FF17BB0357F58B13BBC4062E535E7B9
   assert.deepStrictEqual([pin.size, pin.edition, pin.build], [7_092_807_680, 'EnterpriseEval', '26200.6584'])
-  assert.strictEqual(images.guestReportProblem({ editionId: 'EnterpriseEval', build: '26200' }, { edition: 'EnterpriseEval', build: '26200.6584' }), null)
-  assert.match(images.guestReportProblem({ editionId: 'Professional', build: '26200' }, { edition: 'EnterpriseEval', build: '26200.6584' }), /edition/)
+  const img = { edition: 'EnterpriseEval', build: '26200.6584' }
+  assert.strictEqual(images.guestReportProblem({ editionId: 'EnterpriseEval', build: '26200', disableForceUnload: 1 }, img), null)
+  assert.match(images.guestReportProblem({ editionId: 'Professional', build: '26200', disableForceUnload: 1 }, img), /edition/)
+  // MC-1522: the registry policy must read back 1.
+  assert.match(images.guestReportProblem({ editionId: 'EnterpriseEval', build: '26200' }, img), /DisableForceUnload policy reads nothing, not 1/)
+  assert.match(images.guestReportProblem({ editionId: 'EnterpriseEval', build: '26200', disableForceUnload: 0 }, img), /reads 0, not 1/)
 })
 
 test('policy: problems named; disk folders strictly inside; caps', () => {

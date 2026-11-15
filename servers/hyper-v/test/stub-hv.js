@@ -151,7 +151,7 @@ function run(s, op, a) {
       if (s.notReady) return { ready: false }
       return { ready: vm.state === 'Running' && vm.installed !== false }
     }
-    case 'guest-setup': { const vm = own(s, a); vm.disk['C:\\build'] = ''; return { editionId: s.guestEdition ?? 'EnterpriseEval', build: '26200', ubr: 6584 } }
+    case 'guest-setup': { const vm = own(s, a); vm.disk['C:\\build'] = ''; return { editionId: s.guestEdition ?? 'EnterpriseEval', build: '26200', ubr: 6584, disableForceUnload: 1, ...(s.setupOverride || {}) } }
     case 'make-clean': {
       const vm = own(s, a)
       vm.state = 'Off'

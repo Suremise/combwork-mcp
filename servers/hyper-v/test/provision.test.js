@@ -21,7 +21,7 @@ async function build(t, name, stub = {}) {
   const plan = await admin.request('pool_plan', { action: 'create', vms: 1, cores: 2, memoryGB: 4 })
   approve(sc, plan.data.planId)
   await admin.request('pool_create', { planId: plan.data.planId })
-  await waitFor(async () => /Last pool job: create (finished|FAILED)/.test(await status(admin)), 15_000, 'the pool job')
+  await waitFor(async () => /Last pool job: create (finished|FAILED)/.test(await status(admin)), 60_000, 'the pool job')
   const line = (await status(admin)).split('\n').find(l => l.startsWith('Last pool job'))
   return { sc, plan, line }
 }
@@ -55,7 +55,7 @@ test('quiet is consecutive good, idle samples: a failed probe and a busy one lat
 
 test('provisioning that never settles fails the build (rolled back), rather than checkpointing a half-provisioned profile', async t => {
   const { sc, line } = await build(t, 'prov-never', { provisionNever: true })
-  assert.match(line, /FAILED: VM 1 of 1 \(hvmcp-[0-9a-f]+\): hvadmin's first-logon provisioning didn't settle within 3 s/)
+  assert.match(line, /FAILED: VM 1 of 1 \(hvmcp-[0-9a-f]+\): hvadmin's first-logon provisioning didn't settle within 15 s/)
   assert.deepStrictEqual(vms(sc), [])
 })
 
@@ -155,4 +155,14 @@ test('an unknown AppContainer count (MC-1520) is never quiet: it starts the wind
   const { sc, line } = await build(t, 'prov-counts-unknown', { profileUnknownAt: 2 })
   assert.match(line, /create finished/)
   assert.ok(vms(sc)[0].provisioned.filter(a => a === 'hvadmin').length >= 4)
+})
+
+// MC-1522: the guest image doesn't forcibly unload a user's registry at logoff; guest-setup reads it back.
+test('the registry policy (MC-1522): named in the plan, read back from guest-setup; a build without it fails and rolls back', async t => {
+  const ok = await build(t, 'dfu-ok')
+  assert.match(ok.line, /create finished/)
+  assert.match(ok.plan.text, /- registry: a user's registry isn't forcibly unloaded at logoff \(the DisableForceUnload policy\)/)
+  const missing = await build(t, 'dfu-missing', { setupOverride: { disableForceUnload: null } })
+  assert.match(missing.line, /the guest's sanity check failed: the guest's DisableForceUnload policy reads nothing, not 1/)
+  assert.deepStrictEqual(vms(missing.sc), [])
 })

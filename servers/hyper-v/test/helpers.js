@@ -54,7 +54,7 @@ function scratch(name, { policy = {}, stub = {} } = {}) {
       HYPERV_MCP_LOGON_WAIT_MS: '3000',
       HYPERV_MCP_PROVISION_POLL_MS: '10',
       HYPERV_MCP_PROVISION_QUIET_MS: '40',
-      HYPERV_MCP_PROVISION_WAIT_MS: '3000',
+      HYPERV_MCP_PROVISION_WAIT_MS: '15000',
       HYPERV_MCP_BUILD_LOGON_WAIT_MS: '3000',
       HYPERV_MCP_LOGON_SNAPSHOT_MS: '2000',
       HYPERV_MCP_INSTALL_WAIT_MS: '3000',
@@ -172,7 +172,7 @@ async function withPool(sc, n = 2, planArgs = {}) {
   const plan = await admin.request('pool_plan', { action: 'create', vms: n, cores: 2, memoryGB: 4, ...planArgs })
   approve(sc, plan.data.planId)
   await admin.request('pool_create', { planId: plan.data.planId })
-  await waitFor(async () => /Last pool job: create finished/.test((await admin.request('status')).text), 15_000, 'the pool job')
+  await waitFor(async () => /Last pool job: create finished/.test((await admin.request('status')).text), 60_000, 'the pool job')
   return { h, admin }
 }
 
