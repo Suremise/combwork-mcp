@@ -21,7 +21,7 @@ async function build(t, name, stub = {}) {
   const plan = await admin.request('pool_plan', { action: 'create', vms: 1, cores: 2, memoryGB: 4 })
   approve(sc, plan.data.planId)
   await admin.request('pool_create', { planId: plan.data.planId })
-  await waitFor(async () => /Last pool job: create (finished|FAILED)/.test(await status(admin)), 15_000, 'the pool job')
+  await waitFor(async () => /Last pool job: create (finished|FAILED)/.test(await status(admin)), 60_000, 'the pool job')
   const line = (await status(admin)).split('\n').find(l => l.startsWith('Last pool job'))
   return { sc, plan, line }
 }

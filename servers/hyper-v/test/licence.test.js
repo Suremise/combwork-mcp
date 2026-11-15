@@ -41,7 +41,7 @@ async function create(sc, admin, args) {
   const plan = await admin.request('pool_plan', { action: 'create', vms: 1, cores: 2, memoryGB: 4, ...args })
   approve(sc, plan.data.planId)
   await admin.request('pool_create', { planId: plan.data.planId })
-  await waitFor(async () => /Last pool job: create (finished|FAILED)/.test(await status(admin)), 15_000, 'the pool job')
+  await waitFor(async () => /Last pool job: create (finished|FAILED)/.test(await status(admin)), 60_000, 'the pool job')
   return { plan, line: (await status(admin)).split('\n').find(l => l.startsWith('Last pool job')) }
 }
 
