@@ -144,7 +144,7 @@ $GuestRunKill = {
 # An interactive run's publish (MC-1503, MC-1504), as the guest's admin: the files in C:\hvmcp, then the request
 # req\<n>.go, renamed from a finished .tmp, for the logged-on session's watcher (guest-agent.ps1), which claims it and
 # starts the wrapper in its session. The helper then polls for the exit file; no exit file by the deadline means the
-# VM is restored (Darren's "exit file or restore").
+# VM is restored ("exit file or restore", decided on MC-1503).
 $GuestRunPublish = {
   param($j, $files)
   $ErrorActionPreference = 'Stop'

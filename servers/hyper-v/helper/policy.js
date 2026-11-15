@@ -82,7 +82,7 @@ function projectProblems(projects) {
     if (!pr || typeof pr !== 'object' || Array.isArray(pr)) { out.push(`${at} must be an object`); continue }
     const known = ['name', 'folders', 'maxVms', 'buildRoots', 'images']
     for (const k of Object.keys(pr)) {
-      // Reserved VMs were dropped (Darren, 13 Nov): projects share by their caps and the line.
+      // Reserved VMs were dropped (MC-1502): projects share by their caps and the line.
       if (k === 'reserveVms') out.push(`${at}: reserveVms isn't supported (projects share the pool by their maxVms caps and the line)`)
       else if (!known.includes(k)) out.push(`${at}: unknown field "${k}"`)
     }
