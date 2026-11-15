@@ -199,7 +199,17 @@ approval → change**:
    installs Windows unattended, with no network:
    - about 20–40 minutes each, one VM at a time, so the host's CPU isn't flooded;
    - then the guest set-up, a sanity check of the installed edition and build, Windows' activation when the plan says
-     so (see "Windows licences"), and the clean checkpoint, taken with the VM off and its adapter disconnected.
+     so (see "Windows licences");
+   - then **the test accounts' profiles**, still offline: `hvadmin`, then `hvuser`, each logged on interactively once,
+     exactly as an interactive start does, and left until Windows' first-logon work (AppX provisioning, OneDrive
+     setup, the user setup screens) is observed quiet: two minutes of samples in a row with no new AppX deployment
+     event, an unchanged package inventory and no busy first-logon worker, with the account still logged on. A sample
+     that fails or is busy starts the two minutes over; a lost logon is retried once; 20 minutes without quiet fails
+     the build. After each logon, a verified undo turns autologon off, deletes its password, turns UAC back on, puts
+     back Windows' own `Userinit` and recreates `C:\hvmcp` empty with inherited permissions only, so the next logon
+     starts clean and the checkpoint keeps none of it. The profiles stay, so an interactive start doesn't replay
+     first-logon work (it took 2–5 minutes, and sometimes failed);
+   - and the clean checkpoint, taken with the VM off and its adapter disconnected.
 
 **Rebuilding.** An evaluation VM lasts about 90 days from its activation at build; `vm_status` and `pool_status` show
 the days left and warn 14 days before. Plan a `remove`, then a new `create`, each approved the same way. **Teardown** is
@@ -634,7 +644,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\projects.test.js test\images.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\projects.test.js test\images.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
 ```
 
 - `units.test.js`:
@@ -726,6 +736,11 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   by recovery or the retry; no Default Switch; an own copy built offline with its bound edition, or with the product key
   only in its answer file (never in a reply, plan, journal, log or the stub's calls); a plan made before activation
   refused; leases and renewals capped at an evaluation's end, and none in its last hour; an older VM's licence unknown.
+- `provision.test.js`, the test accounts' profiles at build: hvadmin then hvuser logged on once each, their
+  first-logon work waited out, a verified undo after each (hvuser's logon with UAC on and Windows' own Userinit, which
+  the stub enforces like the guest), the checkpoint without any of it; quiet started over by a failed or busy sample;
+  never quiet fails the build; a lost logon retried once after an undo, twice failing; an undo that doesn't verify
+  (an explicit ACE left on `C:\hvmcp`, UAC still off) failing the build.
 - `projects.test.js`, sharing the pool: one shared pool with no projects; caps (one project at its cap refused while
   another still gets its VM); the line, first come first served, a capped waiter passed over keeping its place, an abandoned
   wait never given a VM and its place expiring, a repeat call keeping its place, a disconnect leaving it, a resize

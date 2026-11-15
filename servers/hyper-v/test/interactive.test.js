@@ -50,7 +50,8 @@ test('the admin logon is elevated (UAC\'s Admin Approval Mode off) and the user\
   assert.match((await s.call('vm_run', { command: 'whoami', as: 'admin', session: 'interactive' })).text, /--- stdout ---\nhvadmin session 1 elevated\n/)
   assert.match((await s.call('vm_run', { command: 'whoami', as: 'user' })).text, /--- stdout ---\nhvuser/)
   assert.match((await s.call('vm_run', { command: 'whoami' })).text, /--- stdout ---\nadmin/)
-  assert.deepStrictEqual(vmOf(sc, vm).logons, [{ user: 'hvuser', elevated: false }, { user: 'hvadmin', elevated: true }])
+  // The build's two logons (MC-1516), then this test's: UAC off only for the admin's.
+  assert.deepStrictEqual(vmOf(sc, vm).logons, [{ user: 'hvadmin', elevated: true, lua: 0 }, { user: 'hvuser', elevated: false, lua: 1 }, { user: 'hvuser', elevated: false, lua: 1 }, { user: 'hvadmin', elevated: true, lua: 0 }])
 })
 
 test('the logon waits out the guest\'s own extra restart: the watcher must be seen twice on one boot', async t => {
@@ -211,10 +212,11 @@ m.Helper.prototype.request = async function (connId, op, args) {
   const s = server(env, { roots: [sc.builds] })
   t.after(() => s.close())
   await s.call('vm_acquire', { minutes: 30 })
+  const built = sc.stub().calls.length // the build's own logons (MC-1516) come before
   const r = await s.call('vm_start', { interactive: 'user' })
   assert.ok(r.isError)
   assert.match(r.text, /The helper speaks hyperv-mcp\/2, and the interactive session needs hyperv-mcp\/3 or later: run setup again/)
-  assert.ok(!sc.stub().calls.some(c => c.op === 'guest-logon'))
+  assert.ok(!sc.stub().calls.slice(built).some(c => c.op === 'guest-logon'))
   await s.call('vm_start')
   assert.match((await s.call('vm_run', { command: 'whoami', as: 'user', session: 'interactive' })).text, /needs hyperv-mcp\/3/)
 })

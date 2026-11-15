@@ -206,6 +206,39 @@ $GuestSetup = {
   @{ editionId = $cv.EditionID; build = $cv.CurrentBuild; ubr = $cv.UBR }
 }
 
+# The guest's LSA secret helper (MC-1503): Store sets the autologon password; Remove (MC-1516) deletes it again. Passed
+# as text into the guest blocks that need it.
+$HvLsaCs = @'
+using System; using System.Runtime.InteropServices;
+public static class HvLsa {
+  [StructLayout(LayoutKind.Sequential)] struct LSA_STRING { public ushort Length, MaximumLength; public IntPtr Buffer; }
+  [StructLayout(LayoutKind.Sequential)] struct LSA_OBJECT_ATTRIBUTES { public int Length; public IntPtr RootDirectory, ObjectName; public int Attributes; public IntPtr SecurityDescriptor, SecurityQualityOfService; }
+  [DllImport("advapi32.dll")] static extern uint LsaOpenPolicy(IntPtr system, ref LSA_OBJECT_ATTRIBUTES attrs, uint access, out IntPtr policy);
+  [DllImport("advapi32.dll")] static extern uint LsaStorePrivateData(IntPtr policy, ref LSA_STRING key, ref LSA_STRING data);
+  [DllImport("advapi32.dll", EntryPoint = "LsaStorePrivateData")] static extern uint LsaDeletePrivateData(IntPtr policy, ref LSA_STRING key, IntPtr data);
+  [DllImport("advapi32.dll")] static extern uint LsaClose(IntPtr policy);
+  [DllImport("advapi32.dll")] static extern int LsaNtStatusToWinError(uint status);
+  static LSA_STRING Str(string s) { LSA_STRING r = new LSA_STRING(); r.Buffer = Marshal.StringToHGlobalUni(s); r.Length = (ushort)(s.Length * 2); r.MaximumLength = (ushort)(s.Length * 2 + 2); return r; }
+  public static void Store(string key, string value) {
+    LSA_OBJECT_ATTRIBUTES a = new LSA_OBJECT_ATTRIBUTES(); a.Length = Marshal.SizeOf(typeof(LSA_OBJECT_ATTRIBUTES));
+    IntPtr h; uint st = LsaOpenPolicy(IntPtr.Zero, ref a, 0x20 /* POLICY_CREATE_SECRET */, out h);
+    if (st != 0) throw new System.ComponentModel.Win32Exception(LsaNtStatusToWinError(st), "LsaOpenPolicy");
+    LSA_STRING k = Str(key), d = Str(value);
+    try { st = LsaStorePrivateData(h, ref k, ref d); if (st != 0) throw new System.ComponentModel.Win32Exception(LsaNtStatusToWinError(st), "LsaStorePrivateData"); }
+    finally { Marshal.FreeHGlobal(k.Buffer); Marshal.ZeroFreeGlobalAllocUnicode(d.Buffer); LsaClose(h); }
+  }
+  // Deletes the secret (LsaStorePrivateData with no data); true once it is gone, also when it never existed.
+  public static bool Remove(string key) {
+    LSA_OBJECT_ATTRIBUTES a = new LSA_OBJECT_ATTRIBUTES(); a.Length = Marshal.SizeOf(typeof(LSA_OBJECT_ATTRIBUTES));
+    IntPtr h; uint st = LsaOpenPolicy(IntPtr.Zero, ref a, 0x20 /* POLICY_CREATE_SECRET */, out h);
+    if (st != 0) throw new System.ComponentModel.Win32Exception(LsaNtStatusToWinError(st), "LsaOpenPolicy");
+    LSA_STRING k = Str(key);
+    try { st = LsaDeletePrivateData(h, ref k, IntPtr.Zero); return st == 0 || st == 0xC0000034 /* STATUS_OBJECT_NAME_NOT_FOUND */; }
+    finally { Marshal.FreeHGlobal(k.Buffer); LsaClose(h); }
+  }
+}
+'@
+
 # The guest's Winlogon Userinit list with the session's watcher added (MC-1518), from its current value; pure, so the
 # tests run it. Only Windows' own list is accepted (userinit.exe alone, any case, trailing comma or not): anything else,
 # missing included, is refused, and $GuestLogon works this out before it changes anything. Winlogon starts each listed
@@ -228,30 +261,9 @@ $UserinitValue = {
 # session, and its watcher, are elevated. Then a restart. All of it is inside the throwaway guest: the next restore of
 # the clean checkpoint takes it away.
 $GuestLogon = {
-  param($u, $p, $elevated, $agent, $userinitText)
+  param($u, $p, $elevated, $agent, $userinitText, $lsaCs)
   $ErrorActionPreference = 'Stop'
-  if (-not ('HvLsa' -as [type])) {
-    Add-Type -TypeDefinition @'
-using System; using System.Runtime.InteropServices;
-public static class HvLsa {
-  [StructLayout(LayoutKind.Sequential)] struct LSA_STRING { public ushort Length, MaximumLength; public IntPtr Buffer; }
-  [StructLayout(LayoutKind.Sequential)] struct LSA_OBJECT_ATTRIBUTES { public int Length; public IntPtr RootDirectory, ObjectName; public int Attributes; public IntPtr SecurityDescriptor, SecurityQualityOfService; }
-  [DllImport("advapi32.dll")] static extern uint LsaOpenPolicy(IntPtr system, ref LSA_OBJECT_ATTRIBUTES attrs, uint access, out IntPtr policy);
-  [DllImport("advapi32.dll")] static extern uint LsaStorePrivateData(IntPtr policy, ref LSA_STRING key, ref LSA_STRING data);
-  [DllImport("advapi32.dll")] static extern uint LsaClose(IntPtr policy);
-  [DllImport("advapi32.dll")] static extern int LsaNtStatusToWinError(uint status);
-  static LSA_STRING Str(string s) { LSA_STRING r = new LSA_STRING(); r.Buffer = Marshal.StringToHGlobalUni(s); r.Length = (ushort)(s.Length * 2); r.MaximumLength = (ushort)(s.Length * 2 + 2); return r; }
-  public static void Store(string key, string value) {
-    LSA_OBJECT_ATTRIBUTES a = new LSA_OBJECT_ATTRIBUTES(); a.Length = Marshal.SizeOf(typeof(LSA_OBJECT_ATTRIBUTES));
-    IntPtr h; uint st = LsaOpenPolicy(IntPtr.Zero, ref a, 0x20 /* POLICY_CREATE_SECRET */, out h);
-    if (st != 0) throw new System.ComponentModel.Win32Exception(LsaNtStatusToWinError(st), "LsaOpenPolicy");
-    LSA_STRING k = Str(key), d = Str(value);
-    try { st = LsaStorePrivateData(h, ref k, ref d); if (st != 0) throw new System.ComponentModel.Win32Exception(LsaNtStatusToWinError(st), "LsaStorePrivateData"); }
-    finally { Marshal.FreeHGlobal(k.Buffer); Marshal.ZeroFreeGlobalAllocUnicode(d.Buffer); LsaClose(h); }
-  }
-}
-'@
-  }
+  if (-not ('HvLsa' -as [type])) { Add-Type -TypeDefinition $lsaCs }
   $wl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
   # The watcher's start at logon (MC-1518), worked out first: an unexpected Userinit refuses before anything changes.
   $userinit = & ([scriptblock]::Create($userinitText)) (Get-ItemProperty -Path $wl -Name Userinit -ErrorAction SilentlyContinue).Userinit
@@ -295,6 +307,53 @@ $GuestLicence = {
   $end = $null
   if ($p.EvaluationEndDate -and $p.EvaluationEndDate.Year -gt 1601) { $end = $p.EvaluationEndDate.ToUniversalTime().ToString('o') }
   @{ status = [int]$p.LicenseStatus; graceMinutes = [int]$p.GracePeriodRemaining; evalEnd = $end; channel = [string]$p.ProductKeyChannel; error = $err }
+}
+
+# MC-1516: what a build-time logon left, undone before the next logon and before the clean checkpoint: autologon off
+# and its LSA password deleted, UAC's Admin Approval Mode back on, Windows' own Userinit list, and C:\hvmcp recreated
+# empty as guest-setup left it (no explicit ACEs, inherited only), so no earlier account's req grant survives. The
+# profiles (C:\Users) are kept. It reads every value back for the helper to check.
+$GuestLogonUndo = {
+  param($lsaCs)
+  $ErrorActionPreference = 'Stop'
+  if (-not ('HvLsa' -as [type])) { Add-Type -TypeDefinition $lsaCs }
+  $wl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+  Set-ItemProperty -Path $wl -Name AutoAdminLogon -Value '0'
+  foreach ($n in 'DefaultUserName', 'DefaultDomainName', 'DefaultPassword') { Remove-ItemProperty -Path $wl -Name $n -ErrorAction SilentlyContinue }
+  $secretRemoved = [HvLsa]::Remove('DefaultPassword')
+  Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name EnableLUA -Value 1 -Type DWord
+  Set-ItemProperty -Path $wl -Name Userinit -Value 'C:\Windows\system32\userinit.exe,'
+  Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name hvmcp-agent -ErrorAction SilentlyContinue
+  if (Test-Path -LiteralPath 'C:\hvmcp') { Remove-Item -LiteralPath 'C:\hvmcp' -Recurse -Force }
+  New-Item -ItemType Directory -Path 'C:\hvmcp' | Out-Null
+  $w = Get-ItemProperty -Path $wl
+  $acl = Get-Acl -LiteralPath 'C:\hvmcp'
+  @{
+    autoAdminLogon = [string]$w.AutoAdminLogon; defaultUserName = [string]$w.DefaultUserName; secretRemoved = [bool]$secretRemoved
+    enableLUA = [int](Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System').EnableLUA
+    userinit = [string]$w.Userinit; hvmcpEmpty = (@(Get-ChildItem -LiteralPath 'C:\hvmcp' -Force).Count -eq 0)
+    hvmcpExplicitAces = @($acl.Access | Where-Object { -not $_.IsInherited }).Count; hvmcpProtected = [bool]$acl.AreAccessRulesProtected
+  }
+}
+
+# MC-1516: one sample of an account's first-logon work at build, for the helper's quiet test: the boot, whether the
+# account is logged on, the newest AppX deployment event, its installed packages (a hash of their names and status),
+# and its busy first-logon workers (OneDriveSetup, or a SystemApps, UserOOBEBroker or WebView2 process that started
+# within the quiet window). Any failed query throws: the helper takes it as unknown, never as idle.
+$GuestProvisioned = {
+  param($u, $quietMs)
+  $ErrorActionPreference = 'Stop'
+  $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
+  $last = $null
+  try { $last = (Get-WinEvent -LogName 'Microsoft-Windows-AppXDeploymentServer/Operational' -MaxEvents 1 -ErrorAction Stop).TimeCreated.ToUniversalTime().ToString('o') }
+  catch { if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { throw } }
+  $pk = @(Get-AppxPackage -User $u | Sort-Object PackageFullName | ForEach-Object { "$($_.PackageFullName)|$($_.Status)" })
+  $sha = [Security.Cryptography.SHA256]::Create()
+  $inventory = -join ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($pk -join "`n")) | ForEach-Object { $_.ToString('x2') })
+  $procs = @(Get-Process -IncludeUserName | Where-Object { $_.SessionId -ge 1 -and $_.UserName -like "*\$u" })
+  $since = (Get-Date).AddMilliseconds(-[int]$quietMs)
+  $busy = @($procs | Where-Object { $_.Name -eq 'OneDriveSetup' -or ((($_.Path -like 'C:\Windows\SystemApps\*') -or ($_.Name -in 'UserOOBEBroker', 'msedgewebview2')) -and $_.StartTime -gt $since) } | ForEach-Object { $_.Name })
+  @{ boot = $boot; user = ($procs.Count -gt 0); lastEvent = $last; count = $pk.Count; inventory = $inventory; busy = $busy }
 }
 
 # The guest's boot time and the sessions (>= 1) in which the account's watcher runs: its interactive logon, ready for runs.
@@ -445,7 +504,15 @@ try {
     'guest-logon' {
       $vm = Get-OwnVm $a
       $agent = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'guest-agent.ps1'))
-      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestLogon -ArgumentList ([string]$a.logon.user), ([string]$a.logon.password), ([bool]$a.elevated), $agent, $UserinitValue.ToString()
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestLogon -ArgumentList ([string]$a.logon.user), ([string]$a.logon.password), ([bool]$a.elevated), $agent, $UserinitValue.ToString(), $HvLsaCs
+    }
+    'guest-logon-undo' {
+      $vm = Get-OwnVm $a
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestLogonUndo -ArgumentList $HvLsaCs
+    }
+    'guest-provisioned' {
+      $vm = Get-OwnVm $a
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestProvisioned -ArgumentList ([string]$a.account), ([int]$a.quietMs)
     }
     'guest-licence' {
       $vm = Get-OwnVm $a

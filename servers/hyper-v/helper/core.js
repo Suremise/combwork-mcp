@@ -35,6 +35,12 @@ const LOGON_WAIT_MS = Number(process.env.HYPERV_MCP_LOGON_WAIT_MS || 10 * 60_000
 const INSTALL_WAIT_MS = Number(process.env.HYPERV_MCP_INSTALL_WAIT_MS || 90 * 60_000)
 const POLL_MS = Number(process.env.HYPERV_MCP_POLL_MS || 3000)
 const LOGON_STABLE_MS = Number(process.env.HYPERV_MCP_LOGON_STABLE_MS || 10_000) // test-only override
+// The build's profile provisioning (MC-1516): an account's first-logon work is taken as done after PROVISION_QUIET_MS
+// of consecutive good, idle samples (PROVISION_POLL_MS apart), within PROVISION_WAIT_MS. Test-only overrides.
+const PROVISION_QUIET_MS = Number(process.env.HYPERV_MCP_PROVISION_QUIET_MS || 2 * 60_000)
+const PROVISION_POLL_MS = Number(process.env.HYPERV_MCP_PROVISION_POLL_MS || 15_000)
+const PROVISION_WAIT_MS = Number(process.env.HYPERV_MCP_PROVISION_WAIT_MS || 20 * 60_000)
+const USERINIT = 'C:\\Windows\\system32\\userinit.exe,' // Windows' own list, as the build's undo leaves it
 const RETRY_MS = Number(process.env.HYPERV_MCP_RETRY_MS || 5 * 60_000)
 // The build's one online step (MC-1513): its call's bound, and net-off's after a failure.
 const ACTIVATE_MS = Number(process.env.HYPERV_MCP_ACTIVATE_MS || 8 * 60_000)
@@ -1019,21 +1025,24 @@ class Helper {
    */
   async logon(vm, lease, which, creds) {
     const account = creds[which]
-    const before = await this.hv('guest-logon', { ...this.ident(vm), cred: creds.admin, logon: account, elevated: which === 'admin' }, this.forLease(lease, 120_000))
+    // A start's logon is the lease's (its calls end with it); the build's (MC-1516) has no lease.
+    const opts = ms => lease ? this.forLease(lease, ms) : { timeoutMs: ms }
+    const held = () => { if (lease) this.stillHeld(lease) }
+    const before = await this.hv('guest-logon', { ...this.ident(vm), cred: creds.admin, logon: account, elevated: which === 'admin' }, opts(120_000))
     const t0 = this.now()
     let seen = null // { boot, at }: the watcher first seen on this boot
     let user = null // { boot, at }: the account first seen logged on, on this boot
     while (this.now() - t0 < LOGON_WAIT_MS) {
-      this.stillHeld(lease)
-      const r = await this.hv('guest-session', { ...this.ident(vm), cred: creds.admin, account: account.user }, this.forLease(lease, 60_000)).catch(() => null)
-      this.stillHeld(lease)
+      held()
+      const r = await this.hv('guest-session', { ...this.ident(vm), cred: creds.admin, account: account.user }, opts(60_000)).catch(() => null)
+      held()
       if (r && r.boot !== before.boot) {
         if (user && user.boot !== r.boot) user = null
         if (r.user === true && !user) user = { boot: r.boot, at: this.now() - t0 }
         if (user && r.user === false && r.armed === false) return { loggedOff: true, after: user.at }
       }
       if (r && r.boot !== before.boot && Array.isArray(r.sessions) && r.sessions.length) {
-        if (seen?.boot === r.boot && this.now() - seen.at >= LOGON_STABLE_MS) return { ms: this.now() - t0 }
+        if (seen?.boot === r.boot && this.now() - seen.at >= LOGON_STABLE_MS) return { ms: this.now() - t0, boot: r.boot }
         if (seen?.boot !== r.boot) seen = { boot: r.boot, at: this.now() }
       } else seen = null
       await sleep(POLL_MS)
@@ -1529,6 +1538,8 @@ class Helper {
     if (why) throw new Error(`the guest's sanity check failed: ${why}`)
     step(plan.activation === 'online-once' ? 'activating Windows online (network on for this step only)' : 'reading its Windows licence (offline)')
     const licence = await this.licenceStep(vm, a, plan, creds)
+    step('provisioning the test accounts\' profiles (offline)')
+    const profiles = await this.provisionProfiles(vm, creds, t => step(`provisioning the test accounts' profiles (offline): ${t}`))
     step('shutting down and taking the clean checkpoint')
     const cp = await this.hv('make-clean', { ...this.ident(vm) }, { timeoutMs: 15 * 60_000 })
     fs.rmSync(media, { recursive: true, force: true })
@@ -1536,7 +1547,76 @@ class Helper {
     const facts = await this.hv('restore', { ...this.ident(vm), checkpointId: cp.checkpointId })
     const bad = baselineProblem(facts, { ...vm, cleanCheckpointId: cp.checkpointId })
     if (bad) throw new Error(`its clean baseline doesn't verify: ${bad}`)
-    this.journal.append({ t: 'ready', intentId: a.intentId, vmId: vm.vmId, cleanCheckpointId: cp.checkpointId, licence })
+    this.journal.append({ t: 'ready', intentId: a.intentId, vmId: vm.vmId, cleanCheckpointId: cp.checkpointId, licence, profiles })
+  }
+
+  /**
+   * MC-1516: each test account logged on interactively once at build, as a start does (guest-logon), and its first-logon
+   * work let finish, so the clean checkpoint holds provisioned profiles and an interactive start doesn't replay it.
+   * hvadmin, then hvuser; a verified undo after each (and before a retry), so the next logon sees Windows' own Userinit
+   * and the intended UAC state, and the checkpoint keeps no autologon, password, UAC change or watcher grants. A lost
+   * logon is retried once per account. Returns what was observed, per account.
+   */
+  async provisionProfiles(vm, creds, step) {
+    const out = {}
+    for (const which of ['admin', 'user']) {
+      const name = creds[which].user
+      for (let attempt = 1; ; attempt++) {
+        step(`logging ${name} on${attempt > 1 ? ' (again)' : ''}`)
+        const o = await this.logon(vm, null, which, creds)
+        let why = null
+        if (o.loggedOff) why = `${name} logged on, then Windows logged the session off`
+        else if (o.ms === undefined) why = o.user ? `${name} logged on, but its watcher didn't start within ${Math.round(LOGON_WAIT_MS / 1000)} s` : `no interactive session of ${name} appeared within ${Math.round(LOGON_WAIT_MS / 1000)} s`
+        let quiet = null
+        if (!why) {
+          step(`waiting for ${name}'s first-logon work to finish`)
+          quiet = await this.waitProvisioned(vm, creds, name, o.boot)
+          if (quiet.lost) why = `${name}'s session was lost while its first-logon work ran`
+        }
+        await this.undoLogon(vm, creds)
+        if (!why) { out[name] = { logonMs: o.ms, quietMs: quiet.ms, packages: quiet.count, inventory: quiet.inventory }; break }
+        if (attempt >= 2) throw new Error(`provisioning ${name}'s profile failed twice: ${why}`)
+      }
+    }
+    return out
+  }
+
+  /**
+   * MC-1516: polls hv.ps1 'guest-provisioned' until the account's first-logon work is observed quiet: PROVISION_QUIET_MS
+   * of consecutive good samples (all probes answered, the account logged on, on the logon's boot) with no newer AppX
+   * deployment event, no change to its package inventory and no busy first-logon worker. A failed probe or a busy one
+   * starts the quiet time over; a changed boot or the account gone is { lost }. This is observed quiescence, not proof.
+   */
+  async waitProvisioned(vm, creds, account, boot) {
+    const t0 = this.now()
+    let last = null
+    let quietSince = null
+    while (this.now() - t0 < PROVISION_WAIT_MS) {
+      const r = await this.hv('guest-provisioned', { ...this.ident(vm), cred: creds.admin, account, quietMs: PROVISION_QUIET_MS }, { timeoutMs: 120_000 }).catch(() => null)
+      if (r && (r.boot !== boot || r.user === false)) return { lost: true }
+      const good = !!r && r.user === true && typeof r.inventory === 'string' && Array.isArray(r.busy)
+      const busy = !good || r.busy.length > 0 || (last && (r.lastEvent !== last.lastEvent || r.inventory !== last.inventory))
+      if (good) last = r
+      if (busy) quietSince = null
+      else if (quietSince === null) quietSince = this.now()
+      if (!busy && this.now() - quietSince >= PROVISION_QUIET_MS) return { ms: this.now() - t0, count: r.count, inventory: r.inventory }
+      await sleep(PROVISION_POLL_MS)
+    }
+    throw new Error(`${account}'s first-logon provisioning didn't settle within ${Math.round(PROVISION_WAIT_MS / 1000)} s`)
+  }
+
+  /** MC-1516: hv.ps1 'guest-logon-undo', every value read back and checked; any mismatch fails the build. */
+  async undoLogon(vm, creds) {
+    const r = await this.hv('guest-logon-undo', { ...this.ident(vm), cred: creds.admin }, { timeoutMs: 120_000 })
+    const bad = []
+    if (r?.autoAdminLogon !== '0') bad.push(`AutoAdminLogon is ${r?.autoAdminLogon}`)
+    if (r?.defaultUserName) bad.push('DefaultUserName is still set')
+    if (r?.secretRemoved !== true) bad.push('the autologon password secret was not removed')
+    if (r?.enableLUA !== 1) bad.push(`EnableLUA is ${r?.enableLUA}`)
+    if (String(r?.userinit).toLowerCase() !== USERINIT.toLowerCase()) bad.push(`Userinit is ${r?.userinit}`)
+    if (r?.hvmcpEmpty !== true) bad.push('C:\\hvmcp is not empty')
+    if (r?.hvmcpExplicitAces !== 0 || r?.hvmcpProtected !== false) bad.push('C:\\hvmcp has explicit or protected ACLs')
+    if (bad.length) throw new Error(`undoing a build logon didn't verify: ${bad.join('; ')}`)
   }
 
   /**
@@ -1705,6 +1785,7 @@ function describePlan(plan, digest, approve) {
   if (plan.switch) lines.push(`- create the internal switch ${plan.switch} (host and guests only; no internet, no LAN)`)
   if (plan.removeSwitch) lines.push(`- remove the switch ${plan.removeSwitch}`)
   if (plan.image) lines.push(`- image: ${plan.image.edition}${plan.image.imageIndex > 1 ? ` (index ${plan.image.imageIndex})` : ''} build ${plan.image.build}, SHA-256 ${plan.image.sha256} (${plan.image.pinned ? 'pinned: a known Microsoft download' : plan.image.source === 'download' ? 'downloaded by the helper over HTTPS from Microsoft' : 'NOT AUTHENTICATED: a local file you chose to trust'})`)
+  if (plan.add?.length) lines.push('- provisioning: each new VM logs hvadmin and hvuser on interactively once (offline), waits for Windows\' first-logon setup to finish, then turns autologon off and resets UAC and the watcher\'s start before its clean checkpoint')
   if (plan.activation === 'online-once') lines.push('- activation: each new VM goes online once, through Windows\' Default Switch, to activate Windows; it is disconnected (verified) before its clean checkpoint, and no start ever uses that switch')
   else if (plan.add?.length) lines.push('- activation: none (each new VM stays offline; its licence is read and shown)')
   if (plan.add?.length && plan.image && !plan.image.evaluation) lines.push(`- product key: ${plan.productKey ? 'the pool\'s (set by install.ps1 -ProductKeyFile), written only into the answer file' : 'none'}`)

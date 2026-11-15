@@ -22,6 +22,11 @@
  * and disconnects; activateDies: it fails with the adapter still connected (a killed call); activateStaysConnected: it
  * answers but leaves it connected (disconnected: false). guest-licence answers state.licence (default: status 1).
  * net-off turns the VM off and disconnects it (fail it with fail['net-off']).
+ * Profiles at build (MC-1516): guest-logon refuses unless the VM's Userinit is Windows' own (null counts, as a fresh
+ * install), as hv.ps1's $UserinitValue does, and records the UAC state each logon's restart applies (logons[].lua);
+ * guest-logon-undo puts Userinit, UAC and autologon back (undoOverride: fields it reports instead). guest-provisioned
+ * samples the account's first-logon work: busy for provisionBusy samples (or provisionNever, or at sample
+ * provisionBusyAt), failing at sample provisionFailAt, and losing the logon at sample provisionLoseOnce (once).
  */
 const fs = require('fs')
 const crypto = require('crypto')
@@ -32,6 +37,7 @@ const load = () => { try { return JSON.parse(fs.readFileSync(FILE, 'utf8')) } ca
 const save = s => fs.writeFileSync(FILE, JSON.stringify(s, null, 1))
 const answer = o => { process.stdout.write('HVJSON:' + JSON.stringify(o) + '\n') }
 const norm = p => String(p).replace(/[\\/]+$/, '').toLowerCase()
+const USERINIT = 'C:\\Windows\\system32\\userinit.exe,'
 const under = (loc, folder) => norm(loc) === norm(folder) || norm(loc).startsWith(norm(folder) + '\\')
 
 let input = ''
@@ -78,6 +84,25 @@ function run(s, op, a) {
       if (!s.activateStaysConnected) vm.switchName = null
       return { ...r, disconnected: !vm.switchName }
     }
+    case 'guest-logon-undo': {
+      const vm = own(s, a)
+      if (vm.state !== 'Running') throw new Error('the VM is not running')
+      vm.userinit = USERINIT
+      vm.enableLUA = 1
+      vm.armed = false
+      vm.undos = (vm.undos || 0) + 1
+      return { autoAdminLogon: '0', defaultUserName: '', secretRemoved: true, enableLUA: 1, userinit: USERINIT, hvmcpEmpty: true, hvmcpExplicitAces: 0, hvmcpProtected: false, ...(s.undoOverride || {}) }
+    }
+    case 'guest-provisioned': {
+      const vm = own(s, a)
+      if (vm.state !== 'Running') throw new Error('the VM is not running')
+      const k = vm.provisionChecks = (vm.provisionChecks || 0) + 1
+      vm.provisioned = [...(vm.provisioned || []), a.account]
+      if (s.provisionFailAt === k) throw new Error('injected: the provisioning probe failed')
+      if (s.provisionLoseOnce === k) { delete s.provisionLoseOnce; vm.loggedOn = null }
+      const busy = s.provisionNever || k <= (s.provisionBusy || 0) || k === s.provisionBusyAt ? ['OneDriveSetup'] : []
+      return { boot: `boot-${vm.boot || 0}`, user: vm.loggedOn === a.account, lastEvent: '2026-11-15T00:00:00.000Z', count: 42, inventory: 'cafe', busy }
+    }
     case 'guest-licence': { own(s, a); return { status: 1, graceMinutes: 0, evalEnd: null, channel: 'Retail', error: null, ...(s.licence || {}) } }
     case 'net-off': { const vm = own(s, a); vm.state = 'Off'; vm.switchName = null; return { offline: true } }
     case 'find-vm': {
@@ -110,7 +135,7 @@ function run(s, op, a) {
       vm.switchName = null
       vm.reserve = 0
       const id = crypto.randomUUID()
-      vm.checkpoints = [{ id, name: 'clean', disk: { ...vm.disk } }]
+      vm.checkpoints = [{ id, name: 'clean', disk: { ...vm.disk }, userinit: vm.userinit ?? null, enableLUA: vm.enableLUA ?? 1 }]
       vm.parent = id
       return { checkpointId: id }
     }
@@ -125,6 +150,7 @@ function run(s, op, a) {
       vm.reserve = 0
       vm.disk = { ...cp.disk }
       vm.loggedOn = null; vm.watcher = false; vm.elevated = false
+      vm.userinit = cp.userinit ?? null; vm.enableLUA = cp.enableLUA ?? 1 // the checkpoint's
       vm.restores = (vm.restores || 0) + 1
       if (s.restoreLeaves) Object.assign(vm, s.restoreLeaves)
       return facts(vm)
@@ -197,6 +223,11 @@ function run(s, op, a) {
       const vm = own(s, a)
       if (vm.state !== 'Running') throw new Error('the VM is not running')
       if (!a.logon?.user || !a.logon?.password) throw new Error('no account to log on')
+      if (vm.userinit && vm.userinit !== USERINIT) throw new Error(`unexpected Userinit in the guest ('${vm.userinit}'): only Windows' own is changed`)
+      vm.userinit = 'watcher'
+      const lua = a.elevated ? 0 : (vm.enableLUA ?? 1)
+      if (a.elevated) vm.enableLUA = 0
+      vm.provisionChecks = 0
       const before = `boot-${vm.boot || 0}`
       vm.boot = (vm.boot || 0) + 1 // the restart: the disk (C:\build, C:\out) stays
       vm.loggedOn = s.logonNeverAppears ? null : a.logon.user
@@ -211,7 +242,7 @@ function run(s, op, a) {
       vm.restartPending = !!s.restartBeforeWatcher
       vm.sessionChecks = 0
       vm.elevated = !!a.elevated // EnableLUA 0: the admin's session is elevated
-      vm.logons = [...(vm.logons || []), { user: a.logon.user, elevated: !!a.elevated }]
+      vm.logons = [...(vm.logons || []), { user: a.logon.user, elevated: !!a.elevated, lua }]
       if (s.extraRestart) vm.extraRestartPending = true
       return { boot: before }
     }
