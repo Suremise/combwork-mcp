@@ -27,6 +27,8 @@
  * guest-logon-undo puts Userinit, UAC and autologon back (undoOverride: fields it reports instead). guest-provisioned
  * samples the account's first-logon work: busy for provisionBusy samples (or provisionNever, or at sample
  * provisionBusyAt), failing at sample provisionFailAt, and losing the logon at sample provisionLoseOnce (once).
+ * Defender (MC-1519): guest-defender records the exclusions (vm.exclusions) and answers them with real-time on;
+ * defenderOverride: fields it reports instead.
  */
 const fs = require('fs')
 const crypto = require('crypto')
@@ -83,6 +85,12 @@ function run(s, op, a) {
       const r = { status: 1, graceMinutes: 90 * 24 * 60, evalEnd: null, channel: 'Retail:TB:Eval', error: null, ...(s.activation || {}) }
       if (!s.activateStaysConnected) vm.switchName = null
       return { ...r, disconnected: !vm.switchName }
+    }
+    case 'guest-defender': {
+      const vm = own(s, a)
+      if (vm.state !== 'Running') throw new Error('the VM is not running')
+      vm.exclusions = [...new Set([...(vm.exclusions || []), ...a.paths])]
+      return { exclusions: vm.exclusions, realTime: true, service: true, tamper: true, ...(s.defenderOverride || {}) }
     }
     case 'guest-logon-undo': {
       const vm = own(s, a)

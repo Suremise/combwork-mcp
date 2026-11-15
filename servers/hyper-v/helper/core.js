@@ -41,6 +41,8 @@ const PROVISION_QUIET_MS = Number(process.env.HYPERV_MCP_PROVISION_QUIET_MS || 2
 const PROVISION_POLL_MS = Number(process.env.HYPERV_MCP_PROVISION_POLL_MS || 15_000)
 const PROVISION_WAIT_MS = Number(process.env.HYPERV_MCP_PROVISION_WAIT_MS || 20 * 60_000)
 const USERINIT = 'C:\\Windows\\system32\\userinit.exe,' // Windows' own list, as the build's undo leaves it
+// MC-1519 (the user's decision): the guest's test work folders, excluded from Defender's real-time scanning at build.
+const DEFENDER_EXCLUSIONS = ['C:\\build', 'C:\\out', 'C:\\trial-session', 'C:\\hvmcp']
 const RETRY_MS = Number(process.env.HYPERV_MCP_RETRY_MS || 5 * 60_000)
 // The build's one online step (MC-1513): its call's bound, and net-off's after a failure.
 const ACTIVATE_MS = Number(process.env.HYPERV_MCP_ACTIVATE_MS || 8 * 60_000)
@@ -1548,6 +1550,8 @@ class Helper {
     const licence = await this.licenceStep(vm, a, plan, creds)
     step('provisioning the test accounts\' profiles (offline)')
     const profiles = await this.provisionProfiles(vm, creds, t => step(`provisioning the test accounts' profiles (offline): ${t}`))
+    step('excluding the test folders from Defender\'s real-time scanning (offline)')
+    const defender = await this.defenderStep(vm, creds)
     step('shutting down and taking the clean checkpoint')
     const cp = await this.hv('make-clean', { ...this.ident(vm) }, { timeoutMs: 15 * 60_000 })
     fs.rmSync(media, { recursive: true, force: true })
@@ -1555,7 +1559,23 @@ class Helper {
     const facts = await this.hv('restore', { ...this.ident(vm), checkpointId: cp.checkpointId })
     const bad = baselineProblem(facts, { ...vm, cleanCheckpointId: cp.checkpointId })
     if (bad) throw new Error(`its clean baseline doesn't verify: ${bad}`)
-    this.journal.append({ t: 'ready', intentId: a.intentId, vmId: vm.vmId, cleanCheckpointId: cp.checkpointId, licence, profiles })
+    this.journal.append({ t: 'ready', intentId: a.intentId, vmId: vm.vmId, cleanCheckpointId: cp.checkpointId, licence, profiles, defender })
+  }
+
+  /**
+   * MC-1519: hv.ps1 'guest-defender' adds the test folders as Defender exclusions; the read-back must hold exactly those
+   * folders, with real-time protection and the antivirus service still on, or the build fails.
+   */
+  async defenderStep(vm, creds) {
+    const r = await this.hv('guest-defender', { ...this.ident(vm), cred: creds.admin, paths: DEFENDER_EXCLUSIONS }, { timeoutMs: 120_000 })
+    const got = (Array.isArray(r?.exclusions) ? r.exclusions : []).map(p => String(p).replace(/\\+$/, '').toLowerCase()).sort()
+    const want = DEFENDER_EXCLUSIONS.map(p => p.toLowerCase()).sort()
+    const bad = []
+    if (got.join('|') !== want.join('|')) bad.push(`its exclusions are ${got.length ? got.join(', ') : 'none'}, not exactly ${want.join(', ')}`)
+    if (r?.realTime !== true) bad.push('real-time protection is off')
+    if (r?.service !== true) bad.push('the antivirus service is off')
+    if (bad.length) throw new Error(`Defender's settings didn't verify: ${bad.join('; ')}`)
+    return { exclusions: DEFENDER_EXCLUSIONS, realTime: true }
   }
 
   /**
@@ -1806,6 +1826,7 @@ function describePlan(plan, digest, approve) {
   if (plan.switch) lines.push(`- create the internal switch ${plan.switch} (host and guests only; no internet, no LAN)`)
   if (plan.removeSwitch) lines.push(`- remove the switch ${plan.removeSwitch}`)
   if (plan.image) lines.push(`- image: ${plan.image.edition}${plan.image.imageIndex > 1 ? ` (index ${plan.image.imageIndex})` : ''} build ${plan.image.build}, SHA-256 ${plan.image.sha256} (${plan.image.pinned ? 'pinned: a known Microsoft download' : plan.image.source === 'download' ? 'downloaded by the helper over HTTPS from Microsoft' : 'NOT AUTHENTICATED: a local file you chose to trust'})`)
+  if (plan.add?.length) lines.push(`- Defender: the test work folders ${DEFENDER_EXCLUSIONS.join(', ')} are excluded from real-time scanning in the guest image (Defender stays on otherwise)`)
   if (plan.add?.length) lines.push('- provisioning: each new VM logs hvadmin and hvuser on interactively once (offline), waits for Windows\' first-logon setup to finish, then turns autologon off and resets UAC and the watcher\'s start before its clean checkpoint')
   if (plan.activation === 'online-once') lines.push('- activation: each new VM goes online once, through Windows\' Default Switch, to activate Windows; it is disconnected (verified) before its clean checkpoint, and no start ever uses that switch')
   else if (plan.add?.length) lines.push('- activation: none (each new VM stays offline; its licence is read and shown)')
