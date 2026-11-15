@@ -332,6 +332,17 @@ test('a logon Windows drops before any check (MC-1524): fails on the first answe
   assert.match(noLogoff.r.text, /no interactive session of it appeared within 3 s/)
 })
 
+test('a logon that never begins (MC-1526): the start fails on the sign window (1 s here), not the 3 s wait, and says so; unreadable counts wait on', async t => {
+  const quiet = await logonCase(t, 'ia-silent', { logonSilent: 1 })
+  assert.ok(quiet.r.isError)
+  assert.match(quiet.r.text, /restarted to log hvadmin on, but no logon of it began within 1 s of the new boot being seen \(no logon event for it on this boot\)\. vm_reset to try again/)
+  assert.match((await quiet.s.call('vm_status')).text, /its last start failed at \S+ \(no logon of hvadmin began within 1 s of its new boot being seen\)/)
+  const absent = await logonCase(t, 'ia-silent-noautologon', { logonSilent: 1, silentArmed: false })
+  assert.match(absent.r.text, /no logon of it began within 1 s/)
+  const unread = await logonCase(t, 'ia-silent-unread', { logonSilent: 1, silentEvents: { logons: null, logoffs: null } })
+  assert.match(unread.r.text, /no interactive session of it appeared within 3 s/, 'null counts are never evidence')
+})
+
 test('logon observations are per boot (MC-1518): the guest restarting by itself while logged on, or a failed probe, is never taken for a logoff', async t => {
   const restart = await logonCase(t, 'ia-selfrestart', { restartBeforeWatcher: true })
   assert.ok(!restart.r.isError, restart.r.text)
