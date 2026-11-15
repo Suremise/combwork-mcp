@@ -200,6 +200,12 @@ approval → change**:
    - about 20–40 minutes each, one VM at a time, so the host's CPU isn't flooded;
    - then the guest set-up, a sanity check of the installed edition and build, Windows' activation when the plan says
      so (see "Windows licences");
+   - in the guest set-up, the **"Do not forcefully unload the user's registry at user logoff"** policy
+     (`DisableForceUnload`, MC-1522), read back. A session-0 run outlives the short PowerShell Direct session that
+     started it (see "Long runs"). Without the policy, Windows force-unloaded the account's registry when that session
+     ended, under the still-running run, and its registry reads then failed ("registry key marked for deletion"; in
+     .NET, a freshly compiled assembly's LoadFile failing with E_UNEXPECTED about 1 time in 4). The policy only stops
+     the forced unload of a registry still in use; it changes no security boundary;
    - then **the test accounts' profiles**, still offline: `hvadmin`, then `hvuser`, each logged on interactively once,
      exactly as an interactive start does, and left until Windows' first-logon work (AppX provisioning, OneDrive
      setup, the user setup screens, the per-user AppContainer profiles) is observed quiet: four minutes of samples in

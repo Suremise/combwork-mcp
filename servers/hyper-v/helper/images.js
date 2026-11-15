@@ -146,6 +146,8 @@ function guestReportProblem(g, img) {
   if (!g || typeof g !== 'object') return 'no report'
   if (g.editionId !== img.edition) return `the guest says edition ${g.editionId}, the image ${img.edition}`
   if (String(g.build) !== String(img.build).split('.')[0]) return `the guest says build ${g.build}, the image ${img.build}`
+  // MC-1522: the guest-setup step's registry policy, read back.
+  if (g.disableForceUnload !== 1) return `the guest's DisableForceUnload policy reads ${g.disableForceUnload ?? 'nothing'}, not 1`
   return null
 }
 

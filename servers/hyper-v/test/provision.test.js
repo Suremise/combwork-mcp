@@ -156,3 +156,13 @@ test('an unknown AppContainer count (MC-1520) is never quiet: it starts the wind
   assert.match(line, /create finished/)
   assert.ok(vms(sc)[0].provisioned.filter(a => a === 'hvadmin').length >= 4)
 })
+
+// MC-1522: the guest image doesn't forcibly unload a user's registry at logoff; guest-setup reads it back.
+test('the registry policy (MC-1522): named in the plan, read back from guest-setup; a build without it fails and rolls back', async t => {
+  const ok = await build(t, 'dfu-ok')
+  assert.match(ok.line, /create finished/)
+  assert.match(ok.plan.text, /- registry: a user's registry isn't forcibly unloaded at logoff \(the DisableForceUnload policy\)/)
+  const missing = await build(t, 'dfu-missing', { setupOverride: { disableForceUnload: null } })
+  assert.match(missing.line, /the guest's sanity check failed: the guest's DisableForceUnload policy reads nothing, not 1/)
+  assert.deepStrictEqual(vms(missing.sc), [])
+})
