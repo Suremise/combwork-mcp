@@ -202,10 +202,11 @@ approval → change**:
      so (see "Windows licences");
    - in the guest set-up, the **"Do not forcefully unload the user's registry at user logoff"** policy
      (`DisableForceUnload`, MC-1522), read back. A session-0 run outlives the short PowerShell Direct session that
-     started it (see "Long runs"). Without the policy, Windows force-unloaded the account's registry when that session
-     ended, under the still-running run, and its registry reads then failed ("registry key marked for deletion"; in
-     .NET, a freshly compiled assembly's LoadFile failing with E_UNEXPECTED about 1 time in 4). The policy only stops
-     the forced unload of a registry still in use; it changes no security boundary;
+     started it (see "Long runs"). The suspected cause, not yet proven (MC-1521's real-build trial checks it): without
+     the policy, Windows force-unloads the account's registry when that session ends, under the still-running run, and
+     its registry reads fail. A run did hit "registry key marked for deletion"; in .NET, a freshly compiled assembly's
+     LoadFile failed with E_UNEXPECTED about 1 time in 4, and 0 times in 9 with the policy set (a small sample). The
+     policy only stops the forced unload of a registry still in use; it changes no security boundary;
    - then **the test accounts' profiles**, still offline: `hvadmin`, then `hvuser`, each logged on interactively once,
      exactly as an interactive start does, and left until Windows' first-logon work (AppX provisioning, OneDrive
      setup, the user setup screens, the per-user AppContainer profiles) is observed quiet: four minutes of samples in

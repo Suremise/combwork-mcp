@@ -203,9 +203,10 @@ $GuestSetup = {
   & icacls.exe C:\out /grant "${userName}:(OI)(CI)M" | Out-Null
   Remove-Item 'C:\Windows\Panther\unattend*.xml', 'C:\Windows\Panther\Unattend\*.xml' -Force -ErrorAction SilentlyContinue
   $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
-  # MC-1522: a session-0 run outlives the PowerShell Direct session that started it (MC-1510); without this policy the
-  # User Profile Service force-unloads the account's registry when that session ends, under the still-running run
-  # ("registry key marked for deletion", 0x800703FA; .NET's LoadFile failing with E_UNEXPECTED). Read back for the check.
+  # MC-1522: a session-0 run outlives the PowerShell Direct session that started it (MC-1510). The evidence suggests,
+  # but doesn't yet prove (MC-1521's trial does), that without this policy the User Profile Service force-unloads the
+  # account's registry when that session ends, under the still-running run ("registry key marked for deletion",
+  # 0x800703FA, seen in a run; .NET's LoadFile failing with E_UNEXPECTED). Read back for the check.
   New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Force | Out-Null
   Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name DisableForceUnload -Value 1 -Type DWord
   $dfu = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -ErrorAction SilentlyContinue).DisableForceUnload

@@ -55,7 +55,7 @@ test('quiet is consecutive good, idle samples: a failed probe and a busy one lat
 
 test('provisioning that never settles fails the build (rolled back), rather than checkpointing a half-provisioned profile', async t => {
   const { sc, line } = await build(t, 'prov-never', { provisionNever: true })
-  assert.match(line, /FAILED: VM 1 of 1 \(hvmcp-[0-9a-f]+\): hvadmin's first-logon provisioning didn't settle within 3 s/)
+  assert.match(line, /FAILED: VM 1 of 1 \(hvmcp-[0-9a-f]+\): hvadmin's first-logon provisioning didn't settle within 15 s/)
   assert.deepStrictEqual(vms(sc), [])
 })
 
