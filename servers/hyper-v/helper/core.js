@@ -41,7 +41,9 @@ const PROVISION_QUIET_MS = Number(process.env.HYPERV_MCP_PROVISION_QUIET_MS || 2
 const PROVISION_POLL_MS = Number(process.env.HYPERV_MCP_PROVISION_POLL_MS || 15_000)
 const PROVISION_WAIT_MS = Number(process.env.HYPERV_MCP_PROVISION_WAIT_MS || 20 * 60_000)
 const USERINIT = 'C:\\Windows\\system32\\userinit.exe,' // Windows' own list, as the build's undo leaves it
-// MC-1519 (the user's decision): the guest's test work folders, excluded from Defender's real-time scanning at build.
+// MC-1519 (the user's decision): the guest's test work folders, excluded from Defender's scanning at build (real-time
+// and scheduled scans: an ExclusionPath). The user's chosen mitigation for an intermittent load failure of a freshly
+// written exe; Defender's part in it is suspected, not established.
 const DEFENDER_EXCLUSIONS = ['C:\\build', 'C:\\out', 'C:\\trial-session', 'C:\\hvmcp']
 const RETRY_MS = Number(process.env.HYPERV_MCP_RETRY_MS || 5 * 60_000)
 // The build's one online step (MC-1513): its call's bound, and net-off's after a failure.
@@ -1550,7 +1552,7 @@ class Helper {
     const licence = await this.licenceStep(vm, a, plan, creds)
     step('provisioning the test accounts\' profiles (offline)')
     const profiles = await this.provisionProfiles(vm, creds, t => step(`provisioning the test accounts' profiles (offline): ${t}`))
-    step('excluding the test folders from Defender\'s real-time scanning (offline)')
+    step('excluding the test folders from Defender\'s scanning (offline)')
     const defender = await this.defenderStep(vm, creds)
     step('shutting down and taking the clean checkpoint')
     const cp = await this.hv('make-clean', { ...this.ident(vm) }, { timeoutMs: 15 * 60_000 })
@@ -1826,7 +1828,7 @@ function describePlan(plan, digest, approve) {
   if (plan.switch) lines.push(`- create the internal switch ${plan.switch} (host and guests only; no internet, no LAN)`)
   if (plan.removeSwitch) lines.push(`- remove the switch ${plan.removeSwitch}`)
   if (plan.image) lines.push(`- image: ${plan.image.edition}${plan.image.imageIndex > 1 ? ` (index ${plan.image.imageIndex})` : ''} build ${plan.image.build}, SHA-256 ${plan.image.sha256} (${plan.image.pinned ? 'pinned: a known Microsoft download' : plan.image.source === 'download' ? 'downloaded by the helper over HTTPS from Microsoft' : 'NOT AUTHENTICATED: a local file you chose to trust'})`)
-  if (plan.add?.length) lines.push(`- Defender: the test work folders ${DEFENDER_EXCLUSIONS.join(', ')} are excluded from real-time scanning in the guest image (Defender stays on otherwise)`)
+  if (plan.add?.length) lines.push(`- Defender: the test work folders ${DEFENDER_EXCLUSIONS.join(', ')} are excluded from Defender's scanning (real-time and scheduled scans) in the guest image; Defender stays on otherwise`)
   if (plan.add?.length) lines.push('- provisioning: each new VM logs hvadmin and hvuser on interactively once (offline), waits for Windows\' first-logon setup to finish, then turns autologon off and resets UAC and the watcher\'s start before its clean checkpoint')
   if (plan.activation === 'online-once') lines.push('- activation: each new VM goes online once, through Windows\' Default Switch, to activate Windows; it is disconnected (verified) before its clean checkpoint, and no start ever uses that switch')
   else if (plan.add?.length) lines.push('- activation: none (each new VM stays offline; its licence is read and shown)')

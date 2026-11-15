@@ -210,11 +210,12 @@ approval → change**:
      starts clean and the checkpoint keeps none of it. The profiles stay, so an interactive start doesn't replay
      first-logon work (it took 2–5 minutes, and sometimes failed);
    - then **Defender exclusions** for the test work folders `C:\build`, `C:\out`, `C:\trial-session` and `C:\hvmcp`
-     (MC-1519, at the user's decision): a freshly written large exe sometimes failed to load (E_UNEXPECTED) while it
-     was being scanned. They're read back, and the build fails unless exactly those four are excluded and real-time
-     protection is still on: Defender stays on for everything else. The trade-off: files written there aren't
-     scanned on write, which matters less in a guest that is offline and restored after every lease. Nothing changes
-     on the host;
+     (MC-1519): the user's chosen mitigation for an intermittent failure to load a freshly written large exe
+     (E_UNEXPECTED). Defender's scan of the new file is suspected, not established. They're read back, and the build
+     fails unless exactly those four are excluded and real-time protection is still on: Defender stays on for
+     everything else. The trade-off: an exclusion path takes those folders out of Defender's real-time **and**
+     scheduled scans, which matters less in a guest that is offline and restored after every lease. Nothing changes on
+     the host;
    - and the clean checkpoint, taken with the VM off and its adapter disconnected.
 
 **Rebuilding.** An evaluation VM lasts about 90 days from its activation at build; `vm_status` and `pool_status` show

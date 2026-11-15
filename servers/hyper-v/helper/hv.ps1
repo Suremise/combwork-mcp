@@ -356,8 +356,9 @@ $GuestProvisioned = {
   @{ boot = $boot; user = ($procs.Count -gt 0); lastEvent = $last; count = $pk.Count; inventory = $inventory; busy = $busy }
 }
 
-# MC-1519 (the user's decision): the test work folders excluded from Defender's real-time scanning, in the guest image
-# only (a just-written large exe sometimes failed to load while it was scanned). Defender stays on otherwise. It reads
+# MC-1519 (the user's decision): the test work folders excluded from Defender's scanning (an ExclusionPath: real-time
+# and scheduled scans), in the guest image only. The user's chosen mitigation for an intermittent load failure of a
+# just-written large exe; Defender's part in it is suspected, not established. Defender stays on otherwise. It reads
 # back the exclusions and Defender's state for the helper to check.
 $GuestDefender = {
   param($paths)

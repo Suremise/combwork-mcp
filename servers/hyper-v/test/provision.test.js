@@ -77,13 +77,14 @@ test('an undo that doesn\'t verify fails the build: a leftover explicit ACE on C
   assert.deepStrictEqual(vms(lua.sc), [])
 })
 
-// MC-1519 (the user's decision): the test work folders excluded from Defender's real-time scanning, in the image.
+// MC-1519 (the user's decision): the test work folders excluded from Defender's scanning (real-time and scheduled), in
+// the image.
 const EXCLUDED = String.raw`C:\build|C:\out|C:\trial-session|C:\hvmcp`.split('|')
 
 test('Defender (MC-1519): the build excludes exactly the test folders, after the profiles and before the checkpoint, read back with real-time on', async t => {
   const { sc, plan, line } = await build(t, 'def-ok')
   assert.match(line, /create finished/)
-  assert.ok(plan.text.includes(String.raw`- Defender: the test work folders C:\build, C:\out, C:\trial-session, C:\hvmcp are excluded from real-time scanning in the guest image (Defender stays on otherwise)`), plan.text)
+  assert.ok(plan.text.includes(String.raw`- Defender: the test work folders C:\build, C:\out, C:\trial-session, C:\hvmcp are excluded from Defender's scanning (real-time and scheduled scans) in the guest image; Defender stays on otherwise`), plan.text)
   const ops = sc.stub().calls.map(c => c.op)
   assert.ok(ops.lastIndexOf('guest-logon-undo') < ops.indexOf('guest-defender') && ops.indexOf('guest-defender') < ops.indexOf('make-clean'), 'after the profiles, before the checkpoint')
   assert.deepStrictEqual(vms(sc)[0].exclusions, EXCLUDED)
@@ -98,4 +99,18 @@ test('Defender (MC-1519): a read-back missing a folder, with another exclusion, 
   const off = await build(t, 'def-off', { defenderOverride: { realTime: false } })
   assert.match(off.line, /didn't verify: real-time protection is off/)
   assert.deepStrictEqual(vms(off.sc), [])
+})
+
+test('Defender (MC-1519): the antivirus service off, or the query failing, fails the build before any checkpoint or ready record, and rolls back', async t => {
+  for (const [name, stub, why] of [
+    ['def-service', { defenderOverride: { service: false } }, /Defender's settings didn't verify: the antivirus service is off/],
+    ['def-query', { fail: { 'guest-defender': 1 } }, /injected failure of guest-defender/]
+  ]) {
+    const { sc, line } = await build(t, name, stub)
+    assert.match(line, why)
+    assert.ok(!sc.stub().calls.some(c => c.op === 'make-clean'), `${name}: never reached the checkpoint`)
+    assert.ok(!sc.journal().some(r => r.t === 'ready'), `${name}: no ready record`)
+    assert.ok(sc.journal().some(r => r.t === 'rolledBack'), `${name}: rolled back`)
+    assert.deepStrictEqual(vms(sc), [])
+  }
 })
