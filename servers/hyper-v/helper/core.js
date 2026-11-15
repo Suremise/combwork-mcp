@@ -1832,6 +1832,8 @@ function diagLine(d) {
 function buildNote(profiles) {
   const notes = []
   for (const [name, p] of Object.entries(profiles || {})) {
+    // The settled counts, always: what the quiet test saw when it accepted the profile.
+    if (Number.isInteger(p.mappings)) notes.push(`${name} settled with ${p.mappings} AppContainer mappings and ${p.packagesDirs} Packages folders after ${Math.round(p.quietMs / 1000)} s`)
     for (const t of p.attempts || []) {
       if (t.why) notes.push(`${name}'s logon attempt ${t.attempt} failed: ${t.why}; ${diagLine(t.diag)}`)
       else if (t.slow) notes.push(`${name}'s logon took ${Math.round(t.logonMs / 1000)} s; at ${Math.round(LOGON_SNAPSHOT_MS / 1000)} s: ${diagLine(t.slow)}`)
