@@ -21,7 +21,7 @@ const creds = { admin: { user: 'hvadmin', password: 'a' }, user: { user: 'hvuser
  * A helper on the fake clock. watcher(account, logonNo, t): whether the session's watcher is seen; probe(account,
  * logonNo, t): fields over a quiet, logged-on provisioning sample.
  */
-function fake({ watcher = () => true, probe = () => ({}), diagFails = false } = {}) {
+function fake({ watcher = () => true, probe = () => ({}), diagFails = false, session = () => ({}) } = {}) {
   const h = Object.create(Helper.prototype)
   let t = 0
   let logons = 0
@@ -33,7 +33,7 @@ function fake({ watcher = () => true, probe = () => ({}), diagFails = false } = 
   h.hv = async (op, a, opts) => {
     calls.push({ op, at: t, timeoutMs: opts?.timeoutMs, account: a.account || a.logon?.user })
     if (op === 'guest-logon') { const before = `b${logons}`; logons++; account = a.logon.user; t += 10; return { boot: before } }
-    if (op === 'guest-session') { t += 5; const w = watcher(account, logons, t); return { boot: `b${logons}`, sessions: w ? [1] : [], user: true, armed: true } }
+    if (op === 'guest-session') { t += 5; const w = watcher(account, logons, t); return { boot: `b${logons}`, sessions: w ? [1] : [], user: true, armed: true, logons: 1, logoffs: 0, ...session(account, logons, t) } }
     if (op === 'guest-provisioned') { t += 5; return { boot: `b${logons}`, user: true, inventory: 'x', lastEvent: null, busy: [], count: 1, mappings: 60, packagesDirs: 25, ...probe(a.account, logons, t) } }
     if (op === 'guest-logon-diag') { t += 5; if (diagFails) throw new Error('injected: the diagnosis failed'); return { uptime: 42, logs: {}, processes: [], autoAdminLogon: '1', watcher: false, message: 'dropped' } }
     throw new Error(`unexpected ${op}`)
@@ -114,3 +114,38 @@ test('a slow build logon whose snapshot is unavailable near the deadline (MC-152
   assert.strictEqual(out.hvadmin.attempts[0].why, null)
   bounded(f.calls)
 })
+
+// MC-1524: a first logon Windows drops before any check: this boot's logon and logoff events, the account gone and
+// autologon disarmed. The attempt ends on its first answered check, and the retry plus its full quiet still fit inside
+// the account's one deadline. Armed, unreadable (null) or absent evidence never ends it.
+const dropped = { sessions: [], user: false, armed: false, logons: 1, logoffs: 1 }
+
+test('a dropped first logon (MC-1524) ends on the first answered check; the retry and its quiet fit in the deadline', async () => {
+  const f = fake({ session: (acc, n) => acc === 'hvadmin' && n === 1 ? dropped : {} })
+  const out = await f.h.provisionProfiles(vm, creds, () => {})
+  const a = out.hvadmin.attempts
+  assert.deepStrictEqual(a.map(x => [x.attempt, x.dropped, !!x.why]), [[1, true, true], [2, false, false]])
+  const first = f.calls.filter(c => c.account === 'hvadmin')
+  const i = first.findIndex(c => c.op === 'guest-session')
+  assert.deepStrictEqual(first.slice(i, i + 3).map(c => c.op), ['guest-session', 'guest-logon-diag', 'guest-logon'], 'one check, the diagnosis, then the retry')
+  assert.strictEqual(f.calls.filter(c => c.op === 'guest-session' && c.at < first[i + 2].at).length, 1)
+  assert.ok(out.hvadmin.quietMs >= 20, 'the retry got its full quiet')
+  assert.strictEqual(f.logons(), 3)
+  bounded(f.calls)
+})
+
+for (const [label, over] of [
+  ['autologon still armed (a restart pending)', { armed: true }],
+  ['the events unreadable', { logons: null, logoffs: null }],
+  ['no logoff event', { logoffs: 0 }],
+  ['no logon event', { logons: 0 }],
+  ['the account still on', { user: true }]
+]) {
+  test(`not a drop (MC-1524): ${label}: the attempt waits on, to its limit`, async () => {
+    const f = fake({ session: (acc, n) => acc === 'hvadmin' && n === 1 ? { ...dropped, ...over } : {} })
+    await f.h.provisionProfiles(vm, creds, () => {}).catch(() => {})
+    const a1 = f.calls.filter(c => c.op === 'guest-session' && c.account === 'hvadmin')
+    assert.ok(a1.length > 3, `${label}: it kept checking (${a1.length})`)
+    bounded(f.calls)
+  })
+}

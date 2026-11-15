@@ -263,6 +263,15 @@ function run(s, op, a) {
       vm.watcherIn = s.watcherLate || 0
       vm.logoffIn = s.logonThenLogoff || 0
       vm.restartPending = !!s.restartBeforeWatcher
+      // MC-1524: logonDroppedUnseen: n: the first n logons are dropped by Windows before any check (the account gone,
+      // autologon cleared, this boot's LSM events show one logon and one logoff). droppedEvents overrides those counts
+      // (null: the log unreadable). droppedArmed keeps autologon armed (a restart pending, not a logoff).
+      vm.lsm = { logons: 0, logoffs: 0 }
+      if (s.logonDroppedUnseen && (s.droppedSoFar || 0) < s.logonDroppedUnseen) {
+        s.droppedSoFar = (s.droppedSoFar || 0) + 1
+        vm.loggedOn = null; vm.armed = !!s.droppedArmed
+        vm.lsm = s.droppedEvents !== undefined ? s.droppedEvents : { logons: 1, logoffs: 1 }
+      }
       vm.sessionChecks = 0
       vm.elevated = !!a.elevated // EnableLUA 0: the admin's session is elevated
       vm.logons = [...(vm.logons || []), { user: a.logon.user, elevated: !!a.elevated, lua }]
@@ -278,7 +287,7 @@ function run(s, op, a) {
       if (vm.watcherIn > 0 && --vm.watcherIn === 0) vm.watcher = true
       if (vm.logoffIn > 0 && --vm.logoffIn === 0) { vm.loggedOn = null; vm.armed = false }
       // extraRestart: the guest restarts once more by itself after the watcher was first seen (MC-1504's trial).
-      const r = { boot: `boot-${vm.boot || 0}`, sessions: vm.loggedOn === a.account && vm.watcher ? [1] : [], user: !!vm.loggedOn && vm.loggedOn === a.account, armed: vm.armed !== false }
+      const r = { boot: `boot-${vm.boot || 0}`, sessions: vm.loggedOn === a.account && vm.watcher ? [1] : [], user: !!vm.loggedOn && vm.loggedOn === a.account, armed: vm.armed !== false, logons: vm.lsm ? vm.lsm.logons : 0, logoffs: vm.lsm ? vm.lsm.logoffs : 0 }
       if (vm.extraRestartPending && r.sessions.length) { vm.extraRestartPending = false; vm.boot++ }
       if (vm.restartPending && r.user) { vm.restartPending = false; vm.boot++; vm.loggedOn = null; vm.relogonIn = 2 }
       return r

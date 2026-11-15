@@ -316,6 +316,22 @@ test('logon outcomes (MC-1518): logged on then logged off fails fast and says so
   assert.match(never.r.text, /logged hvadmin on, but its session's watcher didn't start within 3 s/)
 })
 
+test('a logon Windows drops before any check (MC-1524): fails on the first answered check, says so, and steers the VM last; armed or unreadable evidence never does', async t => {
+  const drop = await logonCase(t, 'ia-dropped', { logonDroppedUnseen: 1 })
+  assert.ok(drop.r.isError)
+  assert.match(drop.r.text, /logged hvadmin on, but Windows logged the session off again before the first check saw it \(its logon and logoff events on this boot\), and turned autologon off\. vm_reset to try again/)
+  assert.strictEqual(Object.values(drop.sc.stub().vms)[0].sessionChecks, 1, 'the first answered check ended it')
+  assert.match((await drop.s.call('vm_status')).text, /its last start failed at \S+ \(Windows logged hvadmin's logon off before it was seen\)/)
+  // A restart pending (autologon still armed), or the events unreadable (null), is not a logoff: the wait runs out.
+  const armed = await logonCase(t, 'ia-dropped-armed', { logonDroppedUnseen: 1, droppedArmed: true })
+  assert.ok(armed.r.isError)
+  assert.match(armed.r.text, /no interactive session of it appeared within 3 s/)
+  const unread = await logonCase(t, 'ia-dropped-unread', { logonDroppedUnseen: 1, droppedEvents: { logons: null, logoffs: null } })
+  assert.match(unread.r.text, /no interactive session of it appeared within 3 s/)
+  const noLogoff = await logonCase(t, 'ia-dropped-nooff', { logonDroppedUnseen: 1, droppedEvents: { logons: 1, logoffs: 0 } })
+  assert.match(noLogoff.r.text, /no interactive session of it appeared within 3 s/)
+})
+
 test('logon observations are per boot (MC-1518): the guest restarting by itself while logged on, or a failed probe, is never taken for a logoff', async t => {
   const restart = await logonCase(t, 'ia-selfrestart', { restartBeforeWatcher: true })
   assert.ok(!restart.r.isError, restart.r.text)
@@ -347,6 +363,39 @@ $events = @(1..15 | ForEach-Object { [pscustomobject]@{ Id = 4600 + $_; TimeCrea
   assert.deepStrictEqual(out[0].map(e => e.id), [4612, 4611, 4610, 4609, 4608, 4607, 4606, 4605, 4604, 4603, 4602, 4601])
   assert.ok(!JSON.stringify(out).includes('secret'))
   assert.deepStrictEqual(out[1], [])
+})
+
+// MC-1524: hv.ps1's own $LogonCounts, run for real on synthetic LSM events: only this boot's (at or after it), only the
+// account's (by its "DOMAIN\name" in the message, not a longer name or another account), logons (21) and logoffs (23)
+// counted apart; an empty log counts 0; an unreadable one ($null) is null for both, never 0.
+const COUNT_LOGONS_BLOCK = (() => { const s = HV_PS.indexOf('\n$LogonCounts = {'); const e = s < 0 ? -1 : HV_PS.indexOf('\n}\n', s + 1); return e < 0 ? null : HV_PS.slice(s + 1, e + 3) })()
+
+test('logon and logoff events (MC-1524), for real: this boot and this account only; empty is 0, unreadable is null', { skip: process.platform !== 'win32' || !COUNT_LOGONS_BLOCK }, () => {
+  const sc = scratch('logon-counts')
+  const file = path.join(sc.dir, 'counts.ps1')
+  fs.writeFileSync(file, `${COUNT_LOGONS_BLOCK}
+$boot = [datetime]'2026-11-15T10:00:00Z'
+function E($id, $s, $who) { [pscustomobject]@{ Id = $id; TimeCreated = $boot.AddSeconds($s); Message = "Remote Desktop Services: Session logon succeeded:\`r\`n\`r\`nUser: HVMCP-1\\$who\`r\`nSession ID: 1" } }
+$events = @(
+  (E 21 -40 'hvadmin'), (E 23 -20 'hvadmin'),
+  (E 21 11 'hvadmin'), (E 23 30 'hvadmin'),
+  (E 21 12 'hvuser'), (E 23 50 'hvuser'), (E 21 13 'hvadmin2')
+)
+'OUT:' + (ConvertTo-Json -InputObject (& $LogonCounts $events $boot 'hvadmin') -Compress)
+'OUT:' + (ConvertTo-Json -InputObject (& $LogonCounts $events $boot 'hvuser') -Compress)
+'OUT:' + (ConvertTo-Json -InputObject (& $LogonCounts @((E 21 -40 'hvadmin'), (E 23 -20 'hvadmin')) $boot 'hvadmin') -Compress)
+'OUT:' + (ConvertTo-Json -InputObject (& $LogonCounts @() $boot 'hvadmin') -Compress)
+'OUT:' + (ConvertTo-Json -InputObject (& $LogonCounts $null $boot 'hvadmin') -Compress)
+`)
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: ps51Env(), timeout: 60_000 })
+  const out = r.stdout.split(/\r?\n/).filter(l => l.startsWith('OUT:')).map(l => JSON.parse(l.slice(4)))
+  assert.strictEqual(out.length, 5, r.stdout + r.stderr)
+  const pick = o => ({ logons: o.logons, logoffs: o.logoffs })
+  assert.deepStrictEqual(pick(out[0]), { logons: 1, logoffs: 1 }, 'hvadmin on this boot only, not hvadmin2 nor the earlier boot')
+  assert.deepStrictEqual(pick(out[1]), { logons: 1, logoffs: 1 }, 'hvuser apart')
+  assert.deepStrictEqual(pick(out[2]), { logons: 0, logoffs: 0 }, "an earlier boot's events never count")
+  assert.deepStrictEqual(pick(out[3]), { logons: 0, logoffs: 0 }, 'an empty log counts 0')
+  assert.deepStrictEqual(pick(out[4]), { logons: null, logoffs: null }, 'an unreadable log is null, never 0')
 })
 
 // MC-1520: hv.ps1's own $ProfileCounts, run for real: a readable but absent location counts 0; an unloaded classes

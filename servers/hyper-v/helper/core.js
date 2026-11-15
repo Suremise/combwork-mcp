@@ -981,6 +981,7 @@ class Helper {
         const o = await this.logon(vm, lease, interactive, creds)
         const again = 'vm_reset to try again, or vm_release and vm_acquire for another VM (one whose start failed is leased last).'
         const wait = Math.round(LOGON_WAIT_MS / 1000)
+        if (o.loggedOff && o.unseen) { failed(`Windows logged ${who}'s logon off before it was seen`); throw new Error(`${vm.vmName} logged ${who} on, but Windows logged the session off again before the first check saw it (its logon and logoff events on this boot), and turned autologon off. ${again}`) }
         if (o.loggedOff) { failed(`${who} logged on, then Windows logged the session off`); throw new Error(`${vm.vmName} logged ${who} on (after ${(o.after / 1000).toFixed(1)} s), but Windows logged the session off again before its watcher started, and turned autologon off. ${again}`) }
         if (o.ms === undefined && o.user) { failed(`${who} logged on, but its watcher didn't start within ${wait} s`); throw new Error(`${vm.vmName} logged ${who} on, but its session's watcher didn't start within ${wait} s. ${again}`) }
         if (o.ms === undefined) { failed(`no interactive session of ${who} appeared within ${wait} s`); throw new Error(`${vm.vmName} restarted to log ${who} on, but no interactive session of it appeared within ${wait} s. ${again}`) }
@@ -1032,6 +1033,8 @@ class Helper {
    * over). Only an answered probe on that same boot saying the account is gone and autologon is no longer armed (Winlogon
    * clears it at a logoff) ends the wait early, as "logged off"; a failed probe is never evidence. Returns { ms }, or
    * { loggedOff: true, after } (ms from the start of the wait to its logon being seen), or { user } once the wait is up.
+   * MC-1524: a logon no check saw (Windows drops a fresh guest's first one within seconds) ends it too, as { loggedOff,
+   * unseen }, but only on the same evidence plus that boot's own LSM logon and logoff events for the account.
    * MC-1516: the build passes its account's provisioning deadline: every call and sleep is then bounded by the time left,
    * nothing that returns after it is accepted, and { late: true } is returned once it has passed. A start passes none.
    */
@@ -1067,6 +1070,9 @@ class Helper {
         if (user && user.boot !== r.boot) user = null
         if (r.user === true && !user) user = { boot: r.boot, at: this.now() - t0 }
         if (user && r.user === false && r.armed === false) return { loggedOff: true, after: user.at }
+        // MC-1524: a logon Windows dropped before any check saw it: this boot's own logon and logoff events for the
+        // account, with the account gone and autologon disarmed. Unreadable events (null) are never evidence.
+        if (!user && r.user === false && r.armed === false && r.logons >= 1 && r.logoffs >= 1 && Number.isInteger(r.logons) && Number.isInteger(r.logoffs)) return { loggedOff: true, after: null, unseen: true }
       }
       if (r && r.boot !== before.boot && Array.isArray(r.sessions) && r.sessions.length) {
         if (seen?.boot === r.boot && this.now() - seen.at >= LOGON_STABLE_MS) return { ms: this.now() - t0, boot: r.boot }
@@ -1629,7 +1635,8 @@ class Helper {
         if (o.late) throw new Error(`${provisionLate(name).message}${slow ? ` (at ${Math.round(LOGON_SNAPSHOT_MS / 1000)} s: ${diagLine(slow)})` : ''}`)
         let why = null
         const waited = Math.round(BUILD_LOGON_WAIT_MS / 1000)
-        if (o.loggedOff) why = `${name} logged on, then Windows logged the session off`
+        if (o.loggedOff && o.unseen) why = `Windows logged ${name}'s logon off before it was seen`
+        else if (o.loggedOff) why = `${name} logged on, then Windows logged the session off`
         else if (o.ms === undefined) why = o.user ? `${name} logged on, but its watcher didn't start within ${waited} s` : `no interactive session of ${name} appeared within ${waited} s`
         let quiet = null
         if (!why) {
@@ -1638,7 +1645,7 @@ class Helper {
           if (quiet.lost) why = `${name}'s session was lost while its first-logon work ran`
         }
         const failed = why ? await diag() : null
-        attempts.push({ attempt, why, logonMs: o.ms ?? null, slow, diag: failed })
+        attempts.push({ attempt, why, dropped: !!(o.loggedOff && o.unseen), logonMs: o.ms ?? null, slow, diag: failed })
         if (why) {
           step(`${name}'s logon attempt ${attempt} failed (${why}; ${diagLine(failed)})${attempt < 2 ? ', retrying' : ''}`)
           this.log(`${vm.vmName}: ${name}'s build logon attempt ${attempt} failed (${why}; ${diagLine(failed)})`)
@@ -1834,8 +1841,12 @@ function buildNote(profiles) {
   for (const [name, p] of Object.entries(profiles || {})) {
     // The settled counts, always: what the quiet test saw when it accepted the profile.
     if (Number.isInteger(p.mappings)) notes.push(`${name} settled with ${p.mappings} AppContainer mappings and ${p.packagesDirs} Packages folders after ${Math.round(p.quietMs / 1000)} s`)
+    // MC-1524: Windows' known drop of a first logon, followed by an attempt that succeeded, is expected: said so, briefly.
+    // Any other failed attempt, or a drop with no later success, stays in full.
+    const ok = (p.attempts || []).some(t => !t.why)
     for (const t of p.attempts || []) {
-      if (t.why) notes.push(`${name}'s logon attempt ${t.attempt} failed: ${t.why}; ${diagLine(t.diag)}`)
+      if (t.why && t.dropped && ok) notes.push(`${name}'s first logon was dropped by Windows (attempt ${t.attempt}), retried`)
+      else if (t.why) notes.push(`${name}'s logon attempt ${t.attempt} failed: ${t.why}; ${diagLine(t.diag)}`)
       else if (t.slow) notes.push(`${name}'s logon took ${Math.round(t.logonMs / 1000)} s; at ${Math.round(LOGON_SNAPSHOT_MS / 1000)} s: ${diagLine(t.slow)}`)
     }
   }
