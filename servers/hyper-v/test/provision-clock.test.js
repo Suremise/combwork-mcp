@@ -10,6 +10,7 @@ process.env.HYPERV_MCP_POLL_MS = '1'
 process.env.HYPERV_MCP_LOGON_STABLE_MS = '10'
 process.env.HYPERV_MCP_BUILD_LOGON_WAIT_MS = '60'
 process.env.HYPERV_MCP_LOGON_SNAPSHOT_MS = '30'
+process.env.HYPERV_MCP_FIRST_LOGON_SIGN_MS = '15'
 const test = require('node:test')
 const assert = require('assert')
 const { Helper } = require('../helper/core')
@@ -149,3 +150,83 @@ for (const [label, over] of [
     bounded(f.calls)
   })
 }
+
+// MC-1526: a logon that never begins: no logon event for the account on its new boot (an integer 0), the user never
+// seen. The host clock starts when the new boot is first seen (an answered probe); FIRST_LOGON_SIGN_MS (15 here) later
+// the attempt ends, and the build retries within the same deadline. Any sign of a logon latches the rule off for that
+// boot; a later boot starts the clock (and the latch) over; null counts and failed probes are never evidence.
+const silent = { sessions: [], user: false, armed: true, logons: 0, logoffs: 0 }
+
+test('a silent first logon (MC-1526) ends FIRST_LOGON_SIGN_MS after its new boot is first seen; the retry and its quiet fit in the deadline', async () => {
+  const f = fake({ session: (acc, n) => acc === 'hvadmin' && n === 1 ? silent : {} })
+  const out = await f.h.provisionProfiles(vm, creds, () => {})
+  const a = out.hvadmin.attempts
+  assert.deepStrictEqual(a.map(x => [x.attempt, x.silent, !!x.why]), [[1, true, true], [2, false, false]])
+  assert.match(a[0].why, /^no logon of hvadmin began within 0 s of its new boot being seen$/)
+  const s1 = f.calls.filter(c => c.op === 'guest-session' && c.account === 'hvadmin')
+  const firstSeen = s1[0].at + 5 // the first probe answers 5 ms after it starts
+  const diagAt = f.calls.find(c => c.op === 'guest-logon-diag' && c.account === 'hvadmin').at
+  assert.ok(diagAt >= firstSeen + 15, `not before the sign window (${diagAt})`)
+  assert.ok(diagAt < firstSeen + 15 + 10, `on the first probe after it, not at the 60 ms attempt ceiling (${diagAt})`)
+  assert.ok(out.hvadmin.quietMs >= 20, 'the retry got its full quiet')
+  bounded(f.calls)
+})
+
+test('a silent first logon (MC-1526): the old boot\'s probes never start the clock; it starts at the new boot', async () => {
+  // The first three probes still answer the old boot (the restart not yet seen), then the new boot, silent.
+  let k = 0
+  const f = fake({ session: (acc, n) => acc === 'hvadmin' && n === 1 ? (++k <= 3 ? { ...silent, boot: 'b0' } : silent) : {} })
+  await f.h.provisionProfiles(vm, creds, () => {}).catch(() => {}) // only the first attempt's timing matters here
+  const s1 = f.calls.filter(c => c.op === 'guest-session' && c.account === 'hvadmin')
+  const newBootSeen = s1[3].at + 5
+  // The attempt's end: the retry's logon (the slow-logon snapshot at 30 is another diag call, so not that).
+  const retryAt = f.calls.filter(c => c.op === 'guest-logon' && c.account === 'hvadmin')[1].at
+  assert.ok(retryAt >= newBootSeen + 15, `timed from the new boot, not the old one (${retryAt} vs ${newBootSeen})`)
+  bounded(f.calls)
+})
+
+test('a silent first logon (MC-1526): a boot change (the guest restarting by itself) starts the clock over', async () => {
+  // Silent on b1 for two probes, then the guest is on b1x (restarted): the window counts from b1x.
+  let k = 0
+  const f = fake({ session: (acc, n) => acc === 'hvadmin' && n === 1 ? (++k <= 2 ? silent : { ...silent, boot: 'b1x' }) : {} })
+  await f.h.provisionProfiles(vm, creds, () => {}).catch(() => {}) // only the first attempt's timing matters here
+  const s1 = f.calls.filter(c => c.op === 'guest-session' && c.account === 'hvadmin')
+  const restartSeen = s1[2].at + 5
+  const retryAt = f.calls.filter(c => c.op === 'guest-logon' && c.account === 'hvadmin')[1].at
+  assert.ok(retryAt >= restartSeen + 15, `timed from the restart (${retryAt} vs ${restartSeen})`)
+  bounded(f.calls)
+})
+
+test('a silent first logon (MC-1526): a failed probe is no evidence and no reset; the attempt still ends on the window', async () => {
+  let k = 0
+  const f = fake({ session: (acc, n) => { if (acc === 'hvadmin' && n === 1 && ++k === 2) throw new Error('injected'); return acc === 'hvadmin' && n === 1 ? silent : {} } })
+  const out = await f.h.provisionProfiles(vm, creds, () => {})
+  assert.strictEqual(out.hvadmin.attempts[0].silent, true)
+  const s1 = f.calls.filter(c => c.op === 'guest-session' && c.account === 'hvadmin')
+  const diagAt = f.calls.find(c => c.op === 'guest-logon-diag' && c.account === 'hvadmin').at
+  assert.ok(diagAt < s1[0].at + 5 + 15 + 10, `the window from the first answered probe (${diagAt})`)
+  bounded(f.calls)
+})
+
+for (const [label, over, waits] of [
+  ['the counts unreadable (null)', { logons: null }, true],
+  ['a logon event on the boot, the watcher late', { logons: 1 }, true],
+  ['the user seen once (then not)', null, true]
+]) {
+  test(`not silent (MC-1526): ${label}: the attempt waits on`, async () => {
+    let k = 0
+    const f = fake({ session: (acc, n) => acc !== 'hvadmin' || n !== 1 ? {} : over ? { ...silent, ...over } : (++k === 1 ? { ...silent, user: true } : silent) })
+    await f.h.provisionProfiles(vm, creds, () => {}).catch(() => {})
+    const s1 = f.calls.filter(c => c.op === 'guest-session' && c.account === 'hvadmin' && c.at < 60)
+    const a1 = f.calls.filter(c => c.op === 'guest-logon' && c.account === 'hvadmin')
+    assert.ok(s1.length > 6, `${label}: it kept checking past the sign window (${s1.length})`)
+    if (waits) assert.ok(a1.length === 1 || a1[1].at >= 60, `${label}: no retry before the attempt's own ceiling (${a1.map(x => x.at)})`)
+    bounded(f.calls)
+  })
+}
+
+test('a silent logon twice (MC-1526): both attempts fail and the build fails in full, inside the deadline', async () => {
+  const f = fake({ session: acc => acc === 'hvadmin' ? silent : {} })
+  await assert.rejects(f.h.provisionProfiles(vm, creds, () => {}), /provisioning hvadmin's profile failed twice: no logon of hvadmin began within 0 s of its new boot being seen/)
+  bounded(f.calls)
+})

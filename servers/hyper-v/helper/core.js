@@ -44,6 +44,9 @@ const PROVISION_WAIT_MS = Number(process.env.HYPERV_MCP_PROVISION_WAIT_MS || 30 
 // one retry; one that is still waiting at LOGON_SNAPSHOT_MS (the runtime limit) gets a read-only diagnostic snapshot.
 const BUILD_LOGON_WAIT_MS = Number(process.env.HYPERV_MCP_BUILD_LOGON_WAIT_MS || 15 * 60_000)
 const LOGON_SNAPSHOT_MS = Number(process.env.HYPERV_MCP_LOGON_SNAPSHOT_MS || 10 * 60_000)
+// MC-1526: a logon attempt with no logon event for the account this long after its new boot is first seen (host clock)
+// has not begun, and ends, for a retry (a build) or a failed start. Test-only override.
+const FIRST_LOGON_SIGN_MS = Number(process.env.HYPERV_MCP_FIRST_LOGON_SIGN_MS || 3 * 60_000)
 const DIAG_LOGS = ['lsm', 'security', 'winlogon', 'profile', 'shellCore', 'appReadinessAdmin', 'appReadinessOperational', 'cloudExperienceHost']
 const FIRST_LOGON_WORKERS = ['OneDriveSetup', 'UserOOBEBroker', 'msedgewebview2', 'CloudExperienceHostBroker', 'StartMenuExperienceHost', 'SearchHost']
 const USERINIT = 'C:\\Windows\\system32\\userinit.exe,' // Windows' own list, as the build's undo leaves it
@@ -1016,6 +1019,7 @@ class Helper {
         const o = await this.logon(vm, lease, interactive, creds)
         const again = 'vm_reset to try again, or vm_release and vm_acquire for another VM (one whose start failed is leased last).'
         const wait = Math.round(LOGON_WAIT_MS / 1000)
+        if (o.silent) { failed(`no logon of ${who} began within ${Math.round(FIRST_LOGON_SIGN_MS / 1000)} s of its new boot being seen`); throw new Error(`${vm.vmName} restarted to log ${who} on, but no logon of it began within ${Math.round(FIRST_LOGON_SIGN_MS / 1000)} s of the new boot being seen (no logon event for it on this boot). ${again}`) }
         if (o.loggedOff && o.unseen) { failed(`Windows logged ${who}'s logon off before it was seen`); throw new Error(`${vm.vmName} logged ${who} on, but Windows logged the session off again before the first check saw it (its logon and logoff events on this boot), and turned autologon off. ${again}`) }
         if (o.loggedOff) { failed(`${who} logged on, then Windows logged the session off`); throw new Error(`${vm.vmName} logged ${who} on (after ${(o.after / 1000).toFixed(1)} s), but Windows logged the session off again before its watcher started, and turned autologon off. ${again}`) }
         if (o.ms === undefined && o.user) { failed(`${who} logged on, but its watcher didn't start within ${wait} s`); throw new Error(`${vm.vmName} logged ${who} on, but its session's watcher didn't start within ${wait} s. ${again}`) }
@@ -1086,6 +1090,7 @@ class Helper {
     const t0 = this.now()
     let seen = null // { boot, at }: the watcher first seen on this boot
     let user = null // { boot, at }: the account first seen logged on, on this boot
+    let bootSeen = null // MC-1526: { boot, at, began }: the new boot first seen (host clock), and any sign of a logon on it
     let snapped = false
     // A start waits LOGON_WAIT_MS; a build's attempt (MC-1520) up to BUILD_LOGON_WAIT_MS within its deadline, with one
     // diagnostic snapshot (onSlow) once LOGON_SNAPSHOT_MS has passed.
@@ -1108,6 +1113,12 @@ class Helper {
         // MC-1524: a logon Windows dropped before any check saw it: this boot's own logon and logoff events for the
         // account, with the account gone and autologon disarmed. Unreadable events (null) are never evidence.
         if (!user && r.user === false && r.armed === false && r.logons >= 1 && r.logoffs >= 1 && Number.isInteger(r.logons) && Number.isInteger(r.logoffs)) return { loggedOff: true, after: null, unseen: true }
+        // MC-1526: a logon that never begins. The host clock starts when this new boot is first seen (a later boot
+        // starts it over, with the latch cleared); any sign of a logon on the boot (an event, the user) latches the rule
+        // off. Only an answered probe with an integer zero count, the user never seen, FIRST_LOGON_SIGN_MS on, ends it.
+        if (bootSeen?.boot !== r.boot) bootSeen = { boot: r.boot, at: this.now(), began: false }
+        if (r.user === true || (Number.isInteger(r.logons) && r.logons >= 1)) bootSeen.began = true
+        if (!bootSeen.began && !user && r.user === false && r.logons === 0 && this.now() - bootSeen.at >= FIRST_LOGON_SIGN_MS) return { silent: true }
       }
       if (r && r.boot !== before.boot && Array.isArray(r.sessions) && r.sessions.length) {
         if (seen?.boot === r.boot && this.now() - seen.at >= LOGON_STABLE_MS) return { ms: this.now() - t0, boot: r.boot }
@@ -1671,7 +1682,8 @@ class Helper {
         if (o.late) throw new Error(`${provisionLate(name).message}${slow ? ` (at ${Math.round(LOGON_SNAPSHOT_MS / 1000)} s: ${diagLine(slow)})` : ''}`)
         let why = null
         const waited = Math.round(BUILD_LOGON_WAIT_MS / 1000)
-        if (o.loggedOff && o.unseen) why = `Windows logged ${name}'s logon off before it was seen`
+        if (o.silent) why = `no logon of ${name} began within ${Math.round(FIRST_LOGON_SIGN_MS / 1000)} s of its new boot being seen`
+        else if (o.loggedOff && o.unseen) why = `Windows logged ${name}'s logon off before it was seen`
         else if (o.loggedOff) why = `${name} logged on, then Windows logged the session off`
         else if (o.ms === undefined) why = o.user ? `${name} logged on, but its watcher didn't start within ${waited} s` : `no interactive session of ${name} appeared within ${waited} s`
         let quiet = null
@@ -1681,7 +1693,7 @@ class Helper {
           if (quiet.lost) why = `${name}'s session was lost while its first-logon work ran`
         }
         const failed = why ? await diag() : null
-        attempts.push({ attempt, why, dropped: !!(o.loggedOff && o.unseen), logonMs: o.ms ?? null, slow, diag: failed })
+        attempts.push({ attempt, why, dropped: !!(o.loggedOff && o.unseen), silent: !!o.silent, logonMs: o.ms ?? null, slow, diag: failed })
         if (why) {
           step(`${name}'s logon attempt ${attempt} failed (${why}; ${diagLine(failed)})${attempt < 2 ? ', retrying' : ''}`)
           this.log(`${vm.vmName}: ${name}'s build logon attempt ${attempt} failed (${why}; ${diagLine(failed)})`)
@@ -1883,6 +1895,7 @@ function buildNote(profiles) {
     const ok = (p.attempts || []).some(t => !t.why)
     for (const t of p.attempts || []) {
       if (t.why && t.dropped && ok) notes.push(`${name}'s first logon was dropped by Windows (attempt ${t.attempt}), retried`)
+      else if (t.why && t.silent && ok) notes.push(`${name}'s first logon didn't begin (attempt ${t.attempt}), retried`)
       else if (t.why) notes.push(`${name}'s logon attempt ${t.attempt} failed: ${t.why}; ${diagLine(t.diag)}`)
       else if (t.slow) notes.push(`${name}'s logon took ${Math.round(t.logonMs / 1000)} s; at ${Math.round(LOGON_SNAPSHOT_MS / 1000)} s: ${diagLine(t.slow)}`)
     }
@@ -1964,7 +1977,7 @@ function describePlan(plan, digest, approve) {
   if (plan.image) lines.push(`- image: ${plan.image.edition}${plan.image.imageIndex > 1 ? ` (index ${plan.image.imageIndex})` : ''} build ${plan.image.build}, SHA-256 ${plan.image.sha256} (${plan.image.pinned ? 'pinned: a known Microsoft download' : plan.image.source === 'download' ? 'downloaded by the helper over HTTPS from Microsoft' : 'NOT AUTHENTICATED: a local file you chose to trust'})`)
   if (plan.add?.length) lines.push('- registry: a user\'s registry isn\'t forcibly unloaded at logoff (the DisableForceUnload policy): the suspected cause of runs losing their HKCU after the short PowerShell Direct session that started them ends (MC-1522; its real-build trial is MC-1521)')
   if (plan.add?.length) lines.push(`- Defender: the test work folders ${DEFENDER_EXCLUSIONS.join(', ')} are excluded from Defender's scanning (real-time and scheduled scans) in the guest image; Defender stays on otherwise`)
-  if (plan.add?.length) lines.push(`- provisioning: each new VM logs hvadmin and hvuser on interactively once (offline), waits for Windows' first-logon setup to finish, then turns autologon off and resets UAC and the watcher's start before its clean checkpoint; each account within ${Math.round(PROVISION_WAIT_MS / 60_000)} min (a logon attempt up to ${Math.round(BUILD_LOGON_WAIT_MS / 60_000)} min, then ${Math.round(PROVISION_QUIET_MS / 60_000)} min of observed quiet, one retry if needed)`)
+  if (plan.add?.length) lines.push(`- provisioning: each new VM logs hvadmin and hvuser on interactively once (offline), waits for Windows' first-logon setup to finish, then turns autologon off and resets UAC and the watcher's start before its clean checkpoint; each account within ${Math.round(PROVISION_WAIT_MS / 60_000)} min (a logon attempt up to ${Math.round(BUILD_LOGON_WAIT_MS / 60_000)} min once it has begun, one with no sign of a logon ${Math.round(FIRST_LOGON_SIGN_MS / 60_000)} min after its new boot is seen retried at once, then ${Math.round(PROVISION_QUIET_MS / 60_000)} min of observed quiet, one retry if needed)`)
   if (plan.activation === 'online-once') lines.push('- activation: each new VM goes online once, through Windows\' Default Switch, to activate Windows; it is disconnected (verified) before its clean checkpoint, and no start ever uses that switch')
   else if (plan.add?.length) lines.push('- activation: none (each new VM stays offline; its licence is read and shown)')
   if (plan.add?.length && plan.image && !plan.image.evaluation) lines.push(`- product key: ${plan.productKey ? 'the pool\'s (set by install.ps1 -ProductKeyFile), written only into the answer file' : 'none'}`)

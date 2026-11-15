@@ -266,7 +266,15 @@ function run(s, op, a) {
       // MC-1524: logonDroppedUnseen: n: the first n logons are dropped by Windows before any check (the account gone,
       // autologon cleared, this boot's LSM events show one logon and one logoff). droppedEvents overrides those counts
       // (null: the log unreadable). droppedArmed keeps autologon armed (a restart pending, not a logoff).
-      vm.lsm = { logons: 0, logoffs: 0 }
+      // A logon's own LSM event: there for every logon (logonNeverAppears too: its event, but no session to be seen).
+      // MC-1526: logonSilent: n: the first n logons never begin: no event, no user; autologon stays armed, or is absent
+      // (silentArmed: false). silentEvents overrides the count (null: the log unreadable).
+      vm.lsm = { logons: 1, logoffs: 0 }
+      if (s.logonSilent && (s.silentSoFar || 0) < s.logonSilent) {
+        s.silentSoFar = (s.silentSoFar || 0) + 1
+        vm.loggedOn = null; vm.armed = s.silentArmed !== false; vm.watcher = false
+        vm.lsm = s.silentEvents !== undefined ? s.silentEvents : { logons: 0, logoffs: 0 }
+      }
       if (s.logonDroppedUnseen && (s.droppedSoFar || 0) < s.logonDroppedUnseen) {
         s.droppedSoFar = (s.droppedSoFar || 0) + 1
         vm.loggedOn = null; vm.armed = !!s.droppedArmed

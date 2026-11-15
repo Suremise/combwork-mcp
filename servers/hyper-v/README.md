@@ -217,8 +217,12 @@ approval → change**:
      or the build fails. On a freshly installed guest, Windows logs hvadmin's first-ever logon off again within
      seconds, often before the helper's first check (MC-1521; what starts it is unknown). The check sees that from the
      boot's own session-manager logon and logoff events for the account, with the account gone and autologon off, and
-     the retry starts at once (MC-1524). The job's note then says the first logon was dropped by Windows and retried;
-     any other failed attempt, or a drop with no successful retry, is reported in full. A build's logon attempt waits up to 15 minutes (a start's waits 10). One still waiting at 10 minutes
+     the retry starts at once (MC-1524). A first logon can also never begin at all (MC-1525's trial: no logon event,
+     no session, for the whole attempt). So an attempt whose account has no logon event 3 minutes after its new boot
+     was first seen (by the host's clock) ends and is retried at once (MC-1526). The 15 minutes are the ceiling for
+     an attempt that has begun. Unreadable events and failed checks never count; a further restart starts the 3
+     minutes over. The job's note then says the first logon was dropped by Windows, or didn't begin, and was retried;
+     any other failed attempt, or either case with no successful retry, is reported in full. A build's logon attempt waits up to 15 minutes (a start's waits 10). One still waiting at 10 minutes
      gets a read-only snapshot of the guest, and a failed one a snapshot before its undo (MC-1520). The snapshot keeps
      allowlisted fields only: event ids and seconds after boot from the session-manager, Security, Winlogon, User
      Profile, Shell-Core, AppReadiness and CloudExperienceHost logs (a missing or disabled log is "unavailable"), the
@@ -583,7 +587,9 @@ there (0x8007045A, `ERROR_DLL_INIT_FAILED`). A logged-on user's session (1 or mo
     restored (below). If the account logs on and Windows then logs the session off again (and so turns autologon off),
     the start fails at once and says so, even when that happened before the first check (seen from that boot's own
     logon and logoff events for the account, MC-1524; unreadable events never count, nor a logoff while autologon is
-    still armed); one that logs on but whose watcher never starts says that instead. Either
+    still armed); one that logs on but whose watcher never starts says that instead. One whose logon never begins (no
+    logon event for the account 3 minutes after the new boot was first seen, MC-1526) fails then, rather than after
+    the full 10 minutes. Either
     marks the VM's start as failed, so `vm_acquire` gives another free VM first.
   - A restart keeps the guest's disk, so a work session's sync record stays right. The clean checkpoint isn't changed:
     every start without `interactive` is as before, and a restore (stop, release, the deadline, `vm_reset`) logs nobody
@@ -777,6 +783,7 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   the stub enforces like the guest), the checkpoint without any of it; quiet started over by a failed or busy sample;
   never quiet fails the build; a lost logon retried once after an undo, twice failing; a first logon Windows drops
   before any check (MC-1524) retried straight after its diagnosis and undo, noted as expected, twice failing in full;
+  a first logon that never begins (MC-1526) retried after the sign window, noted as expected, twice failing in full;
   an undo that doesn't verify
   (an explicit ACE left on `C:\hvmcp`, UAC still off) failing the build; Defender's exclusions (MC-1519) added after
   the profiles and before the checkpoint, exactly the four test folders, and a read-back missing one, with another, or
@@ -785,7 +792,10 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   account over its logon, quiet wait and retry, so a session lost near it gets no new allowance; every call bounded by
   the time left; nothing accepted that returns after the deadline (a logon's readiness, a quiet probe); a start's logon,
   with no deadline, keeps its own wait and timeouts; a slow build logon's snapshot at the threshold kept with the attempt
-  that then succeeds, and an unavailable one changing nothing (MC-1520). `provision.test.js` also covers a failed build
+  that then succeeds, and an unavailable one changing nothing (MC-1520); a dropped first logon (MC-1524) and a silent
+  one (MC-1526) ending on their evidence, the silent one timed from the new boot's first sighting (never the old
+  boot's), started over by a restart, not reset by a failed probe, never ended by unreadable counts, a logon event or
+  the user seen, and the retry with its full quiet inside the deadline. `provision.test.js` also covers a failed build
   logon diagnosed before its undo, its reason and allowlisted snapshot in the record and the job note (fields such as
   messages, command lines and passwords dropped), and an unavailable diagnosis; quiet waiting for the AppContainer
   counts to stop changing (recorded), and an unknown count never quiet; `interactive.test.js` runs hv.ps1's

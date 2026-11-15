@@ -84,6 +84,19 @@ test('a first logon Windows drops before any check (MC-1524): retried at once af
   assert.deepStrictEqual(vms(twice.sc), [])
 })
 
+test('a first logon that never begins (MC-1526): retried after the sign window, noted as expected; twice fails in full', async t => {
+  const once = await build(t, 'prov-silent-once', { logonSilent: 1 })
+  assert.match(once.line, /create finished/)
+  assert.match(once.line, /hvadmin's first logon didn't begin \(attempt 1\), retried/)
+  assert.doesNotMatch(once.line, /attempt 1 failed/)
+  const ready = once.sc.journal().find(r => r.t === 'ready')
+  assert.strictEqual(ready.profiles.hvadmin.attempts[0].silent, true)
+  assert.strictEqual(ready.profiles.hvadmin.attempts.length, 2)
+  const twice = await build(t, 'prov-silent-twice', { logonSilent: 2 })
+  assert.match(twice.line, /FAILED: .*provisioning hvadmin's profile failed twice: no logon of hvadmin began within 1 s of its new boot being seen/)
+  assert.deepStrictEqual(vms(twice.sc), [])
+})
+
 test('an undo that doesn\'t verify fails the build: a leftover explicit ACE on C:\\hvmcp, or UAC still off', async t => {
   const ace = await build(t, 'prov-undo-ace', { undoOverride: { hvmcpExplicitAces: 1 } })
   assert.match(ace.line, /undoing a build logon didn't verify: C:\\hvmcp has explicit or protected ACLs/)
@@ -158,7 +171,7 @@ test('a failed build logon whose diagnosis fails (MC-1520): recorded as unavaila
 test('quiet waits for the account\'s AppContainer counts to stop changing (MC-1520); they\'re recorded; the plan names the budget', async t => {
   const { sc, plan, line } = await build(t, 'prov-counts', { profileGrow: 4 })
   assert.match(line, /create finished/)
-  assert.match(plan.text, /each account within \d+ min \(a logon attempt up to \d+ min, then \d+ min of observed quiet, one retry if needed\)/)
+  assert.match(plan.text, /each account within \d+ min \(a logon attempt up to \d+ min once it has begun, one with no sign of a logon \d+ min after its new boot is seen retried at once, then \d+ min of observed quiet, one retry if needed\)/)
   for (const who of ['hvadmin', 'hvuser']) assert.ok(vms(sc)[0].provisioned.filter(a => a === who).length >= 6, `${who}: 4 changing samples, then quiet`)
   const p = sc.journal().find(r => r.t === 'ready').profiles
   assert.deepStrictEqual([p.hvadmin.mappings, p.hvadmin.packagesDirs, p.hvuser.mappings, p.hvuser.packagesDirs], [64, 29, 64, 29])
