@@ -356,6 +356,19 @@ $GuestProvisioned = {
   @{ boot = $boot; user = ($procs.Count -gt 0); lastEvent = $last; count = $pk.Count; inventory = $inventory; busy = $busy }
 }
 
+# MC-1519 (the user's decision): the test work folders excluded from Defender's scanning (an ExclusionPath: real-time
+# and scheduled scans), in the guest image only. The user's chosen mitigation for an intermittent load failure of a
+# just-written large exe; Defender's part in it is suspected, not established. Defender stays on otherwise. It reads
+# back the exclusions and Defender's state for the helper to check.
+$GuestDefender = {
+  param($paths)
+  $ErrorActionPreference = 'Stop'
+  Add-MpPreference -ExclusionPath ([string[]]$paths)
+  $p = Get-MpPreference
+  $s = Get-MpComputerStatus
+  @{ exclusions = @($p.ExclusionPath | Where-Object { $_ }); realTime = [bool]$s.RealTimeProtectionEnabled; service = [bool]$s.AMServiceEnabled; tamper = [bool]$s.IsTamperProtected }
+}
+
 # The guest's boot time and the sessions (>= 1) in which the account's watcher runs: its interactive logon, ready for runs.
 # Also (MC-1518) whether the account is logged on at all (any process of it in a session >= 1) and whether autologon is
 # still armed (Winlogon clears AutoAdminLogon when the session is logged off): together, "logged on, then logged off".
@@ -513,6 +526,10 @@ try {
     'guest-provisioned' {
       $vm = Get-OwnVm $a
       Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestProvisioned -ArgumentList ([string]$a.account), ([int]$a.quietMs)
+    }
+    'guest-defender' {
+      $vm = Get-OwnVm $a
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestDefender -ArgumentList (,[string[]]@($a.paths))
     }
     'guest-licence' {
       $vm = Get-OwnVm $a

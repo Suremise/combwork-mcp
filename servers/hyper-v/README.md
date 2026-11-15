@@ -209,6 +209,13 @@ approval → change**:
      back Windows' own `Userinit` and recreates `C:\hvmcp` empty with inherited permissions only, so the next logon
      starts clean and the checkpoint keeps none of it. The profiles stay, so an interactive start doesn't replay
      first-logon work (it took 2–5 minutes, and sometimes failed);
+   - then **Defender exclusions** for the test work folders `C:\build`, `C:\out`, `C:\trial-session` and `C:\hvmcp`
+     (MC-1519): the user's chosen mitigation for an intermittent failure to load a freshly written large exe
+     (E_UNEXPECTED). Defender's scan of the new file is suspected, not established. They're read back, and the build
+     fails unless exactly those four are excluded and real-time protection is still on: Defender stays on for
+     everything else. The trade-off: an exclusion path takes those folders out of Defender's real-time **and**
+     scheduled scans, which matters less in a guest that is offline and restored after every lease. Nothing changes on
+     the host;
    - and the clean checkpoint, taken with the VM off and its adapter disconnected.
 
 **Rebuilding.** An evaluation VM lasts about 90 days from its activation at build; `vm_status` and `pool_status` show
@@ -740,7 +747,9 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   first-logon work waited out, a verified undo after each (hvuser's logon with UAC on and Windows' own Userinit, which
   the stub enforces like the guest), the checkpoint without any of it; quiet started over by a failed or busy sample;
   never quiet fails the build; a lost logon retried once after an undo, twice failing; an undo that doesn't verify
-  (an explicit ACE left on `C:\hvmcp`, UAC still off) failing the build.
+  (an explicit ACE left on `C:\hvmcp`, UAC still off) failing the build; Defender's exclusions (MC-1519) added after
+  the profiles and before the checkpoint, exactly the four test folders, and a read-back missing one, with another, or
+  with real-time protection off failing the build.
 - `provision-clock.test.js`, the real provisioning and logon methods on a fake clock: one provisioning deadline per
   account over its logon, quiet wait and retry, so a session lost near it gets no new allowance; every call bounded by
   the time left; nothing accepted that returns after the deadline (a logon's readiness, a quiet probe); a start's logon,
