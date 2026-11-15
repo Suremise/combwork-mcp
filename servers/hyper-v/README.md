@@ -741,9 +741,10 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   the stub enforces like the guest), the checkpoint without any of it; quiet started over by a failed or busy sample;
   never quiet fails the build; a lost logon retried once after an undo, twice failing; an undo that doesn't verify
   (an explicit ACE left on `C:\hvmcp`, UAC still off) failing the build.
-- `provision-clock.test.js`, the same methods on a fake clock: one provisioning deadline per account, so a session lost
-  near it gets no new allowance on its retry; each probe's call bounded by the time left; nothing accepted from a probe
-  that returns after the deadline.
+- `provision-clock.test.js`, the real provisioning and logon methods on a fake clock: one provisioning deadline per
+  account over its logon, quiet wait and retry, so a session lost near it gets no new allowance; every call bounded by
+  the time left; nothing accepted that returns after the deadline (a logon's readiness, a quiet probe); a start's logon,
+  with no deadline, keeps its own wait and timeouts.
 - `projects.test.js`, sharing the pool: one shared pool with no projects; caps (one project at its cap refused while
   another still gets its VM); the line, first come first served, a capped waiter passed over keeping its place, an abandoned
   wait never given a VM and its place expiring, a repeat call keeping its place, a disconnect leaving it, a resize

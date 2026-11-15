@@ -1022,20 +1022,28 @@ class Helper {
    * over). Only an answered probe on that same boot saying the account is gone and autologon is no longer armed (Winlogon
    * clears it at a logoff) ends the wait early, as "logged off"; a failed probe is never evidence. Returns { ms }, or
    * { loggedOff: true, after } (ms from the start of the wait to its logon being seen), or { user } once the wait is up.
+   * MC-1516: the build passes its account's provisioning deadline: every call and sleep is then bounded by the time left,
+   * nothing that returns after it is accepted, and { late: true } is returned once it has passed. A start passes none.
    */
-  async logon(vm, lease, which, creds) {
+  async logon(vm, lease, which, creds, deadline = null) {
     const account = creds[which]
-    // A start's logon is the lease's (its calls end with it); the build's (MC-1516) has no lease.
-    const opts = ms => lease ? this.forLease(lease, ms) : { timeoutMs: ms }
+    // A start's logon is the lease's (its calls end with it); the build's (MC-1516) has no lease, but a deadline.
+    const left = ms => deadline === null ? ms : Math.max(1, Math.min(ms, deadline - this.now()))
+    const late = () => deadline !== null && this.now() >= deadline
+    const opts = ms => lease ? this.forLease(lease, ms) : { timeoutMs: left(ms) }
     const held = () => { if (lease) this.stillHeld(lease) }
+    if (late()) return { late: true }
     const before = await this.hv('guest-logon', { ...this.ident(vm), cred: creds.admin, logon: account, elevated: which === 'admin' }, opts(120_000))
+    if (late()) return { late: true }
     const t0 = this.now()
     let seen = null // { boot, at }: the watcher first seen on this boot
     let user = null // { boot, at }: the account first seen logged on, on this boot
     while (this.now() - t0 < LOGON_WAIT_MS) {
+      if (late()) return { late: true }
       held()
       const r = await this.hv('guest-session', { ...this.ident(vm), cred: creds.admin, account: account.user }, opts(60_000)).catch(() => null)
       held()
+      if (late()) return { late: true }
       if (r && r.boot !== before.boot) {
         if (user && user.boot !== r.boot) user = null
         if (r.user === true && !user) user = { boot: r.boot, at: this.now() - t0 }
@@ -1045,7 +1053,7 @@ class Helper {
         if (seen?.boot === r.boot && this.now() - seen.at >= LOGON_STABLE_MS) return { ms: this.now() - t0, boot: r.boot }
         if (seen?.boot !== r.boot) seen = { boot: r.boot, at: this.now() }
       } else seen = null
-      await sleep(POLL_MS)
+      await sleep(deadline === null ? POLL_MS : Math.min(POLL_MS, Math.max(0, deadline - this.now())))
     }
     return { user: !!user }
   }
@@ -1566,7 +1574,8 @@ class Helper {
       for (let attempt = 1; ; attempt++) {
         if (this.now() >= deadline) throw provisionLate(name)
         step(`logging ${name} on${attempt > 1 ? ' (again)' : ''}`)
-        const o = await this.logon(vm, null, which, creds)
+        const o = await this.logon(vm, null, which, creds, deadline)
+        if (o.late) throw provisionLate(name)
         let why = null
         if (o.loggedOff) why = `${name} logged on, then Windows logged the session off`
         else if (o.ms === undefined) why = o.user ? `${name} logged on, but its watcher didn't start within ${Math.round(LOGON_WAIT_MS / 1000)} s` : `no interactive session of ${name} appeared within ${Math.round(LOGON_WAIT_MS / 1000)} s`
