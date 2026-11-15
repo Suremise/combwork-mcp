@@ -206,17 +206,29 @@ $GuestSetup = {
   @{ editionId = $cv.EditionID; build = $cv.CurrentBuild; ubr = $cv.UBR }
 }
 
+# The guest's Winlogon Userinit list with the session's watcher added (MC-1518), from its current value; pure, so the
+# tests run it. Only Windows' own list is accepted (userinit.exe alone, any case, trailing comma or not): anything else,
+# missing included, is refused, and $GuestLogon works this out before it changes anything. Winlogon starts each listed
+# program in the new session at logon, as the account; the watcher by absolute paths, in the admin-only C:\hvmcp.
+$UserinitValue = {
+  param($current)
+  $canonical = 'C:\Windows\system32\userinit.exe'
+  if (-not ($current -is [string]) -or ($current.Trim().TrimEnd(',').Trim() -ine $canonical)) { throw "unexpected Userinit in the guest ('$current'): only Windows' own is changed" }
+  "$canonical,C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\hvmcp\agent.ps1,"
+}
+
 # vm_start's interactive logon (MC-1503, MC-1504): Winlogon autologon of one guest account at the next boot, its password
 # as the LSA secret DefaultPassword (readable only by SYSTEM and admins; not the registry value, which Users can read),
 # the first-logon animation and privacy questions off, and the session's watcher (guest-agent.ps1, as C:\hvmcp\agent.ps1)
-# started at logon by an HKLM Run entry. C:\hvmcp is made admin-only (Users read and execute) so no user can change the
-# watcher or a wrapper it starts; C:\hvmcp\user is where a standard user's session-0 runs stage their scripts; req is
-# where requests are published, writable by the logged-on account only so its watcher can claim them. For an admin
-# logon ($elevated), UAC's Admin Approval Mode is turned off (EnableLUA 0), so the admin's session, and its watcher, are
-# elevated. Then a restart. All of it is inside the throwaway guest: the next restore of the clean checkpoint takes it
-# away.
+# started at logon from Winlogon's Userinit list ($UserinitValue, MC-1518: before and apart from Explorer, whose Run
+# entries wait for a new desktop to settle, minutes on a first logon). C:\hvmcp is made admin-only (Users read and
+# execute) so no user can change the watcher or a wrapper it starts; C:\hvmcp\user is where a standard user's session-0
+# runs stage their scripts; req is where requests are published, writable by the logged-on account only so its watcher
+# can claim them. For an admin logon ($elevated), UAC's Admin Approval Mode is turned off (EnableLUA 0), so the admin's
+# session, and its watcher, are elevated. Then a restart. All of it is inside the throwaway guest: the next restore of
+# the clean checkpoint takes it away.
 $GuestLogon = {
-  param($u, $p, $elevated, $agent)
+  param($u, $p, $elevated, $agent, $userinitText)
   $ErrorActionPreference = 'Stop'
   if (-not ('HvLsa' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -241,6 +253,8 @@ public static class HvLsa {
 '@
   }
   $wl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+  # The watcher's start at logon (MC-1518), worked out first: an unexpected Userinit refuses before anything changes.
+  $userinit = & ([scriptblock]::Create($userinitText)) (Get-ItemProperty -Path $wl -Name Userinit -ErrorAction SilentlyContinue).Userinit
   Set-ItemProperty -Path $wl -Name AutoAdminLogon -Value '1'
   Set-ItemProperty -Path $wl -Name DefaultUserName -Value $u
   Set-ItemProperty -Path $wl -Name DefaultDomainName -Value $env:COMPUTERNAME
@@ -256,7 +270,8 @@ public static class HvLsa {
   & $icacls C:\hvmcp\user C:\hvmcp\user /grant '*S-1-5-32-545:(OI)(CI)M'
   & $icacls C:\hvmcp\req C:\hvmcp\req /inheritance:r /grant:r '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-18:(OI)(CI)F' "${u}:(OI)(CI)M"
   [IO.File]::WriteAllText('C:\hvmcp\agent.ps1', [string]$agent, (New-Object Text.UTF8Encoding $false))
-  Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name hvmcp-agent -Value 'powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\hvmcp\agent.ps1'
+  Set-ItemProperty -Path $wl -Name Userinit -Value $userinit
+  Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name hvmcp-agent -ErrorAction SilentlyContinue
   $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
   # A short delay, so this call returns before the guest goes down.
   & shutdown.exe /r /t 3 /f /d p:4:1 | Out-Null
@@ -283,12 +298,16 @@ $GuestLicence = {
 }
 
 # The guest's boot time and the sessions (>= 1) in which the account's watcher runs: its interactive logon, ready for runs.
+# Also (MC-1518) whether the account is logged on at all (any process of it in a session >= 1) and whether autologon is
+# still armed (Winlogon clears AutoAdminLogon when the session is logged off): together, "logged on, then logged off".
 $GuestSession = {
   param($u)
   $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
   $ids = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object {
     $_.SessionId -ge 1 -and $_.CommandLine -match 'C:\\hvmcp\\agent\.ps1' -and (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User -eq $u } | ForEach-Object { [int]$_.SessionId })
-  @{ boot = $boot; sessions = $ids }
+  $user = [bool](@(Get-Process -IncludeUserName -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -ge 1 -and $_.UserName -like "*\$u" }).Count)
+  $armed = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction SilentlyContinue).AutoAdminLogon -eq '1'
+  @{ boot = $boot; sessions = $ids; user = $user; armed = $armed }
 }
 
 # Windows' built-in NAT switch (fixed id). Used only by a build's one approved online step (guest-activate) and by
@@ -426,7 +445,7 @@ try {
     'guest-logon' {
       $vm = Get-OwnVm $a
       $agent = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'guest-agent.ps1'))
-      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestLogon -ArgumentList ([string]$a.logon.user), ([string]$a.logon.password), ([bool]$a.elevated), $agent
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestLogon -ArgumentList ([string]$a.logon.user), ([string]$a.logon.password), ([bool]$a.elevated), $agent, $UserinitValue.ToString()
     }
     'guest-licence' {
       $vm = Get-OwnVm $a

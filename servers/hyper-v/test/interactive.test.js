@@ -254,3 +254,70 @@ test('a VM whose start just failed is leased last: a retry gets another free VM;
   assert.doesNotMatch(await lineOf(first), /last start failed/)
   assert.match(await lineOf(other), /its last start failed/)
 })
+
+// MC-1518: the watcher starts from Winlogon's Userinit list. hv.ps1's own $UserinitValue, run for real (Windows
+// PowerShell 5.1): only Windows' list is changed, to exactly that list plus the watcher by absolute paths.
+const { spawnSync } = require('child_process')
+const { ps51Env } = require('../helper/hv')
+const HV_PS = fs.readFileSync(path.join(__dirname, '..', 'helper', 'hv.ps1'), 'utf8')
+const USERINIT_BLOCK = (() => { const s = HV_PS.indexOf('\n$UserinitValue = {'); const e = s < 0 ? -1 : HV_PS.indexOf('\n}\n', s + 1); return e < 0 ? null : HV_PS.slice(s + 1, e + 3) })()
+const WATCHER_LIST = String.raw`C:\Windows\system32\userinit.exe,C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File C:\hvmcp\agent.ps1,`
+
+test('Userinit (MC-1518), for real: Windows\' own list, any case, with or without its comma, gets exactly the watcher added; anything else is refused', { skip: process.platform !== 'win32' || !USERINIT_BLOCK }, () => {
+  const cases = [
+    [String.raw`C:\Windows\system32\userinit.exe,`, WATCHER_LIST],
+    [String.raw`C:\Windows\system32\userinit.exe`, WATCHER_LIST],
+    [String.raw`c:\windows\SYSTEM32\USERINIT.EXE,`, WATCHER_LIST],
+    [String.raw` C:\Windows\system32\userinit.exe, `, WATCHER_LIST],
+    [null, 'REFUSED'], ['', 'REFUSED'], [String.raw`C:\Windows\system32\userinit.exe,C:\evil.exe,`, 'REFUSED'],
+    [WATCHER_LIST, 'REFUSED'], ['userinit.exe,', 'REFUSED']
+  ]
+  const sc = scratch('userinit')
+  const file = path.join(sc.dir, 'userinit.ps1')
+  const lines = cases.map(([v]) => `try { $r = & $UserinitValue ${v === null ? '$null' : `'${v.replace(/'/g, "''")}'`}; 'OUT:' + $r } catch { 'OUT:REFUSED ' + $_.Exception.Message }`)
+  fs.writeFileSync(file, `${USERINIT_BLOCK}\n${lines.join('\n')}\n`)
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: ps51Env(), timeout: 60_000 })
+  const out = r.stdout.split(/\r?\n/).filter(l => l.startsWith('OUT:')).map(l => l.slice(4))
+  assert.strictEqual(out.length, cases.length, r.stdout + r.stderr)
+  cases.forEach(([v, want], i) => {
+    if (want === 'REFUSED') assert.match(out[i], /^REFUSED unexpected Userinit in the guest/, `refused: ${v}`)
+    else assert.strictEqual(out[i], want, `for ${v}`)
+  })
+  // $GuestLogon works it out before any change, writes it, and drops the old Run entry.
+  const start = HV_PS.indexOf('\n$GuestLogon = {')
+  const logon = HV_PS.slice(start, HV_PS.indexOf('\n$GuestSession = {', start)) // its C# class has lines of only "}"
+  assert.ok(logon.indexOf('$userinit = & ([scriptblock]::Create($userinitText))') > 0, 'computed in $GuestLogon')
+  assert.ok(logon.indexOf('$userinit = & ([scriptblock]::Create($userinitText))') < logon.indexOf('Set-ItemProperty -Path $wl -Name AutoAdminLogon'), 'refused before anything changes')
+  assert.ok(logon.includes('Set-ItemProperty -Path $wl -Name Userinit -Value $userinit'))
+  assert.ok(logon.includes(String.raw`Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name hvmcp-agent`))
+  assert.ok(!/Set-ItemProperty[^\n]*CurrentVersion\\Run/.test(logon), 'no Run entry written')
+})
+
+/** A session with a 1-VM pool, its stub set for this logon case before the start. */
+async function logonCase(t, name, stub) {
+  const { sc, s } = await session(t, name)
+  sc.patchStub(st => Object.assign(st, stub))
+  return { sc, s, r: await s.call('vm_start', { interactive: 'admin' }) }
+}
+
+test('logon outcomes (MC-1518): logged on then logged off fails fast and says so; a late watcher still passes; logged on with no watcher is named', async t => {
+  const off = await logonCase(t, 'ia-loggedoff', { logonThenLogoff: 2 })
+  assert.ok(off.r.isError)
+  assert.match(off.r.text, /logged hvadmin on \(after \d+\.\d s\), but Windows logged the session off again before its watcher started, and turned autologon off\. vm_reset to try again/)
+  assert.ok(Object.values(off.sc.stub().vms)[0].sessionChecks <= 3, 'it failed fast, not at the end of the wait')
+  assert.match((await off.s.call('vm_status')).text, /its last start failed at \S+ \(hvadmin logged on, then Windows logged the session off\)/)
+  const late = await logonCase(t, 'ia-late', { watcherLate: 5 })
+  assert.ok(!late.r.isError, late.r.text)
+  assert.match(late.r.text, /hvadmin logged on interactively/)
+  const never = await logonCase(t, 'ia-never', { watcherNever: true })
+  assert.ok(never.r.isError)
+  assert.match(never.r.text, /logged hvadmin on, but its session's watcher didn't start within 3 s/)
+})
+
+test('logon observations are per boot (MC-1518): the guest restarting by itself while logged on, or a failed probe, is never taken for a logoff', async t => {
+  const restart = await logonCase(t, 'ia-selfrestart', { restartBeforeWatcher: true })
+  assert.ok(!restart.r.isError, restart.r.text)
+  assert.match(restart.r.text, /hvadmin logged on interactively/)
+  const probe = await logonCase(t, 'ia-probe', { watcherLate: 4, sessionFailAt: 2 })
+  assert.ok(!probe.r.isError, probe.r.text)
+})
