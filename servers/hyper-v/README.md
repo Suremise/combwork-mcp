@@ -644,7 +644,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\projects.test.js test\images.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\projects.test.js test\images.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
 ```
 
 - `units.test.js`:
@@ -741,6 +741,9 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   the stub enforces like the guest), the checkpoint without any of it; quiet started over by a failed or busy sample;
   never quiet fails the build; a lost logon retried once after an undo, twice failing; an undo that doesn't verify
   (an explicit ACE left on `C:\hvmcp`, UAC still off) failing the build.
+- `provision-clock.test.js`, the same methods on a fake clock: one provisioning deadline per account, so a session lost
+  near it gets no new allowance on its retry; each probe's call bounded by the time left; nothing accepted from a probe
+  that returns after the deadline.
 - `projects.test.js`, sharing the pool: one shared pool with no projects; caps (one project at its cap refused while
   another still gets its VM); the line, first come first served, a capped waiter passed over keeping its place, an abandoned
   wait never given a VM and its place expiring, a repeat call keeping its place, a disconnect leaving it, a resize

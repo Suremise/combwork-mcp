@@ -1555,13 +1555,16 @@ class Helper {
    * work let finish, so the clean checkpoint holds provisioned profiles and an interactive start doesn't replay it.
    * hvadmin, then hvuser; a verified undo after each (and before a retry), so the next logon sees Windows' own Userinit
    * and the intended UAC state, and the checkpoint keeps no autologon, password, UAC change or watcher grants. A lost
-   * logon is retried once per account. Returns what was observed, per account.
+   * logon is retried once per account, within the same PROVISION_WAIT_MS deadline: a retry gets no new allowance.
+   * Returns what was observed, per account.
    */
   async provisionProfiles(vm, creds, step) {
     const out = {}
     for (const which of ['admin', 'user']) {
       const name = creds[which].user
+      const deadline = this.now() + PROVISION_WAIT_MS // the account's one provisioning budget, retry included
       for (let attempt = 1; ; attempt++) {
+        if (this.now() >= deadline) throw provisionLate(name)
         step(`logging ${name} on${attempt > 1 ? ' (again)' : ''}`)
         const o = await this.logon(vm, null, which, creds)
         let why = null
@@ -1570,7 +1573,7 @@ class Helper {
         let quiet = null
         if (!why) {
           step(`waiting for ${name}'s first-logon work to finish`)
-          quiet = await this.waitProvisioned(vm, creds, name, o.boot)
+          quiet = await this.waitProvisioned(vm, creds, name, o.boot, deadline)
           if (quiet.lost) why = `${name}'s session was lost while its first-logon work ran`
         }
         await this.undoLogon(vm, creds)
@@ -1586,13 +1589,17 @@ class Helper {
    * of consecutive good samples (all probes answered, the account logged on, on the logon's boot) with no newer AppX
    * deployment event, no change to its package inventory and no busy first-logon worker. A failed probe or a busy one
    * starts the quiet time over; a changed boot or the account gone is { lost }. This is observed quiescence, not proof.
+   * Everything is bounded by the account's deadline: each probe's call by the time left, and nothing it returns once
+   * the deadline has passed is accepted.
    */
-  async waitProvisioned(vm, creds, account, boot) {
+  async waitProvisioned(vm, creds, account, boot, deadline) {
     const t0 = this.now()
     let last = null
     let quietSince = null
-    while (this.now() - t0 < PROVISION_WAIT_MS) {
-      const r = await this.hv('guest-provisioned', { ...this.ident(vm), cred: creds.admin, account, quietMs: PROVISION_QUIET_MS }, { timeoutMs: 120_000 }).catch(() => null)
+    while (this.now() < deadline) {
+      const left = deadline - this.now()
+      const r = await this.hv('guest-provisioned', { ...this.ident(vm), cred: creds.admin, account, quietMs: PROVISION_QUIET_MS }, { timeoutMs: Math.max(1, Math.min(120_000, left)) }).catch(() => null)
+      if (this.now() >= deadline) break
       if (r && (r.boot !== boot || r.user === false)) return { lost: true }
       const good = !!r && r.user === true && typeof r.inventory === 'string' && Array.isArray(r.busy)
       const busy = !good || r.busy.length > 0 || (last && (r.lastEvent !== last.lastEvent || r.inventory !== last.inventory))
@@ -1600,9 +1607,9 @@ class Helper {
       if (busy) quietSince = null
       else if (quietSince === null) quietSince = this.now()
       if (!busy && this.now() - quietSince >= PROVISION_QUIET_MS) return { ms: this.now() - t0, count: r.count, inventory: r.inventory }
-      await sleep(PROVISION_POLL_MS)
+      await sleep(Math.min(PROVISION_POLL_MS, Math.max(0, deadline - this.now())))
     }
-    throw new Error(`${account}'s first-logon provisioning didn't settle within ${Math.round(PROVISION_WAIT_MS / 1000)} s`)
+    throw provisionLate(account)
   }
 
   /** MC-1516: hv.ps1 'guest-logon-undo', every value read back and checked; any mismatch fails the build. */
@@ -1717,6 +1724,11 @@ const PROTOCOL = 'hyperv-mcp/3' // 2: renew, sync_plan, sync (MC-1497); 3: start
 // acquire's os and image, per-OS shares, a project's image allowlist (MC-1502).
 const FEATURES = ['projects', 'images']
 const DAY_MS = 24 * 60 * 60 * 1000
+
+/** MC-1516: an account's provisioning budget, retry included, ran out. */
+function provisionLate(account) {
+  return new Error(`${account}'s first-logon provisioning didn't settle within ${Math.round(PROVISION_WAIT_MS / 1000)} s`)
+}
 
 /** An evaluation VM's recorded end (ms), or null: an own copy, or a VM built before licences were recorded. */
 function evalEnd(vm) {
