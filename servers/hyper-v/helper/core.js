@@ -40,6 +40,12 @@ const LOGON_STABLE_MS = Number(process.env.HYPERV_MCP_LOGON_STABLE_MS || 10_000)
 const PROVISION_QUIET_MS = Number(process.env.HYPERV_MCP_PROVISION_QUIET_MS || 2 * 60_000)
 const PROVISION_POLL_MS = Number(process.env.HYPERV_MCP_PROVISION_POLL_MS || 15_000)
 const PROVISION_WAIT_MS = Number(process.env.HYPERV_MCP_PROVISION_WAIT_MS || 20 * 60_000)
+// MC-1520: a build-time logon attempt waits up to BUILD_LOGON_WAIT_MS (within the account's deadline), leaving room for
+// one retry; one that is still waiting at LOGON_SNAPSHOT_MS (the runtime limit) gets a read-only diagnostic snapshot.
+const BUILD_LOGON_WAIT_MS = Number(process.env.HYPERV_MCP_BUILD_LOGON_WAIT_MS || 15 * 60_000)
+const LOGON_SNAPSHOT_MS = Number(process.env.HYPERV_MCP_LOGON_SNAPSHOT_MS || 10 * 60_000)
+const DIAG_LOGS = ['lsm', 'security', 'winlogon', 'profile', 'shellCore', 'appReadinessAdmin', 'appReadinessOperational', 'cloudExperienceHost']
+const FIRST_LOGON_WORKERS = ['OneDriveSetup', 'UserOOBEBroker', 'msedgewebview2', 'CloudExperienceHostBroker', 'StartMenuExperienceHost', 'SearchHost']
 const USERINIT = 'C:\\Windows\\system32\\userinit.exe,' // Windows' own list, as the build's undo leaves it
 // MC-1519 (the user's decision): the guest's test work folders, excluded from Defender's scanning at build (real-time
 // and scheduled scans: an ExclusionPath). The user's chosen mitigation for an intermittent load failure of a freshly
@@ -1029,7 +1035,7 @@ class Helper {
    * MC-1516: the build passes its account's provisioning deadline: every call and sleep is then bounded by the time left,
    * nothing that returns after it is accepted, and { late: true } is returned once it has passed. A start passes none.
    */
-  async logon(vm, lease, which, creds, deadline = null) {
+  async logon(vm, lease, which, creds, deadline = null, onSlow = null) {
     const account = creds[which]
     // A start's logon is the lease's (its calls end with it); the build's (MC-1516) has no lease, but a deadline.
     const left = ms => deadline === null ? ms : Math.max(1, Math.min(ms, deadline - this.now()))
@@ -1042,8 +1048,17 @@ class Helper {
     const t0 = this.now()
     let seen = null // { boot, at }: the watcher first seen on this boot
     let user = null // { boot, at }: the account first seen logged on, on this boot
-    while (this.now() - t0 < LOGON_WAIT_MS) {
+    let snapped = false
+    // A start waits LOGON_WAIT_MS; a build's attempt (MC-1520) up to BUILD_LOGON_WAIT_MS within its deadline, with one
+    // diagnostic snapshot (onSlow) once LOGON_SNAPSHOT_MS has passed.
+    const limit = deadline === null ? LOGON_WAIT_MS : BUILD_LOGON_WAIT_MS
+    while (this.now() - t0 < limit) {
       if (late()) return { late: true }
+      if (deadline !== null && onSlow && !snapped && this.now() - t0 >= LOGON_SNAPSHOT_MS) {
+        snapped = true
+        await onSlow().catch(() => {})
+        if (late()) return { late: true }
+      }
       held()
       const r = await this.hv('guest-session', { ...this.ident(vm), cred: creds.admin, account: account.user }, opts(60_000)).catch(() => null)
       held()
@@ -1505,8 +1520,8 @@ class Helper {
     for (const [k, a] of (plan.add || []).entries()) {
       const label = `VM ${k + 1} of ${plan.add.length} (${a.name})`
       try {
-        await this.createVm(job, plan, a, label)
-        done.push(`created ${a.name}`)
+        const note = await this.createVm(job, plan, a, label)
+        done.push(`created ${a.name}${note ? ` (${note})` : ''}`)
       } catch (e) {
         job.progress = `${label} failed (${e.message}); rolling it back`
         const intent = this.state.intents.get(a.intentId)
@@ -1562,6 +1577,7 @@ class Helper {
     const bad = baselineProblem(facts, { ...vm, cleanCheckpointId: cp.checkpointId })
     if (bad) throw new Error(`its clean baseline doesn't verify: ${bad}`)
     this.journal.append({ t: 'ready', intentId: a.intentId, vmId: vm.vmId, cleanCheckpointId: cp.checkpointId, licence, profiles, defender })
+    return buildNote(profiles)
   }
 
   /**
@@ -1593,23 +1609,43 @@ class Helper {
     for (const which of ['admin', 'user']) {
       const name = creds[which].user
       const deadline = this.now() + PROVISION_WAIT_MS // the account's one provisioning budget, retry included
+      const attempts = [] // MC-1520: each attempt's outcome, a slow one's snapshot and a failed one's diagnosis
       for (let attempt = 1; ; attempt++) {
         if (this.now() >= deadline) throw provisionLate(name)
         step(`logging ${name} on${attempt > 1 ? ' (again)' : ''}`)
-        const o = await this.logon(vm, null, which, creds, deadline)
-        if (o.late) throw provisionLate(name)
+        // MC-1520: a read-only snapshot of the guest when the attempt is slow, and before the undo when it failed.
+        const diag = async () => {
+          const left = deadline - this.now()
+          if (left <= 0) return { unavailable: true }
+          const r = await this.hv('guest-logon-diag', { ...this.ident(vm), cred: creds.admin, account: name }, { timeoutMs: Math.max(1, Math.min(60_000, left)) }).catch(() => null)
+          return diagSummary(r)
+        }
+        let slow = null
+        const o = await this.logon(vm, null, which, creds, deadline, async () => {
+          slow = await diag()
+          step(`${name}'s logon is still waiting at ${Math.round(LOGON_SNAPSHOT_MS / 1000)} s: ${diagLine(slow)}`)
+          this.log(`${vm.vmName}: ${name}'s build logon still waiting at ${Math.round(LOGON_SNAPSHOT_MS / 1000)} s: ${diagLine(slow)}`)
+        })
+        if (o.late) throw new Error(`${provisionLate(name).message}${slow ? ` (at ${Math.round(LOGON_SNAPSHOT_MS / 1000)} s: ${diagLine(slow)})` : ''}`)
         let why = null
+        const waited = Math.round(BUILD_LOGON_WAIT_MS / 1000)
         if (o.loggedOff) why = `${name} logged on, then Windows logged the session off`
-        else if (o.ms === undefined) why = o.user ? `${name} logged on, but its watcher didn't start within ${Math.round(LOGON_WAIT_MS / 1000)} s` : `no interactive session of ${name} appeared within ${Math.round(LOGON_WAIT_MS / 1000)} s`
+        else if (o.ms === undefined) why = o.user ? `${name} logged on, but its watcher didn't start within ${waited} s` : `no interactive session of ${name} appeared within ${waited} s`
         let quiet = null
         if (!why) {
           step(`waiting for ${name}'s first-logon work to finish`)
           quiet = await this.waitProvisioned(vm, creds, name, o.boot, deadline)
           if (quiet.lost) why = `${name}'s session was lost while its first-logon work ran`
         }
+        const failed = why ? await diag() : null
+        attempts.push({ attempt, why, logonMs: o.ms ?? null, slow, diag: failed })
+        if (why) {
+          step(`${name}'s logon attempt ${attempt} failed (${why}; ${diagLine(failed)})${attempt < 2 ? ', retrying' : ''}`)
+          this.log(`${vm.vmName}: ${name}'s build logon attempt ${attempt} failed (${why}; ${diagLine(failed)})`)
+        }
         await this.undoLogon(vm, creds)
-        if (!why) { out[name] = { logonMs: o.ms, quietMs: quiet.ms, packages: quiet.count, inventory: quiet.inventory }; break }
-        if (attempt >= 2) throw new Error(`provisioning ${name}'s profile failed twice: ${why}`)
+        if (!why) { out[name] = { logonMs: o.ms, quietMs: quiet.ms, packages: quiet.count, inventory: quiet.inventory, attempts }; break }
+        if (attempt >= 2) throw new Error(`provisioning ${name}'s profile failed twice: ${why} (${diagLine(failed)})`)
       }
     }
     return out
@@ -1756,6 +1792,53 @@ const PROTOCOL = 'hyperv-mcp/3' // 2: renew, sync_plan, sync (MC-1497); 3: start
 const FEATURES = ['projects', 'images']
 const DAY_MS = 24 * 60 * 60 * 1000
 
+/**
+ * MC-1520: a build logon's diagnostic snapshot, reduced to its allowlisted fields (event ids and seconds after the boot,
+ * process names and seconds, booleans), capped; anything else hv.ps1 might return is dropped. { unavailable } if none.
+ */
+function diagSummary(r) {
+  if (!r || typeof r !== 'object') return { unavailable: true }
+  const n = v => (Number.isFinite(Number(v)) && v !== null && v !== '' ? Math.trunc(Number(v)) : null)
+  const events = v => (Array.isArray(v) ? v.slice(-12).map(e => ({ id: n(e?.id), s: n(e?.s) })) : 'unavailable')
+  const logs = {}
+  for (const k of DIAG_LOGS) logs[k] = events(r.logs?.[k])
+  return {
+    uptime: n(r.uptime), logs, appxLast: r.appxLast === 'unavailable' ? 'unavailable' : n(r.appxLast),
+    autoAdminLogon: ['0', '1'].includes(r.autoAdminLogon) ? r.autoAdminLogon : null, defaultUserIsAccount: r.defaultUserIsAccount === true,
+    watcher: r.watcher === true, watcherS: n(r.watcherS),
+    processes: (Array.isArray(r.processes) ? r.processes : []).slice(0, 25).map(p => ({ name: String(p?.name ?? '').replace(/[^\w.-]/g, '').slice(0, 40), s: n(p?.s) }))
+  }
+}
+
+/** MC-1520: one line from a snapshot's allowlisted fields, for progress, the job note and the helper's log. */
+function diagLine(d) {
+  if (!d || d.unavailable) return 'diagnostics unavailable'
+  const at = (log, id) => (Array.isArray(d.logs[log]) ? d.logs[log].filter(e => e.id === id).map(e => e.s).at(-1) : undefined)
+  const parts = [`up ${d.uptime}s`]
+  for (const [id, what] of [[21, 'logon'], [22, 'shell'], [23, 'logoff']]) { const t = at('lsm', id); if (t !== undefined) parts.push(`${what} +${t}s`) }
+  const off = at('security', 4647)
+  if (off !== undefined) parts.push(`user-initiated logoff +${off}s`)
+  parts.push(d.watcher ? `watcher +${d.watcherS}s` : 'no watcher')
+  parts.push(d.autoAdminLogon === '1' ? 'autologon armed' : d.autoAdminLogon === '0' ? 'autologon cleared' : 'autologon unknown')
+  const busy = [...new Set(d.processes.map(p => p.name).filter(x => FIRST_LOGON_WORKERS.includes(x)))]
+  if (busy.length) parts.push(`busy: ${busy.join(', ')}`)
+  const gone = DIAG_LOGS.filter(k => d.logs[k] === 'unavailable')
+  if (gone.length) parts.push(`unavailable: ${gone.join(', ')}`)
+  return parts.join(', ')
+}
+
+/** MC-1520: the build's note on its slow or retried logons, for the job's done line (pool_status), or ''. */
+function buildNote(profiles) {
+  const notes = []
+  for (const [name, p] of Object.entries(profiles || {})) {
+    for (const t of p.attempts || []) {
+      if (t.why) notes.push(`${name}'s logon attempt ${t.attempt} failed: ${t.why}; ${diagLine(t.diag)}`)
+      else if (t.slow) notes.push(`${name}'s logon took ${Math.round(t.logonMs / 1000)} s; at ${Math.round(LOGON_SNAPSHOT_MS / 1000)} s: ${diagLine(t.slow)}`)
+    }
+  }
+  return notes.join('; ')
+}
+
 /** MC-1516: an account's provisioning budget, retry included, ran out. */
 function provisionLate(account) {
   return new Error(`${account}'s first-logon provisioning didn't settle within ${Math.round(PROVISION_WAIT_MS / 1000)} s`)
@@ -1840,4 +1923,4 @@ function describePlan(plan, digest, approve) {
   return lines.join('\n')
 }
 
-module.exports = { Helper, canonical, baselineProblem, expiry, licenceOf, keyOf, ancestorClash, PLAN_ID_RE, PROTOCOL }
+module.exports = { Helper, canonical, baselineProblem, expiry, licenceOf, diagSummary, diagLine, keyOf, ancestorClash, PLAN_ID_RE, PROTOCOL }

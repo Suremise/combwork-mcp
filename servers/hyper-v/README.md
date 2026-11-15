@@ -205,7 +205,13 @@ approval → change**:
      setup, the user setup screens) is observed quiet: two minutes of samples in a row with no new AppX deployment
      event, an unchanged package inventory and no busy first-logon worker, with the account still logged on. A sample
      that fails or is busy starts the two minutes over; a lost logon is retried once; 20 minutes without quiet fails
-     the build. After each logon, a verified undo turns autologon off, deletes its password, turns UAC back on, puts
+     the build. A build's logon attempt waits up to 15 minutes (a start's waits 10). One still waiting at 10 minutes
+     gets a read-only snapshot of the guest, and a failed one a snapshot before its undo (MC-1520). The snapshot keeps
+     allowlisted fields only: event ids and seconds after boot from the session-manager, Security, Winlogon, User
+     Profile, Shell-Core, AppReadiness and CloudExperienceHost logs (a missing or disabled log is "unavailable"), the
+     autologon state, the watcher, and the account's process names. It never holds a message, a command line or a
+     password. It's kept with the attempt in the build's record and summed up in one line in the job's note, which
+     `pool_status` shows. After each logon, a verified undo turns autologon off, deletes its password, turns UAC back on, puts
      back Windows' own `Userinit` and recreates `C:\hvmcp` empty with inherited permissions only, so the next logon
      starts clean and the checkpoint keeps none of it. The profiles stay, so an interactive start doesn't replay
      first-logon work (it took 2–5 minutes, and sometimes failed);
@@ -753,7 +759,11 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
 - `provision-clock.test.js`, the real provisioning and logon methods on a fake clock: one provisioning deadline per
   account over its logon, quiet wait and retry, so a session lost near it gets no new allowance; every call bounded by
   the time left; nothing accepted that returns after the deadline (a logon's readiness, a quiet probe); a start's logon,
-  with no deadline, keeps its own wait and timeouts.
+  with no deadline, keeps its own wait and timeouts; a slow build logon's snapshot at the threshold kept with the attempt
+  that then succeeds, and an unavailable one changing nothing (MC-1520). `provision.test.js` also covers a failed build
+  logon diagnosed before its undo, its reason and allowlisted snapshot in the record and the job note (fields such as
+  messages, command lines and passwords dropped), and an unavailable diagnosis; `interactive.test.js` runs hv.ps1's
+  event-shaping block for real.
 - `projects.test.js`, sharing the pool: one shared pool with no projects; caps (one project at its cap refused while
   another still gets its VM); the line, first come first served, a capped waiter passed over keeping its place, an abandoned
   wait never given a VM and its place expiring, a repeat call keeping its place, a disconnect leaving it, a resize

@@ -29,6 +29,8 @@
  * provisionBusyAt), failing at sample provisionFailAt, and losing the logon at sample provisionLoseOnce (once).
  * Defender (MC-1519): guest-defender records the exclusions (vm.exclusions) and answers them with real-time on;
  * defenderOverride: fields it reports instead.
+ * Logon diagnostics (MC-1520): guest-logon-diag answers state.diag, or a sample that also carries fields the helper must
+ * drop (an event message, a command line, a password), to show only the allowlisted ones are kept.
  */
 const fs = require('fs')
 const crypto = require('crypto')
@@ -91,6 +93,15 @@ function run(s, op, a) {
       if (vm.state !== 'Running') throw new Error('the VM is not running')
       vm.exclusions = [...new Set([...(vm.exclusions || []), ...a.paths])]
       return { exclusions: vm.exclusions, realTime: true, service: true, tamper: true, ...(s.defenderOverride || {}) }
+    }
+    case 'guest-logon-diag': {
+      const vm = own(s, a)
+      vm.diags = (vm.diags || 0) + 1
+      return s.diag || {
+        uptime: 600, appxLast: 300, autoAdminLogon: '0', defaultUserIsAccount: false, watcher: false, watcherS: null, message: 'raw event text', password: 'hunter2',
+        logs: { lsm: [{ id: 21, s: 400, message: 'User: X\\hvadmin' }, { id: 22, s: 402 }], security: [{ id: 4647, s: 460 }], winlogon: [], profile: [{ id: 1, s: 399 }], shellCore: 'unavailable', appReadinessAdmin: [], appReadinessOperational: [], cloudExperienceHost: 'unavailable' },
+        processes: [{ name: 'explorer', s: 403 }, { name: 'OneDriveSetup', s: 410, commandLine: 'OneDriveSetup.exe /token=SECRET' }]
+      }
     }
     case 'guest-logon-undo': {
       const vm = own(s, a)

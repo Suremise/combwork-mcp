@@ -114,3 +114,27 @@ test('Defender (MC-1519): the antivirus service off, or the query failing, fails
     assert.deepStrictEqual(vms(sc), [])
   }
 })
+
+// MC-1520: a failed build logon is diagnosed before its undo, and the attempt recorded where anyone can see it.
+test('a failed build logon (MC-1520): diagnosed before its undo; the attempt, its reason and the allowlisted snapshot recorded, also in the job note', async t => {
+  const { sc, line } = await build(t, 'diag-retry', { provisionLoseOnce: 2 })
+  assert.match(line, /create finished: created hvmcp-[0-9a-f]+ \(hvadmin's logon attempt 1 failed: hvadmin's session was lost while its first-logon work ran; up 600s, logon \+400s, shell \+402s, user-initiated logoff \+460s, no watcher, autologon cleared, busy: OneDriveSetup, unavailable: shellCore, cloudExperienceHost\)/)
+  const ops = sc.stub().calls.map(c => c.op)
+  assert.ok(ops.indexOf('guest-logon-diag') < ops.indexOf('guest-logon-undo'), 'diagnosed before the undo')
+  const p = sc.journal().find(r => r.t === 'ready').profiles.hvadmin
+  assert.strictEqual(p.attempts.length, 2)
+  assert.match(p.attempts[0].why, /session was lost/)
+  assert.deepStrictEqual(p.attempts[0].diag.logs.lsm, [{ id: 21, s: 400 }, { id: 22, s: 402 }])
+  assert.strictEqual(p.attempts[0].diag.logs.shellCore, 'unavailable')
+  assert.deepStrictEqual(p.attempts[0].diag.logs.winlogon, [], 'an empty log stays empty, not unavailable')
+  assert.deepStrictEqual(p.attempts[0].diag.processes, [{ name: 'explorer', s: 403 }, { name: 'OneDriveSetup', s: 410 }])
+  assert.strictEqual(p.attempts[1].why, null)
+  const all = JSON.stringify(sc.journal()) + line
+  for (const bad of ['raw event text', 'hunter2', 'SECRET', 'commandLine', 'message', 'password']) assert.ok(!all.includes(bad), `dropped: ${bad}`)
+})
+
+test('a failed build logon whose diagnosis fails (MC-1520): recorded as unavailable, and the retry goes on', async t => {
+  const { sc, line } = await build(t, 'diag-unavail', { provisionLoseOnce: 2, fail: { 'guest-logon-diag': 1 } })
+  assert.match(line, /create finished: .*hvadmin's logon attempt 1 failed: .*diagnostics unavailable\)/)
+  assert.deepStrictEqual(sc.journal().find(r => r.t === 'ready').profiles.hvadmin.attempts[0].diag, { unavailable: true })
+})

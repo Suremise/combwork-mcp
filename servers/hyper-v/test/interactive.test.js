@@ -323,3 +323,28 @@ test('logon observations are per boot (MC-1518): the guest restarting by itself 
   const probe = await logonCase(t, 'ia-probe', { watcherLate: 4, sessionFailAt: 2 })
   assert.ok(!probe.r.isError, probe.r.text)
 })
+
+// MC-1520: hv.ps1's own $DiagEvents, run for real (Windows PowerShell 5.1) on synthetic events: only { id, s } (whole
+// seconds after the boot), the last 12, oldest first; a message or any other field never comes out.
+const DIAG_BLOCK = (() => { const s = HV_PS.indexOf('\n$DiagEvents = {'); const e = s < 0 ? -1 : HV_PS.indexOf('\n}\n', s + 1); return e < 0 ? null : HV_PS.slice(s + 1, e + 3) })()
+
+test('diagnostic events (MC-1520), for real: allowlisted { id, s } only, capped at the last 12, oldest first', { skip: process.platform !== 'win32' || !DIAG_BLOCK }, () => {
+  const sc = scratch('diag-events')
+  const file = path.join(sc.dir, 'diag.ps1')
+  fs.writeFileSync(file, `${DIAG_BLOCK}
+$boot = [datetime]'2026-11-15T10:00:00Z'
+$events = @(1..15 | ForEach-Object { [pscustomobject]@{ Id = 4600 + $_; TimeCreated = $boot.AddSeconds(16 - $_ + 0.7); Message = "secret $_"; UserId = 'S-1-5-21-x' } })
+'OUT:' + (ConvertTo-Json -InputObject @(& $DiagEvents $events $boot 12) -Compress)
+'OUT:' + (ConvertTo-Json -InputObject @(& $DiagEvents @() $boot 12) -Compress)
+`)
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: ps51Env(), timeout: 60_000 })
+  const out = r.stdout.split(/\r?\n/).filter(l => l.startsWith('OUT:')).map(l => JSON.parse(l.slice(4)))
+  assert.strictEqual(out.length, 2, r.stdout + r.stderr)
+  assert.strictEqual(out[0].length, 12)
+  for (const e of out[0]) assert.deepStrictEqual(Object.keys(e).sort(), ['id', 's'])
+  // Events 15..1 have seconds 1..15 (+0.7, floored): the last 12 by time are seconds 4..15, i.e. ids 4612 down to 4601.
+  assert.deepStrictEqual(out[0].map(e => e.s), [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+  assert.deepStrictEqual(out[0].map(e => e.id), [4612, 4611, 4610, 4609, 4608, 4607, 4606, 4605, 4604, 4603, 4602, 4601])
+  assert.ok(!JSON.stringify(out).includes('secret'))
+  assert.deepStrictEqual(out[1], [])
+})

@@ -8,6 +8,8 @@ process.env.HYPERV_MCP_PROVISION_QUIET_MS = '20'
 process.env.HYPERV_MCP_PROVISION_POLL_MS = '1'
 process.env.HYPERV_MCP_POLL_MS = '1'
 process.env.HYPERV_MCP_LOGON_STABLE_MS = '10'
+process.env.HYPERV_MCP_BUILD_LOGON_WAIT_MS = '60'
+process.env.HYPERV_MCP_LOGON_SNAPSHOT_MS = '30'
 const test = require('node:test')
 const assert = require('assert')
 const { Helper } = require('../helper/core')
@@ -19,7 +21,7 @@ const creds = { admin: { user: 'hvadmin', password: 'a' }, user: { user: 'hvuser
  * A helper on the fake clock. watcher(account, logonNo, t): whether the session's watcher is seen; probe(account,
  * logonNo, t): fields over a quiet, logged-on provisioning sample.
  */
-function fake({ watcher = () => true, probe = () => ({}) } = {}) {
+function fake({ watcher = () => true, probe = () => ({}), diagFails = false } = {}) {
   const h = Object.create(Helper.prototype)
   let t = 0
   let logons = 0
@@ -27,19 +29,21 @@ function fake({ watcher = () => true, probe = () => ({}) } = {}) {
   const calls = []
   h.now = () => t
   h.undoLogon = async () => { t += 5 }
+  h.log = () => {}
   h.hv = async (op, a, opts) => {
-    calls.push({ op, at: t, timeoutMs: opts?.timeoutMs })
+    calls.push({ op, at: t, timeoutMs: opts?.timeoutMs, account: a.account || a.logon?.user })
     if (op === 'guest-logon') { const before = `b${logons}`; logons++; account = a.logon.user; t += 10; return { boot: before } }
     if (op === 'guest-session') { t += 5; const w = watcher(account, logons, t); return { boot: `b${logons}`, sessions: w ? [1] : [], user: true, armed: true } }
     if (op === 'guest-provisioned') { t += 5; return { boot: `b${logons}`, user: true, inventory: 'x', lastEvent: null, busy: [], count: 1, ...probe(a.account, logons, t) } }
+    if (op === 'guest-logon-diag') { t += 5; if (diagFails) throw new Error('injected: the diagnosis failed'); return { uptime: 42, logs: {}, processes: [], autoAdminLogon: '1', watcher: false, message: 'dropped' } }
     throw new Error(`unexpected ${op}`)
   }
   return { h, calls, logons: () => logons, now: () => t }
 }
 
 /** Every call made before the deadline was bounded by the time left; none started after it. */
-function bounded(calls, deadline = 100) {
-  for (const c of calls) {
+function bounded(calls, deadline = 100, account = 'hvadmin') {
+  for (const c of calls.filter(x => x.account === account)) {
     assert.ok(c.at < deadline, `no call started at or after the deadline: ${JSON.stringify(c)}`)
     assert.ok(c.timeoutMs >= 1 && c.timeoutMs <= deadline - c.at, `bounded by the time left: ${JSON.stringify(c)}`)
   }
@@ -66,7 +70,7 @@ test('a logon whose readiness comes back only after the deadline is not accepted
 })
 
 test('a session lost early: the retry runs within the same deadline and the account is provisioned', async () => {
-  const f = fake({ probe: (acc, n, t) => acc === 'hvadmin' && n === 1 && t >= 40 ? { user: false } : {} })
+  const f = fake({ probe: (acc, n, t) => acc === 'hvadmin' && n === 1 && t >= 30 ? { user: false } : {} })
   const out = await f.h.provisionProfiles(vm, creds, () => {})
   assert.deepStrictEqual(Object.keys(out), ['hvadmin', 'hvuser'])
   assert.strictEqual(f.logons(), 3, 'hvadmin twice, hvuser once')
@@ -86,4 +90,27 @@ test('a start\'s logon (no deadline) keeps its own wait and timeouts', async () 
   assert.ok(o.ms > 0 && !o.late)
   assert.deepStrictEqual(f.calls.filter(c => c.op === 'guest-logon').map(c => c.timeoutMs), [120_000])
   assert.ok(f.calls.filter(c => c.op === 'guest-session').every(c => c.timeoutMs === 60_000))
+})
+
+// MC-1520: a build logon still waiting at the snapshot threshold gets one read-only snapshot and goes on waiting, within
+// BUILD_LOGON_WAIT_MS and the account's deadline; the snapshot is kept with the attempt; an unavailable one changes
+// nothing. (This file's env: snapshot at 30, a build attempt waits up to 60, the account's budget 100.)
+test('a slow build logon (MC-1520): a snapshot at the threshold, kept with the attempt that then succeeds', async () => {
+  const f = fake({ watcher: (acc, n, t) => acc === 'hvuser' || t >= 45 })
+  const out = await f.h.provisionProfiles(vm, creds, () => {})
+  const a = out.hvadmin.attempts
+  assert.strictEqual(a.length, 1)
+  assert.strictEqual(a[0].why, null)
+  assert.ok(a[0].logonMs >= 30, `slow: ${a[0].logonMs}`)
+  assert.strictEqual(a[0].slow.uptime, 42, 'the snapshot kept, allowlisted')
+  assert.strictEqual(f.calls.filter(c => c.op === 'guest-logon-diag').length, 1, 'one snapshot only')
+  bounded(f.calls)
+})
+
+test('a slow build logon whose snapshot is unavailable near the deadline (MC-1520): recorded as unavailable, the outcome unchanged', async () => {
+  const f = fake({ watcher: (acc, n, t) => acc === 'hvuser' || t >= 45, diagFails: true })
+  const out = await f.h.provisionProfiles(vm, creds, () => {})
+  assert.deepStrictEqual(out.hvadmin.attempts[0].slow, { unavailable: true })
+  assert.strictEqual(out.hvadmin.attempts[0].why, null)
+  bounded(f.calls)
 })
