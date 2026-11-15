@@ -114,3 +114,45 @@ test('Defender (MC-1519): the antivirus service off, or the query failing, fails
     assert.deepStrictEqual(vms(sc), [])
   }
 })
+
+// MC-1520: a failed build logon is diagnosed before its undo, and the attempt recorded where anyone can see it.
+test('a failed build logon (MC-1520): diagnosed before its undo; the attempt, its reason and the allowlisted snapshot recorded, also in the job note', async t => {
+  const { sc, line } = await build(t, 'diag-retry', { provisionLoseOnce: 2 })
+  assert.match(line, /create finished: created hvmcp-[0-9a-f]+ \(hvadmin settled with \d+ AppContainer mappings and \d+ Packages folders after \d+ s; hvadmin's logon attempt 1 failed: hvadmin's session was lost while its first-logon work ran; up 600s, logon \+400s, shell \+402s, user-initiated logoff \+460s, no watcher, autologon cleared, busy: OneDriveSetup, unavailable: shellCore, cloudExperienceHost; hvuser settled/)
+  const ops = sc.stub().calls.map(c => c.op)
+  assert.ok(ops.indexOf('guest-logon-diag') < ops.indexOf('guest-logon-undo'), 'diagnosed before the undo')
+  const p = sc.journal().find(r => r.t === 'ready').profiles.hvadmin
+  assert.strictEqual(p.attempts.length, 2)
+  assert.match(p.attempts[0].why, /session was lost/)
+  assert.deepStrictEqual(p.attempts[0].diag.logs.lsm, [{ id: 21, s: 400 }, { id: 22, s: 402 }])
+  assert.strictEqual(p.attempts[0].diag.logs.shellCore, 'unavailable')
+  assert.deepStrictEqual(p.attempts[0].diag.logs.winlogon, [], 'an empty log stays empty, not unavailable')
+  assert.deepStrictEqual(p.attempts[0].diag.processes, [{ name: 'explorer', s: 403 }, { name: 'OneDriveSetup', s: 410 }])
+  assert.strictEqual(p.attempts[1].why, null)
+  const all = JSON.stringify(sc.journal()) + line
+  for (const bad of ['raw event text', 'hunter2', 'SECRET', 'commandLine', 'message', 'password']) assert.ok(!all.includes(bad), `dropped: ${bad}`)
+})
+
+test('a failed build logon whose diagnosis fails (MC-1520): recorded as unavailable, and the retry goes on', async t => {
+  const { sc, line } = await build(t, 'diag-unavail', { provisionLoseOnce: 2, fail: { 'guest-logon-diag': 1 } })
+  assert.match(line, /create finished: .*hvadmin's logon attempt 1 failed: .*diagnostics unavailable; hvuser settled/)
+  assert.deepStrictEqual(sc.journal().find(r => r.t === 'ready').profiles.hvadmin.attempts[0].diag, { unavailable: true })
+})
+
+// MC-1520 part 4: the account's AppContainer profiles in the quiet test, and the named per-account budget.
+test('quiet waits for the account\'s AppContainer counts to stop changing (MC-1520); they\'re recorded; the plan names the budget', async t => {
+  const { sc, plan, line } = await build(t, 'prov-counts', { profileGrow: 4 })
+  assert.match(line, /create finished/)
+  assert.match(plan.text, /each account within \d+ min \(a logon attempt up to \d+ min, then \d+ min of observed quiet, one retry if needed\)/)
+  for (const who of ['hvadmin', 'hvuser']) assert.ok(vms(sc)[0].provisioned.filter(a => a === who).length >= 6, `${who}: 4 changing samples, then quiet`)
+  const p = sc.journal().find(r => r.t === 'ready').profiles
+  assert.deepStrictEqual([p.hvadmin.mappings, p.hvadmin.packagesDirs, p.hvuser.mappings, p.hvuser.packagesDirs], [64, 29, 64, 29])
+  // The settled counts are visible to any agent, in the job's note (pool_status).
+  assert.match(line, /hvadmin settled with 64 AppContainer mappings and 29 Packages folders after \d+ s; hvuser settled with 64 AppContainer mappings and 29 Packages folders after \d+ s/)
+})
+
+test('an unknown AppContainer count (MC-1520) is never quiet: it starts the window over, and the build still settles', async t => {
+  const { sc, line } = await build(t, 'prov-counts-unknown', { profileUnknownAt: 2 })
+  assert.match(line, /create finished/)
+  assert.ok(vms(sc)[0].provisioned.filter(a => a === 'hvadmin').length >= 4)
+})

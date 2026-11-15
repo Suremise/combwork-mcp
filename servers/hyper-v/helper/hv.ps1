@@ -340,8 +340,20 @@ $GuestLogonUndo = {
 # account is logged on, the newest AppX deployment event, its installed packages (a hash of their names and status),
 # and its busy first-logon workers (OneDriveSetup, or a SystemApps, UserOOBEBroker or WebView2 process that started
 # within the quiet window). Any failed query throws: the helper takes it as unknown, never as idle.
+# MC-1520: an account's AppContainer profile counts from raw facts, pure so the tests run it. A location that is
+# readable but absent counts 0 (a first profile may have none yet); an unloaded classes store, an unknown profile path or
+# a failed enumeration is $null (unknown: the helper never takes it as quiet).
+$ProfileCounts = {
+  param($r)
+  $mappings = $null
+  if ($r.classesLoaded) { if ($r.mappingsKey -eq 'missing') { $mappings = 0 } elseif ($r.mappingsKey -eq 'present') { $mappings = [int]$r.mappingsCount } }
+  $packages = $null
+  if ($r.profilePath) { if ($r.packagesDir -eq 'missing') { $packages = 0 } elseif ($r.packagesDir -eq 'present') { $packages = [int]$r.packagesCount } }
+  @{ mappings = $mappings; packagesDirs = $packages }
+}
+
 $GuestProvisioned = {
-  param($u, $quietMs)
+  param($u, $quietMs, $countsText)
   $ErrorActionPreference = 'Stop'
   $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
   $last = $null
@@ -353,7 +365,25 @@ $GuestProvisioned = {
   $procs = @(Get-Process -IncludeUserName | Where-Object { $_.SessionId -ge 1 -and $_.UserName -like "*\$u" })
   $since = (Get-Date).AddMilliseconds(-[int]$quietMs)
   $busy = @($procs | Where-Object { $_.Name -eq 'OneDriveSetup' -or ((($_.Path -like 'C:\Windows\SystemApps\*') -or ($_.Name -in 'UserOOBEBroker', 'msedgewebview2')) -and $_.StartTime -gt $since) } | ForEach-Object { $_.Name })
-  @{ boot = $boot; user = ($procs.Count -gt 0); lastEvent = $last; count = $pk.Count; inventory = $inventory; busy = $busy }
+  # MC-1520: the account's own AppContainer profiles (its classes store by SID, its profile by SID: never this session's
+  # HKCU), as CB1's census counts them for the logged-on user.
+  $raw = @{ classesLoaded = $false; mappingsKey = 'error'; mappingsCount = 0; profilePath = $null; packagesDir = 'error'; packagesCount = 0 }
+  try {
+    $sid = [string](Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True AND Name='$u'").SID
+    if ($sid) {
+      $classes = "Registry::HKEY_USERS\${sid}_Classes"
+      $raw.classesLoaded = Test-Path -LiteralPath $classes
+      $mk = "$classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppContainer\Mappings"
+      try { if (Test-Path -LiteralPath $mk) { $raw.mappingsCount = @(Get-ChildItem -LiteralPath $mk -ErrorAction Stop).Count; $raw.mappingsKey = 'present' } else { $raw.mappingsKey = 'missing' } } catch { $raw.mappingsKey = 'error' }
+      $raw.profilePath = [string](Get-CimInstance Win32_UserProfile -Filter "SID='$sid'").LocalPath
+      if ($raw.profilePath) {
+        $pd = Join-Path $raw.profilePath 'AppData\Local\Packages'
+        try { if (Test-Path -LiteralPath $pd) { $raw.packagesCount = @(Get-ChildItem -LiteralPath $pd -Directory -Force -ErrorAction Stop).Count; $raw.packagesDir = 'present' } else { $raw.packagesDir = 'missing' } } catch { $raw.packagesDir = 'error' }
+      }
+    }
+  } catch { }
+  $counts = & ([scriptblock]::Create($countsText)) $raw
+  @{ boot = $boot; user = ($procs.Count -gt 0); lastEvent = $last; count = $pk.Count; inventory = $inventory; busy = $busy; mappings = $counts.mappings; packagesDirs = $counts.packagesDirs }
 }
 
 # MC-1519 (the user's decision): the test work folders excluded from Defender's scanning (an ExclusionPath: real-time
@@ -367,6 +397,59 @@ $GuestDefender = {
   $p = Get-MpPreference
   $s = Get-MpComputerStatus
   @{ exclusions = @($p.ExclusionPath | Where-Object { $_ }); realTime = [bool]$s.RealTimeProtectionEnabled; service = [bool]$s.AMServiceEnabled; tamper = [bool]$s.IsTamperProtected }
+}
+
+# MC-1520: events shaped to allowlisted fields only, pure so the tests run it: the last $cap of them, oldest first, as
+# { id; s } (s = whole seconds after the boot). Never a message, a command line or any other field.
+$DiagEvents = {
+  param($events, $boot, $cap)
+  @($events | Sort-Object TimeCreated | Select-Object -Last ([int]$cap) | ForEach-Object { @{ id = [int]$_.Id; s = [int][Math]::Floor(($_.TimeCreated - $boot).TotalSeconds) } })
+}
+
+# MC-1520: a read-only snapshot of a build-time logon, for the helper's record of a slow or failed attempt. Allowlisted
+# fields only (event ids and seconds after the boot, process names and seconds, booleans, the fixed account name);
+# never a password, LSA data, a command line or an event message. Each log is 'unavailable' when it is missing,
+# disabled or its query fails, or a list (possibly empty) of its last 12 events of this boot, filtered to the account
+# where the event names one.
+$GuestLogonDiag = {
+  param($u, $shapeText)
+  $ErrorActionPreference = 'Stop'
+  $shape = [scriptblock]::Create($shapeText)
+  $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+  function Chan($log, $ids, $keep) {
+    try {
+      $l = Get-WinEvent -ListLog $log -ErrorAction Stop
+      if (-not $l.IsEnabled) { return 'unavailable' }
+      $f = @{ LogName = $log; StartTime = $boot }
+      if ($ids) { $f.Id = $ids }
+      $ev = @()
+      try { $ev = @(Get-WinEvent -FilterHashtable $f -ErrorAction Stop) } catch { if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { throw } }
+      if ($keep) { $ev = @($ev | Where-Object $keep) }
+      ,@(& $shape $ev $boot 12)
+    } catch { 'unavailable' }
+  }
+  $acct = [regex]::Escape($u)
+  $logs = [ordered]@{
+    lsm = Chan 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational' @(21, 22, 23, 24, 40) { $_.Message -match "\\$acct\b" }
+    security = Chan 'Security' @(4624, 4647) { $_.Message -match "Account Name:\s+$acct\b" -and ($_.Id -eq 4647 -or $_.Message -match 'Logon Type:\s+2\b') }
+    winlogon = Chan 'Microsoft-Windows-Winlogon/Operational' $null $null
+    profile = Chan 'Microsoft-Windows-User Profile Service/Operational' $null $null
+    shellCore = Chan 'Microsoft-Windows-Shell-Core/Operational' $null $null
+    appReadinessAdmin = Chan 'Microsoft-Windows-AppReadiness/Admin' $null $null
+    appReadinessOperational = Chan 'Microsoft-Windows-AppReadiness/Operational' $null $null
+    cloudExperienceHost = Chan 'Microsoft-Windows-CloudExperienceHost/Operational' $null $null
+  }
+  $appx = 'unavailable'
+  try { $e = Get-WinEvent -LogName 'Microsoft-Windows-AppXDeploymentServer/Operational' -MaxEvents 1 -ErrorAction Stop; $appx = [int][Math]::Floor(($e.TimeCreated - $boot).TotalSeconds) } catch { if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { $appx = $null } }
+  $w = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+  $watch = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.SessionId -ge 1 -and $_.CommandLine -match 'C:\\hvmcp\\agent\.ps1' -and (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User -eq $u })
+  $procs = @(Get-Process -IncludeUserName -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -ge 1 -and $_.UserName -like "*\$u" } | Sort-Object StartTime | Select-Object -First 25 | ForEach-Object { @{ name = [string]$_.Name; s = [int][Math]::Floor(($_.StartTime - $boot).TotalSeconds) } })
+  @{
+    uptime = [int][Math]::Floor(((Get-Date) - $boot).TotalSeconds); logs = $logs; appxLast = $appx
+    autoAdminLogon = [string]$w.AutoAdminLogon; defaultUserIsAccount = ([string]$w.DefaultUserName -eq $u)
+    watcher = ($watch.Count -gt 0); watcherS = $(if ($watch.Count) { [int][Math]::Floor(($watch[0].CreationDate - $boot).TotalSeconds) } else { $null })
+    processes = $procs
+  }
 }
 
 # The guest's boot time and the sessions (>= 1) in which the account's watcher runs: its interactive logon, ready for runs.
@@ -519,13 +602,17 @@ try {
       $agent = [IO.File]::ReadAllText((Join-Path $PSScriptRoot 'guest-agent.ps1'))
       Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestLogon -ArgumentList ([string]$a.logon.user), ([string]$a.logon.password), ([bool]$a.elevated), $agent, $UserinitValue.ToString(), $HvLsaCs
     }
+    'guest-logon-diag' {
+      $vm = Get-OwnVm $a
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestLogonDiag -ArgumentList ([string]$a.account), $DiagEvents.ToString()
+    }
     'guest-logon-undo' {
       $vm = Get-OwnVm $a
       Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestLogonUndo -ArgumentList $HvLsaCs
     }
     'guest-provisioned' {
       $vm = Get-OwnVm $a
-      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestProvisioned -ArgumentList ([string]$a.account), ([int]$a.quietMs)
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestProvisioned -ArgumentList ([string]$a.account), ([int]$a.quietMs), $ProfileCounts.ToString()
     }
     'guest-defender' {
       $vm = Get-OwnVm $a

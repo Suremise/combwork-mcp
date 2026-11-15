@@ -29,6 +29,8 @@
  * provisionBusyAt), failing at sample provisionFailAt, and losing the logon at sample provisionLoseOnce (once).
  * Defender (MC-1519): guest-defender records the exclusions (vm.exclusions) and answers them with real-time on;
  * defenderOverride: fields it reports instead.
+ * Logon diagnostics (MC-1520): guest-logon-diag answers state.diag, or a sample that also carries fields the helper must
+ * drop (an event message, a command line, a password), to show only the allowlisted ones are kept.
  */
 const fs = require('fs')
 const crypto = require('crypto')
@@ -92,6 +94,15 @@ function run(s, op, a) {
       vm.exclusions = [...new Set([...(vm.exclusions || []), ...a.paths])]
       return { exclusions: vm.exclusions, realTime: true, service: true, tamper: true, ...(s.defenderOverride || {}) }
     }
+    case 'guest-logon-diag': {
+      const vm = own(s, a)
+      vm.diags = (vm.diags || 0) + 1
+      return s.diag || {
+        uptime: 600, appxLast: 300, autoAdminLogon: '0', defaultUserIsAccount: false, watcher: false, watcherS: null, message: 'raw event text', password: 'hunter2',
+        logs: { lsm: [{ id: 21, s: 400, message: 'User: X\\hvadmin' }, { id: 22, s: 402 }], security: [{ id: 4647, s: 460 }], winlogon: [], profile: [{ id: 1, s: 399 }], shellCore: 'unavailable', appReadinessAdmin: [], appReadinessOperational: [], cloudExperienceHost: 'unavailable' },
+        processes: [{ name: 'explorer', s: 403 }, { name: 'OneDriveSetup', s: 410, commandLine: 'OneDriveSetup.exe /token=SECRET' }]
+      }
+    }
     case 'guest-logon-undo': {
       const vm = own(s, a)
       if (vm.state !== 'Running') throw new Error('the VM is not running')
@@ -109,7 +120,11 @@ function run(s, op, a) {
       if (s.provisionFailAt === k) throw new Error('injected: the provisioning probe failed')
       if (s.provisionLoseOnce === k) { delete s.provisionLoseOnce; vm.loggedOn = null }
       const busy = s.provisionNever || k <= (s.provisionBusy || 0) || k === s.provisionBusyAt ? ['OneDriveSetup'] : []
-      return { boot: `boot-${vm.boot || 0}`, user: vm.loggedOn === a.account, lastEvent: '2026-11-15T00:00:00.000Z', count: 42, inventory: 'cafe', busy }
+      // MC-1520: the account's AppContainer counts: grow for profileGrow samples (one per sample), unknown at sample
+      // profileUnknownAt.
+      const grow = Math.min(k, s.profileGrow || 0)
+      const unknown = s.profileUnknownAt === k
+      return { boot: `boot-${vm.boot || 0}`, user: vm.loggedOn === a.account, lastEvent: '2026-11-15T00:00:00.000Z', count: 42, inventory: 'cafe', busy, mappings: unknown ? null : 60 + grow, packagesDirs: unknown ? null : 25 + grow }
     }
     case 'guest-licence': { own(s, a); return { status: 1, graceMinutes: 0, evalEnd: null, channel: 'Retail', error: null, ...(s.licence || {}) } }
     case 'net-off': { const vm = own(s, a); vm.state = 'Off'; vm.switchName = null; return { offline: true } }
