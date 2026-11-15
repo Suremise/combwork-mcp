@@ -214,7 +214,11 @@ approval → change**:
      AppContainer mappings (read from its own classes store, by its SID) and `AppData\Local\Packages` folders, and no
      busy first-logon worker, with the account still logged on. A sample that fails, can't read a count, or is busy
      starts the four minutes over; a lost logon is retried once; each account has 30 minutes for all of it (MC-1520),
-     or the build fails. A build's logon attempt waits up to 15 minutes (a start's waits 10). One still waiting at 10 minutes
+     or the build fails. On a freshly installed guest, Windows logs hvadmin's first-ever logon off again within
+     seconds, often before the helper's first check (MC-1521; what starts it is unknown). The check sees that from the
+     boot's own session-manager logon and logoff events for the account, with the account gone and autologon off, and
+     the retry starts at once (MC-1524). The job's note then says the first logon was dropped by Windows and retried;
+     any other failed attempt, or a drop with no successful retry, is reported in full. A build's logon attempt waits up to 15 minutes (a start's waits 10). One still waiting at 10 minutes
      gets a read-only snapshot of the guest, and a failed one a snapshot before its undo (MC-1520). The snapshot keeps
      allowlisted fields only: event ids and seconds after boot from the session-manager, Security, Winlogon, User
      Profile, Shell-Core, AppReadiness and CloudExperienceHost logs (a missing or disabled log is "unavailable"), the
@@ -569,7 +573,9 @@ there (0x8007045A, `ERROR_DLL_INIT_FAILED`). A logged-on user's session (1 or mo
     1 or more, seen twice 10 s apart on the same boot: the guest may restart once more by itself after an autologon.
     That's a readiness check, not a guarantee. A later restart just means the next run isn't taken, and the VM is
     restored (below). If the account logs on and Windows then logs the session off again (and so turns autologon off),
-    the start fails at once and says so; one that logs on but whose watcher never starts says that instead. Either
+    the start fails at once and says so, even when that happened before the first check (seen from that boot's own
+    logon and logoff events for the account, MC-1524; unreadable events never count, nor a logoff while autologon is
+    still armed); one that logs on but whose watcher never starts says that instead. Either
     marks the VM's start as failed, so `vm_acquire` gives another free VM first.
   - A restart keeps the guest's disk, so a work session's sync record stays right. The clean checkpoint isn't changed:
     every start without `interactive` is as before, and a restore (stop, release, the deadline, `vm_reset`) logs nobody
@@ -761,7 +767,9 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
 - `provision.test.js`, the test accounts' profiles at build: hvadmin then hvuser logged on once each, their
   first-logon work waited out, a verified undo after each (hvuser's logon with UAC on and Windows' own Userinit, which
   the stub enforces like the guest), the checkpoint without any of it; quiet started over by a failed or busy sample;
-  never quiet fails the build; a lost logon retried once after an undo, twice failing; an undo that doesn't verify
+  never quiet fails the build; a lost logon retried once after an undo, twice failing; a first logon Windows drops
+  before any check (MC-1524) retried straight after its diagnosis and undo, noted as expected, twice failing in full;
+  an undo that doesn't verify
   (an explicit ACE left on `C:\hvmcp`, UAC still off) failing the build; Defender's exclusions (MC-1519) added after
   the profiles and before the checkpoint, exactly the four test folders, and a read-back missing one, with another, or
   with real-time protection off failing the build.

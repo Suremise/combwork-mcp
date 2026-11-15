@@ -69,6 +69,21 @@ test('a lost logon is retried once, after a verified undo (so the retry sees Win
   assert.deepStrictEqual(vms(twice.sc), [])
 })
 
+test('a first logon Windows drops before any check (MC-1524): retried at once after the undo, noted as expected; dropped twice fails in full', async t => {
+  const once = await build(t, 'prov-dropped-once', { logonDroppedUnseen: 1 })
+  assert.match(once.line, /create finished/)
+  assert.match(once.line, /hvadmin's first logon was dropped by Windows \(attempt 1\), retried/)
+  assert.doesNotMatch(once.line, /attempt 1 failed/)
+  // The dropped attempt: one session check, then its diagnosis and undo, then the retry (no quiet wait in between).
+  const seq = once.sc.stub().calls.map(c => c.op).filter(op => ['guest-logon', 'guest-session', 'guest-provisioned', 'guest-logon-diag', 'guest-logon-undo'].includes(op))
+  assert.deepStrictEqual(seq.slice(0, 5),['guest-logon', 'guest-session', 'guest-logon-diag', 'guest-logon-undo', 'guest-logon'])
+  const ready = once.sc.journal().find(r => r.t === 'ready')
+  assert.strictEqual(ready.profiles.hvadmin.attempts[0].dropped, true)
+  const twice = await build(t, 'prov-dropped-twice', { logonDroppedUnseen: 2 })
+  assert.match(twice.line, /FAILED: .*provisioning hvadmin's profile failed twice: Windows logged hvadmin's logon off before it was seen/)
+  assert.deepStrictEqual(vms(twice.sc), [])
+})
+
 test('an undo that doesn\'t verify fails the build: a leftover explicit ACE on C:\\hvmcp, or UAC still off', async t => {
   const ace = await build(t, 'prov-undo-ace', { undoOverride: { hvmcpExplicitAces: 1 } })
   assert.match(ace.line, /undoing a build logon didn't verify: C:\\hvmcp has explicit or protected ACLs/)

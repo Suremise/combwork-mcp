@@ -462,14 +462,31 @@ $GuestLogonDiag = {
 # The guest's boot time and the sessions (>= 1) in which the account's watcher runs: its interactive logon, ready for runs.
 # Also (MC-1518) whether the account is logged on at all (any process of it in a session >= 1) and whether autologon is
 # still armed (Winlogon clears AutoAdminLogon when the session is logged off): together, "logged on, then logged off".
+# MC-1524: the account's logons (LSM 21) and logoffs (LSM 23) on this boot, pure so the tests run it: $events is the
+# log's events (an empty list when it has none) or $null when it couldn't be read; then both counts are $null, never 0,
+# so an unreadable log is never evidence. Only events at or after $boot whose message names the account count.
+$LogonCounts = {
+  param($events, $boot, $u)
+  if ($null -eq $events) { return @{ logons = $null; logoffs = $null } }
+  $acct = [regex]::Escape($u)
+  $mine = @($events | Where-Object { $_.TimeCreated -ge $boot -and [string]$_.Message -match "\\$acct\b" })
+  @{ logons = [int]@($mine | Where-Object { $_.Id -eq 21 }).Count; logoffs = [int]@($mine | Where-Object { $_.Id -eq 23 }).Count }
+}
+
 $GuestSession = {
-  param($u)
-  $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
+  param($u, $countsText)
+  $bootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+  $boot = $bootTime.ToUniversalTime().ToString('o')
   $ids = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object {
     $_.SessionId -ge 1 -and $_.CommandLine -match 'C:\\hvmcp\\agent\.ps1' -and (Invoke-CimMethod -InputObject $_ -MethodName GetOwner).User -eq $u } | ForEach-Object { [int]$_.SessionId })
   $user = [bool](@(Get-Process -IncludeUserName -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -ge 1 -and $_.UserName -like "*\$u" }).Count)
   $armed = (Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -ErrorAction SilentlyContinue).AutoAdminLogon -eq '1'
-  @{ boot = $boot; sessions = $ids; user = $user; armed = $armed }
+  # MC-1524: a first logon Windows drops before any check sees it leaves only its LSM logon and logoff events.
+  $ev = $null
+  try { $ev = @(Get-WinEvent -FilterHashtable @{ LogName = 'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational'; Id = 21, 23; StartTime = $bootTime } -ErrorAction Stop) }
+  catch { if ($_.FullyQualifiedErrorId -like 'NoMatchingEventsFound*') { $ev = @() } }
+  $c = & ([scriptblock]::Create($countsText)) $ev $bootTime $u
+  @{ boot = $boot; sessions = $ids; user = $user; armed = $armed; logons = $c.logons; logoffs = $c.logoffs }
 }
 
 # Windows' built-in NAT switch (fixed id). Used only by a build's one approved online step (guest-activate) and by
@@ -658,7 +675,7 @@ try {
     'guest-session' {
       $vm = Get-OwnVm $a
       if ($vm.State -ne 'Running') { throw 'the VM is not running' }
-      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestSession -ArgumentList ([string]$a.account)
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestSession -ArgumentList ([string]$a.account), $LogonCounts.ToString()
     }
     'guest-run-start' {
       # A session-0 run, started (MC-1510): as the admin, or as the standard user in its own PowerShell Direct session,
