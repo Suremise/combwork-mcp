@@ -225,6 +225,10 @@ your OS and Node version, and what you ran. For a security problem (for example 
 confinement), please **don't** open a public issue. Use GitHub's private vulnerability reporting instead: the
 repository's **Security** tab, then **Report a vulnerability**. [SECURITY.md](SECURITY.md) says what's in scope.
 
+Repo text (code, comments, tests and docs) never names people: cite a decision by its card key and its reason, for
+example "(MC-1502) reserved VMs were dropped: projects share by their caps". Sample paths are neutral
+(`C:\path\to\…`, `D:\hyperv-mcp`), never someone's machine. LICENSE keeps its copyright line.
+
 Files are LF, in the repo and in every working tree, whatever `core.autocrlf` says (`.gitattributes`), so a server's
 zip holds the same bytes as the repo. `npm test` fails on a file with mixed line endings, and `npm run pack` on one
 with CRLF.

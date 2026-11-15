@@ -1,4 +1,4 @@
-// A pool built from more than one image (MC-1502, gap 3; Darren's decision): each VM's image and OS (recorded at create,
+// A pool built from more than one image (MC-1502, gap 3, as decided there): each VM's image and OS (recorded at create,
 // recovered through its approved plan for older VMs, else "legacy", never guessed); groups by image in pool_plan;
 // vm_acquire({ os, image }); a project's caps per OS, and its image allowlist; one VM per session.
 // Only Windows exists for real: a "linux" image here is a stub kind, made only in the journal (no Linux guest code).

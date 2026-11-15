@@ -1,5 +1,5 @@
 // Several projects sharing the pool (MC-1502): a project is what the caller's roots say (the one project with a folder
-// they're in; none or several is "other"); caps at every grant (no reserved VMs: Darren, 13 Nov); vm_acquire's FIFO queue with bounded
+// they're in; none or several is "other"); caps at every grant (no reserved VMs: dropped on MC-1502); vm_acquire's FIFO queue with bounded
 // waits (HYPERV_MCP_WAIT_MS), a place kept between calls (HYPERV_MCP_KEEP_MS), grants only to a waiting request, a
 // newer call superseding an older one, a disconnect leaving the line, and a freed VM (release, pool job) going to the
 // first waiter allowed it; build folders scoped per project; setup's projects check. Through helper.js (the host
