@@ -974,7 +974,9 @@ class Helper {
           // The licence, read while it runs, for the record only: nothing is activated, and the host's evaluation end
           // (vm.licence.expiresAt) is never rewritten.
           const lic = await this.hv('guest-licence', { ...this.ident(vm), cred: creds.admin }, { timeoutMs: 120_000 })
-          const licNote = lic && Number.isInteger(lic.status) ? `licence status ${lic.status}` : 'licence unread'
+          const licBad = refreshLicenceProblem(lic, vm, this.now())
+          if (licBad) throw new Error(`its licence doesn't check out: ${licBad}`)
+          const licNote = `licence status ${lic.status}`
           await freeOk()
           step('shutting down and taking the new clean checkpoint')
           const f1 = await this.hv('guest-shutdown', this.ident(vm), { timeoutMs: 6 * 60_000 })
@@ -1067,6 +1069,14 @@ class Helper {
       const list = (await this.hv('snapshots', this.ident(vm))).snapshots || []
       const old = list.find(x => x.id === rec.oldClean)
       if (old && old.name !== rec.oldName) return `old clean removal pending: its id ${rec.oldClean} now has the name "${old.name}"`
+      // Preflight, before the old one is touched: the selected new clean, by id and name, and every published pool
+      // checkpoint of the VM must be there. Otherwise the old clean stays (it may be the only good baseline left).
+      const fresh = new Map(list.map(x => [x.id, x]))
+      const nw = fresh.get(rec.newId)
+      if (!nw) return 'old clean removal pending: the new clean checkpoint is missing (the old one is kept)'
+      if (nw.name !== rec.snapName) return `old clean removal pending: the new clean checkpoint's id ${rec.newId} now has the name "${nw.name}" (the old one is kept)`
+      const missing = [...this.state.poolSnaps.values()].filter(x => x.vmId === vm.vmId && !fresh.has(x.checkpointId))
+      if (missing.length) return `old clean removal pending: pool checkpoint(s) ${missing.map(x => `"${x.name}"`).join(', ')} are missing (the old clean is kept)`
       if (old) {
         const gone = (await this.hv('snapshot-remove', { ...this.ident(vm), checkpointId: rec.oldClean, snapName: rec.oldName })).removed === true
         if (!gone) return 'old clean removal pending: it is still there'
@@ -2687,6 +2697,23 @@ function licenceOf(r, evaluation, now) {
   const days = Math.floor((end - now) / DAY_MS)
   if (days < EVAL_MIN_DAYS) throw new Error(`the evaluation activated with only ${days} day(s) left (at least ${EVAL_MIN_DAYS} needed)`)
   return { kind: 'evaluation', expiresAt: new Date(end).toISOString() }
+}
+
+/**
+ * MC-1531: why a refresh's guest licence report isn't acceptable, or null. A report is required. An evaluation (or a VM
+ * with no recorded kind) must be licensed with a reported period not yet over: any length, not the fresh build's
+ * minimum, since a refreshed VM is part way through its evaluation. An own copy follows the build's policy (its status
+ * is recorded, not required). Never used to write the host's record.
+ */
+function refreshLicenceProblem(r, vm, now) {
+  if (!r || typeof r !== 'object' || !Number.isFinite(Number(r.status))) return 'the guest reported no licence'
+  if (vm.licence?.kind === 'own') return null
+  const status = Number(r.status)
+  if (status !== 1) return `Windows isn't licensed (licence status ${status}${r.error ? `: ${r.error}` : ''})`
+  const ends = [Number(r.graceMinutes) > 0 ? now + Number(r.graceMinutes) * 60_000 : NaN, r.evalEnd ? Date.parse(r.evalEnd) : NaN].filter(Number.isFinite)
+  if (!ends.length) return 'Windows reported no evaluation period'
+  if (Math.min(...ends) <= now) return `the evaluation's end, as Windows reports it (${new Date(Math.min(...ends)).toISOString()}), has passed`
+  return null
 }
 
 /** Why restored facts aren't the clean baseline, or null. */
