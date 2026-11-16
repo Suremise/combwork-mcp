@@ -178,6 +178,15 @@ function run(s, op, a) {
       if (s.restoreGate) while (!fs.existsSync(s.restoreGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25) // held until the test opens the gate
       const cp = vm.checkpoints.find(c => c.id === a.checkpointId)
       if (!cp) throw new Error('its clean checkpoint (by id) is missing')
+      // MC-1536: restoreTimeout: { phase, last } reports that phase timed out. For 'off' nothing is restored (the
+      // VM ends Off, disk and parent untouched); for 'parent' the restore is issued but reported unconfirmed. The
+      // facts are read afterwards either way, so they may match the target.
+      if (s.restoreTimeout) {
+        const t = s.restoreTimeout
+        vm.state = 'Off'
+        if (t.phase === 'parent') { vm.parent = cp.id; vm.disk = { ...cp.disk } }
+        return { ...facts(vm), restore: { ok: false, phase: t.phase, timedOut: true, last: t.last ?? 'Running', waitedMs: t.phase === 'off' ? 20000 : 65000 } }
+      }
       vm.state = 'Off'
       vm.parent = cp.id
       vm.switchName = null
@@ -187,7 +196,7 @@ function run(s, op, a) {
       vm.userinit = cp.userinit ?? null; vm.enableLUA = cp.enableLUA ?? 1 // the checkpoint's
       vm.restores = (vm.restores || 0) + 1
       if (s.restoreLeaves && (!s.restoreLeavesWhen || fs.existsSync(s.restoreLeavesWhen))) Object.assign(vm, s.restoreLeaves) // restoreLeavesWhen: only once that file exists
-      return facts(vm)
+      return { ...facts(vm), restore: { ok: true, phase: 'done', timedOut: false, last: cp.id, waitedMs: 0 } }
     }
     case 'configure-start': {
       const vm = own(s, a)
@@ -257,13 +266,19 @@ function run(s, op, a) {
       if (s.leaseRestoreGate) while (!fs.existsSync(s.leaseRestoreGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25)
       const cp = vm.checkpoints.find(c => c.id === a.checkpointId && c.name === a.snapName)
       if (!cp) throw new Error(`checkpoint ${a.snapName} (by id) is missing on this VM`)
+      if (s.restoreTimeout) {
+        const t = s.restoreTimeout
+        vm.state = 'Off'
+        if (t.phase === 'parent') { vm.parent = cp.id; vm.disk = { ...cp.disk } }
+        return { ...facts(vm), restore: { ok: false, phase: t.phase, timedOut: true, last: t.last ?? 'Running', waitedMs: t.phase === 'off' ? 20000 : 65000 } }
+      }
       vm.state = 'Off' // a production checkpoint restores Off
       vm.parent = cp.id
       vm.disk = { ...cp.disk }
       vm.switchName = cp.switchName ?? null // the checkpoint's own configuration, until the start reapplies the lease's
       vm.reserve = cp.reserve ?? 0
       vm.loggedOn = null; vm.watcher = false; vm.elevated = false
-      return facts(vm)
+      return { ...facts(vm), restore: { ok: true, phase: 'done', timedOut: false, last: cp.id, waitedMs: 0 } }
     }
     // factsParentWrong: the next facts-vm reports another parent (a verification mismatch), once.
     case 'facts-vm': { const vm = own(s, a); if (s.factsParentWrong) { delete s.factsParentWrong; return { ...facts(vm), parentCheckpointId: 'someone-else' } } return facts(vm) }
