@@ -491,6 +491,18 @@ const tools = [
     run: pass('stop')
   },
   {
+    name: 'vm_checkpoint',
+    description: 'Take a named checkpoint of the leased VM as it runs now (MC-1529): files, installed software and the registry, so you can try something and roll back with vm_restore. Not running programs or a logon session (it is a production checkpoint: disk only). Yours only, at most a few per lease (the policy\'s maxLeaseCheckpoints), and removed when the lease ends: vm_release always returns the VM to clean. Needs a running VM and a confirmed C:\\build.',
+    inputSchema: { type: 'object', properties: { name: { type: 'string', description: '1-40 letters, digits, spaces, dots, dashes or underscores; not "clean".' } }, required: ['name'] },
+    run: async args => { await needFeature('checkpoints', 'vm_checkpoint'); return pass('checkpoint')(args) }
+  },
+  {
+    name: 'vm_restore',
+    description: 'Restore one of this lease\'s checkpoints (vm_checkpoint) and start the VM from it, with this lease\'s current network and CPU reserve. Files, installed software and the registry come back as they were; running programs and any logon session do not (the guest boots fresh, and no one is logged on interactively afterwards: vm_start or vm_reset, even with interactive, restore clean instead and discard this state). C:\\build is left unconfirmed: run a full vm_sync before relying on it.',
+    inputSchema: { type: 'object', properties: { name: { type: 'string', description: 'The checkpoint\'s name.' } }, required: ['name'] },
+    run: async args => { await needFeature('checkpoints', 'vm_restore'); return pass('restore-checkpoint')(args) }
+  },
+  {
     name: 'vm_release',
     description: 'Restore the VM and end the lease. Always call it when done.',
     inputSchema: { type: 'object', properties: {} },

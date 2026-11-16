@@ -58,6 +58,10 @@ function problems(p) {
   // A work session's cap (vm_renew), optional so a policy from before it stays usable; never below one lease.
   if (p.maxSessionMinutes !== undefined && (!int(p.maxSessionMinutes, 5, 24 * 60) || p.maxSessionMinutes < p.maxLeaseMinutes)) out.push('maxSessionMinutes must be 5-1440 and at least maxLeaseMinutes')
   if (!int(p.maxBuildMB, 1, 64 * 1024)) out.push('maxBuildMB must be 1-65536')
+  // MC-1529: lease checkpoints, optional (defaults 3 and 20 GB): how many one lease may hold, and the free space the
+  // VM folder's drive must keep for a take.
+  if (p.maxLeaseCheckpoints !== undefined && !int(p.maxLeaseCheckpoints, 0, 8)) out.push('maxLeaseCheckpoints must be 0-8')
+  if (p.minFreeGBForCheckpoint !== undefined && !int(p.minFreeGBForCheckpoint, 1, 1024)) out.push('minFreeGBForCheckpoint must be 1-1024')
   if (typeof p.allowUnpinnedIso !== 'boolean') out.push('allowUnpinnedIso must be true or false')
   // Build folders an admin named at setup (install.ps1 -BuildRoot): optional, so a policy from before it stays usable.
   if (p.buildRoots !== undefined) {

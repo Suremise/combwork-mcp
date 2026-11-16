@@ -167,7 +167,7 @@ function run(s, op, a) {
       vm.switchName = null
       vm.reserve = 0
       const id = crypto.randomUUID()
-      vm.checkpoints = [{ id, name: 'clean', disk: { ...vm.disk }, userinit: vm.userinit ?? null, enableLUA: vm.enableLUA ?? 1 }]
+      vm.checkpoints = [{ id, name: 'clean', parentId: null, disk: { ...vm.disk }, userinit: vm.userinit ?? null, enableLUA: vm.enableLUA ?? 1 }]
       vm.parent = id
       return { checkpointId: id }
     }
@@ -195,13 +195,62 @@ function run(s, op, a) {
         if (!a.switchId) throw new Error(`no recorded id for switch ${a.switchName}`)
         if (!sw || sw.id !== a.switchId || sw.type !== 'Internal') throw new Error(`switch ${a.switchName} (id ${a.switchId}) is missing, renamed or not internal`)
         vm.switchName = a.switchName
-      }
+      } else vm.switchName = null // MC-1529: network off is disconnected, whatever a restored checkpoint's adapter said
       vm.reserve = a.reserve
       vm.state = 'Running'
       vm.boot = (vm.boot || 0) + 1
       vm.loggedOn = null; vm.watcher = false; vm.elevated = false
       vm.disk['C:\\out'] = ''
       return { started: true }
+    }
+    // MC-1529: a snapshot tree. A take's parent is the VM's current position, which then becomes the new snapshot (as
+    // Hyper-V does); a restore moves the current position to the snapshot; a removal merges into the children (they're
+    // re-parented to its parent). Knobs: productionFail (the take fails, nothing made), productionFailButMade (made, then
+    // the call fails, as a timeout), snapshotsFail (listing fails), snapRemoveFail: n (the next n removals fail),
+    // extraSnapshot: { name } (an unrelated snapshot appears at the next listing).
+    case 'snapshots': {
+      const vm = own(s, a)
+      if (s.snapshotsFail) throw new Error('injected: listing snapshots failed')
+      if (s.extraSnapshot && !vm.checkpoints.some(c => c.name === s.extraSnapshot.name)) vm.checkpoints.push({ id: crypto.randomUUID(), name: s.extraSnapshot.name, parentId: vm.parent, disk: { ...vm.disk } })
+      return { snapshots: vm.checkpoints.map(c => ({ id: c.id, name: c.name, parentId: c.parentId ?? null })) }
+    }
+    case 'lease-checkpoint': {
+      const vm = own(s, a)
+      if (vm.state !== 'Running') throw new Error(`the VM is ${vm.state}, not Running`)
+      if (!/^hvmcp-lease-[0-9a-f]{12}$/.test(a.snapName)) throw new Error('bad checkpoint name')
+      if (s.takeGate) while (!fs.existsSync(s.takeGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25) // held until the test opens it
+      if (s.productionFail) throw new Error('injected: a production checkpoint could not be made')
+      const id = crypto.randomUUID()
+      vm.checkpoints.push({ id, name: a.snapName, parentId: vm.parent, disk: { ...vm.disk }, switchName: vm.switchName, reserve: vm.reserve, production: true })
+      vm.parent = id
+      vm.leaseTakes = (vm.leaseTakes || 0) + 1
+      if (s.productionFailButMade) throw new Error('injected: the take timed out after making the checkpoint')
+      return { checkpointId: id, checkpointType: 'Standard' }
+    }
+    case 'lease-restore': {
+      const vm = own(s, a)
+      const cp = vm.checkpoints.find(c => c.id === a.checkpointId && c.name === a.snapName)
+      if (!cp) throw new Error(`checkpoint ${a.snapName} (by id) is missing on this VM`)
+      vm.state = 'Off' // a production checkpoint restores Off
+      vm.parent = cp.id
+      vm.disk = { ...cp.disk }
+      vm.switchName = cp.switchName ?? null // the checkpoint's own configuration, until the start reapplies the lease's
+      vm.reserve = cp.reserve ?? 0
+      vm.loggedOn = null; vm.watcher = false; vm.elevated = false
+      return facts(vm)
+    }
+    case 'facts-vm': return facts(own(s, a))
+    case 'snapshot-remove': {
+      const vm = own(s, a)
+      if (s.snapRemoveFail > 0) { s.snapRemoveFail--; throw new Error('injected: removing the snapshot failed') }
+      const cp = vm.checkpoints.find(c => c.id === a.checkpointId && c.name === a.snapName)
+      if (cp) {
+        for (const c of vm.checkpoints) if (c.parentId === cp.id) c.parentId = cp.parentId
+        if (vm.parent === cp.id) vm.parent = cp.parentId
+        vm.checkpoints = vm.checkpoints.filter(c => c !== cp)
+        vm.removedSnaps = [...(vm.removedSnaps || []), a.snapName]
+      }
+      return { removed: !vm.checkpoints.some(c => c.id === a.checkpointId) }
     }
     case 'copy-in': {
       const vm = own(s, a)

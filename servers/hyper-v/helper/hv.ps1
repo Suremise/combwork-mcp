@@ -613,6 +613,44 @@ try {
       Restore-VMSnapshot -VMSnapshot $cp -Confirm:$false
       Facts $vm
     }
+    # MC-1529: a lease's own checkpoints. Each is a production checkpoint (disk-consistent through VSS in the guest, no
+    # memory state), taken only while the VM runs, under its unique name hvmcp-lease-<opId>; the VM's checkpoint type is
+    # put back whatever happens, and a production checkpoint that can't be made fails: never a standard one instead.
+    'snapshots' {
+      $vm = Get-OwnVm $a
+      @{ snapshots = @(Get-VMSnapshot -VM $vm | ForEach-Object { @{ id = $_.Id.ToString(); name = [string]$_.Name; parentId = if ($_.ParentSnapshotId) { $_.ParentSnapshotId.ToString() } else { $null } } }) }
+    }
+    'lease-checkpoint' {
+      $vm = Get-OwnVm $a
+      if ($vm.State -ne 'Running') { throw "the VM is $($vm.State), not Running" }
+      if ([string]$a.snapName -notmatch '^hvmcp-lease-[0-9a-f]{12}$') { throw 'bad checkpoint name' }
+      $old = $vm.CheckpointType
+      try {
+        Set-VM -VM $vm -CheckpointType ProductionOnly
+        $cp = Checkpoint-VM -VM $vm -SnapshotName ([string]$a.snapName) -Passthru -ErrorAction Stop
+      } finally { Set-VM -VM $vm -CheckpointType $old }
+      @{ checkpointId = $cp.Id.ToString(); checkpointType = [string](Get-VM -Id $vm.Id).CheckpointType }
+    }
+    'lease-restore' {
+      $vm = Get-OwnVm $a
+      $cp = Get-VMSnapshot -VM $vm | Where-Object { $_.Id.ToString() -eq [string]$a.checkpointId -and [string]$_.Name -ceq [string]$a.snapName }
+      if (-not $cp) { throw "checkpoint $($a.snapName) (by id) is missing on this VM" }
+      if ($vm.State -eq 'Saved') { Remove-VMSavedState -VM $vm }
+      elseif ($vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -Force }
+      Restore-VMSnapshot -VMSnapshot $cp -Confirm:$false
+      Facts $vm
+    }
+    'facts-vm' {
+      Facts (Get-OwnVm $a)
+    }
+    'snapshot-remove' {
+      # Only the exact snapshot: this id and this name, on this VM. Absent already counts as removed.
+      $vm = Get-OwnVm $a
+      $cp = Get-VMSnapshot -VM $vm | Where-Object { $_.Id.ToString() -eq [string]$a.checkpointId -and [string]$_.Name -ceq [string]$a.snapName }
+      if ($cp) { Remove-VMSnapshot -VMSnapshot $cp -Confirm:$false }
+      $left = @(Get-VMSnapshot -VM $vm | Where-Object { $_.Id.ToString() -eq [string]$a.checkpointId })
+      @{ removed = ($left.Count -eq 0) }
+    }
     'configure-start' {
       $vm = Get-OwnVm $a
       if ($vm.State -ne 'Off') { throw 'the VM is not Off after its restore' }
@@ -622,6 +660,9 @@ try {
         $sw = Get-VMSwitch -Id ([guid]$a.switchId) -ErrorAction SilentlyContinue
         if (-not $sw -or $sw.Name -cne [string]$a.switchName -or $sw.SwitchType -ne 'Internal') { throw "switch $($a.switchName) (id $($a.switchId)) is missing, renamed or not internal" }
         Get-VMNetworkAdapter -VM $vm | Connect-VMNetworkAdapter -VMSwitch $sw
+      } else {
+        # MC-1529: network off means disconnected, whatever the restored checkpoint's adapter said.
+        Get-VMNetworkAdapter -VM $vm | Disconnect-VMNetworkAdapter
       }
       Set-VMProcessor -VM $vm -Reserve ([int]$a.reserve)
       Start-VM -VM $vm
