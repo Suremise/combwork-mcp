@@ -66,6 +66,11 @@ path serves both:
    writes a **dynamic VHD**, skipping zero blocks, then hv.ps1 `vhd-convert` (`Convert-VHD`) makes the base VHDX in the
    disk folder's `images\`. Its SHA-256 is recorded with the image. A create copies that base, rechecking its hash
    first.
+   **Nothing is installed or run on the host for this:** no qemu-img or other converter. The qcow2 reading and VHD
+   writing are the helper's own code (Node built-ins: `fs` and `zlib`). `Convert-VHD` is a cmdlet of Hyper-V's own
+   PowerShell module, run by hv.ps1 like the `New-VHD` and `New-VM` it already uses. It's needed because Gen 2 VMs take
+   only VHDX. If even that step isn't wanted, the helper could write VHDX itself, a bigger format (MC-1501 would then
+   carry a VHDX writer instead of the VHD one).
 4. **Sanity after the first boot, never verification:** the guest's `/etc/os-release` (`ID`, `VERSION_ID`) and its
    build serial (Ubuntu's `/etc/cloud/build.info`, Debian's image serial in its `/etc/` image metadata, whichever the
    trial shows is reliable) must match the pin, or the build fails, as Windows' edition and build check does today.
