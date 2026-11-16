@@ -140,7 +140,7 @@ counterpart of guest-sync.ps1 and the `guest-*` blocks, and is tested the same w
 ## 4. Talking to the guest: SSH over a Hyper-V socket (recommended), or the internal switch
 
 The card's agreed shape was SSH over the pool's internal switch. Looking closer, there is a better transport, and it's
-**a choice for the user**:
+**the user chose A** (decisions, below):
 
 **A. Hyper-V socket, AF_HYPERV ↔ AF_VSOCK (recommended).** PowerShell Direct itself runs over Hyper-V sockets. Linux
 has the same channel (`hv_sock`): a guest listener on vsock port 22 is reached from the host by VM id and the service
@@ -303,9 +303,10 @@ running guest, with syncs between runs.
 ## 7. Tools: what agents see
 
 The same tools, with nothing new:
-- `vm_acquire({ os: 'linux', image? })`. A plain `os: 'linux'` takes any Linux image; to choose a distro, give `image`
-  (a SHA-256 prefix), or use the new `distro: 'debian' | 'ubuntu'` filter. **That filter is a choice for the user:** it's
-  convenient, but it's one more argument. Without it, `image` covers it;
+- `vm_acquire({ os: 'linux', distro?, image? })`. A plain `os: 'linux'` takes any Linux image. `distro: 'debian' |
+  'ubuntu'` (the user's decision) narrows it to that distro's images, and implies `os: 'linux'`. An `image`
+  (a SHA-256 prefix) narrows it to one image, and must agree with `distro`, or it's refused, as `os` and `image` are
+  today. A distro the project's image list leaves no image for is refused at once, never queued;
 - `vm_status` and `pool_status` show OS, distro, release and serial;
 - `pool_plan({ image: { distro: 'debian' } })` picks the newest pinned Debian; or give a pin's SHA-256.
 
@@ -382,11 +383,12 @@ Trial steps:
    - the helper and host each killed mid-run and recovered.
 5. Ubuntu repeats steps 3 and 4 (shorter). Then release everything and confirm the CLI team's VMs were never touched.
 
-## Choices for the user
+## The user's decisions (16 Nov)
 
-1. **Transport:** A, the Hyper-V socket (recommended: no network path at all, the same channel PowerShell Direct uses,
-   one registry key at setup), or B, the internal switch (as first agreed: a standing IP path held shut by ACLs and a
-   firewall rule, and two host settings changed).
-2. **Debian's trust:** pin plus HTTPS only, since Debian doesn't sign its cloud image sums. Accept, or Ubuntu only
-   until Debian signs? Recommend accept: it's the same as the Windows evaluation ISO.
-3. **`vm_acquire({ distro })`:** add the convenience filter, or `image` only. Recommend `distro`.
+1. **Transport: A**, SSH over a Hyper-V socket, with no network path. B (the internal switch) only if the trial finds
+   hv_sock missing, and only on the user's further decision (§4.1, §4.2).
+2. **Debian's trust:** the pinned SHA-512 hash plus HTTPS, accepted (Debian's checksums aren't signed). Ubuntu's signed
+   checksums are verified.
+3. **`vm_acquire({ distro: 'debian' | 'ubuntu' })`** is added.
+
+The qcow2-to-VHDX conversion installs no tool on the host (§2.3). If that ever changed, it would go back to the user.
