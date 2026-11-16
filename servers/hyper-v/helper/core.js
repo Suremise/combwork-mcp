@@ -2625,7 +2625,7 @@ class Helper {
 }
 
 const PROTOCOL = 'hyperv-mcp/3' // 2: renew, sync_plan, sync (MC-1497); 3: start's interactive, run's session (MC-1503)
-// Additive features since protocol 3, by name, so a server that asks for exactly hyperv-mcp/3 (hyper-v 1.2.0) keeps
+// Additive features since protocol 3, by name, so a server that asks for exactly hyperv-mcp/3 (MC-1503's) keeps
 // working with this helper: 'projects' = projects, acquire's wait and roots, whoami; 'images' = image groups,
 // acquire's os and image, per-OS shares, a project's image allowlist (MC-1502).
 // 'named' = acquire's vm, one VM by name (MC-1523).

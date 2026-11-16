@@ -1,6 +1,6 @@
 {
-  "version": "1.2.0",
-  "description": "Disposable Hyper-V test VMs from a pool: several agents at once, each from a clean checkpoint or kept warm with changed files synced in; commands in session 0 or a logged-on desktop.",
+  "version": "2.0.0",
+  "description": "Disposable Hyper-V test VMs from a pool: several agents at once, each from a clean checkpoint, a shared pool checkpoint or kept warm; lease checkpoints; commands in session 0 or a logged-on desktop.",
   "tags": ["testing", "windows", "hyper-v", "vm"],
   "requires": {
     "os": ["windows"],
@@ -10,6 +10,6 @@
       "features": ["Hyper-V"]
     },
     "node": ">=18",
-    "apps": ["Its helper service, set up once in an admin PowerShell (setup\\install.ps1)", "A Windows 11 Enterprise evaluation ISO for the pool's VMs"]
+    "apps": ["Its helper service, set up once in an admin PowerShell (setup\\install.ps1), and again after upgrading", "A Windows 11 x64 ISO for the pool's VMs: Microsoft's Enterprise evaluation, or your own non-evaluation copy (Enterprise, Pro or Education) with its product key"]
   }
 }
