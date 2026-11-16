@@ -4,6 +4,7 @@
 // that never settle exhaust the budget. core.js's own provisionProfiles, logon and waitProvisioned run on a bare object
 // with a fake transport and a clock that moves only by its calls (guest-logon 10, a probe 5, the undo 5).
 process.env.HYPERV_MCP_PROVISION_WAIT_MS = '300'
+process.env.HYPERV_MCP_PROVISION_DWELL_MS = '0' // the dwell (MC-1527) has its own file, provision-dwell.test.js
 process.env.HYPERV_MCP_PROVISION_QUIET_MS = '40'
 process.env.HYPERV_MCP_PROVISION_POLL_MS = '1'
 process.env.HYPERV_MCP_POLL_MS = '1'

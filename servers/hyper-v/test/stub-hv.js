@@ -124,7 +124,10 @@ function run(s, op, a) {
       // profileUnknownAt.
       const grow = Math.min(k, s.profileGrow || 0)
       const unknown = s.profileUnknownAt === k
-      return { boot: `boot-${vm.boot || 0}`, user: vm.loggedOn === a.account, lastEvent: '2026-11-15T00:00:00.000Z', count: 42, inventory: 'cafe', busy, mappings: unknown ? null : 60 + grow, packagesDirs: unknown ? null : 25 + grow }
+      // MC-1527: waveAfterMs: the account's AppContainer wave (+39 each) lands this long after this logon's first probe.
+      if (k === 1) vm.provisionStart = Date.now()
+      const wave = s.waveAfterMs !== undefined && Date.now() - vm.provisionStart >= s.waveAfterMs ? 39 : 0
+      return { boot: `boot-${vm.boot || 0}`, user: vm.loggedOn === a.account, lastEvent: '2026-11-15T00:00:00.000Z', count: 42, inventory: 'cafe', busy, mappings: unknown ? null : 60 + grow + wave, packagesDirs: unknown ? null : 25 + grow + wave }
     }
     case 'guest-licence': { own(s, a); return { status: 1, graceMinutes: 0, evalEnd: null, channel: 'Retail', error: null, ...(s.licence || {}) } }
     case 'net-off': { const vm = own(s, a); vm.state = 'Off'; vm.switchName = null; return { offline: true } }

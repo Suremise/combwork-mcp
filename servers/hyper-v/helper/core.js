@@ -39,6 +39,9 @@ const LOGON_STABLE_MS = Number(process.env.HYPERV_MCP_LOGON_STABLE_MS || 10_000)
 // of consecutive good, idle samples (PROVISION_POLL_MS apart), within PROVISION_WAIT_MS. Test-only overrides.
 const PROVISION_QUIET_MS = Number(process.env.HYPERV_MCP_PROVISION_QUIET_MS || 4 * 60_000) // MC-1520: 4 min, a trial value
 const PROVISION_POLL_MS = Number(process.env.HYPERV_MCP_PROVISION_POLL_MS || 15_000)
+// MC-1527: the least time from an attempt's readiness to its acceptance: each account's AppContainer wave (about 39
+// profiles) comes after an earlier quiet, within about 11 min of the logon (MC-1525). Test-only override.
+const PROVISION_DWELL_MS = Number(process.env.HYPERV_MCP_PROVISION_DWELL_MS || 13 * 60_000)
 const PROVISION_WAIT_MS = Number(process.env.HYPERV_MCP_PROVISION_WAIT_MS || 30 * 60_000) // MC-1520: 30 min per account (the user's scope decision)
 // MC-1520: a build-time logon attempt waits up to BUILD_LOGON_WAIT_MS (within the account's deadline), leaving room for
 // one retry; one that is still waiting at LOGON_SNAPSHOT_MS (the runtime limit) gets a read-only diagnostic snapshot.
@@ -1699,7 +1702,7 @@ class Helper {
           this.log(`${vm.vmName}: ${name}'s build logon attempt ${attempt} failed (${why}; ${diagLine(failed)})`)
         }
         await this.undoLogon(vm, creds)
-        if (!why) { out[name] = { logonMs: o.ms, quietMs: quiet.ms, packages: quiet.count, inventory: quiet.inventory, mappings: quiet.mappings, packagesDirs: quiet.packagesDirs, attempts }; break }
+        if (!why) { out[name] = { logonMs: o.ms, quietMs: quiet.ms, dwellMs: quiet.dwellMs, packages: quiet.count, inventory: quiet.inventory, mappings: quiet.mappings, packagesDirs: quiet.packagesDirs, attempts }; break }
         if (attempt >= 2) throw new Error(`provisioning ${name}'s profile failed twice: ${why} (${diagLine(failed)})`)
       }
     }
@@ -1716,6 +1719,10 @@ class Helper {
    */
   async waitProvisioned(vm, creds, account, boot, deadline) {
     const t0 = this.now()
+    // MC-1527: no acceptance before PROVISION_DWELL_MS after this attempt's readiness (t0, a little after the logon
+    // itself), so the account's later AppContainer wave lands before the checkpoint. Dwell and quiet run together; if
+    // the dwell can't end before the deadline, the attempt is late at once.
+    if (t0 + PROVISION_DWELL_MS >= deadline) throw provisionLate(account)
     let last = null
     let quietSince = null
     while (this.now() < deadline) {
@@ -1729,7 +1736,7 @@ class Helper {
       if (good) last = r
       if (busy) quietSince = null
       else if (quietSince === null) quietSince = this.now()
-      if (!busy && this.now() - quietSince >= PROVISION_QUIET_MS) return { ms: this.now() - t0, count: r.count, inventory: r.inventory, mappings: r.mappings, packagesDirs: r.packagesDirs }
+      if (!busy && this.now() - quietSince >= PROVISION_QUIET_MS && this.now() - t0 >= PROVISION_DWELL_MS) return { ms: this.now() - t0, dwellMs: PROVISION_DWELL_MS, count: r.count, inventory: r.inventory, mappings: r.mappings, packagesDirs: r.packagesDirs }
       await sleep(Math.min(PROVISION_POLL_MS, Math.max(0, deadline - this.now())))
     }
     throw provisionLate(account)
@@ -1889,7 +1896,7 @@ function buildNote(profiles) {
   const notes = []
   for (const [name, p] of Object.entries(profiles || {})) {
     // The settled counts, always: what the quiet test saw when it accepted the profile.
-    if (Number.isInteger(p.mappings)) notes.push(`${name} settled with ${p.mappings} AppContainer mappings and ${p.packagesDirs} Packages folders after ${Math.round(p.quietMs / 1000)} s`)
+    if (Number.isInteger(p.mappings)) notes.push(`${name} settled with ${p.mappings} AppContainer mappings and ${p.packagesDirs} Packages folders after ${Math.round(p.quietMs / 1000)} s${Number.isInteger(p.dwellMs) ? ` (at least ${Math.round(p.dwellMs / 1000)} s after its logon)` : ''}`)
     // MC-1524: Windows' known drop of a first logon, followed by an attempt that succeeded, is expected: said so, briefly.
     // Any other failed attempt, or a drop with no later success, stays in full.
     const ok = (p.attempts || []).some(t => !t.why)
@@ -1977,7 +1984,7 @@ function describePlan(plan, digest, approve) {
   if (plan.image) lines.push(`- image: ${plan.image.edition}${plan.image.imageIndex > 1 ? ` (index ${plan.image.imageIndex})` : ''} build ${plan.image.build}, SHA-256 ${plan.image.sha256} (${plan.image.pinned ? 'pinned: a known Microsoft download' : plan.image.source === 'download' ? 'downloaded by the helper over HTTPS from Microsoft' : 'NOT AUTHENTICATED: a local file you chose to trust'})`)
   if (plan.add?.length) lines.push('- registry: a user\'s registry isn\'t forcibly unloaded at logoff (the DisableForceUnload policy): the suspected cause of runs losing their HKCU after the short PowerShell Direct session that started them ends (MC-1522; its real-build trial is MC-1521)')
   if (plan.add?.length) lines.push(`- Defender: the test work folders ${DEFENDER_EXCLUSIONS.join(', ')} are excluded from Defender's scanning (real-time and scheduled scans) in the guest image; Defender stays on otherwise`)
-  if (plan.add?.length) lines.push(`- provisioning: each new VM logs hvadmin and hvuser on interactively once (offline), waits for Windows' first-logon setup to finish, then turns autologon off and resets UAC and the watcher's start before its clean checkpoint; each account within ${Math.round(PROVISION_WAIT_MS / 60_000)} min (a logon attempt up to ${Math.round(BUILD_LOGON_WAIT_MS / 60_000)} min once it has begun, one with no sign of a logon ${Math.round(FIRST_LOGON_SIGN_MS / 60_000)} min after its new boot is seen retried at once, then ${Math.round(PROVISION_QUIET_MS / 60_000)} min of observed quiet, one retry if needed)`)
+  if (plan.add?.length) lines.push(`- provisioning: each new VM logs hvadmin and hvuser on interactively once (offline), waits for Windows' first-logon setup to finish, then turns autologon off and resets UAC and the watcher's start before its clean checkpoint; each account within ${Math.round(PROVISION_WAIT_MS / 60_000)} min (a logon attempt up to ${Math.round(BUILD_LOGON_WAIT_MS / 60_000)} min once it has begun, one with no sign of a logon ${Math.round(FIRST_LOGON_SIGN_MS / 60_000)} min after its new boot is seen retried at once, then accepted at least ${Math.round(PROVISION_DWELL_MS / 60_000)} min after its logon, with the last ${Math.round(PROVISION_QUIET_MS / 60_000)} min observed quiet, one retry if needed)`)
   if (plan.activation === 'online-once') lines.push('- activation: each new VM goes online once, through Windows\' Default Switch, to activate Windows; it is disconnected (verified) before its clean checkpoint, and no start ever uses that switch')
   else if (plan.add?.length) lines.push('- activation: none (each new VM stays offline; its licence is read and shown)')
   if (plan.add?.length && plan.image && !plan.image.evaluation) lines.push(`- product key: ${plan.productKey ? 'the pool\'s (set by install.ps1 -ProductKeyFile), written only into the answer file' : 'none'}`)

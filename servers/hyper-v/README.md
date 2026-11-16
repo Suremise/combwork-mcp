@@ -222,7 +222,12 @@ approval → change**:
      was first seen (by the host's clock) ends and is retried at once (MC-1526). The 15 minutes are the ceiling for
      an attempt that has begun. Unreadable events and failed checks never count; a further restart starts the 3
      minutes over. The job's note then says the first logon was dropped by Windows, or didn't begin, and was retried;
-     any other failed attempt, or either case with no successful retry, is reported in full. A build's logon attempt waits up to 15 minutes (a start's waits 10). One still waiting at 10 minutes
+     any other failed attempt, or either case with no successful retry, is reported in full. Each account's wave of
+     about 39 AppContainer profiles comes after an earlier quiet, within about 11 minutes of its logon (MC-1525: an
+     account accepted at 61 mappings went to 100 in an interactive start's first 11 minutes). So an account is
+     accepted no sooner than 13 minutes after its logon was seen ready, with the last 4 minutes observed quiet; the
+     two run together, inside the same 30 minutes (MC-1527). The job's note gives each account's settled counts, the
+     time it took, and that 13-minute minimum. A build's logon attempt waits up to 15 minutes (a start's waits 10). One still waiting at 10 minutes
      gets a read-only snapshot of the guest, and a failed one a snapshot before its undo (MC-1520). The snapshot keeps
      allowlisted fields only: event ids and seconds after boot from the session-manager, Security, Winlogon, User
      Profile, Shell-Core, AppReadiness and CloudExperienceHost logs (a missing or disabled log is "unavailable"), the
@@ -686,7 +691,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-dwell.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
 ```
 
 - `units.test.js`:
@@ -788,6 +793,11 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   (an explicit ACE left on `C:\hvmcp`, UAC still off) failing the build; Defender's exclusions (MC-1519) added after
   the profiles and before the checkpoint, exactly the four test folders, and a read-back missing one, with another, or
   with real-time protection off failing the build.
+- `provision-dwell.test.js`, the per-account dwell (MC-1527) on a fake clock: no acceptance before it even when quiet,
+  acceptance at the first sample with dwell and quiet both held, a wave late in the dwell accepted only after its own
+  quiet (with the post-wave counts), a dwell that can't end before the deadline late at once (and its boundary), and a
+  retry's dwell counted from its own readiness. `provision.test.js` also checks the stub's wave landing during the
+  dwell and the checkpoint keeping the post-wave counts.
 - `provision-clock.test.js`, the real provisioning and logon methods on a fake clock: one provisioning deadline per
   account over its logon, quiet wait and retry, so a session lost near it gets no new allowance; every call bounded by
   the time left; nothing accepted that returns after the deadline (a logon's readiness, a quiet probe); a start's logon,
