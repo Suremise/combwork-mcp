@@ -607,7 +607,8 @@ class Helper {
         want = { os: tOs, ...(tImg !== 'legacy' ? { image: tImg } : {}), vm: named, vmImage: tImg }
       } else {
         want = { os, ...(image !== undefined ? { image: this.verifiedImage(image).sha256 } : {}) }
-        if (want.image && (this.state.images.get(want.image)?.os || 'windows') !== os) throw new Error(`image ${want.image.slice(0, 12)} is a ${this.state.images.get(want.image)?.os || 'windows'} image, not ${os}.`)
+        // MC-1532: with a checkpoint and no os, the OS comes from the checkpoint's VMs (filtered by this image below).
+        if (want.image && !(checkpoint !== undefined && osAsked === undefined) && (this.state.images.get(want.image)?.os || 'windows') !== os) throw new Error(`image ${want.image.slice(0, 12)} is a ${this.state.images.get(want.image)?.os || 'windows'} image, not ${os}.`)
       }
       if (checkpoint !== undefined) {
         // MC-1532: only VMs with this published (not retiring) pool checkpoint. A vm narrows first; then os and image.
@@ -1871,18 +1872,24 @@ class Helper {
    * Hyper-V work runs under the VM's lock only; the bound lease is checked after every await and just before publishing.
    */
   async pcpPublish(plan, e) {
-    const s = this.state
-    const vm = s.vms.get(e.vmId)
+    const vm = this.state.vms.get(e.vmId)
+    // The binding, re-read from the journal's current state at every boundary (state() is rebuilt each time): the
+    // lease, and the name's target on this VM: a publish finds none of that name (retiring ones included); a replace
+    // finds exactly the planned one, still selected.
     const bound = () => {
+      const st = this.state
+      const v = st.vms.get(e.vmId)
       const l = this.leases.get(e.vmId)
-      if (!vm || vm.vmName !== e.name || !l || l.leaseId !== e.leaseId || l.ending || l.project !== e.owner || this.imageOf(vm) !== e.image) throw new Error('the lease the plan was made from has ended or changed: nothing was published (make a new plan)')
-      if (e.replaces) { const old = s.poolSnaps.get(e.replaces); if (!old || old.retiring || old.vmId !== e.vmId || old.name.toLowerCase() !== plan.checkpoint.toLowerCase()) throw new Error('the checkpoint to replace has changed: nothing was published (make a new plan)') }
+      if (!v || v.vmName !== e.name || !l || l.leaseId !== e.leaseId || l.ending || l.project !== e.owner || this.imageOf(v) !== e.image) throw new Error('the lease the plan was made from has ended or changed: nothing was published (make a new plan)')
+      const same = [...st.poolSnaps.values()].filter(x => x.vmId === e.vmId && x.name.toLowerCase() === plan.checkpoint.toLowerCase())
+      if (!e.replaces && same.length) throw new Error(`it already has a pool checkpoint "${plan.checkpoint}"${same.every(x => x.retiring) ? ' (retiring)' : ''}: nothing was published (replace it with a new plan, replace: true)`)
+      if (e.replaces) { const live = same.filter(x => !x.retiring); if (live.length !== 1 || live[0].checkpointId !== e.replaces || live[0].owner !== e.owner) throw new Error('the checkpoint to replace has changed: nothing was published (make a new plan)') }
       return l
     }
     let lease = bound()
     if (this.pcpBusy.has(e.vmId)) throw new Error('another pool-checkpoint operation is running on it')
     const cap = this.policy.maxCheckpointsPerVm ?? 4
-    const held = [...s.poolSnaps.values()].filter(x => x.vmId === e.vmId).length + [...s.leaseSnaps.values()].filter(x => x.vmId === e.vmId && x.snapName.startsWith('hvmcp-pool-')).length
+    const held = [...this.state.poolSnaps.values()].filter(x => x.vmId === e.vmId).length + [...this.state.leaseSnaps.values()].filter(x => x.vmId === e.vmId && x.snapName.startsWith('hvmcp-pool-')).length
     if (held + 1 > cap) throw new Error(`it would hold more than maxCheckpointsPerVm (${cap}) pool checkpoints`)
     this.pcpBusy.add(e.vmId)
     try {
@@ -1890,17 +1897,25 @@ class Helper {
         lease = bound()
         const opts = () => this.forLease(lease)
         const creds = this.creds()
-        let stage = 'undo'
+        let stage = 'disk'
         try {
+          // 0. The disk floor, now (the plan's reading may be 30 minutes old): nothing has changed yet.
+          const floor = this.policy.minFreeGBForCheckpoint ?? 20
+          const df = await this.hv('facts', { folders: [vm.folder] }, opts())
+          lease = bound()
+          const free = df.folders?.[0]?.freeGB
+          if (!Number.isFinite(free) || free < floor) throw new Error(`the VM folder's drive has ${free ?? 'unknown'} GB free, under the ${floor} GB a checkpoint must leave`)
           // 1. The logon undone and verified (no autologon, no LSA secret, UAC on, Userinit, C:\hvmcp empty and plain).
+          // From here no interactive run may start: the undo removes the watcher's start and files, verified or not.
+          stage = 'undo'
+          lease.interactive = null
           await this.undoLogon(vm, creds, opts())
           lease = bound()
-          lease.interactive = null
-          // 2. The network disconnected, read back.
+          // 2. The network disconnected, read back. Assumed off from the attempt on, whatever the call's outcome.
           stage = 'network'
+          lease.network = false
           const f1 = await this.hv('net-disconnect', this.ident(vm), opts())
           lease = bound()
-          lease.network = false
           if (f1.switchName) throw new Error(`its network adapter is still connected to ${f1.switchName}`)
           // 3. A clean guest shutdown, verified Off.
           stage = 'shutdown'
@@ -1941,11 +1956,11 @@ class Helper {
           return `published "${plan.checkpoint}" (${r.checkpointId}); the VM is Off at it, and this lease now starts from it (vm_start)${e.replaces ? '; the old one is no longer offered and is removed when this lease ends' : ''}.`
         } catch (err) {
           // Nothing was published. Say what changed, and get the prepared state running again if it's safely Off.
-          const done = { undo: 'nothing changed', network: 'its logon was undone (no interactive session)', shutdown: 'its logon was undone and its network disconnected', take: 'its logon was undone, its network disconnected and it was shut down', verify: 'it was shut down and checkpointed, but that checkpoint is unpublished (removed with this lease)' }[stage]
+          const done = { disk: 'nothing changed', undo: 'its logon may be partly undone (no interactive session from now; vm_start or vm_reset with interactive logs on again)', network: 'its logon was undone (no interactive session) and its network may be disconnected (taken as off)', shutdown: 'its logon was undone and its network disconnected', take: 'its logon was undone, its network disconnected and it was shut down', verify: 'it was shut down and checkpointed, but that checkpoint is unpublished (removed with this lease)' }[stage]
           if (this.leases.get(e.vmId)?.leaseId !== e.leaseId || this.leases.get(e.vmId)?.ending) throw new Error(`${err.message}; the lease ended meanwhile, so nothing was published (its release cleans up)`)
           let state = null
           try { state = (await this.hv('facts-vm', this.ident(vm), this.forLease(lease))).state } catch { state = null }
-          if (state === 'Off' && stage !== 'undo') {
+          if (state === 'Off' && stage !== 'undo' && stage !== 'disk') {
             let again = null
             try {
               await this.hv('configure-start', { ...this.ident(vm), switchName: null, switchId: null, reserve: lease.reserve || 0 }, this.forLease(lease))
@@ -1953,8 +1968,12 @@ class Helper {
               if (waited === null) throw new Error('its guest didn\'t answer')
             } catch (e2) { again = e2 }
             if (again) {
+              // Read again: the start may have succeeded with the guest not answering. No runs until it's verified.
               lease.running = false
-              throw new Error(`${err.message}. Nothing was published; ${done}. Starting it again failed (${again.message}): the VM is Off, and vm_start would restore its start point and lose what you prepared (take a lease checkpoint, vm_checkpoint, before pool_checkpoint next time).`)
+              let now = null
+              try { now = (await this.hv('facts-vm', this.ident(vm), this.forLease(lease))).state } catch { now = null }
+              const where = now === 'Off' ? 'the VM is Off, and vm_start would restore its start point and lose what you prepared (take a lease checkpoint, vm_checkpoint, before pool_checkpoint next time)' : `the VM is ${now ?? 'in an unknown state'}; no runs until vm_start or vm_reset (which restore its start point)`
+              throw new Error(`${err.message}. Nothing was published; ${done}. Starting it again failed (${again.message}): ${where}.`)
             }
             lease.running = true
             lease.sync.trusted = false
