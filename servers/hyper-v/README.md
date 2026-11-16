@@ -363,9 +363,12 @@ projects start from (MC-1532) and refreshing the clean checkpoint in place (MC-1
   before its parent, each confirmed gone. If one can't be removed, the VM is quarantined ("lease checkpoint cleanup
   pending") and isn't leased again until they're all gone, even though clean itself verified; the helper retries.
 - **Crashes:** each take is journalled before it starts, under a unique Hyper-V name (`hvmcp-lease-<id>`), with the
-  VM's checkpoint type before it, and again once confirmed; each removal likewise. A take whose call failed is never
-  assumed not to have happened: found by its name it's kept as the lease's; not found it stays "unconfirmed", holds
-  its slot, and is settled only after clean is restored at the lease's end. Removal matches a confirmed checkpoint by
+  VM's checkpoint type before it, and again once confirmed; each removal likewise. A take Hyper-V itself reports
+  as failed is settled at once (no standard checkpoint is taken instead). A take whose call died or timed out is
+  never assumed not to have happened: found by its name it's kept as the lease's; not found it stays "unconfirmed"
+  and holds its slot, and at the lease's end it's settled as never made only when Hyper-V shows no job still running
+  on the host (WMI's Msvm_ConcreteJob); until then the VM stays quarantined, and a take that finishes later is found
+  and removed. Removal matches a confirmed checkpoint by
   its id (the same id under another name is left alone and keeps the VM quarantined) and an unconfirmed one by its
   name; the checkpoint type is put back from the journal before each is forgotten. Any other checkpoint on a pool VM
   (neither clean nor one of these, a same-named one with another id included) is left alone and listed in

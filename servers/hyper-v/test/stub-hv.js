@@ -189,6 +189,8 @@ function run(s, op, a) {
     }
     case 'configure-start': {
       const vm = own(s, a)
+      if (s.configureEntered) fs.writeFileSync(s.configureEntered, 'entered')
+      if (s.configureGate) while (!fs.existsSync(s.configureGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25)
       if (vm.state !== 'Off') throw new Error('the VM is not Off after its restore')
       if (a.switchName) {
         const sw = s.switches[a.switchName]
@@ -213,7 +215,7 @@ function run(s, op, a) {
       if (s.snapshotsFail) throw new Error('injected: listing snapshots failed')
       if (s.extraSnapshot && !vm.checkpoints.some(c => c.name === s.extraSnapshot.name)) vm.checkpoints.push({ id: crypto.randomUUID(), name: s.extraSnapshot.name, parentId: vm.parent, disk: { ...vm.disk } })
       // productionFailDelayed: a take whose call failed completes afterwards: it appears from the second listing on.
-      if (vm.delayedTake && ++vm.delayedTake.listings >= 2) { vm.checkpoints.push(vm.delayedTake.cp); vm.delayedTake = null }
+      if (vm.delayedTake && ++vm.delayedTake.listings >= (s.delayedAfter || 2)) { vm.checkpoints.push(vm.delayedTake.cp); vm.delayedTake = null }
       return { snapshots: vm.checkpoints.map(c => ({ id: c.id, name: c.name, parentId: c.parentId ?? null })) }
     }
     case 'lease-checkpoint': {
@@ -227,7 +229,10 @@ function run(s, op, a) {
       vm.checkpointType = 'ProductionOnly'
       const wait = g => { while (!fs.existsSync(g)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25) }
       if (s.takeGate) wait(s.takeGate)
-      if (s.productionFail) { vm.checkpointType = orig; throw new Error('injected: a production checkpoint could not be made') }
+      // productionFail: Hyper-V's own terminal failure, answered as such (failed: true), as hv.ps1 does.
+      if (s.productionFail) { vm.checkpointType = orig; return { failed: true, error: 'injected: a production checkpoint could not be made', checkpointType: orig } }
+      // productionCallDies: the call itself fails (transport, a killed process): the outcome is unknown.
+      if (s.productionCallDies) { vm.checkpointType = orig; throw new Error('injected: the take call died') }
       const id = crypto.randomUUID()
       const cp = { id, name: a.snapName, parentId: vm.parent, disk: { ...vm.disk }, switchName: vm.switchName, reserve: vm.reserve, production: true }
       if (s.productionFailDelayed) { vm.delayedTake = { cp, listings: 0 }; vm.checkpointType = orig; throw new Error('injected: the take call failed; Hyper-V finishes it later') }
@@ -259,6 +264,12 @@ function run(s, op, a) {
       return facts(vm)
     }
     case 'facts-vm': return facts(own(s, a))
+    // A take Hyper-V hasn't finished (productionFailDelayed) is a running job until it appears; jobsUnreadable fails.
+    case 'jobs-idle': {
+      if (s.jobsUnreadable) throw new Error('injected: the job state is unreadable')
+      const running = Object.values(s.vms).filter(v => v.delayedTake).length
+      return { idle: running === 0, running }
+    }
     case 'snapshot-remove': {
       const vm = own(s, a)
       if (s.snapRemoveFail > 0) { s.snapRemoveFail--; throw new Error('injected: removing the snapshot failed') }

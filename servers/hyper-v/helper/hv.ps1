@@ -625,11 +625,22 @@ try {
       if ($vm.State -ne 'Running') { throw "the VM is $($vm.State), not Running" }
       if ([string]$a.snapName -notmatch '^hvmcp-lease-[0-9a-f]{12}$') { throw 'bad checkpoint name' }
       $old = $vm.CheckpointType
+      $cp = $null; $err = $null
       try {
         Set-VM -VM $vm -CheckpointType ProductionOnly
-        $cp = Checkpoint-VM -VM $vm -SnapshotName ([string]$a.snapName) -Passthru -ErrorAction Stop
+        # Checkpoint-VM runs Hyper-V's job to completion: an error here is that job's terminal failure, answered as such
+        # (failed: true); only a call that dies or times out leaves the outcome unknown.
+        try { $cp = Checkpoint-VM -VM $vm -SnapshotName ([string]$a.snapName) -Passthru -ErrorAction Stop } catch { $err = $_.Exception.Message }
       } finally { Set-VM -VM $vm -CheckpointType $old }
-      @{ checkpointId = $cp.Id.ToString(); checkpointType = [string](Get-VM -Id $vm.Id).CheckpointType }
+      $type = [string](Get-VM -Id $vm.Id).CheckpointType
+      if ($err) { @{ failed = $true; error = $err; checkpointType = $type } }
+      else { @{ checkpointId = $cp.Id.ToString(); checkpointType = $type } }
+    }
+    'jobs-idle' {
+      # MC-1529: whether any Hyper-V job is still starting or running on this host (WMI Msvm_ConcreteJob, JobState 3 or 4,
+      # host-wide, so a conservative check): a take whose call died is settled as never made only when none is.
+      $running = @(Get-CimInstance -Namespace root\virtualization\v2 -ClassName Msvm_ConcreteJob -ErrorAction Stop | Where-Object { $_.JobState -in 3, 4 })
+      @{ idle = ($running.Count -eq 0); running = $running.Count }
     }
     'lease-restore' {
       $vm = Get-OwnVm $a

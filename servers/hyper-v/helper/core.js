@@ -751,10 +751,16 @@ class Helper {
         if (y && y.name !== x.snapName) return `lease checkpoint cleanup pending: ${x.name}'s id ${x.checkpointId} now has the name "${y.name}"`
         targets.push({ x, snap: y || null })
       } else {
-        // An unconfirmed take: by its unique name. Absent here, after clean was restored (a later operation on this VM
-        // that finished), it's taken as never made; two with the name is a mismatch, left alone.
+        // An unconfirmed take (its call died or timed out): by its unique name. Absent, it's settled as never made only
+        // when Hyper-V positively shows no job still starting or running on the host: absence alone proves nothing.
+        // Two with the name is a mismatch, left alone.
         const ys = list.filter(y => y.name === x.snapName)
         if (ys.length > 1) return `lease checkpoint cleanup pending: ${ys.length} snapshots are named ${x.snapName}`
+        if (!ys.length) {
+          let idle = null
+          try { idle = (await this.hv('jobs-idle', this.ident(vm))).idle === true } catch { idle = null }
+          if (idle !== true) return `lease checkpoint cleanup pending: the take of ${x.name} may still be in progress (Hyper-V ${idle === false ? 'has a job running' : 'job state unreadable'})`
+        }
         targets.push({ x, snap: ys[0] || null })
       }
     }
@@ -1413,6 +1419,15 @@ class Helper {
         const found = list ? list.filter(x => x.name === snapName) : []
         if (found.length === 1) this.journal.append({ t: 'lcp-taken', opId, checkpointId: found[0].id })
         throw new Error(`The checkpoint "${name}" couldn't be taken (${e.message}).${found.length === 1 ? " One was made all the same: it's kept as this lease's, and removed with it." : ' Whether Hyper-V made one is settled when this lease ends (it holds a checkpoint slot until then).'}`)
+      }
+      if (r.failed) {
+        // Hyper-V's own terminal failure (Checkpoint-VM answered with an error): nothing is in progress. Confirmed absent
+        // by name, the intent is settled now; if it exists after all, it's this lease's.
+        const list = await this.hv('snapshots', this.ident(vm)).then(x => x.snapshots || [], () => null)
+        const found = list ? list.filter(x => x.name === snapName) : null
+        if (found?.length === 1) this.journal.append({ t: 'lcp-taken', opId, checkpointId: found[0].id })
+        else if (found?.length === 0) this.journal.append({ t: 'lcp-dropped', opId })
+        throw new Error(`The checkpoint "${name}" couldn't be taken (${r.error}).${found?.length === 1 ? " One was made all the same: it's kept as this lease's, and removed with it." : ''} No standard checkpoint is taken instead.`)
       }
       const id = r.checkpointId
       this.journal.append({ t: 'lcp-taken', opId, checkpointId: id })

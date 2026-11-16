@@ -98,12 +98,13 @@ test('a production checkpoint that can\'t be made fails, with no standard fallba
   const r = await s.call('vm_checkpoint', { name: 'a' })
   assert.match(r.text, /The checkpoint "a" couldn't be taken \((lease-checkpoint: )?injected: a production checkpoint could not be made\)\./)
   assert.deepStrictEqual(stubVm().checkpoints.map(c => c.name), ['clean'])
-  assert.match(r.text, /Whether Hyper-V made one is settled when this lease ends/)
-  assert.ok(!journal().some(x => x.t === 'lcp-dropped'), 'an absence right after a failed call proves nothing: still journalled')
-  assert.match((await s.call('vm_status')).text, /your checkpoints: "a" \(unconfirmed\)/)
+  assert.match(r.text, /No standard checkpoint is taken instead\./)
+  // Hyper-V's own terminal failure (not a call that died): nothing is in progress, so it's settled at once.
+  assert.ok(journal().some(x => x.t === 'lcp-dropped'), 'a known failure is settled now, freeing its slot')
+  assert.doesNotMatch((await s.call('vm_status')).text, /your checkpoints/)
   sc.patchStub(st => { st.productionFail = false; st.productionFailButMade = true })
   assert.match((await s.call('vm_checkpoint', { name: 'b' })).text, /couldn't be taken .*One was made all the same: it's kept as this lease's, and removed with it\./)
-  assert.match((await s.call('vm_status')).text, /your checkpoints: "a" \(unconfirmed\), "b" \(taken/)
+  assert.match((await s.call('vm_status')).text, /your checkpoints: "b" \(taken/)
   sc.patchStub(st => { st.productionFailButMade = false })
   await s.call('vm_release')
   assert.deepStrictEqual(stubVm().checkpoints.map(c => c.name), ['clean'], 'removed with the lease')
@@ -242,6 +243,51 @@ test('the checkpoint type: put back at once if the take left it changed; if that
   const s3 = two.open()
   assert.match((await s3.call('vm_status')).text, new RegExp(`${two.vm}: .*; free`))
   assert.strictEqual(two.stubVm().checkpointType, 'Production')
+})
+
+test('a take still unfinished at the release (absent at the first look AND the release\'s): the VM stays quarantined, its slot owned, until Hyper-V finishes it; then it\'s removed', async t => {
+  const { s, sc, vm, stubVm, open, journal } = await lease(t, 'cp-ambiguous', { stub: { delayedAfter: 4 } })
+  await s.call('vm_start', {})
+  sc.patchStub(st => { st.productionFailDelayed = true })
+  assert.match((await s.call('vm_checkpoint', { name: 'a' })).text, /couldn't be taken .*settled when this lease ends/) // listing 1: absent
+  sc.patchStub(st => { st.productionFailDelayed = false })
+  const rel = await s.call('vm_release') // listing 2: absent, and Hyper-V still has the job running
+  assert.match(rel.text, /CLEANUP FAILED: .*the take of a may still be in progress \(Hyper-V has a job running\)/)
+  assert.ok(!journal().some(x => x.t === 'lcp-dropped'), 'not forgotten')
+  await s.close()
+  const s2 = open() // recovery: listing 3, still absent and running: still quarantined
+  assert.match((await s2.call('vm_status')).text, new RegExp(`${vm}: .*QUARANTINED \\(lease checkpoint cleanup pending: the take of a may still be in progress`))
+  await s2.close()
+  const s3 = open() // listing 4: Hyper-V finished it; it's found by name and removed, the VM freed
+  assert.match((await s3.call('vm_status')).text, new RegExp(`${vm}: .*; free`))
+  const v = stubVm()
+  assert.deepStrictEqual(v.checkpoints.map(c => c.name), ['clean'], 'never left unowned')
+  assert.strictEqual((v.removedSnaps || []).length, 1)
+})
+
+test('a take call that dies with nothing in progress: settled at the release only once Hyper-V shows no job running; unreadable job state keeps it pending', async t => {
+  const { s, sc, vm, open, journal } = await lease(t, 'cp-died')
+  await s.call('vm_start', {})
+  sc.patchStub(st => { st.productionCallDies = true })
+  assert.match((await s.call('vm_checkpoint', { name: 'a' })).text, /couldn't be taken \((guest|lease-checkpoint: )?.*the take call died\)\. Whether Hyper-V made one is settled when this lease ends/)
+  sc.patchStub(st => { st.productionCallDies = false; st.jobsUnreadable = true })
+  assert.match((await s.call('vm_release')).text, /may still be in progress \(Hyper-V job state unreadable\)/)
+  await s.close()
+  sc.patchStub(st => { st.jobsUnreadable = false })
+  const s2 = open() // absent, and Hyper-V idle: settled as never made
+  assert.match((await s2.call('vm_status')).text, new RegExp(`${vm}: .*; free`))
+  assert.ok(journal().some(x => x.t === 'lcp-dropped'))
+})
+
+test('a lease released during the start after a restore (configure-start): no success; the VM ends clean, its checkpoints removed', async t => {
+  const { s, sc, stubVm } = await lease(t, 'cp-cancel-start')
+  await s.call('vm_start', {})
+  await s.call('vm_checkpoint', { name: 'a' })
+  const gate = path.join(sc.dir, 'configure-gate-never')
+  const { r, rel } = await releaseDuring(s, sc, () => s.call('vm_restore', { name: 'a' }), entered => ({ configureEntered: entered, configureGate: gate }))
+  assert.ok(!/^Restored /.test(r.text), `no success: ${r.text}`)
+  assert.match(rel.text, /^Released/)
+  assert.deepStrictEqual(stubVm().checkpoints.map(c => c.name), ['clean'])
 })
 
 test('server.js: vm_checkpoint and vm_restore are refused, before anything is sent, by a helper without the checkpoints feature', async t => {
