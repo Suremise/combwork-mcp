@@ -1020,8 +1020,9 @@ class Helper {
           const img = this.state.images.get(this.imageOf(vm))
           const why = img ? images.guestReportProblem(g, img) : (g?.disableForceUnload === 1 ? null : 'DisableForceUnload is not 1')
           if (why) throw new Error(`the guest's sanity check failed: ${why}`)
-          step('provisioning the test accounts\' profiles again (offline)')
-          const profiles = await this.provisionProfiles(vm, creds, t => step(`provisioning (offline): ${t}`))
+          // MC-1539 (the user's decision): no account logs on. The test accounts' profiles are carried unchanged in the
+          // clean checkpoint (an already-provisioned account's re-logon makes App Readiness log nothing at all, so the
+          // build's first-logon wait could never complete here); fixes to the build's profile setup need a rebuild.
           step('excluding the test folders from Defender\'s scanning (offline)')
           await this.defenderStep(vm, creds)
           // The licence, read while it runs, for the record only: nothing is activated, and the host's evaluation end
@@ -1050,12 +1051,12 @@ class Helper {
           committed = true
           step('removing the old clean checkpoint')
           const retired = await this.rclRetire(vm)
-          if (retired) { this.quarantineWhy(vm, retired); return `${e.name}: refreshed (${licNote}; ${buildNote(profiles) || 'profiles settled'}), but ${retired}: it stays quarantined until that's done` }
+          if (retired) { this.quarantineWhy(vm, retired); return `${e.name}: refreshed (${licNote}; profiles kept as built), but ${retired}: it stays quarantined until that's done` }
           // The selected baseline, verified as a start would see it.
           const f3 = await this.restoreVia(vm, 'restore', { ...this.ident(vm), checkpointId: r.checkpointId })
           const bad3 = baselineProblem(f3, { ...vm, cleanCheckpointId: r.checkpointId })
           if (bad3) { this.quarantineWhy(vm, `its new clean checkpoint doesn't verify: ${bad3}`); return `${e.name}: refreshed, but its new clean checkpoint doesn't verify (${bad3}): quarantined` }
-          return `${e.name}: refreshed (${licNote}; ${buildNote(profiles) || 'profiles settled'}; its pool checkpoints kept)`
+          return `${e.name}: refreshed (${licNote}; profiles kept as built; its pool checkpoints kept)`
         } catch (err) {
           if (committed) { this.quarantineWhy(vm, `refresh cleanup pending: ${err.message}`); return `${e.name}: refreshed, but ${err.message}: quarantined until cleanup verifies` }
           const left = await this.rclAbandon(vm)
@@ -2807,7 +2808,7 @@ function describePlan(plan, digest, approve) {
   for (const a of plan.add || []) lines.push(`- create ${a.name}: ${a.cores} cores, ${a.memoryMB} MB static memory, ${a.diskGB} GB dynamic disk, in ${a.folder}; network adapter disconnected`)
   for (const r of plan.remove || []) lines.push(`- remove ${r.name} and its folder ${r.folder}`)
   // MC-1531: refresh plans.
-  if (plan.op === 'refresh') for (const v of plan.refresh) lines.push(`- refresh the clean checkpoint of ${v.name}: restore it, start it offline, rerun the build's guest steps (registry, provisioning with the App Readiness wait, Defender), shut it down and take a new clean checkpoint; then remove the old one (its pool checkpoints are kept). Nothing goes online and nothing is re-activated; its evaluation end stays as recorded. The VM isn't leased meanwhile.`)
+  if (plan.op === 'refresh') for (const v of plan.refresh) lines.push(`- refresh the clean checkpoint of ${v.name}: restore it, start it offline, rerun the build's guest steps (the registry policy and the Defender exclusions; the test accounts' profiles are kept as built, not logged on again: fixes to the build's profile setup need a rebuild, not a refresh), shut it down and take a new clean checkpoint; then remove the old one (its pool checkpoints are kept). Nothing goes online and nothing is re-activated; its evaluation end stays as recorded. The VM isn't leased meanwhile.`)
   // MC-1532: pool-checkpoint plans.
   if (plan.op === 'checkpoint') for (const v of plan.vms) lines.push(plan.mode === 'remove' ? `- remove the pool checkpoint "${plan.checkpoint}" of ${v.name} (owner ${v.owner}); a lease already using it keeps it until that lease ends` : `- ${plan.mode === 'replace' ? 'replace' : 'publish'} the pool checkpoint "${plan.checkpoint}" of ${v.name} (owner ${v.owner}, ${v.os}, image ${v.image === 'legacy' ? 'unknown' : v.image.slice(0, 12)}), from lease ${v.leaseId}'s state: its logon undone and verified, network disconnected, the guest shut down, then checkpointed Off; any project's lease may then start from it${plan.mode === 'replace' ? '; the old one stops being offered at once and is removed when no lease uses it' : ''}`)
   if (plan.switch) lines.push(`- create the internal switch ${plan.switch} (host and guests only; no internet, no LAN)`)

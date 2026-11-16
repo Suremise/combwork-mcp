@@ -46,7 +46,7 @@ Write-Host "Plan ${Plan}: $($p.op) the hyper-v pool" -ForegroundColor Cyan
 foreach ($a in @($p.add)) { if ($a) { Write-Host ("  create {0}: {1} cores, {2} MB memory, {3} GB disk, in {4}" -f $a.name, $a.cores, $a.memoryMB, $a.diskGB, $a.folder) } }
 foreach ($r in @($p.remove)) { if ($r) { Write-Host ("  remove {0} and its folder {1}" -f $r.name, $r.folder) } }
 # MC-1531: a refresh plan.
-foreach ($r in @($p.refresh)) { if ($r) { Write-Host ("  refresh the clean checkpoint of {0}: rerun the build's guest steps offline, take a new clean checkpoint, remove the old one (pool checkpoints kept; nothing goes online; its evaluation end unchanged)" -f $r.name) } }
+foreach ($r in @($p.refresh)) { if ($r) { Write-Host ("  refresh the clean checkpoint of {0}: rerun the build's guest steps offline (registry policy and Defender; the accounts' profiles kept as built, not logged on: profile-setup fixes need a rebuild), take a new clean checkpoint, remove the old one (pool checkpoints kept; nothing goes online; its evaluation end unchanged)" -f $r.name) } }
 # MC-1532: a pool-checkpoint plan.
 if ($p.op -eq 'checkpoint') {
   foreach ($v in @($p.vms)) {
