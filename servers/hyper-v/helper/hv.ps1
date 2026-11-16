@@ -29,11 +29,12 @@ function Cred($c) {
   return New-Object Management.Automation.PSCredential ([string]$c.user, $sec)
 }
 
-# MC-1536: a restore, as one pure handler both restore ops use (the tests run it with mock io). Hyper-V reports a
-# restore's new parent (and an Off after a turn-off) a moment after the cmdlet returns, so each is polled as a
-# condition on a monotonic clock, every sleep capped to the time left and none after the deadline: Off within 20 s
-# (else no restore is issued at all), then the target as the VM's parent within 45 s. Returns { ok, phase, timedOut,
-# last, waitedMs }; the callers refuse any timedOut, whatever the facts read afterwards say.
+# MC-1536: a restore, as one pure handler both restore ops use (the tests run it with mock io). Off after a turn-off
+# is polled as a condition on a monotonic clock, every sleep capped to the time left and none after the deadline,
+# within 20 s; else no restore is issued at all. Then the restore is issued, and that's all: MC-1537 found that this
+# process's Hyper-V objects keep the VM's parent as it was when the process started, so the new parent is never judged
+# here; core verifies it from fresh facts-vm calls (each its own process). Returns { ok, phase, timedOut, last,
+# waitedMs }; the callers refuse any timedOut, whatever the facts read afterwards say.
 $RestoreTo = {
   param($cpId, $io)
   $t0 = & $io.now
@@ -53,18 +54,15 @@ $RestoreTo = {
   $off = & $poll $io.state 'Off' 20000
   if (-not $off.ok) { return @{ ok = $false; phase = 'off'; timedOut = $true; last = [string]$off.last; waitedMs = [int]((& $io.now) - $t0) } }
   & $io.restore
-  $par = & $poll $io.parent $cpId 45000
-  if (-not $par.ok) { return @{ ok = $false; phase = 'parent'; timedOut = $true; last = [string]$par.last; waitedMs = [int]((& $io.now) - $t0) } }
-  @{ ok = $true; phase = 'done'; timedOut = $false; last = [string]$par.last; waitedMs = [int]((& $io.now) - $t0) }
+  @{ ok = $true; phase = 'restored'; timedOut = $false; last = 'Off'; waitedMs = [int]((& $io.now) - $t0) }
 }
 
-# MC-1536: the real io for $RestoreTo: Get-VM, Stop-VM, Remove-VMSavedState, Restore-VMSnapshot, Start-Sleep, a Stopwatch.
+# MC-1536: the real io for $RestoreTo: Get-VM (for the state), Stop-VM, Remove-VMSavedState, Restore-VMSnapshot, Start-Sleep, a Stopwatch.
 function RestoreIo($vm, $cp) {
   $id = $vm.Id
   $sw = [Diagnostics.Stopwatch]::StartNew()
   @{
     state = { [string](Get-VM -Id $id).State }.GetNewClosure()
-    parent = { $p = (Get-VM -Id $id).ParentCheckpointId; if ($p) { $p.ToString() } else { $null } }.GetNewClosure()
     turnOff = { Stop-VM -VM (Get-VM -Id $id) -TurnOff -Force }.GetNewClosure()
     removeSaved = { Remove-VMSavedState -VM (Get-VM -Id $id) }.GetNewClosure()
     restore = { Restore-VMSnapshot -VMSnapshot $cp -Confirm:$false }.GetNewClosure()

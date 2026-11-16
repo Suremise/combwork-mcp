@@ -75,6 +75,8 @@ const KEEP_MS = Number(process.env.HYPERV_MCP_KEEP_MS || 120_000)
 
 const hex = n => crypto.randomBytes(n).toString('hex')
 const sleep = ms => new Promise(r => setTimeout(r, ms))
+// MC-1537: how long a restore's new parent is waited for, read fresh (each facts-vm its own process), probe time included.
+const RESTORE_VERIFY_MS = Number(process.env.HYPERV_MCP_RESTORE_VERIFY_MS || 45_000)
 const sha256 = buf => crypto.createHash('sha256').update(buf).digest('hex')
 const mins = ms => `${Math.max(0, Math.round(ms / 60000))} min`
 
@@ -118,12 +120,14 @@ class Helper {
    * approve.ps1 writes (default stateDir\approvals); checkApprovalAcl: whether to ask hv.ps1 to confirm that only
    * Administrators and SYSTEM can write there (on in the service; tests run without real ACLs).
    */
-  constructor({ stateDir, hv, approvalsDir, checkApprovalAcl = true, now = () => Date.now(), log = () => {} }) {
+  constructor({ stateDir, hv, approvalsDir, checkApprovalAcl = true, now = () => Date.now(), log = () => {}, mono = () => performance.now(), sleepFn = sleep }) {
     this.dir = stateDir
     this.hv = hv
     this.approvalsDir = approvalsDir || join(stateDir, 'approvals')
     this.checkApprovalAcl = checkApprovalAcl
     this.now = now
+    this.mono = mono // MC-1537: a monotonic clock and a sleeper, injectable, for the restore verification's deadline
+    this.sleep = sleepFn
     this.log = log
     this.poolLock = mutex()
     this.vmLocks = new Map()
@@ -745,10 +749,58 @@ class Helper {
   }
 
   /**
-   * Turns the VM off, restores the clean checkpoint by id, and verifies the baseline. Quarantines it on failure.
-   * Returns { ok, text }.
+   * MC-1537: every restore, by one path. The op (restore or lease-restore) turns the VM off and issues the restore; an
+   * explicit failed or timed-out report from it is returned as it is (refused by restoreProblem: fresh facts can't turn
+   * an unissued restore into success). Otherwise the new parent is read from fresh facts-vm calls, each its own
+   * PowerShell process (the restoring process's Hyper-V objects keep the parent it started with), polled until it is
+   * the target, within verifyMs on the monotonic clock: probe time included, each probe's timeout and each sleep capped
+   * to the time left, and no result accepted after the deadline. Returns the last fresh facts with a restore report
+   * { ok, phase: 'verified' | 'parent', timedOut, last, waitedMs }, for the callers' existing checks. With a lease,
+   * every call is the lease's (ending it kills them) and it is checked still held after each await.
    */
-  async restore(vm, target = null) {
+  async restoreVia(vm, op, args, { lease = null, verifyMs = RESTORE_VERIFY_MS } = {}) {
+    const opts = ms => lease ? this.forLease(lease, ms) : { timeoutMs: ms }
+    const held = () => { if (lease) this.stillHeld(lease) }
+    const r = await this.hv(op, args, opts(120_000))
+    held()
+    const rep0 = r?.restore
+    if (rep0 && typeof rep0 === 'object' && (rep0.timedOut === true || rep0.ok === false)) return r
+    const t0 = this.mono()
+    const spent = () => this.mono() - t0
+    let last = null
+    let lastErr = null
+    for (;;) {
+      const left = verifyMs - spent()
+      if (left <= 0) break
+      let f = null
+      try {
+        f = await this.hv('facts-vm', this.ident(vm), opts(Math.max(1, Math.ceil(left))))
+      } catch (e) {
+        held()
+        lastErr = e.message
+      }
+      held()
+      if (f) {
+        if (spent() > verifyMs) { lastErr = 'the last read came after the wait ended'; break }
+        last = f
+        lastErr = null
+        if (f.parentCheckpointId === args.checkpointId) return { ...f, restore: { ok: true, phase: 'verified', timedOut: false, last: f.parentCheckpointId, waitedMs: Math.round(spent()) } }
+      }
+      const rest = verifyMs - spent()
+      if (rest <= 0) break
+      await this.sleep(Math.min(1000, rest))
+      held()
+    }
+    const seen = last ? (last.parentCheckpointId || 'no parent') : 'nothing'
+    return { ...(last || {}), restore: { ok: false, phase: 'parent', timedOut: true, last: lastErr ? `${seen}; the last read failed: ${lastErr}` : seen, waitedMs: Math.round(spent()) } }
+  }
+
+  /**
+   * Turns the VM off, restores the clean checkpoint by id, and verifies the baseline. Quarantines it on failure.
+   * Returns { ok, text }. With a lease (a start or stop on its behalf), the restore is the lease's: if the lease ends
+   * meanwhile, it stops there and leaves the VM to the lease's own cleanup, without quarantining it.
+   */
+  async restore(vm, target = null, lease = null) {
     let facts = null
     let why = null
     // MC-1532: a lease's start may restore one of the VM's pool checkpoints instead of clean (by its exact id); the
@@ -763,10 +815,10 @@ class Helper {
     }
     const to = target ? target.checkpointId : vm.cleanCheckpointId
     try {
-      // MC-1536: up to 20 s for Off and 45 s for the new parent inside the op, so the call allows 120 s.
-      facts = await this.hv('restore', { ...this.ident(vm), checkpointId: to, label: target ? `"${target.name}"` : 'clean' }, { timeoutMs: 120_000 })
+      facts = await this.restoreVia(vm, 'restore', { ...this.ident(vm), checkpointId: to, label: target ? `"${target.name}"` : 'clean' }, { lease })
       why = baselineProblem(facts, { ...vm, cleanCheckpointId: to })
     } catch (e) {
+      if (lease && (lease.ending || this.leases.get(lease.vmId) !== lease)) return { ok: false, text: `This connection's lease on ${vm.vmName} ended while the request waited: call vm_acquire again.` }
       why = e.message
     }
     const s = this.state
@@ -958,7 +1010,7 @@ class Helper {
           const freeOk = async () => { const f = await this.hv('facts', { folders: [vm.folder] }); const g = f.folders?.[0]?.freeGB; if (!Number.isFinite(g) || g < floor) throw new Error(`its drive has ${g ?? 'unknown'} GB free, under the ${floor} GB a checkpoint must leave`) }
           await freeOk()
           step('restoring its clean checkpoint and starting it (offline)')
-          const f0 = await this.hv('restore', { ...this.ident(vm), checkpointId: e.cleanCheckpointId })
+          const f0 = await this.restoreVia(vm, 'restore', { ...this.ident(vm), checkpointId: e.cleanCheckpointId })
           const bad0 = baselineProblem(f0, { ...vm, cleanCheckpointId: e.cleanCheckpointId })
           if (bad0) throw new Error(`its clean checkpoint doesn't verify: ${bad0}`)
           await this.hv('configure-start', { ...this.ident(vm), switchName: null, switchId: null, reserve: 0 })
@@ -1000,7 +1052,7 @@ class Helper {
           const retired = await this.rclRetire(vm)
           if (retired) { this.quarantineWhy(vm, retired); return `${e.name}: refreshed (${licNote}; ${buildNote(profiles) || 'profiles settled'}), but ${retired}: it stays quarantined until that's done` }
           // The selected baseline, verified as a start would see it.
-          const f3 = await this.hv('restore', { ...this.ident(vm), checkpointId: r.checkpointId })
+          const f3 = await this.restoreVia(vm, 'restore', { ...this.ident(vm), checkpointId: r.checkpointId })
           const bad3 = baselineProblem(f3, { ...vm, cleanCheckpointId: r.checkpointId })
           if (bad3) { this.quarantineWhy(vm, `its new clean checkpoint doesn't verify: ${bad3}`); return `${e.name}: refreshed, but its new clean checkpoint doesn't verify (${bad3}): quarantined` }
           return `${e.name}: refreshed (${licNote}; ${buildNote(profiles) || 'profiles settled'}; its pool checkpoints kept)`
@@ -1031,7 +1083,7 @@ class Helper {
     const rec = this.refreshOf(vm.vmId)
     if (!rec || rec.selected) return null
     try {
-      const f = await this.hv('restore', { ...this.ident(vm), checkpointId: rec.oldClean })
+      const f = await this.restoreVia(vm, 'restore', { ...this.ident(vm), checkpointId: rec.oldClean })
       const bad = baselineProblem(f, { ...vm, cleanCheckpointId: rec.oldClean })
       if (bad) return `refresh cleanup pending: its old clean checkpoint doesn't verify (${bad})`
       let list = (await this.hv('snapshots', this.ident(vm))).snapshots || []
@@ -1358,7 +1410,7 @@ class Helper {
       s.plan = null
       s.trusted = false
       s.record = new Map()
-      const r = await this.restore(vm, target) // unconditionally, before every run
+      const r = await this.restore(vm, target, lease) // unconditionally, before every run
       if (!r.ok) { lease.dirty = true; throw new Error(`${r.text} The start was refused.`) }
       const tRestore = this.now()
       // Every stage of a start is the lease's: its Hyper-V calls are registered with it (ending the lease kills them), and
@@ -1641,7 +1693,7 @@ class Helper {
    */
   async restoreAfterRun(lease, vm) {
     this.stillHeld(lease)
-    const r = await this.restore(vm)
+    const r = await this.restore(vm, null, lease)
     lease.running = false
     lease.interactive = null
     lease.dirty = !r.ok
@@ -1659,7 +1711,7 @@ class Helper {
       lease.running = false
       return { text: `${vm.vmName} is kept for inspection as it is (not restored)${keep ? '' : ' because a run failed and the lease has keepOnFailure'}. It is restored when you vm_release it or at the lease's deadline (${new Date(lease.deadline).toISOString()}); vm_start is refused until then.` }
     }
-    const r = await this.vmLock(vm.vmId)(() => { this.stillHeld(lease); return this.restore(vm) })
+    const r = await this.vmLock(vm.vmId)(() => { this.stillHeld(lease); return this.restore(vm, null, lease) })
     lease.running = false
     lease.interactive = null
     lease.dirty = !r.ok
@@ -1759,9 +1811,9 @@ class Helper {
       Object.assign(lease.sync, { gen: lease.sync.gen + 1, plan: null, trusted: false, record: new Map() })
       this.dropStage(this.conns.get(lease.connId))
       lease.dirty = true
-      const after = await this.hv('lease-restore', { ...this.ident(vm), checkpointId: cp.checkpointId, snapName: cp.snapName }, this.forLease(lease, 120_000))
+      const after = await this.restoreVia(vm, 'lease-restore', { ...this.ident(vm), checkpointId: cp.checkpointId, snapName: cp.snapName }, { lease })
       this.stillHeld(lease)
-      const rp = restoreProblem(after) // MC-1536: a timed-out phase is refused, whatever the facts say
+      const rp = restoreProblem(after) // MC-1536/1537: a timed-out phase is refused, whatever the facts say
       if (rp) throw new Error(`Restoring "${name}" didn't verify: ${rp}. vm_reset to go on from clean.`)
       if (after.vmId !== vm.vmId || after.parentCheckpointId !== cp.checkpointId || after.state !== 'Off') throw new Error(`Restoring "${name}" didn't verify (state ${after.state}, parent ${after.parentCheckpointId}): vm_reset to go on from clean.`)
       const sw = lease.network ? this.state.switch : null
@@ -2344,7 +2396,7 @@ class Helper {
     const cp = await this.hv('make-clean', { ...this.ident(vm) }, { timeoutMs: 15 * 60_000 })
     fs.rmSync(media, { recursive: true, force: true })
     fs.rmSync(unattendIso, { force: true })
-    const facts = await this.hv('restore', { ...this.ident(vm), checkpointId: cp.checkpointId })
+    const facts = await this.restoreVia(vm, 'restore', { ...this.ident(vm), checkpointId: cp.checkpointId })
     const bad = baselineProblem(facts, { ...vm, cleanCheckpointId: cp.checkpointId })
     if (bad) throw new Error(`its clean baseline doesn't verify: ${bad}`)
     this.journal.append({ t: 'ready', intentId: a.intentId, vmId: vm.vmId, cleanCheckpointId: cp.checkpointId, licence, profiles, defender })

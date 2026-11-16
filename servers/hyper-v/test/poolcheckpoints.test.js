@@ -186,7 +186,11 @@ test('acquire by checkpoint: an unknown name, a vm that lacks it, a contradictin
   const pw = req(w, 'acquire', { minutes: 30, checkpoint: 'tools', wait: true })
   await waitFor(async () => /Waiting in line: 1\./.test((await admin.request('status')).text), 5000, 'waiting')
   await a.request('release')
-  assert.match((await pw).text, new RegExp(`^Leased ${v1} .*starts from the pool checkpoint "tools"`))
+  // A wait can end (WAIT_MS) before the release's restore has freed v1: the place is kept, and the waiter asks again, as
+  // the reply says, until it holds a lease (a condition, not a longer wait).
+  let got = await pw
+  for (let i = 0; /^Still waiting for a VM/.test(got.text) && i < 50; i++) got = await req(w, 'acquire', { minutes: 30, checkpoint: 'tools', wait: true })
+  assert.match(got.text, new RegExp(`^Leased ${v1} .*starts from the pool checkpoint "tools"`))
   await h.stop()
 })
 
