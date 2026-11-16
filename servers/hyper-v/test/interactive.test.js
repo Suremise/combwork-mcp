@@ -379,6 +379,58 @@ $events = @(1..15 | ForEach-Object { [pscustomobject]@{ Id = 4600 + $_; TimeCrea
 // MC-1524: hv.ps1's own $LogonCounts, run for real on synthetic LSM events: only this boot's (at or after it), only the
 // account's (by its "DOMAIN\name" in the message, not a longer name or another account), logons (21) and logoffs (23)
 // counted apart; an empty log counts 0; an unreadable one ($null) is null for both, never 0.
+// MC-1528: hv.ps1's own $AppReadinessState, run for real on synthetic App Readiness events worded as Windows words them
+// (MC-1528's evidence): done only with a 211 for this SID, the latest task count 0 and no task added after the 211;
+// another account's events (and a longer SID) never count; 216's "resume at" (with its direction marks and nine
+// fraction digits) parsed; unreadable is null, an empty log not done. (This boot only: the caller's query filters that.)
+const READINESS_BLOCK = (() => { const s = HV_PS.indexOf('\n$AppReadinessState = {'); const e = s < 0 ? -1 : HV_PS.indexOf('\n}\n', s + 1); return e < 0 ? null : HV_PS.slice(s + 1, e + 3) })()
+
+test('App Readiness state (MC-1528), for real: done only on 211 + tasks 0 + nothing added after, for this SID; unreadable is null', { skip: process.platform !== 'win32' || !READINESS_BLOCK }, () => {
+  const sc = scratch('readiness-state')
+  const file = path.join(sc.dir, 'readiness.ps1')
+  fs.writeFileSync(file, `${READINESS_BLOCK}
+$t0 = [datetime]::SpecifyKind([datetime]'2026-11-16T02:00:15', 'Utc')
+$me = 'S-1-5-21-26-54-54-1001'
+$script:rec = 0
+function E($id, $s, $msg) { $script:rec++; [pscustomobject]@{ Id = $id; TimeCreated = $t0.AddSeconds($s); RecordId = $script:rec; Message = $msg } }
+$lrm = [char]0x200E
+$resume = "Activity for '$me' has been suspended and will resume at \${lrm}2026\${lrm}-\${lrm}11\${lrm}-\${lrm}16T02:00:55.499000000Z."
+$full = @(
+  (E 240 10 "Task 'install::Clipchamp.Clipchamp_yxz26nhyzhsrt' is added for $me, tasks: 1"),
+  (E 216 10 $resume),
+  (E 240 15 "Task 'ART:OemFirstRun' is added for $me, tasks: 40"),
+  (E 217 40 "Activity for '$me' has resumed."),
+  (E 241 99 "Task 'install::Clipchamp.Clipchamp_yxz26nhyzhsrt' is removed for $me, tasks: 1"),
+  (E 211 100 "App Readiness service has completed tasks for $me."),
+  (E 241 100 "Task 'ART:OemFirstRun' is removed for $me, tasks: 0")
+)
+$pending = @((E 240 10 "Task 'install::A' is added for $me, tasks: 39"), (E 216 10 $resume))
+$later = $full + @((E 240 120 "Task 'install::B' is added for $me, tasks: 1"))
+$other = @((E 211 100 'App Readiness service has completed tasks for S-1-5-21-26-54-54-1000.'), (E 241 100 "Task 'X' is removed for S-1-5-21-26-54-54-1000, tasks: 0"), (E 211 101 "App Readiness service has completed tasks for \${me}1."), (E 241 101 "Task 'X' is removed for \${me}1, tasks: 0"))
+$left = @((E 211 100 "App Readiness service has completed tasks for $me."), (E 241 100 "Task 'X' is removed for $me, tasks: 2"))
+$sameSecond = $full + @((E 240 100 "Task 'install::C' is added for $me, tasks: 1"))
+foreach ($c in @($full, $pending, $later, $other, $left, $sameSecond)) { 'OUT:' + (ConvertTo-Json -InputObject (& $AppReadinessState $c $me) -Compress) }
+'OUT:' + (ConvertTo-Json -InputObject (& $AppReadinessState @() $me) -Compress)
+'OUT:' + (ConvertTo-Json -InputObject (& $AppReadinessState $null $me) -Compress)
+`)
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: ps51Env(), timeout: 60_000 })
+  const out = r.stdout.split(/\r?\n/).filter(l => l.startsWith('OUT:')).map(l => JSON.parse(l.slice(4)))
+  assert.strictEqual(out.length, 8, r.stdout + r.stderr)
+  const [full, pending, later, other, left, same, empty, unread] = out
+  assert.strictEqual(full.done, true)
+  assert.strictEqual(full.tasks, 0)
+  assert.strictEqual(full.completedAt, '2026-11-16T02:01:55.0000000Z')
+  assert.strictEqual(full.suspendedUntil, '2026-11-16T02:00:55.4990000Z', 'the direction marks and nine digits handled')
+  assert.strictEqual(full.resumedAt, '2026-11-16T02:00:55.0000000Z')
+  assert.deepStrictEqual([pending.done, pending.tasks, pending.completedAt], [false, 39, null])
+  assert.strictEqual(later.done, false, 'a task added after the 211')
+  assert.deepStrictEqual([other.done, other.tasks], [false, null], 'another account, or a longer SID, never counts')
+  assert.deepStrictEqual([left.done, left.tasks], [false, 2], 'a 211 with tasks left')
+  assert.strictEqual(same.done, false, 'a task added in the same second as the 211, after it by record order')
+  assert.deepStrictEqual([empty.done, empty.tasks], [false, null], 'an empty log: not done')
+  assert.strictEqual(unread.done, null, 'unreadable: null, never false or true')
+})
+
 const COUNT_LOGONS_BLOCK = (() => { const s = HV_PS.indexOf('\n$LogonCounts = {'); const e = s < 0 ? -1 : HV_PS.indexOf('\n}\n', s + 1); return e < 0 ? null : HV_PS.slice(s + 1, e + 3) })()
 
 test('logon and logoff events (MC-1524), for real: this boot and this account only; empty is 0, unreadable is null', { skip: process.platform !== 'win32' || !COUNT_LOGONS_BLOCK }, () => {

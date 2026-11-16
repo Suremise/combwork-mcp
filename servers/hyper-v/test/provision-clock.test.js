@@ -4,7 +4,6 @@
 // provisionProfiles, logon and waitProvisioned run on a bare object, with a fake transport and a clock that moves only
 // by its calls: guest-logon 10 ms, guest-session 5, guest-provisioned 5, the undo 5.
 process.env.HYPERV_MCP_PROVISION_WAIT_MS = '100'
-process.env.HYPERV_MCP_PROVISION_DWELL_MS = '0' // the dwell (MC-1527) has its own file, provision-dwell.test.js
 process.env.HYPERV_MCP_PROVISION_QUIET_MS = '20'
 process.env.HYPERV_MCP_PROVISION_POLL_MS = '1'
 process.env.HYPERV_MCP_POLL_MS = '1'
@@ -36,7 +35,7 @@ function fake({ watcher = () => true, probe = () => ({}), diagFails = false, ses
     calls.push({ op, at: t, timeoutMs: opts?.timeoutMs, account: a.account || a.logon?.user })
     if (op === 'guest-logon') { const before = `b${logons}`; logons++; account = a.logon.user; t += 10; return { boot: before } }
     if (op === 'guest-session') { t += 5; const w = watcher(account, logons, t); return { boot: `b${logons}`, sessions: w ? [1] : [], user: true, armed: true, logons: 1, logoffs: 0, ...session(account, logons, t) } }
-    if (op === 'guest-provisioned') { t += 5; return { boot: `b${logons}`, user: true, inventory: 'x', lastEvent: null, busy: [], count: 1, mappings: 60, packagesDirs: 25, ...probe(a.account, logons, t) } }
+    if (op === 'guest-provisioned') { t += 5; return { boot: `b${logons}`, user: true, inventory: 'x', lastEvent: null, busy: [], count: 1, mappings: 60, packagesDirs: 25, appReadiness: { done: true, tasks: 0 }, ...probe(a.account, logons, t) } }
     if (op === 'guest-logon-diag') { t += 5; if (diagFails) throw new Error('injected: the diagnosis failed'); return { uptime: 42, logs: {}, processes: [], autoAdminLogon: '1', watcher: false, message: 'dropped' } }
     throw new Error(`unexpected ${op}`)
   }
