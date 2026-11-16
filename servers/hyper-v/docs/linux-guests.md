@@ -98,7 +98,8 @@ Administrators and the service. They're never in a reply, plan, journal, log or 
 today.
 
 **The seed:** `make-iso` (today's IMAPI2 action) builds a `cidata`-labelled ISO holding `meta-data` (a random
-instance-id), `network-config` (`version: 2`, no addresses: the guest stays off the network) and `user-data`:
+instance-id), `network-config` (per transport, §4.1: under A `version: 2` with no addresses, so the guest stays off the
+network; under B the one static address on eth0) and `user-data`:
 - users: `hvadmin` (sudo only for the dispatcher, below) and `hvuser` (no sudo), both with **locked passwords**;
 - `ssh_keys:` the generated host key; `ssh_pwauth: false`; and `disable_root: true`;
 - `write_files:` the fixed guest files (below), and `runcmd:` to enable the units.
@@ -109,17 +110,21 @@ instance-id), `network-config` (`version: 2`, no addresses: the guest stays off 
   A leaked key reaches nothing but the dispatcher;
 - sudoers allows `hvadmin` exactly `/usr/local/libexec/hvmcp/dispatch`, as root, with no password. `hvuser` has no
   key and no sudo;
-- sshd runs only on the Hyper-V socket (§4): our `hvmcp-sshd.socket` (`ListenStream=vsock::22`, `Accept=yes`) starts
-  `sshd -i -f /etc/ssh/hvmcp_sshd_config`. That config allows only public-key auth for `AllowUsers hvadmin`, with no
-  passwords, no keyboard-interactive and no forwarding. The distro's own `ssh.service` and `ssh.socket` are disabled
-  and masked, so nothing listens on TCP, even with `network: true`;
+- sshd runs only from our `hvmcp-sshd.socket` (`Accept=yes`), which starts `sshd -i -f /etc/ssh/hvmcp_sshd_config`.
+  The socket listens on the transport's one endpoint (§4.1): `ListenStream=vsock::22` under A, or
+  `ListenStream=<guest address>:22` under B, never both. That config allows only public-key auth for
+  `AllowUsers hvadmin`, with no passwords, no keyboard-interactive and no forwarding. The distro's own `ssh.service`
+  and `ssh.socket` are disabled and masked, so nothing else ever listens;
 - `/build` is owned by root and read-only to `hvuser`, as `C:\build` is. `/out` is writable by both, and `/hvmcp`
   (staging, runs) is root's.
 
-**The build's steps, all offline:** boot from the seed. Wait for SSH `ready`, then for `cloud-init status --wait` to say
-done with no errors (bounded: 15 minutes). Then:
-1. verify what matters: the units, the masked distro sshd, no TCP listener (`ss -ltn` empty), no IP address, the keys,
-   the sudoers line, the os-release sanity check;
+**The build's steps, all offline:** boot from the seed, with the build's diagnostic serial port attached (§4.2). Wait
+for **readiness**, which is an authenticated round trip, never a module listing: the helper's SSH over the transport,
+host key matched, the forced command answering `ready`. Then wait for `cloud-init status --wait` to say done with no
+errors (bounded: 15 minutes in all). If readiness doesn't come, the serial diagnostic says why (§4.2). Then:
+1. verify what matters: the units, the masked distro sshd, the keys, the sudoers line, the os-release sanity check,
+   and the transport's own network facts from §4.1's table (A: no address, no TCP listener; B: exactly the one
+   address, and the only listener on it at port 22);
 2. `touch /etc/cloud/cloud-init.disabled`, so later boots never rerun cloud-init or regenerate keys;
 3. shut down, detach and delete the seed ISO (it held the host key), and take the clean checkpoint Off and
    disconnected, as Windows does.
@@ -155,7 +160,8 @@ GUID `00000016-facb-11e6-bd58-64006a7986d3`.
   never adds features itself).
 - **Risk:** the guest kernel must have `hv_sock` (`CONFIG_HYPERV_VSOCKETS`). Debian's `cloud-amd64` and Ubuntu's
   generic kernels are built with Hyper-V support, but whether hv_sock ships in the cloud image (rather than in
-  Ubuntu's `linux-modules-extra`) is **the trial's first check**. If it's missing, B below, with no change to the rest.
+  Ubuntu's `linux-modules-extra`) is **the trial's first check** (§4.2, §11). If it's missing, the trial stops, and
+  moving to B is the user's decision, never automatic (§4.1).
 
 **B. Internal switch (the card's original shape).** The guest gets a static address from the seed's `network-config`,
 always connected to the pool's internal switch. Setup gives the host's vEthernet adapter for that switch a static
@@ -164,7 +170,70 @@ in, everything else denied), so guests can't reach each other. Setup also adds a
 everything inbound from that subnet. The costs:
 - a permanent IP path from every Linux guest to the host's network stack, held shut by ACLs and a firewall rule;
 - two more host settings changed (an adapter address and a firewall rule), where today the README promises none;
-- `network: true` then means nothing new for Linux.
+- `network: true` can't keep its meaning (the guest is already on the switch), so under B it's refused for Linux
+  leases: "a Linux guest is always on the internal switch for SSH, limited to the host; no wider network is offered".
+
+### 4.1 Transport profiles: everything that depends on A or B
+
+The pool has **one transport for Linux**, recorded in the helper's state when setup configures it, and on every Linux
+VM at its create. A VM built for one transport is never served under the other: it's rebuilt. **The transport is
+the user's choice:** setup takes it as `-LinuxTransport HvSocket|InternalSwitch` (default HvSocket). Nothing (not the
+helper, a failed check or a trial) switches from A to B by itself. A failure under A stops and reports, and the user
+decides.
+
+| | A: Hyper-V socket | B: internal switch |
+|---|---|---|
+| Seed `network-config` | no addresses | one static address on eth0 from the pool's subnet, recorded on the VM |
+| VM adapter | disconnected, as Windows | always connected to the pool's switch, with port ACLs (in: TCP 22 from the host's address only; all else denied, both ways) |
+| sshd socket | `ListenStream=vsock::22` | `ListenStream=<guest address>:22` |
+| Helper's ssh.exe | `ProxyCommand=HvMcpVsock.exe <vmId> 22` | `hvadmin@<guest address>`, no ProxyCommand |
+| Setup's host changes | one GUID under GuestCommunicationServices; HvMcpVsock.exe | the vEthernet adapter's static address; a firewall rule blocking all inbound from the subnet |
+| Build verification | no address on any interface but lo; `ss -ltn` and `ss -lun` empty; the vsock listener on 22 | exactly the recorded address on eth0 and none elsewhere; the only listener `<address>:22`; the VM's ACLs read back exactly; the firewall rule present |
+| Verified at every restore | adapter disconnected (as today) | adapter connected to the pool's switch by id, ACLs read back exactly (a mismatch quarantines, like a wrong checkpoint) |
+| `network: true` | the internal switch for one run, as Windows | refused (above) |
+| Trial confinement checks | no address, no listener, no reachability of the host or the other guest | guest reaches nothing but the host's address at port 22 replies; the other Linux guest unreachable; host services (SMB 445, RDP 3389, a test listener) unreachable from the guest |
+
+The guest driver reads the VM's recorded transport. ssh.js takes it as one argument, and nothing else in the design
+differs between A and B.
+
+### 4.2 Diagnosing a guest that never answers, without SSH
+
+Under A, SSH is the only data channel, so "no `ready`" can't explain itself. So the build has a second, one-way,
+bounded channel that doesn't depend on hv_sock or the network: **the VM's COM1, mapped to a named pipe for the build
+only.**
+- Before the first boot, hv.ps1 runs `Set-VMComPort -VMName <own VM> -Number 1 -Path \\.\pipe\hvmcp-diag-<random>`.
+  This is a VM setting on a pool VM, like the others, and it works on Gen 2 through PowerShell. The helper's hv.ps1
+  reads that pipe as a client into a bounded buffer (64 KB, discarded past that) for the build's duration.
+- The seed's `runcmd` (as root, early, and again once the socket unit is up) writes fixed lines to `/dev/ttyS0`:
+  `HVMCP-DIAG key=value ...` with keys from a fixed set:
+  - `stage` (seed-read, units-written, socket-up, cloud-init-done);
+  - `vmbus` (`/sys/bus/vmbus` present);
+  - `hv_sock_driver`: `/sys/bus/vmbus/drivers/hv_sock` present. This works whether the driver is built in or a module,
+    unlike `lsmod`;
+  - `hv_sock_modinfo` (`modinfo hv_sock` found, for a module not loaded);
+  - `vsock_listen`: a real `AF_VSOCK` bind and listen on port 22, done by the socket unit, read from
+    `systemctl is-active hvmcp-sshd.socket`;
+  - `sshd_config_ok` (`sshd -t -f ...` exit status);
+  - `kernel` (`uname -r`).
+- The helper keeps only lines with that prefix and those keys, with values from a fixed alphabet (`[A-Za-z0-9._+-]`,
+  64 characters), and drops everything else (the kernel's own console output included). The parsed facts go in the
+  build's record and its job note, as MC-1520's snapshot does today. It's data, never acted on beyond the build's
+  pass or fail.
+- Before the clean checkpoint, the COM port is removed (`Set-VMComPort -Path ''`) and read back as unset, so no
+  lease ever has it. Refresh-clean attaches it the same way for its boot, and removes it again.
+
+**How readiness ends:**
+- **Ready:** the authenticated forced-command round trip (above) succeeds within 10 minutes of the first boot. The
+  diagnostics are kept for the record only.
+- **Not ready, diagnosis conclusive:** e.g. `hv_sock_driver=absent`, or the socket unit failed. The build fails and
+  its reason says so ("the guest kernel has no hv_sock driver (kernel 6.x): this image can't use the Hyper-V socket
+  transport"), and the VM is rolled back as any failed create.
+- **Not ready, inconclusive:** no diagnostic lines, or every stage reached with no SSH. The build fails as
+  **inconclusive**, with what was seen, and stops there. Neither outcome retries over B: changing transport is the
+  user's decision (§4.1).
+
+`lsmod` is never the test: a built-in driver doesn't appear in it, and only the real authenticated round trip proves
+the transport works.
 
 **Either way:** `helper/ssh.js` (the Linux driver's transport) bounds each call's time and output, and kills the
 ssh.exe child by its handle on timeout. The README's "runs no program but powershell.exe and node" becomes "...and
@@ -247,7 +316,9 @@ Linux `pool_plan` to a helper without it, and says "run setup again".
 
 ## 8. Setup changes
 
-- Registers the hv_sock service GUID (A), or the adapter address, firewall rule and port ACLs (B). Either way it's
+- Takes the user's transport choice, `-LinuxTransport HvSocket|InternalSwitch` (§4.1); a rerun without it keeps the
+  recorded one. It then registers the hv_sock service GUID (A), or sets the adapter address and firewall rule (B;
+  the port ACLs are per VM, set by the helper at create). Either way it's
   undone by uninstall, recorded, and shown in setup's report.
 - Compiles `HvMcpVsock.exe` (A), and checks for the OpenSSH Client.
 - Installs the new helper files (`guests/*.js`, `ssh.js`, `qcow2.js`, `openpgp.js`, `guest.py`). Setup's helper file
@@ -287,8 +358,12 @@ So the driver is "Debian family with systemd and cloud-init". A new release of D
 Trial steps:
 1. **Prerequisites:** setup rerun; pins filled from downloads the Assistant allows; one approved plan adding **one
    Debian and one Ubuntu VM** (2 cores, 4 GB, 32 GB each) beside the two Windows VMs, within `maxVms` 4.
-2. **Transport first:** `lsmod | grep hv_sock` on each, then the SSH-over-vsock ready check. If hv_sock is missing, stop
-   and switch to B.
+2. **Transport first:** the build itself is the check (§4.2). Each VM's build must reach readiness, which is the
+   authenticated forced-command round trip over vsock. Its record must show the serial diagnostic
+   (`hv_sock_driver=present`, `vsock_listen=active`, the kernel). If a build fails, conclusive or inconclusive, the
+   trial **stops**, and the diagnosis goes to the user through the Assistant, who decides whether to move to B (a setup
+   rerun with `-LinuxTransport InternalSwitch` and rebuilt Linux VMs). Then a forced-command check: an SSH session
+   asking for a shell, or for a command other than the dispatcher's, gets only the dispatcher's refusal.
 3. **Build and test, side by side:** two sessions in one project, one leasing Debian and one leasing the Windows VM the
    CLI team frees (or a timed window). Then:
    - the same small Node project built on the host, its tests run in both guests at once, with a pinned Node linux-x64
@@ -297,7 +372,9 @@ Trial steps:
    - `vm_checkpoint`, then `vm_restore`, and `vm_reset`;
    - a pool checkpoint "node" published from the Debian lease, then a second lease acquired from it with no reinstall.
 4. **Confinement checks:**
-   - no address on eth0 and no TCP listener;
+   - the transport's own row in §4.1's table, "Trial confinement checks" (under A: no address, no listener, nothing
+     reachable; under B: only SSH from the host, nothing else either way);
+   - no COM port on any leased VM;
    - a sentinel gone after release;
    - the forced command refusing a shell;
    - no key anywhere an agent can read (replies, logs, `%ProgramData%` as the user);
