@@ -103,14 +103,17 @@ test('an abandoned wait is never given a VM: it goes to a caller who is there, a
 })
 
 test('a repeat call within the keep time keeps its place ahead of later waiters', async () => {
-  const { h } = await pool('pr-keep', 1, undefined, { HYPERV_MCP_WAIT_MS: '300', HYPERV_MCP_KEEP_MS: '60000' })
+  // Each wait lasts 5 s: long enough that the release's restore (slow under a loaded test run) finishes while b and c
+  // are both still waiting. A 300 ms wait could expire first and hand b "Still waiting" (MC-1528's review).
+  const { h } = await pool('pr-keep', 1, undefined, { HYPERV_MCP_WAIT_MS: '5000', HYPERV_MCP_KEEP_MS: '60000' })
   const [a, b, c] = [h.conn(1), h.conn(2), h.conn(3)]
   await acquire(a, {})
   assert.match((await acquire(b, { wait: true })).text, /number 1 of 1/)
   assert.match((await acquire(c, { wait: true })).text, /number 2 of 2/)
-  // Both call again: b is still first.
+  // Both call again: b is still first. Release only once both are waiting right then (not between calls).
   const pb = acquire(b, { wait: true })
   const pc = acquire(c, { wait: true })
+  await waitFor(async () => { const st = await status(a); return /Waiting in line: 1\. other, \d+ s[^;]*; 2\. other, \d+ s/.test(st) && !/between calls/.test(st) }, 5000, 'b and c both waiting')
   await a.request('release')
   assert.match((await pb).text, /^Leased /)
   assert.match((await pc).text, /^Still waiting/)

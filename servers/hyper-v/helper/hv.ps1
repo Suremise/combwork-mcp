@@ -359,8 +359,34 @@ $ProfileCounts = {
   @{ mappings = $mappings; packagesDirs = $packages }
 }
 
+# MC-1528: whether App Readiness has finished the account's per-user queue (the AppContainer wave, MC-1525), pure so the
+# tests run it. $events: AppReadiness Admin/Operational events of this boot (Id, TimeCreated, RecordId, Message), or
+# $null when a log couldn't be read (then done is $null: never evidence). Done = a 211 ("completed tasks for <SID>")
+# naming the SID, the latest 240/241 for the SID at "tasks: 0", and no 240 (a task added) for the SID after that 211.
+# Also returned for the record: the task count, 216's "will resume at" and 217's resume, as UTC times.
+$AppReadinessState = {
+  param($events, $sid)
+  if ($null -eq $events) { return @{ done = $null; tasks = $null; completedAt = $null; completionId = $null; suspendedUntil = $null; resumedAt = $null } }
+  $s = [regex]::Escape($sid)
+  $mine = @($events | Where-Object { [string]$_.Message -match "$s(\b|')" } | Sort-Object TimeCreated, RecordId)
+  $iso = { param($t) if ($t) { $t.ToUniversalTime().ToString('o') } else { $null } }
+  $done211 = @($mine | Where-Object { $_.Id -eq 211 }) | Select-Object -Last 1
+  $counted = @($mine | Where-Object { ($_.Id -in @(240, 241)) -and ([string]$_.Message -match 'tasks:\s*(\d+)') }) | Select-Object -Last 1
+  $tasks = $null
+  if ($counted -and ([string]$counted.Message -match 'tasks:\s*(\d+)')) { $tasks = [int]$Matches[1] }
+  # 211 and 240 are both Admin-log events: its record order catches a task added in the same second as the 211.
+  $addedAfter = $done211 -and @($mine | Where-Object { $_.Id -eq 240 -and ($_.TimeCreated -gt $done211.TimeCreated -or ($_.TimeCreated -eq $done211.TimeCreated -and $_.RecordId -gt $done211.RecordId)) }).Count -gt 0
+  $susp = @($mine | Where-Object { $_.Id -eq 216 }) | Select-Object -Last 1
+  $until = $null
+  if ($susp -and ([string]$susp.Message -match 'resume at\s+(.+?)\.?\s*$')) { $d = [datetime]::MinValue; if ([datetime]::TryParse((($Matches[1] -replace '[^0-9TZ:.\-]', '') -replace '(\.\d{7})\d+', '$1'), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal, [ref]$d)) { $until = $d.ToString('o') } }
+  $res = @($mine | Where-Object { $_.Id -eq 217 }) | Select-Object -Last 1
+  # completionId: the 211's Admin-log record id, the completion's generation (two in the same second still differ).
+  $cid = if ($done211) { [long]$done211.RecordId } else { $null }
+  @{ done = [bool]($done211 -and $tasks -eq 0 -and -not $addedAfter); tasks = $tasks; completedAt = (& $iso $done211.TimeCreated); completionId = $cid; suspendedUntil = $until; resumedAt = (& $iso $res.TimeCreated) }
+}
+
 $GuestProvisioned = {
-  param($u, $quietMs, $countsText)
+  param($u, $quietMs, $countsText, $readinessText)
   $ErrorActionPreference = 'Stop'
   $boot = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime().ToString('o')
   $last = $null
@@ -390,7 +416,20 @@ $GuestProvisioned = {
     }
   } catch { }
   $counts = & ([scriptblock]::Create($countsText)) $raw
-  @{ boot = $boot; user = ($procs.Count -gt 0); lastEvent = $last; count = $pk.Count; inventory = $inventory; busy = $busy; mappings = $counts.mappings; packagesDirs = $counts.packagesDirs }
+  # MC-1528: App Readiness's per-user queue for this account, from this boot's events (both logs readable, or $null).
+  $ar = $null
+  try {
+    $bootTime = (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
+    $arSid = [string](Get-CimInstance Win32_UserAccount -Filter "LocalAccount=True AND Name='$u'").SID
+    $evs = foreach ($log in 'Microsoft-Windows-AppReadiness/Admin', 'Microsoft-Windows-AppReadiness/Operational') {
+      $info = Get-WinEvent -ListLog $log -ErrorAction Stop
+      if (-not $info.IsEnabled) { throw "$log is disabled" }
+      try { Get-WinEvent -FilterHashtable @{ LogName = $log; Id = 211, 216, 217, 240, 241; StartTime = $bootTime } -ErrorAction Stop } catch { if ($_.FullyQualifiedErrorId -notlike 'NoMatchingEventsFound*') { throw } }
+    }
+    if ($arSid) { $ar = & ([scriptblock]::Create($readinessText)) @($evs) $arSid }
+  } catch { $ar = $null }
+  if ($null -eq $ar) { $ar = & ([scriptblock]::Create($readinessText)) $null '' }
+  @{ boot = $boot; user = ($procs.Count -gt 0); lastEvent = $last; count = $pk.Count; inventory = $inventory; busy = $busy; mappings = $counts.mappings; packagesDirs = $counts.packagesDirs; appReadiness = $ar }
 }
 
 # MC-1519 (the user's decision): the test work folders excluded from Defender's scanning (an ExclusionPath: real-time
@@ -636,7 +675,7 @@ try {
     }
     'guest-provisioned' {
       $vm = Get-OwnVm $a
-      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestProvisioned -ArgumentList ([string]$a.account), ([int]$a.quietMs), $ProfileCounts.ToString()
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestProvisioned -ArgumentList ([string]$a.account), ([int]$a.quietMs), $ProfileCounts.ToString(), $AppReadinessState.ToString()
     }
     'guest-defender' {
       $vm = Get-OwnVm $a

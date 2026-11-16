@@ -124,10 +124,16 @@ function run(s, op, a) {
       // profileUnknownAt.
       const grow = Math.min(k, s.profileGrow || 0)
       const unknown = s.profileUnknownAt === k
-      // MC-1527: waveAfterMs: the account's AppContainer wave (+39 each) lands this long after this logon's first probe.
-      if (k === 1) vm.provisionStart = Date.now()
-      const wave = s.waveAfterMs !== undefined && Date.now() - vm.provisionStart >= s.waveAfterMs ? 39 : 0
-      return { boot: `boot-${vm.boot || 0}`, user: vm.loggedOn === a.account, lastEvent: '2026-11-15T00:00:00.000Z', count: 42, inventory: 'cafe', busy, mappings: unknown ? null : 60 + grow + wave, packagesDirs: unknown ? null : 25 + grow + wave }
+      // MC-1528: App Readiness's per-user queue. readinessDoneAt: k: not done (39 tasks left, suspended) before this
+      // logon's k-th probe, then done, and the AppContainer wave (+39 each) has landed; readinessNever: never done;
+      // readinessUnknown: its logs unreadable (null). Default: done from the first probe.
+      const doneAt = s.readinessNever || s.readinessUnknown ? Infinity : (s.readinessDoneAt || 1)
+      const done = k >= doneAt
+      const wave = s.readinessDoneAt && done ? 39 : 0
+      const appReadiness = s.readinessUnknown ? { done: null, tasks: null, completedAt: null, completionId: null, suspendedUntil: null, resumedAt: null }
+        : done ? { done: true, tasks: 0, completedAt: '2026-11-16T02:01:55.000Z', completionId: 7, suspendedUntil: '2026-11-16T02:00:55.499Z', resumedAt: '2026-11-16T02:00:55.600Z', secret: 'dropped' }
+          : { done: false, tasks: 39, completedAt: null, completionId: null, suspendedUntil: '2026-11-16T02:00:55.499Z', resumedAt: null }
+      return { boot: `boot-${vm.boot || 0}`, user: vm.loggedOn === a.account, lastEvent: '2026-11-15T00:00:00.000Z', count: 42, inventory: 'cafe', busy, mappings: unknown ? null : 60 + grow + wave, packagesDirs: unknown ? null : 25 + grow + wave, appReadiness }
     }
     case 'guest-licence': { own(s, a); return { status: 1, graceMinutes: 0, evalEnd: null, channel: 'Retail', error: null, ...(s.licence || {}) } }
     case 'net-off': { const vm = own(s, a); vm.state = 'Off'; vm.switchName = null; return { offline: true } }

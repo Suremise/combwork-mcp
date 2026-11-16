@@ -97,18 +97,26 @@ test('a first logon that never begins (MC-1526): retried after the sign window, 
   assert.deepStrictEqual(vms(twice.sc), [])
 })
 
-test('the AppContainer wave lands during the dwell (MC-1527): the checkpoint takes the post-wave counts; the note says the dwell is a minimum', async t => {
-  // The stub's wave comes 60 ms after each logon's first probe; quiet (40 ms) would hold before it, but the dwell (100 ms
-  // in the tests' env) holds acceptance back until it has landed.
-  const { sc, line } = await build(t, 'prov-wave', { waveAfterMs: 60 })
+test('the build waits for App Readiness to finish each account (MC-1528): the checkpoint takes the post-wave counts, its state recorded allowlisted', async t => {
+  // App Readiness finishes (and the wave lands) only at each logon's 8th probe; quiet alone (40 ms) would hold before it.
+  const { sc, line } = await build(t, 'prov-readiness', { readinessDoneAt: 8 })
   assert.match(line, /create finished/)
   const ready = sc.journal().find(r => r.t === 'ready')
   for (const who of ['hvadmin', 'hvuser']) {
     assert.strictEqual(ready.profiles[who].mappings, 99, `${who}: the post-wave count`)
     assert.strictEqual(ready.profiles[who].packagesDirs, 64)
-    assert.strictEqual(ready.profiles[who].dwellMs, 100)
+    assert.deepStrictEqual(ready.profiles[who].appReadiness, { done: true, tasks: 0, completedAt: '2026-11-16T02:01:55.000Z', completionId: 7, suspendedUntil: '2026-11-16T02:00:55.499Z', resumedAt: '2026-11-16T02:00:55.600Z' }, 'allowlisted: no other field')
   }
-  assert.match(line, /hvadmin settled with 99 AppContainer mappings and 64 Packages folders after \d+ s \(at least 0 s after its logon\)/)
+  assert.match(line, /hvadmin settled with 99 AppContainer mappings and 64 Packages folders after \d+ s \(App Readiness finished\)/)
+})
+
+test('App Readiness never finishing, or unreadable (MC-1528), fails the build late with its state, never accepted on quiet alone', async t => {
+  const never = await build(t, 'prov-readiness-never', { readinessNever: true })
+  assert.match(never.line, /FAILED: .*hvadmin's first-logon provisioning didn't settle within 15 s \(App Readiness: not finished, 39 tasks left, suspended until 2026-11-16T02:00:55\.499Z\)/)
+  assert.deepStrictEqual(vms(never.sc), [], 'rolled back')
+  assert.ok(!never.sc.journal().some(r => r.t === 'ready'), 'no ready record, no checkpoint kept')
+  const unknown = await build(t, 'prov-readiness-unknown', { readinessUnknown: true })
+  assert.match(unknown.line, /FAILED: .*didn't settle within 15 s \(App Readiness: unknown \(its logs unreadable or no answer\)\)/)
 })
 
 test('an undo that doesn\'t verify fails the build: a leftover explicit ACE on C:\\hvmcp, or UAC still off', async t => {
@@ -160,7 +168,7 @@ test('Defender (MC-1519): the antivirus service off, or the query failing, fails
 // MC-1520: a failed build logon is diagnosed before its undo, and the attempt recorded where anyone can see it.
 test('a failed build logon (MC-1520): diagnosed before its undo; the attempt, its reason and the allowlisted snapshot recorded, also in the job note', async t => {
   const { sc, line } = await build(t, 'diag-retry', { provisionLoseOnce: 2 })
-  assert.match(line, /create finished: created hvmcp-[0-9a-f]+ \(hvadmin settled with \d+ AppContainer mappings and \d+ Packages folders after \d+ s \(at least \d+ s after its logon\); hvadmin's logon attempt 1 failed: hvadmin's session was lost while its first-logon work ran; up 600s, logon \+400s, shell \+402s, user-initiated logoff \+460s, no watcher, autologon cleared, busy: OneDriveSetup, unavailable: shellCore, cloudExperienceHost; hvuser settled/)
+  assert.match(line, /create finished: created hvmcp-[0-9a-f]+ \(hvadmin settled with \d+ AppContainer mappings and \d+ Packages folders after \d+ s \(App Readiness finished\); hvadmin's logon attempt 1 failed: hvadmin's session was lost while its first-logon work ran; up 600s, logon \+400s, shell \+402s, user-initiated logoff \+460s, no watcher, autologon cleared, busy: OneDriveSetup, unavailable: shellCore, cloudExperienceHost; hvuser settled/)
   const ops = sc.stub().calls.map(c => c.op)
   assert.ok(ops.indexOf('guest-logon-diag') < ops.indexOf('guest-logon-undo'), 'diagnosed before the undo')
   const p = sc.journal().find(r => r.t === 'ready').profiles.hvadmin
@@ -185,12 +193,12 @@ test('a failed build logon whose diagnosis fails (MC-1520): recorded as unavaila
 test('quiet waits for the account\'s AppContainer counts to stop changing (MC-1520); they\'re recorded; the plan names the budget', async t => {
   const { sc, plan, line } = await build(t, 'prov-counts', { profileGrow: 4 })
   assert.match(line, /create finished/)
-  assert.match(plan.text, /each account within \d+ min \(a logon attempt up to \d+ min once it has begun, one with no sign of a logon \d+ min after its new boot is seen retried at once, then accepted at least \d+ min after its logon, with the last \d+ min observed quiet, one retry if needed\)/)
+  assert.match(plan.text, /each account within \d+ min \(a logon attempt up to \d+ min once it has begun, one with no sign of a logon \d+ min after its new boot is seen retried at once, then accepted once Windows' App Readiness reports the account's first-logon app setup finished and \d+ min of observed quiet follow, one retry if needed\)/)
   for (const who of ['hvadmin', 'hvuser']) assert.ok(vms(sc)[0].provisioned.filter(a => a === who).length >= 6, `${who}: 4 changing samples, then quiet`)
   const p = sc.journal().find(r => r.t === 'ready').profiles
   assert.deepStrictEqual([p.hvadmin.mappings, p.hvadmin.packagesDirs, p.hvuser.mappings, p.hvuser.packagesDirs], [64, 29, 64, 29])
   // The settled counts are visible to any agent, in the job's note (pool_status).
-  assert.match(line, /hvadmin settled with 64 AppContainer mappings and 29 Packages folders after \d+ s \(at least \d+ s after its logon\); hvuser settled with 64 AppContainer mappings and 29 Packages folders after \d+ s \(at least \d+ s after its logon\)/)
+  assert.match(line, /hvadmin settled with 64 AppContainer mappings and 29 Packages folders after \d+ s \(App Readiness finished\); hvuser settled with 64 AppContainer mappings and 29 Packages folders after \d+ s \(App Readiness finished\)/)
 })
 
 test('an unknown AppContainer count (MC-1520) is never quiet: it starts the window over, and the build still settles', async t => {
