@@ -212,23 +212,42 @@ function run(s, op, a) {
       const vm = own(s, a)
       if (s.snapshotsFail) throw new Error('injected: listing snapshots failed')
       if (s.extraSnapshot && !vm.checkpoints.some(c => c.name === s.extraSnapshot.name)) vm.checkpoints.push({ id: crypto.randomUUID(), name: s.extraSnapshot.name, parentId: vm.parent, disk: { ...vm.disk } })
+      // productionFailDelayed: a take whose call failed completes afterwards: it appears from the second listing on.
+      if (vm.delayedTake && ++vm.delayedTake.listings >= 2) { vm.checkpoints.push(vm.delayedTake.cp); vm.delayedTake = null }
       return { snapshots: vm.checkpoints.map(c => ({ id: c.id, name: c.name, parentId: c.parentId ?? null })) }
     }
     case 'lease-checkpoint': {
       const vm = own(s, a)
       if (vm.state !== 'Running') throw new Error(`the VM is ${vm.state}, not Running`)
       if (!/^hvmcp-lease-[0-9a-f]{12}$/.test(a.snapName)) throw new Error('bad checkpoint name')
-      if (s.takeGate) while (!fs.existsSync(s.takeGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25) // held until the test opens it
-      if (s.productionFail) throw new Error('injected: a production checkpoint could not be made')
+      // takeEntered: a file written as the take begins; takeGate: held before the snapshot is made; takeGateAfter: held
+      // after it's made (Hyper-V succeeded, the call hasn't answered). typeRestoreFails: the type stays ProductionOnly.
+      if (s.takeEntered) fs.writeFileSync(s.takeEntered, 'entered')
+      const orig = vm.checkpointType || 'Production'
+      vm.checkpointType = 'ProductionOnly'
+      const wait = g => { while (!fs.existsSync(g)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25) }
+      if (s.takeGate) wait(s.takeGate)
+      if (s.productionFail) { vm.checkpointType = orig; throw new Error('injected: a production checkpoint could not be made') }
       const id = crypto.randomUUID()
-      vm.checkpoints.push({ id, name: a.snapName, parentId: vm.parent, disk: { ...vm.disk }, switchName: vm.switchName, reserve: vm.reserve, production: true })
+      const cp = { id, name: a.snapName, parentId: vm.parent, disk: { ...vm.disk }, switchName: vm.switchName, reserve: vm.reserve, production: true }
+      if (s.productionFailDelayed) { vm.delayedTake = { cp, listings: 0 }; vm.checkpointType = orig; throw new Error('injected: the take call failed; Hyper-V finishes it later') }
+      vm.checkpoints.push(cp)
       vm.parent = id
       vm.leaseTakes = (vm.leaseTakes || 0) + 1
+      if (s.takeGateAfter) { save(s); wait(s.takeGateAfter) } // saved first: Hyper-V has made it, whatever happens to this call
+      if (!s.typeRestoreFails) vm.checkpointType = orig
       if (s.productionFailButMade) throw new Error('injected: the take timed out after making the checkpoint')
-      return { checkpointId: id, checkpointType: 'Standard' }
+      return { checkpointId: id, checkpointType: vm.checkpointType }
+    }
+    case 'checkpoint-type': {
+      const vm = own(s, a)
+      if (a.set && !s.typeSetFails) vm.checkpointType = a.set
+      return { type: vm.checkpointType || 'Production' }
     }
     case 'lease-restore': {
       const vm = own(s, a)
+      if (s.restoreEntered) fs.writeFileSync(s.restoreEntered, 'entered')
+      if (s.leaseRestoreGate) while (!fs.existsSync(s.leaseRestoreGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25)
       const cp = vm.checkpoints.find(c => c.id === a.checkpointId && c.name === a.snapName)
       if (!cp) throw new Error(`checkpoint ${a.snapName} (by id) is missing on this VM`)
       vm.state = 'Off' // a production checkpoint restores Off

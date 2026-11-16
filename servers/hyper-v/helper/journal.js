@@ -23,8 +23,8 @@
  *             into the switch's Notes at creation, so it is recognised as the pool's even before its id is journalled
  *   jobEnd    { jobId, ok, note }
  *   quarantine{ vmId, why } / unquarantine { vmId }       a VM that couldn't be confirmed clean, and its release
- *   lcp-take  { opId, vmId, leaseId, name, snapName }    MC-1529: before a lease checkpoint's take (its Hyper-V name is
- *             snapName, hvmcp-lease-<opId>); lcp-taken { opId, checkpointId } once confirmed; lcp-drop { opId }
+ *   lcp-take  { opId, vmId, leaseId, name, snapName, origType }  MC-1529: before a lease checkpoint's take (its Hyper-V
+ *             name is snapName, hvmcp-lease-<opId>; origType the VM's checkpoint type before it); lcp-taken { opId, checkpointId } once confirmed; lcp-drop { opId }
  *             before its removal; lcp-dropped { opId } once confirmed gone (or never made)
  */
 const fs = require('fs')
@@ -147,7 +147,7 @@ class Journal {
           else s.switch = { name: r.name, switchId: r.switchId ?? s.switch?.switchId ?? null, token: r.token ?? s.switch?.token ?? null, phase: r.phase, jobId: r.jobId }
           break
         // MC-1529: a lease checkpoint's life: intent before the take, its id once confirmed, intent before removal, gone.
-        case 'lcp-take': s.leaseSnaps.set(r.opId, { opId: r.opId, vmId: r.vmId, leaseId: r.leaseId, name: r.name, snapName: r.snapName, checkpointId: null, at: r.at, dropping: false }); break
+        case 'lcp-take': s.leaseSnaps.set(r.opId, { opId: r.opId, vmId: r.vmId, leaseId: r.leaseId, name: r.name, snapName: r.snapName, origType: r.origType ?? null, checkpointId: null, at: r.at, dropping: false }); break
         case 'lcp-taken': { const x = s.leaseSnaps.get(r.opId); if (x) x.checkpointId = r.checkpointId; break }
         case 'lcp-drop': { const x = s.leaseSnaps.get(r.opId); if (x) x.dropping = true; break }
         case 'lcp-dropped': s.leaseSnaps.delete(r.opId); break

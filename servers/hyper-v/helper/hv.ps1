@@ -640,6 +640,12 @@ try {
       Restore-VMSnapshot -VMSnapshot $cp -Confirm:$false
       Facts $vm
     }
+    'checkpoint-type' {
+      # MC-1529: the VM's checkpoint type, read, or set and read back (an interrupted take's type is put back by this).
+      $vm = Get-OwnVm $a
+      if ($a.set) { Set-VM -VM $vm -CheckpointType ([string]$a.set) }
+      @{ type = [string](Get-VM -Id $vm.Id).CheckpointType }
+    }
     'facts-vm' {
       Facts (Get-OwnVm $a)
     }

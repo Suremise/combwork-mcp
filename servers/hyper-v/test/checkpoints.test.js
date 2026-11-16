@@ -96,12 +96,14 @@ test('a production checkpoint that can\'t be made fails, with no standard fallba
   await s.call('vm_start', {})
   sc.patchStub(st => { st.productionFail = true })
   const r = await s.call('vm_checkpoint', { name: 'a' })
-  assert.match(r.text, /The checkpoint "a" couldn't be taken \((lease-checkpoint: )?injected: a production checkpoint could not be made\)\.$/)
+  assert.match(r.text, /The checkpoint "a" couldn't be taken \((lease-checkpoint: )?injected: a production checkpoint could not be made\)\./)
   assert.deepStrictEqual(stubVm().checkpoints.map(c => c.name), ['clean'])
-  assert.ok(journal().some(x => x.t === 'lcp-dropped'), 'its intent settled: no slot held')
+  assert.match(r.text, /Whether Hyper-V made one is settled when this lease ends/)
+  assert.ok(!journal().some(x => x.t === 'lcp-dropped'), 'an absence right after a failed call proves nothing: still journalled')
+  assert.match((await s.call('vm_status')).text, /your checkpoints: "a" \(unconfirmed\)/)
   sc.patchStub(st => { st.productionFail = false; st.productionFailButMade = true })
   assert.match((await s.call('vm_checkpoint', { name: 'b' })).text, /couldn't be taken .*One was made all the same: it's kept as this lease's, and removed with it\./)
-  assert.match((await s.call('vm_status')).text, /your checkpoints: "b" \(taken/)
+  assert.match((await s.call('vm_status')).text, /your checkpoints: "a" \(unconfirmed\), "b" \(taken/)
   sc.patchStub(st => { st.productionFailButMade = false })
   await s.call('vm_release')
   assert.deepStrictEqual(stubVm().checkpoints.map(c => c.name), ['clean'], 'removed with the lease')
@@ -143,20 +145,103 @@ test('recovery: a take journalled without its id is found by its unique name and
   assert.match(st, new RegExp(`${vm}: .*unknown checkpoints left alone: someone else's`))
 })
 
-test('a lease that ends during a take gets no success; nothing it took survives', async t => {
-  const { s, sc, stubVm } = await lease(t, 'cp-cancel')
+/** Starts a call, waits for the stub's "entered" file, then releases; returns both replies. */
+async function releaseDuring(s, sc, call, knobs) {
+  const entered = path.join(sc.dir, `entered-${Date.now()}`)
+  sc.patchStub(st => Object.assign(st, knobs(entered)))
+  const p = call()
+  await waitFor(async () => fs.existsSync(entered), 10_000, 'the call has entered Hyper-V')
+  const rel = await s.call('vm_release')
+  return { r: await p, rel }
+}
+
+test('a lease released while a take waits before Hyper-V makes the snapshot: no success, nothing left, the intent settled', async t => {
+  const { s, sc, stubVm, journal } = await lease(t, 'cp-cancel-before')
   await s.call('vm_start', {})
-  const gate = path.join(sc.dir, 'take-gate')
-  sc.patchStub(st => { st.takeGate = gate })
-  const take = s.call('vm_checkpoint', { name: 'a' })
-  await waitFor(async () => (stubVm().leaseTakes || 0) === 0 && fs.existsSync(path.join(sc.dir)), 2000, 'the take is waiting')
-  const rel = s.call('vm_release')
-  setTimeout(() => fs.writeFileSync(gate, 'open'), 300)
-  const r = await take
-  assert.ok(r.isError || !/^Checkpoint "a" taken/.test(r.text), `no success for an ended lease: ${r.text}`)
-  await rel
-  await waitFor(async () => stubVm().checkpoints.length === 1, 10_000, 'only clean left')
+  const gate = path.join(sc.dir, 'gate-never')
+  const { r, rel } = await releaseDuring(s, sc, () => s.call('vm_checkpoint', { name: 'a' }), entered => ({ takeEntered: entered, takeGate: gate }))
+  assert.ok(!/^Checkpoint "a" taken/.test(r.text), `no success: ${r.text}`)
+  assert.match(rel.text, /^Released/)
   assert.deepStrictEqual(stubVm().checkpoints.map(c => c.name), ['clean'])
+  assert.ok(journal().some(x => x.t === 'lcp-dropped'), 'settled after clean was restored')
+})
+
+test('a lease released just after Hyper-V made the snapshot but before the call answered: no success; the snapshot is owned and removed', async t => {
+  const { s, sc, stubVm } = await lease(t, 'cp-cancel-after')
+  await s.call('vm_start', {})
+  const gate = path.join(sc.dir, 'gate-after-never')
+  const { r, rel } = await releaseDuring(s, sc, () => s.call('vm_checkpoint', { name: 'a' }), entered => ({ takeEntered: entered, takeGateAfter: gate }))
+  assert.ok(!/^Checkpoint "a" taken/.test(r.text), `no success: ${r.text}`)
+  assert.match(rel.text, /^Released/)
+  const v = stubVm()
+  assert.deepStrictEqual(v.checkpoints.map(c => c.name), ['clean'])
+  assert.strictEqual((v.removedSnaps || []).length, 1, 'the one it made, removed by the release')
+  assert.strictEqual(v.checkpointType, 'Production', 'and the checkpoint type put back from the journal')
+})
+
+test('a take that Hyper-V completes after its call failed (absent at the first look) is never forgotten: the release finds and removes it', async t => {
+  const { s, sc, stubVm } = await lease(t, 'cp-delayed')
+  await s.call('vm_start', {})
+  sc.patchStub(st => { st.productionFailDelayed = true })
+  assert.match((await s.call('vm_checkpoint', { name: 'a' })).text, /couldn't be taken .*settled when this lease ends/)
+  sc.patchStub(st => { st.productionFailDelayed = false })
+  assert.match((await s.call('vm_release')).text, /^Released/)
+  const v = stubVm()
+  assert.deepStrictEqual(v.checkpoints.map(c => c.name), ['clean'], 'it appeared later, and was removed')
+  assert.strictEqual((v.removedSnaps || []).length, 1)
+})
+
+test('a lease released during a restore: no success; the VM ends clean, its checkpoints removed', async t => {
+  const { s, sc, stubVm } = await lease(t, 'cp-cancel-restore')
+  await s.call('vm_start', {})
+  await s.call('vm_checkpoint', { name: 'a' })
+  const gate = path.join(sc.dir, 'restore-gate-never')
+  const { r, rel } = await releaseDuring(s, sc, () => s.call('vm_restore', { name: 'a' }), entered => ({ restoreEntered: entered, leaseRestoreGate: gate }))
+  assert.ok(!/^Restored /.test(r.text), `no success: ${r.text}`)
+  assert.match(rel.text, /^Released/)
+  assert.deepStrictEqual(stubVm().checkpoints.map(c => c.name), ['clean'])
+})
+
+test('identity mismatches: a known id under another name is neither removed nor forgotten (quarantined); a same-named snapshot with another id is unknown, left alone', async t => {
+  const renamed = await lease(t, 'cp-mismatch-id')
+  await renamed.s.call('vm_start', {})
+  await renamed.s.call('vm_checkpoint', { name: 'a' })
+  renamed.sc.patchStub(st => { const v = Object.values(st.vms).find(x => x.name === renamed.vm); v.checkpoints.find(c => c.name.startsWith('hvmcp-lease-')).name = 'renamed by someone' })
+  const rel = await renamed.s.call('vm_release')
+  assert.match(rel.text, /CLEANUP FAILED: .*lease checkpoint cleanup pending: a's id \S+ now has the name "renamed by someone"/)
+  assert.ok(renamed.stubVm().checkpoints.some(c => c.name === 'renamed by someone'), 'not removed')
+  assert.ok(renamed.journal().filter(x => x.t === 'lcp-take').length === 1 && !renamed.journal().some(x => x.t === 'lcp-dropped'), 'not forgotten')
+
+  const twin = await lease(t, 'cp-mismatch-name')
+  await twin.s.call('vm_start', {})
+  await twin.s.call('vm_checkpoint', { name: 'a' })
+  twin.sc.patchStub(st => { const v = Object.values(st.vms).find(x => x.name === twin.vm); const own = v.checkpoints.find(c => c.name.startsWith('hvmcp-lease-')); v.checkpoints.push({ id: 'snap-twin', name: own.name, parentId: v.parent, disk: {} }) })
+  assert.match((await twin.s.call('vm_release')).text, /^Released/)
+  const left = twin.stubVm().checkpoints.map(c => c.id)
+  assert.ok(left.includes('snap-twin') && left.length === 2, 'only the owned id removed')
+  assert.match((await twin.s.call('vm_status')).text, /unknown checkpoints left alone: hvmcp-lease-[0-9a-f]+ \(snap-twin\)/)
+})
+
+test('the checkpoint type: put back at once if the take left it changed; if that fails too, said in the reply and put back at the lease\'s end', async t => {
+  const one = await lease(t, 'cp-type-fixed')
+  await one.s.call('vm_start', {})
+  one.sc.patchStub(st => { st.typeRestoreFails = true })
+  const r1 = await one.s.call('vm_checkpoint', { name: 'a' })
+  assert.doesNotMatch(r1.text, /Note: the VM's checkpoint type/)
+  assert.strictEqual(one.stubVm().checkpointType, 'Production')
+
+  const two = await lease(t, 'cp-type-pending')
+  await two.s.call('vm_start', {})
+  two.sc.patchStub(st => { st.typeRestoreFails = true; st.typeSetFails = true })
+  const r2 = await two.s.call('vm_checkpoint', { name: 'a' })
+  assert.match(r2.text, /Note: the VM's checkpoint type was left as ProductionOnly \(it was Production\); it's put back when this lease ends\./)
+  const rel = await two.s.call('vm_release')
+  assert.match(rel.text, /CLEANUP FAILED: .*the checkpoint type is ProductionOnly, not Production/)
+  await two.s.close()
+  two.sc.patchStub(st => { st.typeSetFails = false; st.typeRestoreFails = false })
+  const s3 = two.open()
+  assert.match((await s3.call('vm_status')).text, new RegExp(`${two.vm}: .*; free`))
+  assert.strictEqual(two.stubVm().checkpointType, 'Production')
 })
 
 test('server.js: vm_checkpoint and vm_restore are refused, before anything is sent, by a helper without the checkpoints feature', async t => {
