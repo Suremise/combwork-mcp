@@ -385,6 +385,17 @@ $AppReadinessState = {
   @{ done = [bool]($done211 -and $tasks -eq 0 -and -not $addedAfter); tasks = $tasks; completedAt = (& $iso $done211.TimeCreated); completionId = $cid; suspendedUntil = $until; resumedAt = (& $iso $res.TimeCreated) }
 }
 
+# MC-1529: Hyper-V's jobs (CIM_ConcreteJob JobState) count as ended only in a documented terminal state: Completed (7),
+# Terminated (8), Exception (10) or Completed with warnings (32768). Every other state, New (2), Starting (3), Running
+# (4), Suspended (5), Shutting Down (6), Killed (9, its work may still be going), Service (11), or any unknown value,
+# is not ended. Pure, so the tests run it. Returns { idle, pending }.
+$JobsIdle = {
+  param($states)
+  $ended = @(7, 8, 10, 32768)
+  $pending = @(@($states) | Where-Object { $null -ne $_ -and [int]$_ -notin $ended })
+  @{ idle = ($pending.Count -eq 0); pending = $pending.Count }
+}
+
 $GuestProvisioned = {
   param($u, $quietMs, $countsText, $readinessText)
   $ErrorActionPreference = 'Stop'
@@ -637,10 +648,10 @@ try {
       else { @{ checkpointId = $cp.Id.ToString(); checkpointType = $type } }
     }
     'jobs-idle' {
-      # MC-1529: whether any Hyper-V job is still starting or running on this host (WMI Msvm_ConcreteJob, JobState 3 or 4,
-      # host-wide, so a conservative check): a take whose call died is settled as never made only when none is.
-      $running = @(Get-CimInstance -Namespace root\virtualization\v2 -ClassName Msvm_ConcreteJob -ErrorAction Stop | Where-Object { $_.JobState -in 3, 4 })
-      @{ idle = ($running.Count -eq 0); running = $running.Count }
+      # MC-1529: whether every Hyper-V job on this host has ended (host-wide, so conservative): a take whose call died is
+      # settled as never made only then. The rule is $JobsIdle's.
+      $states = @(Get-CimInstance -Namespace root\virtualization\v2 -ClassName Msvm_ConcreteJob -ErrorAction Stop | ForEach-Object { [int]$_.JobState })
+      & $JobsIdle $states
     }
     'lease-restore' {
       $vm = Get-OwnVm $a

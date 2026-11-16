@@ -267,6 +267,8 @@ function run(s, op, a) {
     // A take Hyper-V hasn't finished (productionFailDelayed) is a running job until it appears; jobsUnreadable fails.
     case 'jobs-idle': {
       if (s.jobsUnreadable) throw new Error('injected: the job state is unreadable')
+      // finishOnIdle: the pending take finishes just as the job check runs (after the first, empty listing).
+      if (s.finishOnIdle) for (const v of Object.values(s.vms)) if (v.delayedTake) { v.checkpoints.push(v.delayedTake.cp); v.delayedTake = null }
       const running = Object.values(s.vms).filter(v => v.delayedTake).length
       return { idle: running === 0, running }
     }

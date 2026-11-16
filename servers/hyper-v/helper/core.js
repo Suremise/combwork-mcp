@@ -754,12 +754,18 @@ class Helper {
         // An unconfirmed take (its call died or timed out): by its unique name. Absent, it's settled as never made only
         // when Hyper-V positively shows no job still starting or running on the host: absence alone proves nothing.
         // Two with the name is a mismatch, left alone.
-        const ys = list.filter(y => y.name === x.snapName)
+        let ys = list.filter(y => y.name === x.snapName)
         if (ys.length > 1) return `lease checkpoint cleanup pending: ${ys.length} snapshots are named ${x.snapName}`
         if (!ys.length) {
           let idle = null
           try { idle = (await this.hv('jobs-idle', this.ident(vm))).idle === true } catch { idle = null }
-          if (idle !== true) return `lease checkpoint cleanup pending: the take of ${x.name} may still be in progress (Hyper-V ${idle === false ? 'has a job running' : 'job state unreadable'})`
+          if (idle !== true) return `lease checkpoint cleanup pending: the take of ${x.name} may still be in progress (Hyper-V ${idle === false ? 'has a job that hasn\'t ended' : 'job state unreadable'})`
+          // Idle now, so the take has ended either way: a fresh look decides (it may have finished since the first one).
+          let fresh
+          try { fresh = (await this.hv('snapshots', this.ident(vm))).snapshots || [] } catch (e) { return `lease checkpoint cleanup pending: ${e.message}` }
+          ys = fresh.filter(y => y.name === x.snapName)
+          if (ys.length > 1) return `lease checkpoint cleanup pending: ${ys.length} snapshots are named ${x.snapName}`
+          for (const y of fresh) if (!byId.has(y.id)) byId.set(y.id, y)
         }
         targets.push({ x, snap: ys[0] || null })
       }

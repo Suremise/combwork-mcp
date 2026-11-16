@@ -252,7 +252,7 @@ test('a take still unfinished at the release (absent at the first look AND the r
   assert.match((await s.call('vm_checkpoint', { name: 'a' })).text, /couldn't be taken .*settled when this lease ends/) // listing 1: absent
   sc.patchStub(st => { st.productionFailDelayed = false })
   const rel = await s.call('vm_release') // listing 2: absent, and Hyper-V still has the job running
-  assert.match(rel.text, /CLEANUP FAILED: .*the take of a may still be in progress \(Hyper-V has a job running\)/)
+  assert.match(rel.text, /CLEANUP FAILED: .*the take of a may still be in progress \(Hyper-V has a job that hasn't ended\)/)
   assert.ok(!journal().some(x => x.t === 'lcp-dropped'), 'not forgotten')
   await s.close()
   const s2 = open() // recovery: listing 3, still absent and running: still quarantined
@@ -288,6 +288,37 @@ test('a lease released during the start after a restore (configure-start): no su
   assert.ok(!/^Restored /.test(r.text), `no success: ${r.text}`)
   assert.match(rel.text, /^Released/)
   assert.deepStrictEqual(stubVm().checkpoints.map(c => c.name), ['clean'])
+})
+
+test('a take that finishes between the empty listing and the job check: the fresh listing after it finds the snapshot, and the release removes it', async t => {
+  const { s, sc, stubVm, journal } = await lease(t, 'cp-race', { stub: { delayedAfter: 99 } })
+  await s.call('vm_start', {})
+  sc.patchStub(st => { st.productionFailDelayed = true })
+  assert.match((await s.call('vm_checkpoint', { name: 'a' })).text, /couldn't be taken/)
+  sc.patchStub(st => { st.productionFailDelayed = false; st.finishOnIdle = true })
+  assert.match((await s.call('vm_release')).text, /^Released/)
+  const v = stubVm()
+  assert.deepStrictEqual(v.checkpoints.map(c => c.name), ['clean'], 'found on the fresh look and removed, never forgotten')
+  assert.strictEqual((v.removedSnaps || []).length, 1)
+  assert.ok(journal().some(x => x.t === 'lcp-drop'), 'removed as an owned snapshot, not settled as absent')
+})
+
+// MC-1529: hv.ps1's own $JobsIdle, run for real: only Completed (7), Terminated (8), Exception (10) and Completed with
+// warnings (32768) count as ended; New, Starting, Running, Suspended, Shutting Down, Killed, Service and any unknown
+// value don't.
+const HV_PS = fs.readFileSync(path.join(__dirname, '..', 'helper', 'hv.ps1'), 'utf8')
+const JOBS_BLOCK = (() => { const a = HV_PS.indexOf('\n$JobsIdle = {'); const e = a < 0 ? -1 : HV_PS.indexOf('\n}\n', a + 1); return e < 0 ? null : HV_PS.slice(a + 1, e + 3) })()
+
+test('job states (MC-1529), for real: idle only when every job is in a documented terminal state', { skip: process.platform !== 'win32' || !JOBS_BLOCK }, () => {
+  const { spawnSync } = require('child_process')
+  const { ps51Env } = require('../helper/hv')
+  const sc = scratch('jobs-idle')
+  const file = path.join(sc.dir, 'jobs.ps1')
+  const cases = [[], [7, 8, 10, 32768], [7, 2], [7, 3], [4], [5], [6], [9], [11], [12345]]
+  fs.writeFileSync(file, `${JOBS_BLOCK}\n${cases.map(c => `'OUT:' + (ConvertTo-Json -InputObject (& $JobsIdle @(${c.join(',')})) -Compress)`).join('\n')}\n`)
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: ps51Env(), timeout: 60_000 })
+  const out = r.stdout.split(/\r?\n/).filter(l => l.startsWith('OUT:')).map(l => JSON.parse(l.slice(4)).idle)
+  assert.deepStrictEqual(out, [true, true, false, false, false, false, false, false, false, false], r.stdout + r.stderr)
 })
 
 test('server.js: vm_checkpoint and vm_restore are refused, before anything is sent, by a helper without the checkpoints feature', async t => {

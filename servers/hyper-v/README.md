@@ -366,8 +366,9 @@ projects start from (MC-1532) and refreshing the clean checkpoint in place (MC-1
   VM's checkpoint type before it, and again once confirmed; each removal likewise. A take Hyper-V itself reports
   as failed is settled at once (no standard checkpoint is taken instead). A take whose call died or timed out is
   never assumed not to have happened: found by its name it's kept as the lease's; not found it stays "unconfirmed"
-  and holds its slot, and at the lease's end it's settled as never made only when Hyper-V shows no job still running
-  on the host (WMI's Msvm_ConcreteJob); until then the VM stays quarantined, and a take that finishes later is found
+  and holds its slot, and at the lease's end it's settled as never made only when every Hyper-V job on the host
+  (WMI's Msvm_ConcreteJob) is in a documented terminal state (Completed, Terminated, Exception, Completed with
+  warnings: not New, Suspended, Killed or any other), followed by a fresh look for it; until then the VM stays quarantined, and a take that finishes later is found
   and removed. Removal matches a confirmed checkpoint by
   its id (the same id under another name is left alone and keeps the VM quarantined) and an unconfirmed one by its
   name; the checkpoint type is put back from the journal before each is forgotten. Any other checkpoint on a pool VM
