@@ -247,7 +247,7 @@ test('the projects feature: this helper still reports hyperv-mcp/3 (so hyper-v 1
   const helper = await startHelper(sc)
   const v = await helper.conn(1).request('version')
   assert.strictEqual(v.data.protocol, 'hyperv-mcp/3')
-  assert.deepStrictEqual(v.data.features, ['projects', 'images', 'named'])
+  assert.deepStrictEqual(v.data.features, ['projects', 'images', 'named', 'checkpoints'])
   await helper.stop()
   const shim = path.join(sc.dir, 'older-core.js')
   fs.writeFileSync(shim, `const m = require(${JSON.stringify(path.join(__dirname, '..', 'helper', 'core.js'))})

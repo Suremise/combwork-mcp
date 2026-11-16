@@ -127,6 +127,7 @@ class Helper {
     this.log = log
     this.poolLock = mutex()
     this.vmLocks = new Map()
+    this.unknownSnapshots = new Map() // MC-1529: vmId -> names of checkpoints neither clean nor a lease's: left alone
     this.leases = new Map() // vmId -> lease
     this.conns = new Map() // connId -> { pid, vmId }
     this.job = null // the pool job in progress: { jobId, op, progress, promise }
@@ -707,12 +708,85 @@ class Helper {
       why = e.message
     }
     const s = this.state
+    // MC-1529: then the lease checkpoints no live lease owns (an ended lease's, or any a crash left) are removed; until
+    // they're confirmed gone the VM stays quarantined, even though clean itself verified.
+    if (!why) why = await this.dropLeaseSnapshots(vm)
     if (why) {
       if (s.quarantined.get(vm.vmId) !== why) this.journal.append({ t: 'quarantine', vmId: vm.vmId, why })
       return { ok: false, text: `CLEANUP FAILED: ${vm.vmName} could not be confirmed clean (${why}). It is quarantined (never leased) until a restore confirms it; the helper retries every few minutes.` }
     }
     if (s.quarantined.has(vm.vmId)) this.journal.append({ t: 'unquarantine', vmId: vm.vmId })
     return { ok: true, text: `${vm.vmName} restored to clean (Off, at its clean checkpoint, network disconnected, no CPU reserve).` }
+  }
+
+  /**
+   * MC-1529: removes this VM's journalled lease checkpoints that no live lease owns, deepest first (a child before its
+   * parent), each by its exact id and owned name, confirmed gone before it's journalled dropped. A take that never got
+   * its id journalled is found by its unique name. Any other snapshot that isn't clean is left alone and noted.
+   * Returns null, or why cleanup is still pending.
+   */
+  async dropLeaseSnapshots(vm) {
+    const live = this.leases.get(vm.vmId)
+    const keep = live && !live.ending ? live.leaseId : null
+    const all = [...this.state.leaseSnaps.values()].filter(x => x.vmId === vm.vmId)
+    const mine = all.filter(x => x.leaseId !== keep)
+    // A start within a live lease with nothing to drop doesn't look (one Hyper-V call fewer on every start).
+    if (!mine.length && keep) return null
+    let list
+    try { list = (await this.hv('snapshots', this.ident(vm))).snapshots || [] } catch (e) { return mine.length ? `lease checkpoint cleanup pending: ${e.message}` : null }
+    // Ownership by identity: a confirmed take by its id, an unconfirmed one by its unique name. Anything else that
+    // isn't clean (a same-named snapshot with another id included) is unknown: reported, never deleted.
+    const ownedIds = new Set(all.filter(x => x.checkpointId).map(x => x.checkpointId))
+    const pendingNames = new Set(all.filter(x => !x.checkpointId).map(x => x.snapName))
+    const unknown = list.filter(x => x.id !== vm.cleanCheckpointId && !ownedIds.has(x.id) && !pendingNames.has(x.name)).map(x => `${x.name} (${x.id})`)
+    if (unknown.length) this.unknownSnapshots.set(vm.vmId, unknown); else this.unknownSnapshots.delete(vm.vmId)
+    if (!mine.length) return null
+    const byId = new Map(list.map(x => [x.id, x]))
+    const depth = x => { let d = 0; for (let p = x.parentId; p && byId.has(p) && d < 64; p = byId.get(p).parentId) d++; return d }
+    const targets = []
+    for (const x of mine) {
+      if (x.checkpointId) {
+        const y = byId.get(x.checkpointId)
+        // The known id under another name: not removed (it may not be ours any more), not forgotten either.
+        if (y && y.name !== x.snapName) return `lease checkpoint cleanup pending: ${x.name}'s id ${x.checkpointId} now has the name "${y.name}"`
+        targets.push({ x, snap: y || null })
+      } else {
+        // An unconfirmed take (its call died or timed out): by its unique name. Absent, it's settled as never made only
+        // when Hyper-V positively shows no job still starting or running on the host: absence alone proves nothing.
+        // Two with the name is a mismatch, left alone.
+        let ys = list.filter(y => y.name === x.snapName)
+        if (ys.length > 1) return `lease checkpoint cleanup pending: ${ys.length} snapshots are named ${x.snapName}`
+        if (!ys.length) {
+          let idle = null
+          try { idle = (await this.hv('jobs-idle', this.ident(vm))).idle === true } catch { idle = null }
+          if (idle !== true) return `lease checkpoint cleanup pending: the take of ${x.name} may still be in progress (Hyper-V ${idle === false ? 'has a job that hasn\'t ended' : 'job state unreadable'})`
+          // Idle now, so the take has ended either way: a fresh look decides (it may have finished since the first one).
+          let fresh
+          try { fresh = (await this.hv('snapshots', this.ident(vm))).snapshots || [] } catch (e) { return `lease checkpoint cleanup pending: ${e.message}` }
+          ys = fresh.filter(y => y.name === x.snapName)
+          if (ys.length > 1) return `lease checkpoint cleanup pending: ${ys.length} snapshots are named ${x.snapName}`
+          for (const y of fresh) if (!byId.has(y.id)) byId.set(y.id, y)
+        }
+        targets.push({ x, snap: ys[0] || null })
+      }
+    }
+    targets.sort((a, b) => (b.snap ? depth(b.snap) : -1) - (a.snap ? depth(a.snap) : -1))
+    for (const { x, snap } of targets) {
+      if (snap) {
+        if (!x.dropping) this.journal.append({ t: 'lcp-drop', opId: x.opId })
+        let gone = false
+        try { gone = (await this.hv('snapshot-remove', { ...this.ident(vm), checkpointId: snap.id, snapName: x.snapName })).removed === true } catch (e) { return `lease checkpoint cleanup pending: removing ${x.name} failed (${e.message})` }
+        if (!gone) return `lease checkpoint cleanup pending: ${x.name} is still there`
+      }
+      // The VM's checkpoint type, as it was before this take (an interrupted take may have left ProductionOnly).
+      if (x.origType) {
+        let type = null
+        try { type = (await this.hv('checkpoint-type', this.ident(vm))).type; if (type !== x.origType) type = (await this.hv('checkpoint-type', { ...this.ident(vm), set: x.origType })).type } catch (e) { return `lease checkpoint cleanup pending: putting back the checkpoint type failed (${e.message})` }
+        if (type !== x.origType) return `lease checkpoint cleanup pending: the checkpoint type is ${type}, not ${x.origType}`
+      }
+      this.journal.append({ t: 'lcp-dropped', opId: x.opId })
+    }
+    return null
   }
 
   /** Retries quarantined VMs that nobody holds. */
@@ -1304,6 +1378,117 @@ class Helper {
     return { text: r.ok ? `Reverted: ${r.text}` : r.text, isError: !r.ok }
   }
 
+  /** MC-1529: this lease's checkpoints, journalled and not dropped (a take not yet confirmed included). */
+  leaseCheckpoints(lease) {
+    return [...this.state.leaseSnaps.values()].filter(x => x.leaseId === lease.leaseId && x.vmId === lease.vmId && !x.dropping)
+  }
+
+  /**
+   * MC-1529: vm_checkpoint. A production checkpoint (disk-consistent, no memory) of the leased VM as it runs now, under
+   * the VM's lock (so never during a run, a sync, a start or a restore), journalled before the take under a unique
+   * Hyper-V name and confirmed after it. Only while running, not kept, with a trusted sync record; within the lease's
+   * cap (unconfirmed takes count) and the disk floor. Dropped when the lease ends.
+   */
+  async checkpoint(connId, { name } = {}) {
+    const lease = this.leaseOf(connId)
+    if (typeof name !== 'string' || !LEASE_CHECKPOINT_RE.test(name) || name.toLowerCase() === 'clean') throw new Error('name must be 1-40 letters, digits, spaces, dots, dashes or underscores, starting with a letter or digit, and not "clean".')
+    const vm = this.vmOf(lease)
+    return this.vmLock(vm.vmId)(async () => {
+      this.stillHeld(lease)
+      if (lease.kept) throw new Error(`${vm.vmName} is kept for inspection: vm_release it first.`)
+      if (!lease.running) throw new Error('The VM is not running: vm_start it first (a checkpoint is taken of a running VM).')
+      if (lease.sync.trusted === false) throw new Error('C:\\build is unconfirmed (a copy or sync didn\'t finish): run a full vm_sync or vm_reset first.')
+      const mine = this.leaseCheckpoints(lease)
+      if (mine.some(x => x.name === name)) throw new Error(`This lease already has a checkpoint "${name}".`)
+      const cap = this.policy.maxLeaseCheckpoints ?? 3
+      if (mine.length >= cap) throw new Error(`This lease holds ${mine.length} checkpoints, the policy's maxLeaseCheckpoints (${cap}).`)
+      const floor = this.policy.minFreeGBForCheckpoint ?? 20
+      const facts = await this.hv('facts', { folders: [vm.folder] }, this.forLease(lease))
+      this.stillHeld(lease)
+      const free = facts.folders?.[0]?.freeGB
+      if (!Number.isFinite(free) || free < floor) throw new Error(`The VM folder's drive has ${free ?? 'unknown'} GB free, under the ${floor} GB a checkpoint must leave (minFreeGBForCheckpoint).`)
+      const opId = hex(6)
+      const snapName = `hvmcp-lease-${opId}`
+      // The VM's checkpoint type before the take, journalled: the take sets ProductionOnly and puts it back, and if that
+      // is interrupted (the call killed), the lease's end puts it back from this record.
+      const origType = (await this.hv('checkpoint-type', this.ident(vm), this.forLease(lease))).type
+      this.stillHeld(lease)
+      this.journal.append({ t: 'lcp-take', opId, vmId: vm.vmId, leaseId: lease.leaseId, name, snapName, origType, at: new Date(this.now()).toISOString() })
+      let r = null
+      try {
+        r = await this.hv('lease-checkpoint', { ...this.ident(vm), snapName }, this.forLease(lease, 10 * 60_000))
+      } catch (e) {
+        // It may have been made despite the failure (a timeout, or completing after the call died). Found by its unique
+        // name, it's confirmed as this lease's; not found, it stays journalled and unconfirmed (an absence now proves
+        // nothing): it holds its slot, and the lease's end settles it after clean is restored.
+        const list = await this.hv('snapshots', this.ident(vm)).then(x => x.snapshots || [], () => null)
+        const found = list ? list.filter(x => x.name === snapName) : []
+        if (found.length === 1) this.journal.append({ t: 'lcp-taken', opId, checkpointId: found[0].id })
+        throw new Error(`The checkpoint "${name}" couldn't be taken (${e.message}).${found.length === 1 ? " One was made all the same: it's kept as this lease's, and removed with it." : ' Whether Hyper-V made one is settled when this lease ends (it holds a checkpoint slot until then).'}`)
+      }
+      if (r.failed) {
+        // Hyper-V's own terminal failure (Checkpoint-VM answered with an error): nothing is in progress. Confirmed absent
+        // by name, the intent is settled now; if it exists after all, it's this lease's.
+        const list = await this.hv('snapshots', this.ident(vm)).then(x => x.snapshots || [], () => null)
+        const found = list ? list.filter(x => x.name === snapName) : null
+        if (found?.length === 1) this.journal.append({ t: 'lcp-taken', opId, checkpointId: found[0].id })
+        else if (found?.length === 0) this.journal.append({ t: 'lcp-dropped', opId })
+        throw new Error(`The checkpoint "${name}" couldn't be taken (${r.error}).${found?.length === 1 ? " One was made all the same: it's kept as this lease's, and removed with it." : ''} No standard checkpoint is taken instead.`)
+      }
+      const id = r.checkpointId
+      this.journal.append({ t: 'lcp-taken', opId, checkpointId: id })
+      // The checkpoint type, read back: put back now if the take left it changed, and said if that fails (the lease's
+      // end tries again from the journal).
+      let typeNote = ''
+      if (r.checkpointType !== origType) {
+        const now = await this.hv('checkpoint-type', { ...this.ident(vm), set: origType }, this.forLease(lease)).then(x => x.type, () => null)
+        if (now !== origType) typeNote = ` Note: the VM's checkpoint type was left as ${r.checkpointType} (it was ${origType}); it's put back when this lease ends.`
+      }
+      this.stillHeld(lease) // a lease that ended meanwhile gets no success; its release removes the checkpoint
+      return { text: `Checkpoint "${name}" taken of ${vm.vmName} (files, installed software and the registry; not running programs or a logon session). vm_restore({ name: "${name}" }) brings it back; it's removed when this lease ends.${typeNote}`, data: { name, checkpointId: id } }
+    })
+  }
+
+  /**
+   * MC-1529: vm_restore. The lease's named checkpoint, verified as this lease's on this VM by id and name, restored
+   * (a production checkpoint restores Off), then started like vm_start: the lease's current network and CPU reserve,
+   * the guest awaited, all read back. The sync record is cleared and untrusted; run numbers keep rising; no one is
+   * logged on interactively afterwards.
+   */
+  async restoreCheckpoint(connId, { name } = {}) {
+    const lease = this.leaseOf(connId)
+    const vm = this.vmOf(lease)
+    return this.vmLock(vm.vmId)(async () => {
+      this.stillHeld(lease)
+      if (lease.kept) throw new Error(`${vm.vmName} is kept for inspection: vm_release it first.`)
+      const cp = this.leaseCheckpoints(lease).find(x => x.name === name)
+      if (!cp) throw new Error(`This lease has no checkpoint "${name}"${this.leaseCheckpoints(lease).length ? ` (it has: ${this.leaseCheckpoints(lease).map(x => x.name).join(', ')})` : ''}.`)
+      if (!cp.checkpointId) throw new Error(`The checkpoint "${name}" wasn't confirmed when it was taken: it can't be restored.`)
+      const t0 = this.now()
+      lease.running = false
+      lease.interactive = null
+      Object.assign(lease.sync, { gen: lease.sync.gen + 1, plan: null, trusted: false, record: new Map() })
+      this.dropStage(this.conns.get(lease.connId))
+      lease.dirty = true
+      const after = await this.hv('lease-restore', { ...this.ident(vm), checkpointId: cp.checkpointId, snapName: cp.snapName }, this.forLease(lease))
+      this.stillHeld(lease)
+      if (after.vmId !== vm.vmId || after.parentCheckpointId !== cp.checkpointId || after.state !== 'Off') throw new Error(`Restoring "${name}" didn't verify (state ${after.state}, parent ${after.parentCheckpointId}): vm_reset to go on from clean.`)
+      const sw = lease.network ? this.state.switch : null
+      await this.hv('configure-start', { ...this.ident(vm), switchName: sw ? sw.name : null, switchId: sw ? sw.switchId : null, reserve: lease.reserve || 0 }, this.forLease(lease))
+      this.stillHeld(lease)
+      const creds = this.creds()
+      const waited = await this.waitGuest(vm, creds.admin, READY_WAIT_MS, lease)
+      this.stillHeld(lease)
+      if (waited === null) throw new Error(`${vm.vmName} was restored to "${name}" but its guest didn't answer within ${Math.round(READY_WAIT_MS / 1000)} s: vm_reset to go on from clean.`)
+      const facts = await this.hv('facts-vm', this.ident(vm), this.forLease(lease))
+      this.stillHeld(lease)
+      const wantSw = sw ? sw.name : null
+      if (facts.state !== 'Running' || facts.parentCheckpointId !== cp.checkpointId || (facts.switchName ?? null) !== wantSw || facts.reserve !== (lease.reserve || 0)) throw new Error(`${vm.vmName} restored to "${name}", but its state didn't read back as expected (${facts.state}, network ${facts.switchName ?? 'none'}, reserve ${facts.reserve}): vm_reset to go on from clean.`)
+      lease.running = true // the sync record stays cleared and untrusted: only a full sync or a reset follows
+      return { text: `Restored ${vm.vmName} to its checkpoint "${name}" and started it (${((this.now() - t0) / 1000).toFixed(1)} s; guest ready after ${(waited / 1000).toFixed(1)} s); network ${wantSw ? `ON (internal switch ${wantSw})` : 'off'}; CPU reserve ${lease.reserve || 0}%. Files, installed software and the registry are as at the checkpoint; running programs and any logon session aren't (no one is logged on interactively: vm_start or vm_reset with interactive restores clean instead). C:\\build is as the checkpoint left it but unconfirmed: run a full vm_sync before relying on it.`, data: { name, vm: vm.vmName } }
+    })
+  }
+
   async release(connId) {
     const lease = this.leaseOf(connId)
     lease.kept = false
@@ -1342,7 +1527,12 @@ class Helper {
           : l ? `leased${l.kept ? ', kept for inspection' : ''}${l.running ? ', running' : ''}${l.interactive ? `, ${l.interactive === 'user' ? 'the standard user' : 'the admin'} logged on interactively` : ''} until ${new Date(l.deadline).toISOString()} (session ends by ${new Date(l.sessionEnd).toISOString()})` : 'free'
       const img = this.imageOf(v)
       const failed = this.failedNote(v)
-      return `- ${v.vmName}: ${this.osOf(v)}, image ${img === 'legacy' ? 'unknown (made before images were recorded)' : img.slice(0, 12)}; ${v.cores} cores, ${v.memoryMB} MB, ${v.diskGB} GB disk; ${state}${v.vmId === mine ? ' (yours)' : ''}${expiry(v, this.now())}${failed ? `; ${failed}` : ''}`
+      // MC-1529: the caller's own lease checkpoints (only theirs), and checkpoints neither clean nor a lease's, left alone.
+      const cps = l && v.vmId === mine ? this.leaseCheckpoints(l) : []
+      const cpNote = cps.length ? `; your checkpoints: ${cps.map(x => `"${x.name}" (${x.checkpointId ? `taken ${x.at}` : 'unconfirmed'})`).join(', ')}` : ''
+      const unknown = this.unknownSnapshots.get(v.vmId)
+      const unknownNote = unknown?.length ? `; unknown checkpoints left alone: ${unknown.join(', ')}` : ''
+      return `- ${v.vmName}: ${this.osOf(v)}, image ${img === 'legacy' ? 'unknown (made before images were recorded)' : img.slice(0, 12)}; ${v.cores} cores, ${v.memoryMB} MB, ${v.diskGB} GB disk; ${state}${v.vmId === mine ? ' (yours)' : ''}${expiry(v, this.now())}${failed ? `; ${failed}` : ''}${cpNote}${unknownNote}`
     })
     const img = [...s.images.values()].at(-1)
     const lines = [
@@ -1836,6 +2026,8 @@ class Helper {
       case 'run': return this.run(connId, args)
       case 'read_out': return this.readOut(connId, args)
       case 'stop': return this.stop(connId, args)
+      case 'checkpoint': return this.checkpoint(connId, args)
+      case 'restore-checkpoint': return this.restoreCheckpoint(connId, args)
       case 'release': return this.release(connId)
       case 'pool_plan': return this.plan(args)
       case 'pool_create': return this.apply('create', args)
@@ -1854,7 +2046,9 @@ const PROTOCOL = 'hyperv-mcp/3' // 2: renew, sync_plan, sync (MC-1497); 3: start
 // working with this helper: 'projects' = projects, acquire's wait and roots, whoami; 'images' = image groups,
 // acquire's os and image, per-OS shares, a project's image allowlist (MC-1502).
 // 'named' = acquire's vm, one VM by name (MC-1523).
-const FEATURES = ['projects', 'images', 'named']
+// 'checkpoints' = vm_checkpoint and vm_restore, a lease's own checkpoints (MC-1529).
+const FEATURES = ['projects', 'images', 'named', 'checkpoints']
+const LEASE_CHECKPOINT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$/
 const DAY_MS = 24 * 60 * 60 * 1000
 
 /**

@@ -326,6 +326,8 @@ non-evaluation Windows 11 ISO (see "Windows licences").
 | `vm_run({ command, shell='cmd'\|'powershell', as='admin'\|'user', timeoutSec=120, cwd='C:\build', session='service'\|'interactive' })` | Runs in the guest. stdout and stderr go to `C:\out\.run-<n>.*`, and the reply has the exit code and 16 KB of each. `as: 'user'` runs as the standard user, for whom `C:\build` is read-only. `session: 'service'` (the default) runs in session 0; on a timeout, the command is killed inside by its PID (`taskkill /T /F`), only while that PID is still the run's process (its creation time). A run is started in one short PowerShell Direct call and its exit file then polled with short calls (see "Long runs"), so it may take as long as `timeoutSec` allows. `session: 'interactive'` runs in the desktop session `vm_start`'s `interactive` logged on, as that account (`as` must name it), through a watcher started in that session at logon (`hvadmin` elevated, `hvuser` a standard user). If it times out or doesn't finish cleanly, its output so far is returned and the VM is restored, which ends everything it started; `vm_start` or `vm_reset` goes on. |
 | `vm_read_out({ paths?, glob?, maxBytes=256 KB, maxTotalBytes=1 MB, base64=false })` | Files from the guest's `C:\out`, read in the guest and capped while reading, returned as data. Paths are relative and checked before the call (no `..`, drives, UNC or device paths, streams or device names). `glob` is matched against a listing. Links are skipped. With neither, it lists. Text as text, PNG/JPEG as images. Read before `vm_stop`, which discards them. |
 | `vm_stop({ keep=false })` | Turns the VM off and restores the clean checkpoint, then **verifies** it: Off, at the checkpoint (by id), adapter disconnected, reserve 0. It says "Reverted" only then. Otherwise **CLEANUP FAILED**, and the VM is quarantined. The lease stays. `keep` (or a failed run with `keepOnFailure`) leaves it as it is until release or the deadline. |
+| `vm_checkpoint({ name })` | Takes a named checkpoint of your leased VM as it runs now: files, installed software and the registry (a production checkpoint, disk only: not running programs or a logon session). Yours only, removed when the lease ends. See "Checkpoints within a lease". |
+| `vm_restore({ name })` | Restores one of your lease's checkpoints and starts the VM from it, with the lease's current network and CPU reserve. No one is logged on interactively afterwards, and C:\build is unconfirmed until a full `vm_sync`. |
 | `vm_release()` | Restores the VM (as `vm_stop`) and ends the lease. |
 | `vm_status()` | The pool, every lease, your VM, any pool job, the policy, and where builds may come from. Works with the server turned off. |
 | `pool_plan({ action='create'\|'resize'\|'remove', vms?, cores?, memoryGB?, diskGB?, location?, network?, image?, activate? })` | Plans a pool change and changes nothing (see "Building the pool"). `image` is a new ISO to check (`{ iso \| download, edition? }`), or a verified image's SHA-256: build from it, or resize only its group (see "A pool from more than one image"). An evaluation image's plan always activates Windows online once per new VM; `activate: true` asks the same for your own copy (see "Windows licences"). |
@@ -334,6 +336,46 @@ non-evaluation Windows 11 ISO (see "Windows licences").
 
 The server's MCP instructions tell agents to use the pool tools only when the user asks, and never to run the approve
 line themselves.
+
+### Checkpoints within a lease
+
+`vm_checkpoint` and `vm_restore` (MC-1529) let one lease try something and roll back: set up tools, checkpoint,
+test, restore, set up something else, and so on. No approval is needed, because nothing a later lease starts from
+changes: the checkpoints are the lease's alone, and `vm_release` (or the deadline) always returns the VM to clean and
+removes them. A lease's own `vm_start`, `vm_reset` and `vm_stop` keep them. Shared checkpoints that other leases and
+projects start from (MC-1532) and refreshing the clean checkpoint in place (MC-1531) are separate.
+
+- **What a checkpoint holds:** files, installed software and the registry. It's a Hyper-V *production* checkpoint,
+  taken through VSS inside the guest, so it's consistent on disk and holds **no memory**: running programs and any
+  logon session are not kept. If Windows can't make a production checkpoint, the take fails; it never falls back to
+  a standard one.
+- **Taking one:** only of a running VM, not one kept for inspection, and with C:\build confirmed (not straight after
+  a copy or sync that didn't finish, nor after a restore: run a full `vm_sync` or `vm_reset` first). At most the
+  policy's `maxLeaseCheckpoints` (default 3) per lease, and the VM folder's drive must keep `minFreeGBForCheckpoint`
+  (default 20 GB) free. Names are 1 to 40 letters, digits, spaces, dots, dashes or underscores; `clean` is reserved.
+- **Restoring one:** the checkpoint is checked to be this lease's on this VM, restored (Off, as production
+  checkpoints restore), then started like `vm_start` with the lease's current network (off means disconnected,
+  whatever the checkpoint's adapter said) and CPU reserve, the guest awaited, and all of it read back. No one is
+  logged on interactively afterwards; `vm_start` or `vm_reset` with `interactive` restore clean, so they discard the
+  restored state. C:\build is as the checkpoint left it but unconfirmed until a full `vm_sync`. Run numbers keep
+  rising, so nothing from before can be taken for a later run's.
+- **Removal:** when the lease ends, after clean is restored and verified, the lease's checkpoints are removed, a child
+  before its parent, each confirmed gone. If one can't be removed, the VM is quarantined ("lease checkpoint cleanup
+  pending") and isn't leased again until they're all gone, even though clean itself verified; the helper retries.
+- **Crashes:** each take is journalled before it starts, under a unique Hyper-V name (`hvmcp-lease-<id>`), with the
+  VM's checkpoint type before it, and again once confirmed; each removal likewise. A take Hyper-V itself reports
+  as failed is settled at once (no standard checkpoint is taken instead). A take whose call died or timed out is
+  never assumed not to have happened: found by its name it's kept as the lease's; not found it stays "unconfirmed"
+  and holds its slot, and at the lease's end it's settled as never made only when every Hyper-V job on the host
+  (WMI's Msvm_ConcreteJob) is in a documented terminal state (Completed, Terminated, Exception, Completed with
+  warnings: not New, Suspended, Killed or any other), followed by a fresh look for it; until then the VM stays quarantined, and a take that finishes later is found
+  and removed. Removal matches a confirmed checkpoint by
+  its id (the same id under another name is left alone and keeps the VM quarantined) and an unconfirmed one by its
+  name; the checkpoint type is put back from the journal before each is forgotten. Any other checkpoint on a pool VM
+  (neither clean nor one of these, a same-named one with another id included) is left alone and listed in
+  `vm_status`.
+- **Limits:** a checkpoint never moves the lease's deadline or the VM's evaluation end, which come from the host's own
+  records, not the guest's clock.
 
 ## Multiple projects (MCP roots)
 
@@ -697,7 +739,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
 ```
 
 - `units.test.js`:
@@ -834,6 +876,14 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   project at its Windows cap still gets Linux, a forbidden OS or image refused, never queued); a waiter never given
   another kind; and, through `server.js`, no
   acquire at all sent to a helper without `images` for an image or Linux.
+- `checkpoints.test.js`, a lease's own checkpoints (MC-1529) against the stub's snapshot tree: a then b, restoring
+  each (a file's state follows), kept across the lease's own reset, removed child-first at release; the refusals (not
+  running, reserved or bad name, duplicate, cap, disk floor, unknown name, unconfirmed C:\build after a restore); the
+  lease's current network and reserve reapplied after a restore; a production checkpoint that can't be made failing
+  with no fallback, and one made despite a failed call kept and removed with the lease; a take whose outcome can't be
+  read holding its slot; a failed removal quarantining the VM until it succeeds, across restarts; recovery removing a
+  take journalled without its id (by name) and leaving an unknown snapshot alone; a lease ending during a take; the
+  deadline unchanged; and the feature gate.
 - `named.test.js`, `vm_acquire({ vm })` (MC-1523): that VM leased rather than the pool's pick; an unknown name, a
   leased VM (with its deadline), the project's cap and contradictory `os`/`image` refused; a legacy VM refused at once
   to a project with an image list (never queued); the VM's own OS when `os` is left out, plain acquires still Windows;

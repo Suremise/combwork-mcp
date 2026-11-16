@@ -385,6 +385,17 @@ $AppReadinessState = {
   @{ done = [bool]($done211 -and $tasks -eq 0 -and -not $addedAfter); tasks = $tasks; completedAt = (& $iso $done211.TimeCreated); completionId = $cid; suspendedUntil = $until; resumedAt = (& $iso $res.TimeCreated) }
 }
 
+# MC-1529: Hyper-V's jobs (CIM_ConcreteJob JobState) count as ended only in a documented terminal state: Completed (7),
+# Terminated (8), Exception (10) or Completed with warnings (32768). Every other state, New (2), Starting (3), Running
+# (4), Suspended (5), Shutting Down (6), Killed (9, its work may still be going), Service (11), or any unknown value,
+# is not ended. Pure, so the tests run it. Returns { idle, pending }.
+$JobsIdle = {
+  param($states)
+  $ended = @(7, 8, 10, 32768)
+  $pending = @(@($states) | Where-Object { $null -ne $_ -and [int]$_ -notin $ended })
+  @{ idle = ($pending.Count -eq 0); pending = $pending.Count }
+}
+
 $GuestProvisioned = {
   param($u, $quietMs, $countsText, $readinessText)
   $ErrorActionPreference = 'Stop'
@@ -613,6 +624,61 @@ try {
       Restore-VMSnapshot -VMSnapshot $cp -Confirm:$false
       Facts $vm
     }
+    # MC-1529: a lease's own checkpoints. Each is a production checkpoint (disk-consistent through VSS in the guest, no
+    # memory state), taken only while the VM runs, under its unique name hvmcp-lease-<opId>; the VM's checkpoint type is
+    # put back whatever happens, and a production checkpoint that can't be made fails: never a standard one instead.
+    'snapshots' {
+      $vm = Get-OwnVm $a
+      @{ snapshots = @(Get-VMSnapshot -VM $vm | ForEach-Object { @{ id = $_.Id.ToString(); name = [string]$_.Name; parentId = if ($_.ParentSnapshotId) { $_.ParentSnapshotId.ToString() } else { $null } } }) }
+    }
+    'lease-checkpoint' {
+      $vm = Get-OwnVm $a
+      if ($vm.State -ne 'Running') { throw "the VM is $($vm.State), not Running" }
+      if ([string]$a.snapName -notmatch '^hvmcp-lease-[0-9a-f]{12}$') { throw 'bad checkpoint name' }
+      $old = $vm.CheckpointType
+      $cp = $null; $err = $null
+      try {
+        Set-VM -VM $vm -CheckpointType ProductionOnly
+        # Checkpoint-VM runs Hyper-V's job to completion: an error here is that job's terminal failure, answered as such
+        # (failed: true); only a call that dies or times out leaves the outcome unknown.
+        try { $cp = Checkpoint-VM -VM $vm -SnapshotName ([string]$a.snapName) -Passthru -ErrorAction Stop } catch { $err = $_.Exception.Message }
+      } finally { Set-VM -VM $vm -CheckpointType $old }
+      $type = [string](Get-VM -Id $vm.Id).CheckpointType
+      if ($err) { @{ failed = $true; error = $err; checkpointType = $type } }
+      else { @{ checkpointId = $cp.Id.ToString(); checkpointType = $type } }
+    }
+    'jobs-idle' {
+      # MC-1529: whether every Hyper-V job on this host has ended (host-wide, so conservative): a take whose call died is
+      # settled as never made only then. The rule is $JobsIdle's.
+      $states = @(Get-CimInstance -Namespace root\virtualization\v2 -ClassName Msvm_ConcreteJob -ErrorAction Stop | ForEach-Object { [int]$_.JobState })
+      & $JobsIdle $states
+    }
+    'lease-restore' {
+      $vm = Get-OwnVm $a
+      $cp = Get-VMSnapshot -VM $vm | Where-Object { $_.Id.ToString() -eq [string]$a.checkpointId -and [string]$_.Name -ceq [string]$a.snapName }
+      if (-not $cp) { throw "checkpoint $($a.snapName) (by id) is missing on this VM" }
+      if ($vm.State -eq 'Saved') { Remove-VMSavedState -VM $vm }
+      elseif ($vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -Force }
+      Restore-VMSnapshot -VMSnapshot $cp -Confirm:$false
+      Facts $vm
+    }
+    'checkpoint-type' {
+      # MC-1529: the VM's checkpoint type, read, or set and read back (an interrupted take's type is put back by this).
+      $vm = Get-OwnVm $a
+      if ($a.set) { Set-VM -VM $vm -CheckpointType ([string]$a.set) }
+      @{ type = [string](Get-VM -Id $vm.Id).CheckpointType }
+    }
+    'facts-vm' {
+      Facts (Get-OwnVm $a)
+    }
+    'snapshot-remove' {
+      # Only the exact snapshot: this id and this name, on this VM. Absent already counts as removed.
+      $vm = Get-OwnVm $a
+      $cp = Get-VMSnapshot -VM $vm | Where-Object { $_.Id.ToString() -eq [string]$a.checkpointId -and [string]$_.Name -ceq [string]$a.snapName }
+      if ($cp) { Remove-VMSnapshot -VMSnapshot $cp -Confirm:$false }
+      $left = @(Get-VMSnapshot -VM $vm | Where-Object { $_.Id.ToString() -eq [string]$a.checkpointId })
+      @{ removed = ($left.Count -eq 0) }
+    }
     'configure-start' {
       $vm = Get-OwnVm $a
       if ($vm.State -ne 'Off') { throw 'the VM is not Off after its restore' }
@@ -622,6 +688,9 @@ try {
         $sw = Get-VMSwitch -Id ([guid]$a.switchId) -ErrorAction SilentlyContinue
         if (-not $sw -or $sw.Name -cne [string]$a.switchName -or $sw.SwitchType -ne 'Internal') { throw "switch $($a.switchName) (id $($a.switchId)) is missing, renamed or not internal" }
         Get-VMNetworkAdapter -VM $vm | Connect-VMNetworkAdapter -VMSwitch $sw
+      } else {
+        # MC-1529: network off means disconnected, whatever the restored checkpoint's adapter said.
+        Get-VMNetworkAdapter -VM $vm | Disconnect-VMNetworkAdapter
       }
       Set-VMProcessor -VM $vm -Reserve ([int]$a.reserve)
       Start-VM -VM $vm
