@@ -105,7 +105,7 @@ test('the build waits for App Readiness to finish each account (MC-1528): the ch
   for (const who of ['hvadmin', 'hvuser']) {
     assert.strictEqual(ready.profiles[who].mappings, 99, `${who}: the post-wave count`)
     assert.strictEqual(ready.profiles[who].packagesDirs, 64)
-    assert.deepStrictEqual(ready.profiles[who].appReadiness, { done: true, tasks: 0, completedAt: '2026-11-16T02:01:55.000Z', suspendedUntil: '2026-11-16T02:00:55.499Z', resumedAt: '2026-11-16T02:00:55.600Z' }, 'allowlisted: no other field')
+    assert.deepStrictEqual(ready.profiles[who].appReadiness, { done: true, tasks: 0, completedAt: '2026-11-16T02:01:55.000Z', completionId: 7, suspendedUntil: '2026-11-16T02:00:55.499Z', resumedAt: '2026-11-16T02:00:55.600Z' }, 'allowlisted: no other field')
   }
   assert.match(line, /hvadmin settled with 99 AppContainer mappings and 64 Packages folders after \d+ s \(App Readiness finished\)/)
 })

@@ -366,7 +366,7 @@ $ProfileCounts = {
 # Also returned for the record: the task count, 216's "will resume at" and 217's resume, as UTC times.
 $AppReadinessState = {
   param($events, $sid)
-  if ($null -eq $events) { return @{ done = $null; tasks = $null; completedAt = $null; suspendedUntil = $null; resumedAt = $null } }
+  if ($null -eq $events) { return @{ done = $null; tasks = $null; completedAt = $null; completionId = $null; suspendedUntil = $null; resumedAt = $null } }
   $s = [regex]::Escape($sid)
   $mine = @($events | Where-Object { [string]$_.Message -match "$s(\b|')" } | Sort-Object TimeCreated, RecordId)
   $iso = { param($t) if ($t) { $t.ToUniversalTime().ToString('o') } else { $null } }
@@ -380,7 +380,9 @@ $AppReadinessState = {
   $until = $null
   if ($susp -and ([string]$susp.Message -match 'resume at\s+(.+?)\.?\s*$')) { $d = [datetime]::MinValue; if ([datetime]::TryParse((($Matches[1] -replace '[^0-9TZ:.\-]', '') -replace '(\.\d{7})\d+', '$1'), [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AdjustToUniversal, [ref]$d)) { $until = $d.ToString('o') } }
   $res = @($mine | Where-Object { $_.Id -eq 217 }) | Select-Object -Last 1
-  @{ done = [bool]($done211 -and $tasks -eq 0 -and -not $addedAfter); tasks = $tasks; completedAt = (& $iso $done211.TimeCreated); suspendedUntil = $until; resumedAt = (& $iso $res.TimeCreated) }
+  # completionId: the 211's Admin-log record id, the completion's generation (two in the same second still differ).
+  $cid = if ($done211) { [long]$done211.RecordId } else { $null }
+  @{ done = [bool]($done211 -and $tasks -eq 0 -and -not $addedAfter); tasks = $tasks; completedAt = (& $iso $done211.TimeCreated); completionId = $cid; suspendedUntil = $until; resumedAt = (& $iso $res.TimeCreated) }
 }
 
 $GuestProvisioned = {

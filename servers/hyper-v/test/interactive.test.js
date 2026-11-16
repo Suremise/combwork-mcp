@@ -409,14 +409,19 @@ $later = $full + @((E 240 120 "Task 'install::B' is added for $me, tasks: 1"))
 $other = @((E 211 100 'App Readiness service has completed tasks for S-1-5-21-26-54-54-1000.'), (E 241 100 "Task 'X' is removed for S-1-5-21-26-54-54-1000, tasks: 0"), (E 211 101 "App Readiness service has completed tasks for \${me}1."), (E 241 101 "Task 'X' is removed for \${me}1, tasks: 0"))
 $left = @((E 211 100 "App Readiness service has completed tasks for $me."), (E 241 100 "Task 'X' is removed for $me, tasks: 2"))
 $sameSecond = $full + @((E 240 100 "Task 'install::C' is added for $me, tasks: 1"))
-foreach ($c in @($full, $pending, $later, $other, $left, $sameSecond)) { 'OUT:' + (ConvertTo-Json -InputObject (& $AppReadinessState $c $me) -Compress) }
+$c1 = E 211 100 "App Readiness service has completed tasks for $me."
+$c2 = E 211 100 "App Readiness service has completed tasks for $me."
+$twice = @($c1, (E 241 100 "Task 'X' is removed for $me, tasks: 0"), $c2, (E 241 100 "Task 'Y' is removed for $me, tasks: 0"))
+'IDS:' + $c1.RecordId + ',' + $c2.RecordId
+foreach ($c in @($full, $pending, $later, $other, $left, $sameSecond, $twice)) { 'OUT:' + (ConvertTo-Json -InputObject (& $AppReadinessState $c $me) -Compress) }
 'OUT:' + (ConvertTo-Json -InputObject (& $AppReadinessState @() $me) -Compress)
 'OUT:' + (ConvertTo-Json -InputObject (& $AppReadinessState $null $me) -Compress)
 `)
   const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: ps51Env(), timeout: 60_000 })
   const out = r.stdout.split(/\r?\n/).filter(l => l.startsWith('OUT:')).map(l => JSON.parse(l.slice(4)))
-  assert.strictEqual(out.length, 8, r.stdout + r.stderr)
-  const [full, pending, later, other, left, same, empty, unread] = out
+  assert.strictEqual(out.length, 9, r.stdout + r.stderr)
+  const [full, pending, later, other, left, same, twice, empty, unread] = out
+  const ids = r.stdout.split(/\r?\n/).find(l => l.startsWith('IDS:')).slice(4).split(',').map(Number)
   assert.strictEqual(full.done, true)
   assert.strictEqual(full.tasks, 0)
   assert.strictEqual(full.completedAt, '2026-11-16T02:01:55.0000000Z')
@@ -427,8 +432,12 @@ foreach ($c in @($full, $pending, $later, $other, $left, $sameSecond)) { 'OUT:' 
   assert.deepStrictEqual([other.done, other.tasks], [false, null], 'another account, or a longer SID, never counts')
   assert.deepStrictEqual([left.done, left.tasks], [false, 2], 'a 211 with tasks left')
   assert.strictEqual(same.done, false, 'a task added in the same second as the 211, after it by record order')
+  assert.ok(Number.isInteger(full.completionId), 'the completion generation: its 211 record id')
+  assert.deepStrictEqual([twice.done, twice.completionId], [true, ids[1]], 'two 211s in the same second: the later record is the generation')
+  assert.notStrictEqual(ids[0], ids[1])
   assert.deepStrictEqual([empty.done, empty.tasks], [false, null], 'an empty log: not done')
   assert.strictEqual(unread.done, null, 'unreadable: null, never false or true')
+  assert.strictEqual(unread.completionId, null)
 })
 
 const COUNT_LOGONS_BLOCK = (() => { const s = HV_PS.indexOf('\n$LogonCounts = {'); const e = s < 0 ? -1 : HV_PS.indexOf('\n}\n', s + 1); return e < 0 ? null : HV_PS.slice(s + 1, e + 3) })()

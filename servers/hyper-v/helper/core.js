@@ -1731,7 +1731,7 @@ class Helper {
       if (r?.appReadiness) readiness = r.appReadiness
       const ready = r?.appReadiness?.done === true
       // A new completion (a later 211: more work came and finished) also starts the quiet over.
-      const busy = !good || !ready || r.busy.length > 0 || (last && (r.lastEvent !== last.lastEvent || r.inventory !== last.inventory || r.mappings !== last.mappings || r.packagesDirs !== last.packagesDirs || r.appReadiness?.completedAt !== last.appReadiness?.completedAt))
+      const busy = !good || !ready || r.busy.length > 0 || (last && (r.lastEvent !== last.lastEvent || r.inventory !== last.inventory || r.mappings !== last.mappings || r.packagesDirs !== last.packagesDirs || r.appReadiness?.completedAt !== last.appReadiness?.completedAt || r.appReadiness?.completionId !== last.appReadiness?.completionId))
       if (good) last = r
       if (busy) quietSince = null
       else if (quietSince === null) quietSince = this.now()
@@ -1915,7 +1915,7 @@ function buildNote(profiles) {
 function readinessRecord(a) {
   if (!a || typeof a !== 'object') return null
   const t = v => (typeof v === 'string' && !Number.isNaN(Date.parse(v)) ? new Date(v).toISOString() : null)
-  return { done: a.done === true ? true : a.done === false ? false : null, tasks: Number.isInteger(a.tasks) ? a.tasks : null, completedAt: t(a.completedAt), suspendedUntil: t(a.suspendedUntil), resumedAt: t(a.resumedAt) }
+  return { done: a.done === true ? true : a.done === false ? false : null, tasks: Number.isInteger(a.tasks) ? a.tasks : null, completedAt: t(a.completedAt), completionId: Number.isSafeInteger(a.completionId) ? a.completionId : null, suspendedUntil: t(a.suspendedUntil), resumedAt: t(a.resumedAt) }
 }
 
 /** MC-1528: one line on App Readiness's state, for a late failure. */

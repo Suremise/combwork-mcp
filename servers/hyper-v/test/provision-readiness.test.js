@@ -17,8 +17,8 @@ const { Helper } = require('../helper/core')
 
 const vm = { vmId: 'v', vmName: 'hvmcp-test', folder: 'X:\\pool\\i-0' }
 const creds = { admin: { user: 'hvadmin', password: 'a' }, user: { user: 'hvuser', password: 'u' } }
-const DONE = { done: true, tasks: 0, completedAt: '2026-11-16T02:01:55.000Z', suspendedUntil: null, resumedAt: '2026-11-16T02:00:55.600Z' }
-const PENDING = { done: false, tasks: 39, completedAt: null, suspendedUntil: '2026-11-16T02:00:55.499Z', resumedAt: null }
+const DONE = { done: true, tasks: 0, completedAt: '2026-11-16T02:01:55.000Z', completionId: 101, suspendedUntil: null, resumedAt: '2026-11-16T02:00:55.600Z' }
+const PENDING = { done: false, tasks: 39, completedAt: null, completionId: null, suspendedUntil: '2026-11-16T02:00:55.499Z', resumedAt: null }
 
 /** A helper on the fake clock. readiness(account, logonNo, sinceReady): App Readiness's state on that probe. */
 function fake(readiness) {
@@ -112,4 +112,12 @@ test('a later completion with the same done state still starts the quiet over (t
   const f = fake((acc, n, since) => since >= 25 ? { ...DONE, completedAt: '2026-11-16T02:09:00.000Z' } : DONE)
   const out = await f.h.provisionProfiles(vm, creds, () => {})
   assert.ok(out.hvadmin.quietMs >= 25 + 20, `quiet restarted at the new completion (${out.hvadmin.quietMs})`)
+})
+
+test('two completions in the same second (MR1): a new completion record id starts the quiet over though completedAt is equal', async () => {
+  // Done (record 101) from 0; at 20 more work came and finished in the same second: record 140, same completedAt.
+  const f = fake((acc, n, since) => since >= 20 ? { ...DONE, completionId: 140 } : DONE)
+  const out = await f.h.provisionProfiles(vm, creds, () => {})
+  assert.ok(out.hvadmin.quietMs >= 20 + 20, `a full fresh quiet after the second completion (${out.hvadmin.quietMs})`)
+  assert.strictEqual(out.hvadmin.appReadiness.completionId, 140)
 })
