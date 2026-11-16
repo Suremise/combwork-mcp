@@ -134,6 +134,17 @@ test('restoreVia: a failing read is retried, and named if it is the last', async
   assert.match(f.restore.last, /^nothing; the last read failed: facts-vm: boom$/)
 })
 
+test('restoreVia: a read cut off by the budget after an earlier one answered keeps that earlier parent, and names the failure (MC-1540)', async () => {
+  // The branch a loaded machine took: the old parent read, then the next read killed for the time left.
+  const { h, calls } = bare({ op: restored, reads: [{ vmId: 'v1', parentCheckpointId: 'old' }, new Error('Hyper-V operation facts-vm timed out after 0 s')], probeMs: 700 })
+  const f = await h.restoreVia(vm, 'restore', { checkpointId: 'T' }, { verifyMs: 2_000 })
+  assert.deepStrictEqual([f.restore.ok, f.restore.phase, f.restore.timedOut], [false, 'parent', true])
+  assert.strictEqual(f.restore.last, 'old; the last read failed: Hyper-V operation facts-vm timed out after 0 s')
+  assert.strictEqual(f.parentCheckpointId, 'old', 'the facts are the last accepted read\'s')
+  const probes = calls.filter(c => c.startsWith('facts-vm')).map(c => Number(c.split(' ')[1]))
+  assert.deepStrictEqual(probes, [2000, 300], 'the second read\'s timeout capped to the 300 ms left')
+})
+
 test('restoreVia: a lease that ends during the poll stops it: no further probe', async () => {
   const { h, calls } = bare({ op: restored, reads: [{ vmId: 'v1', parentCheckpointId: 'old' }] })
   const lease = { vmId: 'v1', vmName: 'hvmcp-1', ending: false, children: new Set() }
@@ -187,7 +198,7 @@ test('the caller refuses a timed-out Off even though the facts read afterwards m
   assert.match((await s.call('vm_status')).text, /QUARANTINED \(the restore didn't complete/)
 })
 
-test('a lease restore that never lands is refused with the last parent seen, and never started', async t => {
+test('a lease restore that never lands is refused in phase parent, and never started; the checkpoint is unchanged', async t => {
   const { sc, s, stubVm } = await lease(t, 'rw-never', { HYPERV_MCP_RESTORE_VERIFY_MS: '1500' })
   const when = path.join(sc.dir, 'never-now')
   sc.patchStub(st => { st.restoreNeverLands = when })
@@ -195,8 +206,16 @@ test('a lease restore that never lands is refused with the last parent seen, and
   await s.call('vm_checkpoint', { name: 'a' })
   await s.call('vm_checkpoint', { name: 'b' }) // the VM now sits on b
   const was = stubVm().parent
+  const cpA = JSON.stringify(stubVm().checkpoints.find(c => c.name.startsWith('hvmcp-lease-') && c.id !== was))
   fs.writeFileSync(when, 'now')
+  const calls0 = sc.stub().calls.length
   const r = await s.call('vm_restore', { name: 'a' })
-  assert.match(r.text, new RegExp(`Restoring "a" didn't verify: the restore didn't complete: Hyper-V didn't report the checkpoint as its parent within the wait \\(last seen: ${was}, after \\d+ ms\\)`))
-  assert.strictEqual(stubVm().state, 'Off', 'never started (no configure-start)')
+  // MC-1540: what this proves, whatever the machine's speed. Under load a fresh read can outlast the budget's time
+  // left and be cut off (reproduced: "last seen: <b>; the last read failed: Hyper-V operation facts-vm timed out after
+  // 0 s"), or none may be accepted at all; the exact last-seen rules are proved on a fake clock (restoreVia tests above).
+  // Whatever was seen can only have been b, the old parent.
+  assert.match(r.text, new RegExp(`Restoring "a" didn't verify: the restore didn't complete: Hyper-V didn't report the checkpoint as its parent within the wait \\(last seen: (${was}(; the last read failed: [^)]+)?|nothing; the last read failed: [^)]+), after \\d+ ms\\)`))
+  assert.ok(!sc.stub().calls.slice(calls0).some(c => c.op === 'configure-start'), 'never started: no configure-start after the restore')
+  assert.strictEqual(stubVm().state, 'Off')
+  assert.strictEqual(JSON.stringify(stubVm().checkpoints.find(c => c.name.startsWith('hvmcp-lease-') && c.id !== was)), cpA, 'checkpoint a unchanged (id and contents)')
 })
