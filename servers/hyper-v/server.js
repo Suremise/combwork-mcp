@@ -526,7 +526,7 @@ const tools = [
     inputSchema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['create', 'resize', 'remove', 'checkpoint', 'checkpoint-remove'], description: 'Default create. checkpoint: publish (or with replace: true, replace) a pool checkpoint of the state your lease prepared on each of targets; checkpoint-remove: remove your project\'s pool checkpoint from targets (MC-1532).' },
+        action: { type: 'string', enum: ['create', 'resize', 'remove', 'checkpoint', 'checkpoint-remove', 'refresh-clean'], description: 'Default create. refresh-clean: rerun the build\'s guest steps on each of targets (free VMs) and make that their new clean checkpoint, keeping their pool checkpoints and evaluation days (MC-1531). checkpoint: publish (or with replace: true, replace) a pool checkpoint of the state your lease prepared on each of targets; checkpoint-remove: remove your project\'s pool checkpoint from targets (MC-1532).' },
         name: { type: 'string', description: 'checkpoint, checkpoint-remove: the pool checkpoint\'s name.' },
         targets: { type: 'array', items: { type: 'string' }, description: 'checkpoint, checkpoint-remove: the VMs, by name (for checkpoint, each leased now by your project).' },
         replace: { type: 'boolean', description: 'checkpoint: replace your project\'s existing checkpoint of that name.' },
@@ -542,8 +542,15 @@ const tools = [
     },
     run: async (args = {}) => {
       if (args.action === 'checkpoint' || args.action === 'checkpoint-remove') { await needFeature('pool-checkpoints', 'pool checkpoints'); return pass('pool_plan')({ ...args, roots: await rootList() }) }
+      if (args.action === 'refresh-clean') await needFeature('refresh-clean', 'refreshing a clean checkpoint')
       return pass('pool_plan')(args)
     }
+  },
+  {
+    name: 'pool_refresh',
+    description: 'Carry out an approved refresh-clean plan (pool_plan with action refresh-clean): for each VM, its clean checkpoint is restored, the build\'s guest steps rerun offline, and a new clean checkpoint taken and made current, then the old one removed. A pool job, like create; follow it with pool_status. Refused unless the user approved that exact plan (approve.ps1).',
+    inputSchema: { type: 'object', properties: { planId: { type: 'string' } }, required: ['planId'] },
+    run: async args => { await needFeature('refresh-clean', 'pool_refresh'); return pass('pool_refresh')(args) }
   },
   {
     name: 'pool_checkpoint',

@@ -328,6 +328,7 @@ non-evaluation Windows 11 ISO (see "Windows licences").
 | `vm_stop({ keep=false })` | Turns the VM off and restores the clean checkpoint, then **verifies** it: Off, at the checkpoint (by id), adapter disconnected, reserve 0. It says "Reverted" only then. Otherwise **CLEANUP FAILED**, and the VM is quarantined. The lease stays. `keep` (or a failed run with `keepOnFailure`) leaves it as it is until release or the deadline. |
 | `vm_checkpoint({ name })` | Takes a named checkpoint of your leased VM as it runs now: files, installed software and the registry (a production checkpoint, disk only: not running programs or a logon session). Yours only, removed when the lease ends. See "Checkpoints within a lease". |
 | `vm_restore({ name })` | Restores one of your lease's checkpoints and starts the VM from it, with the lease's current network and CPU reserve. No one is logged on interactively afterwards, and C:\build is unconfirmed until a full `vm_sync`. |
+| `pool_refresh({ planId })` | Carries out an approved refresh-clean plan: reruns the build's guest steps on each VM and makes that its new clean checkpoint, keeping its pool checkpoints and evaluation days. See "Refreshing a VM's clean checkpoint in place". |
 | `pool_checkpoint({ planId })` | Carries out an approved pool-checkpoint plan: publishes (or replaces, or removes) a named checkpoint of each VM a lease prepared. See "Pool checkpoints". |
 | `vm_release()` | Restores the VM (as `vm_stop`) and ends the lease. |
 | `vm_status()` | The pool, every lease, your VM, any pool job, the policy, and where builds may come from. Works with the server turned off. |
@@ -337,6 +338,28 @@ non-evaluation Windows 11 ISO (see "Windows licences").
 
 The server's MCP instructions tell agents to use the pool tools only when the user asks, and never to run the approve
 line themselves.
+
+### Refreshing a VM's clean checkpoint in place
+
+When a fix changes what the build puts in the guest (MC-1522's registry policy, MC-1528's wait for App Readiness),
+`pool_plan({ action: 'refresh-clean', targets: [vm, ...] })` and, after the user's approve line, `pool_refresh({ planId })`
+(MC-1531) apply it to existing VMs without a rebuild. It's a pool job, like a create. Each VM is handled on its own
+while it's free, and isn't leased meanwhile.
+
+- **What it does:** restores the VM's clean checkpoint, starts it offline, and reruns the build's guest steps (the
+  guest setup and its registry policy, each account's logon with the App Readiness wait and the verified undo, the
+  Defender exclusions). It reads the licence for the record, shuts the guest down, and takes a new checkpoint of the
+  Off VM, verified. Only then does it make that the VM's clean checkpoint (a journalled commit) and remove the old one.
+  Nothing goes online, Windows isn't re-activated, and the VM's evaluation end stays as recorded, whatever the guest
+  says.
+- **Pool checkpoints are kept:** they hang off the old clean checkpoint, and Hyper-V merges a removed checkpoint into
+  its children, so they (and the new clean) survive with their contents.
+- **If it fails** before the commit, the old clean checkpoint is restored and verified, the new checkpoint (if any) is
+  found and removed, and the VM is left as it was. If that cleanup can't be confirmed, or the old checkpoint's removal
+  fails after the commit, the VM stays quarantined and the helper retries until it can. A crash at any point is
+  settled the same way at the next start. One refresh per VM at a time: another is refused until it's resolved.
+- **An account already set up:** the refresh still waits for App Readiness's completion on that logon. If Windows
+  doesn't report one, the refresh fails visibly and the old clean checkpoint is kept.
 
 ### Pool checkpoints: a prepared state any lease can start from
 
@@ -773,7 +796,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
 ```
 
 - `units.test.js`:
@@ -910,6 +933,7 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   project at its Windows cap still gets Linux, a forbidden OS or image refused, never queued); a waiter never given
   another kind; and, through `server.js`, no
   acquire at all sent to a helper without `images` for an image or Linux.
+- `refresh.test.js`, refreshing a clean checkpoint (MC-1531): with a pool checkpoint present (the new clean carrying the fix, the old one removed, the pool checkpoint kept and startable, the evaluation end unchanged, never online); a repeat refresh keeping the sibling pool checkpoint; failures before the commit (a guest step, a failed take, a take made despite its call failing) abandoning with only the old clean left; a removal failing after the commit, quarantined until a retry; crashes before and after the commit; a leased VM skipped and a refreshing VM never leased while another is; an aged evaluation with a guest claiming more days; a second refresh refused while one is unresolved; and the feature gate.
 - `poolcheckpoints.test.js`, pool checkpoints (MC-1532):
   - published from a lease, then another project starting from it, clean on demand and released to clean;
   - binding and ownership refusals, and an ended lease publishing nothing;

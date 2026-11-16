@@ -135,7 +135,7 @@ function run(s, op, a) {
           : { done: false, tasks: 39, completedAt: null, completionId: null, suspendedUntil: '2026-11-16T02:00:55.499Z', resumedAt: null }
       return { boot: `boot-${vm.boot || 0}`, user: vm.loggedOn === a.account, lastEvent: '2026-11-15T00:00:00.000Z', count: 42, inventory: 'cafe', busy, mappings: unknown ? null : 60 + grow + wave, packagesDirs: unknown ? null : 25 + grow + wave, appReadiness }
     }
-    case 'guest-licence': { own(s, a); return { status: 1, graceMinutes: 0, evalEnd: null, channel: 'Retail', error: null, ...(s.licence || {}) } }
+    case 'guest-licence': { const vm = own(s, a); if (vm.state !== 'Running') throw new Error('the VM is not running'); vm.licenceReads = (vm.licenceReads || 0) + 1; return { status: 1, graceMinutes: 0, evalEnd: null, channel: 'Retail', error: null, ...(s.licence || {}) } }
     case 'net-off': { const vm = own(s, a); vm.state = 'Off'; vm.switchName = null; return { offline: true } }
     case 'find-vm': {
       const hits = Object.values(s.vms).filter(v => v.name === a.name && under(v.location, a.folder))
@@ -160,7 +160,9 @@ function run(s, op, a) {
       if (s.notReady) return { ready: false }
       return { ready: vm.state === 'Running' && vm.installed !== false }
     }
-    case 'guest-setup': { const vm = own(s, a); vm.disk['C:\\build'] = ''; return { editionId: s.guestEdition ?? 'EnterpriseEval', build: '26200', ubr: 6584, disableForceUnload: 1, ...(s.setupOverride || {}) } }
+    // MC-1531 knobs: setupMarker (written to C:\marker.txt, a stand-in for a fix the setup applies), setupThrows,
+    // setupEntered + setupGate (held as it begins).
+    case 'guest-setup': { const vm = own(s, a); if (s.setupEntered) fs.writeFileSync(s.setupEntered, 'entered'); if (s.setupGate) while (!fs.existsSync(s.setupGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25); if (s.setupThrows) throw new Error('injected: the guest setup failed'); vm.disk['C:\\build'] = ''; if (s.setupMarker) vm.disk['C:\\marker.txt'] = Buffer.from(s.setupMarker).toString('base64'); return { editionId: s.guestEdition ?? 'EnterpriseEval', build: '26200', ubr: 6584, disableForceUnload: 1, ...(s.setupOverride || {}) } }
     case 'make-clean': {
       const vm = own(s, a)
       vm.state = 'Off'
@@ -184,7 +186,7 @@ function run(s, op, a) {
       vm.loggedOn = null; vm.watcher = false; vm.elevated = false
       vm.userinit = cp.userinit ?? null; vm.enableLUA = cp.enableLUA ?? 1 // the checkpoint's
       vm.restores = (vm.restores || 0) + 1
-      if (s.restoreLeaves) Object.assign(vm, s.restoreLeaves)
+      if (s.restoreLeaves && (!s.restoreLeavesWhen || fs.existsSync(s.restoreLeavesWhen))) Object.assign(vm, s.restoreLeaves) // restoreLeavesWhen: only once that file exists
       return facts(vm)
     }
     case 'configure-start': {
@@ -263,7 +265,8 @@ function run(s, op, a) {
       vm.loggedOn = null; vm.watcher = false; vm.elevated = false
       return facts(vm)
     }
-    case 'facts-vm': return facts(own(s, a))
+    // factsParentWrong: the next facts-vm reports another parent (a verification mismatch), once.
+    case 'facts-vm': { const vm = own(s, a); if (s.factsParentWrong) { delete s.factsParentWrong; return { ...facts(vm), parentCheckpointId: 'someone-else' } } return facts(vm) }
     // MC-1532: a pool checkpoint's steps. Knobs: disconnectFails (the adapter stays connected), shutdownFails (the guest
     // stays Running), poolTakeFail (Hyper-V's terminal failure), poolTakeEntered + poolTakeGate (held before the take).
     case 'net-disconnect': { const vm = own(s, a); if (!s.disconnectFails) vm.switchName = null; return facts(vm) }
@@ -273,11 +276,15 @@ function run(s, op, a) {
       if (s.poolTakeEntered) fs.writeFileSync(s.poolTakeEntered, 'entered')
       if (s.poolTakeGate) while (!fs.existsSync(s.poolTakeGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25)
       if (vm.state !== 'Off') throw new Error(`the VM is ${vm.state}, not Off`)
-      if (!/^hvmcp-pool-[0-9a-f]{12}$/.test(a.snapName)) throw new Error('bad checkpoint name')
+      if (!/^hvmcp-(pool|clean)-[0-9a-f]{12}$/.test(a.snapName)) throw new Error('bad checkpoint name')
       if (s.poolTakeFail) return { failed: true, error: 'injected: Hyper-V could not take it' }
       const id = crypto.randomUUID()
+      // poolTakeDelayed: the call fails and Hyper-V finishes the take later (a running job until it appears, at the
+      // delayedAfter-th listing, as productionFailDelayed).
+      if (s.poolTakeDelayed) { vm.delayedTake = { cp: { id, name: a.snapName, parentId: vm.parent, disk: { ...vm.disk } }, listings: 0 }; throw new Error('injected: the take call died; Hyper-V finishes it later') }
       vm.checkpoints.push({ id, name: a.snapName, parentId: vm.parent, disk: { ...vm.disk }, userinit: vm.userinit ?? null, enableLUA: vm.enableLUA ?? 1 })
       vm.parent = id
+      if (s.poolTakeFailButMade) throw new Error('injected: the take call failed after Hyper-V made it')
       return { checkpointId: id }
     }
     // A take Hyper-V hasn't finished (productionFailDelayed) is a running job until it appears; jobsUnreadable fails.

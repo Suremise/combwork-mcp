@@ -679,7 +679,7 @@ try {
     'pool-take' {
       $vm = Get-OwnVm $a
       if ($vm.State -ne 'Off') { throw "the VM is $($vm.State), not Off" }
-      if ([string]$a.snapName -notmatch '^hvmcp-pool-[0-9a-f]{12}$') { throw 'bad checkpoint name' }
+      if ([string]$a.snapName -notmatch '^hvmcp-(pool|clean)-[0-9a-f]{12}$') { throw 'bad checkpoint name' }
       $cp = $null; $err = $null
       try { $cp = Checkpoint-VM -VM $vm -SnapshotName ([string]$a.snapName) -Passthru -ErrorAction Stop } catch { $err = $_.Exception.Message }
       if ($err) { @{ failed = $true; error = $err } } else { @{ checkpointId = $cp.Id.ToString() } }

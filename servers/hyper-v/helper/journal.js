@@ -30,6 +30,10 @@
  *             pool checkpoint published (its take, an lcp-take of the source lease, leaves the lease's records); the one
  *             it replaces starts retiring; pcp-retire { vmId, checkpointId } retires one by plan; pcp-retired
  *             { checkpointId } once its removal is confirmed
+ *   rcl-begin { opId, vmId, oldClean, oldName, snapName }  MC-1531: a refresh of a VM's clean checkpoint begins (its new
+ *             snapshot is snapName, hvmcp-clean-<opId>); rcl-taken { opId, checkpointId }; rcl-select { opId } makes it
+ *             the VM's clean (the durable commit); rcl-abandoned { opId } (before select, cleaned up) or rcl-retired
+ *             { opId } (after, the old clean removed) resolves it
  */
 const fs = require('fs')
 const crypto = require('crypto')
@@ -118,7 +122,7 @@ class Journal {
     // checkpointId (null until its take is confirmed), at, dropping }.
     // poolSnaps (MC-1532): published pool checkpoints by checkpointId: { checkpointId, opId, name, vmId, snapName, owner,
     // image, os, at, sourceLease, retiring }.
-    const s = { vms: new Map(), intents: new Map(), jobs: new Map(), usedNonces: new Set(), images: new Map(), switch: null, quarantined: new Map(), leaseSnaps: new Map(), poolSnaps: new Map() }
+    const s = { vms: new Map(), intents: new Map(), jobs: new Map(), usedNonces: new Set(), images: new Map(), switch: null, quarantined: new Map(), leaseSnaps: new Map(), poolSnaps: new Map(), refreshes: new Map() }
     for (const r of this.records) {
       switch (r.t) {
         case 'image': s.images.set(r.sha256, r); break
@@ -147,7 +151,7 @@ class Journal {
           break
         }
         case 'removing': { const vm = s.vms.get(r.vmId); if (vm) vm.removing = true; break }
-        case 'removed': s.vms.delete(r.vmId); s.quarantined.delete(r.vmId); for (const [k, x] of s.leaseSnaps) if (x.vmId === r.vmId) s.leaseSnaps.delete(k); for (const [k, x] of s.poolSnaps) if (x.vmId === r.vmId) s.poolSnaps.delete(k); break
+        case 'removed': s.vms.delete(r.vmId); s.quarantined.delete(r.vmId); for (const [k, x] of s.leaseSnaps) if (x.vmId === r.vmId) s.leaseSnaps.delete(k); for (const [k, x] of s.poolSnaps) if (x.vmId === r.vmId) s.poolSnaps.delete(k); for (const [k, x] of s.refreshes) if (x.vmId === r.vmId) s.refreshes.delete(k); break
         case 'switch':
           if (r.phase === 'removed') s.switch = null
           else s.switch = { name: r.name, switchId: r.switchId ?? s.switch?.switchId ?? null, token: r.token ?? s.switch?.token ?? null, phase: r.phase, jobId: r.jobId }
@@ -167,6 +171,11 @@ class Journal {
           break
         }
         case 'pcp-retire': { const x = s.poolSnaps.get(r.checkpointId); if (x) x.retiring = true; break }
+        // MC-1531: a refresh of a VM's clean checkpoint. Unresolved until abandoned (before select) or retired (after).
+        case 'rcl-begin': s.refreshes.set(r.opId, { opId: r.opId, vmId: r.vmId, oldClean: r.oldClean, oldName: r.oldName, snapName: r.snapName, newId: null, selected: false }); break
+        case 'rcl-taken': { const x = s.refreshes.get(r.opId); if (x) x.newId = r.checkpointId; break }
+        case 'rcl-select': { const x = s.refreshes.get(r.opId); if (x) { x.selected = true; const vm = s.vms.get(x.vmId); if (vm) vm.cleanCheckpointId = x.newId } break }
+        case 'rcl-abandoned': case 'rcl-retired': s.refreshes.delete(r.opId); break
         case 'pcp-retired': s.poolSnaps.delete(r.checkpointId); break
         case 'quarantine': s.quarantined.set(r.vmId, r.why); break
         case 'unquarantine': s.quarantined.delete(r.vmId); break

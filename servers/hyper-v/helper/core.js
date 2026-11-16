@@ -129,6 +129,7 @@ class Helper {
     this.vmLocks = new Map()
     this.unknownSnapshots = new Map() // MC-1529: vmId -> names of checkpoints neither clean nor a lease's: left alone
     this.pcpBusy = new Set() // MC-1532: VMs a pool-checkpoint operation has reserved: never leased or cleaned meanwhile
+    this.refreshing = new Set() // MC-1531: VMs a clean refresh is working on: never leased meanwhile
     this.leases = new Map() // vmId -> lease
     this.conns = new Map() // connId -> { pid, vmId }
     this.job = null // the pool job in progress: { jobId, op, progress, promise }
@@ -335,7 +336,7 @@ class Helper {
   freeVms() {
     const s = this.state
     const now = this.now()
-    return [...s.vms.values()].filter(v => v.ready && !v.removing && !s.quarantined.has(v.vmId) && !this.leases.has(v.vmId) && !this.pcpBusy.has(v.vmId) && (evalEnd(v) ?? Infinity) - now >= EVAL_LAST_MS)
+    return [...s.vms.values()].filter(v => v.ready && !v.removing && !s.quarantined.has(v.vmId) && !this.leases.has(v.vmId) && !this.pcpBusy.has(v.vmId) && !this.refreshing.has(v.vmId) && !this.refreshOf(v.vmId) && (evalEnd(v) ?? Infinity) - now >= EVAL_LAST_MS)
   }
 
   // ---------- projects, fair share and the queue (MC-1502) ----------
@@ -752,6 +753,14 @@ class Helper {
     let why = null
     // MC-1532: a lease's start may restore one of the VM's pool checkpoints instead of clean (by its exact id); the
     // baseline is then checked against that id. Everything else (release, recovery, retries) restores clean.
+    // MC-1531: an unresolved refresh (a crash or a failed cleanup) is settled first: abandoned before its commit,
+    // its old clean retired after. Not while a refresh is working on the VM.
+    if (!this.refreshing.has(vm.vmId) && this.refreshOf(vm.vmId)) {
+      const rec = this.refreshOf(vm.vmId)
+      const left = rec.selected ? await this.rclRetire(vm) : await this.rclAbandon(vm)
+      if (left) { this.quarantineWhy(vm, left); return { ok: false, text: `CLEANUP FAILED: ${vm.vmName} could not be confirmed clean (${left}). It is quarantined (never leased) until a restore confirms it; the helper retries every few minutes.` } }
+      vm = this.state.vms.get(vm.vmId) || vm // the current record (its clean id may have changed)
+    }
     const to = target ? target.checkpointId : vm.cleanCheckpointId
     try {
       facts = await this.hv('restore', { ...this.ident(vm), checkpointId: to, label: target ? `"${target.name}"` : 'clean' })
@@ -792,8 +801,11 @@ class Helper {
     try { list = (await this.hv('snapshots', this.ident(vm))).snapshots || [] } catch (e) { return mine.length || retiring.length ? `lease checkpoint cleanup pending: ${e.message}` : null }
     // Ownership by identity: a confirmed take by its id, an unconfirmed one by its unique name. Anything else that
     // isn't clean (a same-named snapshot with another id included) is unknown: reported, never deleted.
-    const ownedIds = new Set([...all.filter(x => x.checkpointId).map(x => x.checkpointId), ...pool.map(x => x.checkpointId)])
-    const pendingNames = new Set(all.filter(x => !x.checkpointId).map(x => x.snapName))
+    // MC-1531: an unresolved refresh's provisional snapshot (by id, or its unique name) and old clean are owned too:
+    // never unknown, and never removed here (only its abandon or retire step touches them).
+    const rf = this.refreshOf(vm.vmId)
+    const ownedIds = new Set([...all.filter(x => x.checkpointId).map(x => x.checkpointId), ...pool.map(x => x.checkpointId), ...(rf ? [rf.oldClean, rf.newId].filter(Boolean) : [])])
+    const pendingNames = new Set([...all.filter(x => !x.checkpointId).map(x => x.snapName), ...(rf && !rf.newId ? [rf.snapName] : [])])
     const unknown = list.filter(x => x.id !== vm.cleanCheckpointId && !ownedIds.has(x.id) && !pendingNames.has(x.name)).map(x => `${x.name} (${x.id})`)
     if (unknown.length) this.unknownSnapshots.set(vm.vmId, unknown); else this.unknownSnapshots.delete(vm.vmId)
     if (!mine.length && !retiring.length) return null
@@ -876,6 +888,206 @@ class Helper {
       if (vm && vm.ready && !vm.removing && !this.leases.has(vmId)) await this.vmLock(vmId)(() => this.restore(vm)).catch(() => {})
     }
     this.kick()
+  }
+
+  // ---------- refreshing a VM's clean checkpoint (MC-1531) ----------
+
+  /** MC-1531: this VM's unresolved refresh record (one at most), or null. */
+  refreshOf(vmId) {
+    return [...this.state.refreshes.values()].find(x => x.vmId === vmId) || null
+  }
+
+  /**
+   * MC-1531: a refresh plan: each target ready, with no unresolved refresh and not in its evaluation's last hour (the
+   * host record), on a drive above the floor. Bound to its current clean checkpoint id and image.
+   */
+  async planRefresh(args) {
+    const list = Array.isArray(args.targets) ? args.targets : Array.isArray(args.vms) ? args.vms : []
+    const names = [...new Set(list)]
+    if (!names.length || names.length > 16 || names.some(n => typeof n !== 'string')) throw new Error('targets must list 1-16 VM names (vm_status lists them).')
+    const s = this.state
+    const floor = this.policy.minFreeGBForCheckpoint ?? 20
+    const facts = await this.hv('facts', { folders: this.policy.diskFolders })
+    const entries = []
+    for (const n of names) {
+      const vm = [...s.vms.values()].find(v => v.vmName === n)
+      if (!vm || !vm.ready || vm.removing) throw new Error(`No ready VM named ${n} in the pool.`)
+      if (this.refreshOf(vm.vmId)) throw new Error(`${n} has an unfinished refresh (its old clean checkpoint not yet removed): wait for it (vm_status), then plan again.`)
+      if ((evalEnd(vm) ?? Infinity) - this.now() < EVAL_LAST_MS) throw new Error(`${n} is in its Windows evaluation's last hour.`)
+      const folder = (facts.folders || []).find(x => vm.folder.toLowerCase().startsWith(x.folder.toLowerCase()))
+      if (!folder || !Number.isFinite(folder.freeGB) || folder.freeGB < floor) throw new Error(`${n}'s drive has ${folder?.freeGB ?? 'unknown'} GB free, under the ${floor} GB a checkpoint must leave.`)
+      entries.push({ vmId: vm.vmId, name: vm.vmName, cleanCheckpointId: vm.cleanCheckpointId, image: this.imageOf(vm) })
+    }
+    const plan = { id: `p-${hex(8)}`, op: 'refresh', epoch: this.journal.epoch, created: this.now(), expires: this.now() + PLAN_TTL_MS, prefix: this.policy.prefix, refresh: entries }
+    const bytes = Buffer.from(canonical(plan), 'utf8')
+    fs.writeFileSync(join(this.dir, 'plans', `${plan.id}.json`), bytes, { flag: 'wx' })
+    const digest = sha256(bytes)
+    return { text: describePlan(plan, digest, this.approveLine(plan.id)), data: { planId: plan.id, digest } }
+  }
+
+  /**
+   * MC-1531: refreshes one VM's clean checkpoint, inside the pool job. Bound and held synchronously (no await between the
+   * free check, the hold and rcl-begin), then under its VM lock: the old clean restored and started offline, the
+   * build's guest steps rerun, its licence read (record only), shut down, a new snapshot of the Off VM taken and
+   * verified, then rcl-select (the commit), then the old clean retired. Before the commit any failure abandons (old
+   * clean restored, the provisional snapshot reconciled); after it, never a rollback. Returns the job note's line.
+   */
+  async refreshOne(job, e, label) {
+    const s = this.state
+    const vm = s.vms.get(e.vmId)
+    const step = t => { job.progress = `${label}: ${t}` }
+    if (!vm || !vm.ready || vm.removing || vm.vmName !== e.name || vm.cleanCheckpointId !== e.cleanCheckpointId) return `${e.name}: skipped (it changed since the plan: make a new one)`
+    if (this.leases.has(vm.vmId) || s.quarantined.has(vm.vmId) || this.pcpBusy.has(vm.vmId) || this.refreshing.has(vm.vmId) || this.refreshOf(vm.vmId)) return `${e.name}: skipped (leased, quarantined or busy: plan again when it's free)`
+    if ((evalEnd(vm) ?? Infinity) - this.now() < EVAL_LAST_MS) return `${e.name}: skipped (its Windows evaluation's last hour)`
+    // The hold and the durable intent, with no await since the checks.
+    this.refreshing.add(vm.vmId)
+    const opId = hex(6)
+    const snapName = `hvmcp-clean-${opId}`
+    let oldName = null
+    try {
+      return await this.vmLock(vm.vmId)(async () => {
+        const list0 = (await this.hv('snapshots', this.ident(vm))).snapshots || []
+        oldName = list0.find(x => x.id === e.cleanCheckpointId)?.name ?? null
+        if (!oldName) throw new Error('its clean checkpoint is missing')
+        this.journal.append({ t: 'rcl-begin', opId, vmId: vm.vmId, oldClean: e.cleanCheckpointId, oldName, snapName })
+        const creds = this.creds()
+        let committed = false
+        try {
+          const floor = this.policy.minFreeGBForCheckpoint ?? 20
+          const freeOk = async () => { const f = await this.hv('facts', { folders: [vm.folder] }); const g = f.folders?.[0]?.freeGB; if (!Number.isFinite(g) || g < floor) throw new Error(`its drive has ${g ?? 'unknown'} GB free, under the ${floor} GB a checkpoint must leave`) }
+          await freeOk()
+          step('restoring its clean checkpoint and starting it (offline)')
+          const f0 = await this.hv('restore', { ...this.ident(vm), checkpointId: e.cleanCheckpointId })
+          const bad0 = baselineProblem(f0, { ...vm, cleanCheckpointId: e.cleanCheckpointId })
+          if (bad0) throw new Error(`its clean checkpoint doesn't verify: ${bad0}`)
+          await this.hv('configure-start', { ...this.ident(vm), switchName: null, switchId: null, reserve: 0 })
+          if (await this.waitGuest(vm, creds.admin, READY_WAIT_MS) === null) throw new Error('its guest didn\'t answer')
+          step('rerunning the guest setup')
+          const g = await this.hv('guest-setup', { ...this.ident(vm), cred: creds.admin, userName: creds.user.user }, { timeoutMs: 15 * 60_000 })
+          const img = this.state.images.get(this.imageOf(vm))
+          const why = img ? images.guestReportProblem(g, img) : (g?.disableForceUnload === 1 ? null : 'DisableForceUnload is not 1')
+          if (why) throw new Error(`the guest's sanity check failed: ${why}`)
+          step('provisioning the test accounts\' profiles again (offline)')
+          const profiles = await this.provisionProfiles(vm, creds, t => step(`provisioning (offline): ${t}`))
+          step('excluding the test folders from Defender\'s scanning (offline)')
+          await this.defenderStep(vm, creds)
+          // The licence, read while it runs, for the record only: nothing is activated, and the host's evaluation end
+          // (vm.licence.expiresAt) is never rewritten.
+          const lic = await this.hv('guest-licence', { ...this.ident(vm), cred: creds.admin }, { timeoutMs: 120_000 })
+          const licBad = refreshLicenceProblem(lic, vm, this.now())
+          if (licBad) throw new Error(`its licence doesn't check out: ${licBad}`)
+          const licNote = `licence status ${lic.status}`
+          await freeOk()
+          step('shutting down and taking the new clean checkpoint')
+          const f1 = await this.hv('guest-shutdown', this.ident(vm), { timeoutMs: 6 * 60_000 })
+          if (f1.state !== 'Off') throw new Error(`the guest didn't shut down (the VM is ${f1.state})`)
+          const r = await this.hv('pool-take', { ...this.ident(vm), snapName }, { timeoutMs: 10 * 60_000 }).catch(err => ({ unknown: err.message }))
+          if (r.unknown) {
+            const list = await this.hv('snapshots', this.ident(vm)).then(x => x.snapshots || [], () => null)
+            const found = list ? list.filter(x => x.name === snapName) : []
+            if (found.length === 1) this.journal.append({ t: 'rcl-taken', opId, checkpointId: found[0].id })
+            throw new Error(`the take's outcome is unknown (${r.unknown})`)
+          }
+          if (r.failed) throw new Error(`Hyper-V couldn't take the new clean checkpoint (${r.error})`)
+          this.journal.append({ t: 'rcl-taken', opId, checkpointId: r.checkpointId })
+          const f2 = await this.hv('facts-vm', this.ident(vm))
+          if (f2.state !== 'Off' || f2.parentCheckpointId !== r.checkpointId) throw new Error(`the new clean checkpoint didn't verify (the VM is ${f2.state}, at ${f2.parentCheckpointId})`)
+          // The commit: from here the new clean is the VM's, whatever happens.
+          this.journal.append({ t: 'rcl-select', opId })
+          committed = true
+          step('removing the old clean checkpoint')
+          const retired = await this.rclRetire(vm)
+          if (retired) { this.quarantineWhy(vm, retired); return `${e.name}: refreshed (${licNote}; ${buildNote(profiles) || 'profiles settled'}), but ${retired}: it stays quarantined until that's done` }
+          // The selected baseline, verified as a start would see it.
+          const f3 = await this.hv('restore', { ...this.ident(vm), checkpointId: r.checkpointId })
+          const bad3 = baselineProblem(f3, { ...vm, cleanCheckpointId: r.checkpointId })
+          if (bad3) { this.quarantineWhy(vm, `its new clean checkpoint doesn't verify: ${bad3}`); return `${e.name}: refreshed, but its new clean checkpoint doesn't verify (${bad3}): quarantined` }
+          return `${e.name}: refreshed (${licNote}; ${buildNote(profiles) || 'profiles settled'}; its pool checkpoints kept)`
+        } catch (err) {
+          if (committed) { this.quarantineWhy(vm, `refresh cleanup pending: ${err.message}`); return `${e.name}: refreshed, but ${err.message}: quarantined until cleanup verifies` }
+          const left = await this.rclAbandon(vm)
+          if (left) { this.quarantineWhy(vm, left); return `${e.name}: FAILED (${err.message}); ${left}: it stays quarantined until that's done` }
+          return `${e.name}: FAILED (${err.message}); its old clean checkpoint is kept, unchanged`
+        }
+      })
+    } catch (err) {
+      return `${e.name}: FAILED (${err.message})`
+    } finally { this.refreshing.delete(vm.vmId) }
+  }
+
+  /** Quarantines a VM with this reason (journalled once). */
+  quarantineWhy(vm, why) {
+    if (this.state.quarantined.get(vm.vmId) !== why) this.journal.append({ t: 'quarantine', vmId: vm.vmId, why })
+  }
+
+  /**
+   * MC-1531: abandons an unselected refresh: the old clean restored and verified (Off, at it, disconnected, no reserve),
+   * then the provisional snapshot reconciled (by id, or by its unique name: absent only counts once Hyper-V's jobs are
+   * all ended and a fresh look agrees), removed if there, then rcl-abandoned. Returns null, or why it's still pending.
+   * Uses the raw restore (never this.restore, which would come back here).
+   */
+  async rclAbandon(vm) {
+    const rec = this.refreshOf(vm.vmId)
+    if (!rec || rec.selected) return null
+    try {
+      const f = await this.hv('restore', { ...this.ident(vm), checkpointId: rec.oldClean })
+      const bad = baselineProblem(f, { ...vm, cleanCheckpointId: rec.oldClean })
+      if (bad) return `refresh cleanup pending: its old clean checkpoint doesn't verify (${bad})`
+      let list = (await this.hv('snapshots', this.ident(vm))).snapshots || []
+      let snap = rec.newId ? list.find(x => x.id === rec.newId) : null
+      if (rec.newId && snap && snap.name !== rec.snapName) return `refresh cleanup pending: its new snapshot's id ${rec.newId} now has the name "${snap.name}"`
+      if (!rec.newId) {
+        let ys = list.filter(x => x.name === rec.snapName)
+        if (ys.length > 1) return `refresh cleanup pending: ${ys.length} snapshots are named ${rec.snapName}`
+        if (!ys.length) {
+          const idle = await this.hv('jobs-idle', this.ident(vm)).then(x => x.idle === true, () => null)
+          if (idle !== true) return `refresh cleanup pending: its take may still be in progress (Hyper-V ${idle === false ? 'has a job that hasn\'t ended' : 'job state unreadable'})`
+          list = (await this.hv('snapshots', this.ident(vm))).snapshots || []
+          ys = list.filter(x => x.name === rec.snapName)
+          if (ys.length > 1) return `refresh cleanup pending: ${ys.length} snapshots are named ${rec.snapName}`
+        }
+        snap = ys[0] || null
+      }
+      if (snap) {
+        const gone = (await this.hv('snapshot-remove', { ...this.ident(vm), checkpointId: snap.id, snapName: rec.snapName })).removed === true
+        if (!gone) return `refresh cleanup pending: its unpublished new snapshot is still there`
+      }
+      this.journal.append({ t: 'rcl-abandoned', opId: rec.opId })
+      return null
+    } catch (err) { return `refresh cleanup pending: ${err.message}` }
+  }
+
+  /**
+   * MC-1531: retires a selected refresh's old clean: removed by its exact id and name (its children merged, kept), then
+   * the new clean and every published pool checkpoint of the VM confirmed still there, then rcl-retired. Returns null, or
+   * why it's still pending.
+   */
+  async rclRetire(vm) {
+    const rec = this.refreshOf(vm.vmId)
+    if (!rec || !rec.selected) return null
+    try {
+      const list = (await this.hv('snapshots', this.ident(vm))).snapshots || []
+      const old = list.find(x => x.id === rec.oldClean)
+      if (old && old.name !== rec.oldName) return `old clean removal pending: its id ${rec.oldClean} now has the name "${old.name}"`
+      // Preflight, before the old one is touched: the selected new clean, by id and name, and every published pool
+      // checkpoint of the VM must be there. Otherwise the old clean stays (it may be the only good baseline left).
+      const fresh = new Map(list.map(x => [x.id, x]))
+      const nw = fresh.get(rec.newId)
+      if (!nw) return 'old clean removal pending: the new clean checkpoint is missing (the old one is kept)'
+      if (nw.name !== rec.snapName) return `old clean removal pending: the new clean checkpoint's id ${rec.newId} now has the name "${nw.name}" (the old one is kept)`
+      const missing = [...this.state.poolSnaps.values()].filter(x => x.vmId === vm.vmId && !fresh.has(x.checkpointId))
+      if (missing.length) return `old clean removal pending: pool checkpoint(s) ${missing.map(x => `"${x.name}"`).join(', ')} are missing (the old clean is kept)`
+      if (old) {
+        const gone = (await this.hv('snapshot-remove', { ...this.ident(vm), checkpointId: rec.oldClean, snapName: rec.oldName })).removed === true
+        if (!gone) return 'old clean removal pending: it is still there'
+      }
+      const after = new Set(((await this.hv('snapshots', this.ident(vm))).snapshots || []).map(x => x.id))
+      if (!after.has(rec.newId)) return 'old clean removal pending: the new clean checkpoint is missing afterwards'
+      const lost = [...this.state.poolSnaps.values()].filter(x => x.vmId === vm.vmId && !after.has(x.checkpointId))
+      if (lost.length) return `old clean removal pending: pool checkpoint(s) ${lost.map(x => `"${x.name}"`).join(', ')} missing afterwards`
+      this.journal.append({ t: 'rcl-retired', opId: rec.opId })
+      return null
+    } catch (err) { return `old clean removal pending: ${err.message}` }
   }
 
   // ---------- build staging ----------
@@ -1639,7 +1851,8 @@ class Helper {
   async plan(args = {}) {
     const op = args.action ?? 'create'
     if (op === 'checkpoint' || op === 'checkpoint-remove') return this.planCheckpoint(args)
-    if (!['create', 'resize', 'remove'].includes(op)) throw new Error('action must be create, resize, remove, checkpoint or checkpoint-remove')
+    if (op === 'refresh-clean') return this.planRefresh(args)
+    if (!['create', 'resize', 'remove'].includes(op)) throw new Error('action must be create, resize, remove, checkpoint, checkpoint-remove or refresh-clean')
     const s = this.state
     const pool = [...s.vms.values()]
     const facts = await this.hv('facts', { folders: this.policy.diskFolders })
@@ -1830,7 +2043,7 @@ class Helper {
         note => { this.journal.append({ t: 'jobEnd', jobId, ok: true, note }); this.lastJob = { op, ok: true, note } },
         e => { this.journal.append({ t: 'jobEnd', jobId, ok: false, note: e.message }); this.lastJob = { op, ok: false, note: e.message } }
       ).finally(() => { this.job = null; this.kick() })
-      return { text: `Approved plan ${planId} accepted: pool job ${jobId} (${op}) is running. ${op === 'remove' ? '' : 'Creating a VM installs Windows unattended: about 20-40 minutes each, one at a time. '}Follow it with pool_status.`, data: { jobId } }
+      return { text: `Approved plan ${planId} accepted: pool job ${jobId} (${op}) is running. ${op === 'remove' ? '' : op === 'refresh' ? "Each VM's guest steps are rerun offline: about 20-40 minutes each, one at a time. " : 'Creating a VM installs Windows unattended: about 20-40 minutes each, one at a time. '}Follow it with pool_status.`, data: { jobId } }
     })
   }
 
@@ -1881,6 +2094,7 @@ class Helper {
       const v = st.vms.get(e.vmId)
       const l = this.leases.get(e.vmId)
       if (!v || v.vmName !== e.name || !l || l.leaseId !== e.leaseId || l.ending || l.project !== e.owner || this.imageOf(v) !== e.image) throw new Error('the lease the plan was made from has ended or changed: nothing was published (make a new plan)')
+      if (this.refreshing.has(e.vmId) || this.refreshOf(e.vmId)) throw new Error('its clean checkpoint is being refreshed: nothing was published (plan again when that has finished)')
       const same = [...st.poolSnaps.values()].filter(x => x.vmId === e.vmId && x.name.toLowerCase() === plan.checkpoint.toLowerCase())
       if (!e.replaces && same.length) throw new Error(`it already has a pool checkpoint "${plan.checkpoint}"${same.every(x => x.retiring) ? ' (retiring)' : ''}: nothing was published (replace it with a new plan, replace: true)`)
       if (e.replaces) { const live = same.filter(x => !x.retiring); if (live.length !== 1 || live[0].checkpointId !== e.replaces || live[0].owner !== e.owner) throw new Error('the checkpoint to replace has changed: nothing was published (make a new plan)') }
@@ -1999,7 +2213,7 @@ class Helper {
     if (!vm || !p || p.vmId !== e.vmId || p.retiring || p.owner !== e.owner || p.name.toLowerCase() !== plan.checkpoint.toLowerCase()) throw new Error('the checkpoint has changed or is already retiring: nothing was done (make a new plan)')
     this.journal.append({ t: 'pcp-retire', vmId: e.vmId, checkpointId: e.checkpointId })
     if (this.leases.has(e.vmId)) return `retired: no longer offered; the lease holding ${vm.vmName} keeps it until it ends, then it's removed.`
-    if (this.pcpBusy.has(e.vmId)) return 'retired: no longer offered; it is removed at the VM\'s next restore.'
+    if (this.pcpBusy.has(e.vmId) || this.refreshing.has(e.vmId)) return 'retired: no longer offered; it is removed at the VM\'s next restore.'
     this.pcpBusy.add(e.vmId)
     try {
       const r = await this.vmLock(e.vmId)(() => this.restore(vm))
@@ -2065,6 +2279,10 @@ class Helper {
       await this.hv('remove-switch', { name: sw.name, switchId: sw.switchId, token: sw.token })
       this.journal.append({ t: 'switch', jobId: job.jobId, name: sw.name, phase: 'removed' })
       done.push(`removed the switch ${sw.name}`)
+    }
+    // MC-1531: refreshes, VM by VM, each committing on its own.
+    for (const [k, e] of (plan.refresh || []).entries()) {
+      done.push(await this.refreshOne(job, e, `VM ${k + 1} of ${plan.refresh.length} (${e.name})`))
     }
     if (plan.add?.length) this.ensureCreds()
     for (const [k, a] of (plan.add || []).entries()) {
@@ -2341,6 +2559,7 @@ class Helper {
       case 'pool_resize': return this.apply('resize', args)
       case 'pool_remove': return this.apply('remove', args)
       case 'pool_checkpoint': return this.poolCheckpoint(connId, args)
+      case 'pool_refresh': return this.apply('refresh', args)
       case 'quiesce': return this.quiesce()
       case 'version': return { text: PROTOCOL, data: { protocol: PROTOCOL, features: [...FEATURES], buildRoots: [...this.policy.buildRoots] } }
       case 'whoami': return this.whoami(args.roots)
@@ -2356,7 +2575,8 @@ const PROTOCOL = 'hyperv-mcp/3' // 2: renew, sync_plan, sync (MC-1497); 3: start
 // 'named' = acquire's vm, one VM by name (MC-1523).
 // 'checkpoints' = vm_checkpoint and vm_restore, a lease's own checkpoints (MC-1529).
 // 'pool-checkpoints' = pool_plan's checkpoint actions, pool_checkpoint, acquire's and start's checkpoint (MC-1532).
-const FEATURES = ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints']
+// 'refresh-clean' = pool_plan's refresh-clean and pool_refresh (MC-1531).
+const FEATURES = ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean']
 const LEASE_CHECKPOINT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$/
 // MC-1532: a pool checkpoint's name.
 const POOL_CHECKPOINT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._+-]{0,39}$/
@@ -2479,6 +2699,23 @@ function licenceOf(r, evaluation, now) {
   return { kind: 'evaluation', expiresAt: new Date(end).toISOString() }
 }
 
+/**
+ * MC-1531: why a refresh's guest licence report isn't acceptable, or null. A report is required. An evaluation (or a VM
+ * with no recorded kind) must be licensed with a reported period not yet over: any length, not the fresh build's
+ * minimum, since a refreshed VM is part way through its evaluation. An own copy follows the build's policy (its status
+ * is recorded, not required). Never used to write the host's record.
+ */
+function refreshLicenceProblem(r, vm, now) {
+  if (!r || typeof r !== 'object' || !Number.isFinite(Number(r.status))) return 'the guest reported no licence'
+  if (vm.licence?.kind === 'own') return null
+  const status = Number(r.status)
+  if (status !== 1) return `Windows isn't licensed (licence status ${status}${r.error ? `: ${r.error}` : ''})`
+  const ends = [Number(r.graceMinutes) > 0 ? now + Number(r.graceMinutes) * 60_000 : NaN, r.evalEnd ? Date.parse(r.evalEnd) : NaN].filter(Number.isFinite)
+  if (!ends.length) return 'Windows reported no evaluation period'
+  if (Math.min(...ends) <= now) return `the evaluation's end, as Windows reports it (${new Date(Math.min(...ends)).toISOString()}), has passed`
+  return null
+}
+
 /** Why restored facts aren't the clean baseline, or null. */
 function baselineProblem(f, vm) {
   if (!f || typeof f !== 'object') return 'no facts'
@@ -2500,6 +2737,8 @@ function describePlan(plan, digest, approve) {
   const lines = [`Plan ${plan.id} (${plan.op}), valid for 30 minutes. Digest ${digest}; its first 6 characters are ${digest.slice(0, 6)}.`]
   for (const a of plan.add || []) lines.push(`- create ${a.name}: ${a.cores} cores, ${a.memoryMB} MB static memory, ${a.diskGB} GB dynamic disk, in ${a.folder}; network adapter disconnected`)
   for (const r of plan.remove || []) lines.push(`- remove ${r.name} and its folder ${r.folder}`)
+  // MC-1531: refresh plans.
+  if (plan.op === 'refresh') for (const v of plan.refresh) lines.push(`- refresh the clean checkpoint of ${v.name}: restore it, start it offline, rerun the build's guest steps (registry, provisioning with the App Readiness wait, Defender), shut it down and take a new clean checkpoint; then remove the old one (its pool checkpoints are kept). Nothing goes online and nothing is re-activated; its evaluation end stays as recorded. The VM isn't leased meanwhile.`)
   // MC-1532: pool-checkpoint plans.
   if (plan.op === 'checkpoint') for (const v of plan.vms) lines.push(plan.mode === 'remove' ? `- remove the pool checkpoint "${plan.checkpoint}" of ${v.name} (owner ${v.owner}); a lease already using it keeps it until that lease ends` : `- ${plan.mode === 'replace' ? 'replace' : 'publish'} the pool checkpoint "${plan.checkpoint}" of ${v.name} (owner ${v.owner}, ${v.os}, image ${v.image === 'legacy' ? 'unknown' : v.image.slice(0, 12)}), from lease ${v.leaseId}'s state: its logon undone and verified, network disconnected, the guest shut down, then checkpointed Off; any project's lease may then start from it${plan.mode === 'replace' ? '; the old one stops being offered at once and is removed when no lease uses it' : ''}`)
   if (plan.switch) lines.push(`- create the internal switch ${plan.switch} (host and guests only; no internet, no LAN)`)
