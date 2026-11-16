@@ -166,8 +166,9 @@ test('named VM states (bare helper): quarantined, being created, being removed, 
   h.policy = { projects: [] }
   h.leases = new Map()
   h.pcpBusy = new Set()
+  h.refreshing = new Set()
   h.startFailed = new Map()
-  const state = { vms: new Map([['v1', vm]]), quarantined: new Map(), intents: new Map([['i1', { image: A }]]), images: new Map([[A, { sha256: A, os: 'windows' }]]), jobs: new Map(), leaseSnaps: new Map(), poolSnaps: new Map() }
+  const state = { vms: new Map([['v1', vm]]), quarantined: new Map(), intents: new Map([['i1', { image: A }]]), images: new Map([[A, { sha256: A, os: 'windows' }]]), jobs: new Map(), leaseSnaps: new Map(), poolSnaps: new Map(), refreshes: new Map() }
   h.journal = { state: () => state }
   const want = { os: 'windows', image: A, vm: vm.vmName, vmImage: A }
   assert.strictEqual(h.blocked('other', want), null)
@@ -188,11 +189,11 @@ test('named VM states (bare helper): quarantined, being created, being removed, 
 function bare() {
   const h = Object.create(Helper.prototype)
   const vm = { vmId: 'v1', vmName: 'hvmcp-22222222', intentId: 'i1', ready: false, cores: 2, memoryMB: 4096, diskGB: 64 }
-  const state = { vms: new Map([['v1', vm]]), quarantined: new Map(), intents: new Map([['i1', { image: A }]]), images: new Map([[A, { sha256: A, os: 'windows' }]]), jobs: new Map(), leaseSnaps: new Map(), poolSnaps: new Map() }
+  const state = { vms: new Map([['v1', vm]]), quarantined: new Map(), intents: new Map([['i1', { image: A }]]), images: new Map([[A, { sha256: A, os: 'windows' }]]), jobs: new Map(), leaseSnaps: new Map(), poolSnaps: new Map(), refreshes: new Map() }
   h.journal = { state: () => state }
   h.now = () => Date.now()
   h.policy = { projects: [], maxLeaseMinutes: 240, buildRoots: [] }
-  Object.assign(h, { leases: new Map(), startFailed: new Map(), conns: new Map([[1, { pid: 1 }], [2, { pid: 2 }]]), queue: [], tokens: 0, timers: new Set(), quiesced: null, pcpBusy: new Set() })
+  Object.assign(h, { leases: new Map(), startFailed: new Map(), conns: new Map([[1, { pid: 1 }], [2, { pid: 2 }]]), queue: [], tokens: 0, timers: new Set(), quiesced: null, pcpBusy: new Set(), refreshing: new Set() })
   h.poolLock = fn => fn()
   h.armDeadline = () => {}
   return { h, vm, state }

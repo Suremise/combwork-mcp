@@ -160,7 +160,9 @@ function run(s, op, a) {
       if (s.notReady) return { ready: false }
       return { ready: vm.state === 'Running' && vm.installed !== false }
     }
-    case 'guest-setup': { const vm = own(s, a); vm.disk['C:\\build'] = ''; return { editionId: s.guestEdition ?? 'EnterpriseEval', build: '26200', ubr: 6584, disableForceUnload: 1, ...(s.setupOverride || {}) } }
+    // MC-1531 knobs: setupMarker (written to C:\marker.txt, a stand-in for a fix the setup applies), setupThrows,
+    // setupEntered + setupGate (held as it begins).
+    case 'guest-setup': { const vm = own(s, a); if (s.setupEntered) fs.writeFileSync(s.setupEntered, 'entered'); if (s.setupGate) while (!fs.existsSync(s.setupGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25); if (s.setupThrows) throw new Error('injected: the guest setup failed'); vm.disk['C:\\build'] = ''; if (s.setupMarker) vm.disk['C:\\marker.txt'] = Buffer.from(s.setupMarker).toString('base64'); return { editionId: s.guestEdition ?? 'EnterpriseEval', build: '26200', ubr: 6584, disableForceUnload: 1, ...(s.setupOverride || {}) } }
     case 'make-clean': {
       const vm = own(s, a)
       vm.state = 'Off'
@@ -273,11 +275,12 @@ function run(s, op, a) {
       if (s.poolTakeEntered) fs.writeFileSync(s.poolTakeEntered, 'entered')
       if (s.poolTakeGate) while (!fs.existsSync(s.poolTakeGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25)
       if (vm.state !== 'Off') throw new Error(`the VM is ${vm.state}, not Off`)
-      if (!/^hvmcp-pool-[0-9a-f]{12}$/.test(a.snapName)) throw new Error('bad checkpoint name')
+      if (!/^hvmcp-(pool|clean)-[0-9a-f]{12}$/.test(a.snapName)) throw new Error('bad checkpoint name')
       if (s.poolTakeFail) return { failed: true, error: 'injected: Hyper-V could not take it' }
       const id = crypto.randomUUID()
       vm.checkpoints.push({ id, name: a.snapName, parentId: vm.parent, disk: { ...vm.disk }, userinit: vm.userinit ?? null, enableLUA: vm.enableLUA ?? 1 })
       vm.parent = id
+      if (s.poolTakeFailButMade) throw new Error('injected: the take call failed after Hyper-V made it')
       return { checkpointId: id }
     }
     // A take Hyper-V hasn't finished (productionFailDelayed) is a running job until it appears; jobsUnreadable fails.
