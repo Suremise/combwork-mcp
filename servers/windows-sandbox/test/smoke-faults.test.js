@@ -11,15 +11,24 @@ const SMOKE = path.join(__dirname, 'smoke.js')
 
 function smoke(s, env) {
   const dir = path.join(s.dir, 'smoke')
-  const r = spawnSync(process.execPath, [SMOKE, '--runs', '0'], { env: { ...s.env, WSB_TEST_SCRATCH: dir, SMOKE_KILL_WAIT_MS: '1500', ...env }, encoding: 'utf8', timeout: 60_000 })
-  const summary = JSON.parse(fs.readFileSync(path.join(dir, 'smoke.json'), 'utf8'))
-  // The watchdogs these runs leave waiting (slowed down on purpose): end them, by the PID their server recorded.
   const root = path.join(dir, 'sandbox')
-  for (const d of fs.existsSync(root) ? fs.readdirSync(root) : []) {
-    const st = JSON.parse(fs.readFileSync(path.join(root, d, 'state.json'), 'utf8').toString() || '{}')
-    try { if (st.watchdogPid) process.kill(st.watchdogPid) } catch { /* already gone */ }
+  const watchdogs = []
+  try {
+    const r = spawnSync(process.execPath, [SMOKE, '--runs', '0'], { env: { ...s.env, WSB_TEST_SCRATCH: dir, SMOKE_KILL_WAIT_MS: '1500', ...env }, encoding: 'utf8', timeout: 60_000 })
+    const summary = JSON.parse(fs.readFileSync(path.join(dir, 'smoke.json'), 'utf8'))
+    for (const d of fs.existsSync(root) ? fs.readdirSync(root) : []) {
+      try { watchdogs.push(JSON.parse(fs.readFileSync(path.join(root, d, 'watchdog.json'), 'utf8'))) } catch { /* none written */ }
+    }
+    return { code: r.status, out: r.stdout + r.stderr, summary, watchdogs }
+  } finally {
+    // The watchdogs these runs leave waiting (slowed down or failing on purpose): end them, by the PID their server
+    // recorded, whatever happened above.
+    for (const d of fs.existsSync(root) ? fs.readdirSync(root) : []) {
+      let st = {}
+      try { st = JSON.parse(fs.readFileSync(path.join(root, d, 'state.json'), 'utf8').toString() || '{}') } catch { /* no state */ }
+      try { if (st.watchdogPid) process.kill(st.watchdogPid) } catch { /* already gone */ }
+    }
   }
-  return { code: r.status, out: r.stdout + r.stderr, summary }
 }
 
 test('watchdog never stops it, and reading its evidence throws: the finally still stops the Sandbox', () => {
@@ -35,11 +44,21 @@ test('watchdog never stops it, and reading its evidence throws: the finally stil
 })
 
 test('the watchdog\'s stop fails: the fallback stop confirms it', () => {
-  const s = scratch('smoke-watchdog-fails', { stop: 3 }) // the watchdog's first round of 3 attempts fails
+  // MC-1538: every stop the watchdog makes fails (the stub tells it by its caller tag), however long smoke waits or
+  // however loaded the machine; the fallback's stops aren't affected. (A count of failing stops raced the watchdog's
+  // next round against smoke's wait.)
+  const s = scratch('smoke-watchdog-fails', { stopCaller: 'watchdog' })
   const r = smoke(s, { WSB_WATCHDOG_CHECK_MS: '100' })
-  assert.strictEqual(r.code, 1)
+  assert.strictEqual(r.code, 1, 'the watchdog failed on purpose: a failing check')
+  assert.match(r.out, /FAIL hard kill: the watchdog stopped/)
   assert.match(r.out, /PASS hard kill: cleanup of \S+ confirmed \(fallback stop\)/)
   assert.deepStrictEqual(s.read().sandboxes, [])
+  assert.strictEqual(r.watchdogs.length, 1)
+  const w = r.watchdogs[0]
+  assert.strictEqual(w.stopped, false, 'the watchdog reported its stop unconfirmed')
+  assert.match(JSON.stringify(w.attempts), /stop failed \(watchdog\)/, 'its attempts were made and refused by the stub')
+  assert.deepStrictEqual(r.summary.fallbackStops.map(f => f.ok), [true], 'one fallback stop, confirmed')
+  assert.ok(!r.summary.leftRunning)
 })
 
 test('every stop fails: reported as possibly still running, with the id kept, and a non-zero exit', () => {

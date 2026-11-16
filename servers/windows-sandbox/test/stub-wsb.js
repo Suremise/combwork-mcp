@@ -7,6 +7,7 @@
  *   list: 'exit' | 'garbage' | 'noarray' | 'badid'   every list fails that way
  *   listAfterStop: same, but only once a stop was called
  *   stop: n            the first n stops fail (exit 1); -1 = always
+ *   stopCaller: 'watchdog'   every stop by that caller fails (its WSB_CALLER tag, MC-1538); others' stops don't
  *   stopLies: true     stop exits 0 but the Sandbox stays listed
  *   start: true        start fails
  *   others: [ids]      Sandboxes not started here, always listed
@@ -70,6 +71,7 @@ const r = withState(s => {
     const n = count('stop')
     const id = opt('--id')
     if (s.fail.stop === -1 || n <= (s.fail.stop || 0)) return { code: 1, stderr: 'stop failed' }
+    if (s.fail.stopCaller && process.env.WSB_CALLER === s.fail.stopCaller) return { code: 1, stderr: `stop failed (${s.fail.stopCaller})` }
     if (!s.fail.stopLies) s.sandboxes = s.sandboxes.filter(x => x !== id)
     return { stdout: '' }
   }
