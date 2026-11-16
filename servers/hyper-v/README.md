@@ -412,7 +412,7 @@ projects start from (MC-1532) and refreshing the clean checkpoint in place (MC-1
   (default 20 GB) free. Names are 1 to 40 letters, digits, spaces, dots, dashes or underscores; `clean` is reserved.
 - **Restoring one:** the checkpoint is checked to be this lease's on this VM, restored (Off, as production
   checkpoints restore), then started like `vm_start` with the lease's current network (off means disconnected,
-  whatever the checkpoint's adapter said) and CPU reserve, the guest awaited, and all of it read back. No one is
+  whatever the checkpoint's adapter said) and CPU reserve, the guest awaited, and all of it read back. Hyper-V reports a restore's new parent a moment after it returns, so every restore (this one, clean, a pool checkpoint) waits for the VM to be Off (20 s, or nothing is restored) and then for the checkpoint to be its parent (45 s); a wait that runs out is refused, whatever is read afterwards (MC-1536). No one is
   logged on interactively afterwards; `vm_start` or `vm_reset` with `interactive` restore clean, so they discard the
   restored state. C:\build is as the checkpoint left it but unconfirmed until a full `vm_sync`. Run numbers keep
   rising, so nothing from before can be taken for a later run's.
@@ -796,7 +796,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\restorewait.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
 ```
 
 - `units.test.js`:
@@ -933,6 +933,7 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   project at its Windows cap still gets Linux, a forbidden OS or image refused, never queued); a waiter never given
   another kind; and, through `server.js`, no
   acquire at all sent to a helper without `images` for an image or Linux.
+- `restorewait.test.js`, a restore's waits (MC-1536): hv.ps1's own restore handler, run for real with mock Hyper-V calls on a fake clock (a parent that changes after a few reads, a late Off, a saved state, never Off with no restore issued, a parent that never changes), and the callers refusing a timed-out phase even when the facts read afterwards match (a clean reset and a lease restore, neither started).
 - `refresh.test.js`, refreshing a clean checkpoint (MC-1531): with a pool checkpoint present (the new clean carrying the fix, the old one removed, the pool checkpoint kept and startable, the evaluation end unchanged, never online); a repeat refresh keeping the sibling pool checkpoint; failures before the commit (a guest step, a failed take, a take made despite its call failing) abandoning with only the old clean left; a removal failing after the commit, quarantined until a retry; crashes before and after the commit; a leased VM skipped and a refreshing VM never leased while another is; an aged evaluation with a guest claiming more days; a second refresh refused while one is unresolved; and the feature gate.
 - `poolcheckpoints.test.js`, pool checkpoints (MC-1532):
   - published from a lease, then another project starting from it, clean on demand and released to clean;

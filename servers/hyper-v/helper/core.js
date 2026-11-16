@@ -763,7 +763,8 @@ class Helper {
     }
     const to = target ? target.checkpointId : vm.cleanCheckpointId
     try {
-      facts = await this.hv('restore', { ...this.ident(vm), checkpointId: to, label: target ? `"${target.name}"` : 'clean' })
+      // MC-1536: up to 20 s for Off and 45 s for the new parent inside the op, so the call allows 120 s.
+      facts = await this.hv('restore', { ...this.ident(vm), checkpointId: to, label: target ? `"${target.name}"` : 'clean' }, { timeoutMs: 120_000 })
       why = baselineProblem(facts, { ...vm, cleanCheckpointId: to })
     } catch (e) {
       why = e.message
@@ -1758,8 +1759,10 @@ class Helper {
       Object.assign(lease.sync, { gen: lease.sync.gen + 1, plan: null, trusted: false, record: new Map() })
       this.dropStage(this.conns.get(lease.connId))
       lease.dirty = true
-      const after = await this.hv('lease-restore', { ...this.ident(vm), checkpointId: cp.checkpointId, snapName: cp.snapName }, this.forLease(lease))
+      const after = await this.hv('lease-restore', { ...this.ident(vm), checkpointId: cp.checkpointId, snapName: cp.snapName }, this.forLease(lease, 120_000))
       this.stillHeld(lease)
+      const rp = restoreProblem(after) // MC-1536: a timed-out phase is refused, whatever the facts say
+      if (rp) throw new Error(`Restoring "${name}" didn't verify: ${rp}. vm_reset to go on from clean.`)
       if (after.vmId !== vm.vmId || after.parentCheckpointId !== cp.checkpointId || after.state !== 'Off') throw new Error(`Restoring "${name}" didn't verify (state ${after.state}, parent ${after.parentCheckpointId}): vm_reset to go on from clean.`)
       const sw = lease.network ? this.state.switch : null
       await this.hv('configure-start', { ...this.ident(vm), switchName: sw ? sw.name : null, switchId: sw ? sw.switchId : null, reserve: lease.reserve || 0 }, this.forLease(lease))
@@ -2716,9 +2719,23 @@ function refreshLicenceProblem(r, vm, now) {
   return null
 }
 
+/**
+ * MC-1536: why a restore didn't complete, from hv.ps1's own report (f.restore), or null. A timed-out phase is refused
+ * whatever the facts read afterwards say (an Off that came late, with the parent already the target, isn't a
+ * restore). A reply without the report (an older helper script) is judged on its facts alone, as before.
+ */
+function restoreProblem(f) {
+  const r = f?.restore
+  if (!r || typeof r !== 'object') return null
+  if (r.timedOut === true || r.ok === false) return `the restore didn't complete: ${r.phase === 'off' ? 'the VM didn\'t turn off' : r.phase === 'parent' ? 'Hyper-V didn\'t report the checkpoint as its parent' : `phase ${r.phase}`} within the wait (last seen: ${r.last || 'nothing'}, after ${r.waitedMs ?? '?'} ms)`
+  return null
+}
+
 /** Why restored facts aren't the clean baseline, or null. */
 function baselineProblem(f, vm) {
   if (!f || typeof f !== 'object') return 'no facts'
+  const rp = restoreProblem(f)
+  if (rp) return rp
   if (f.vmId !== vm.vmId) return 'a different VM answered'
   if (f.state !== 'Off') return `state is ${f.state}, not Off`
   if (!vm.cleanCheckpointId) return 'no clean checkpoint recorded'

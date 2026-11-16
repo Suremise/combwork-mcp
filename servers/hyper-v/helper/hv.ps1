@@ -29,6 +29,50 @@ function Cred($c) {
   return New-Object Management.Automation.PSCredential ([string]$c.user, $sec)
 }
 
+# MC-1536: a restore, as one pure handler both restore ops use (the tests run it with mock io). Hyper-V reports a
+# restore's new parent (and an Off after a turn-off) a moment after the cmdlet returns, so each is polled as a
+# condition on a monotonic clock, every sleep capped to the time left and none after the deadline: Off within 20 s
+# (else no restore is issued at all), then the target as the VM's parent within 45 s. Returns { ok, phase, timedOut,
+# last, waitedMs }; the callers refuse any timedOut, whatever the facts read afterwards say.
+$RestoreTo = {
+  param($cpId, $io)
+  $t0 = & $io.now
+  $poll = {
+    param($probe, $want, $limitMs)
+    $start = & $io.now
+    for (;;) {
+      $v = & $probe
+      if ([string]$v -eq [string]$want) { return @{ ok = $true; last = $v } }
+      $left = $limitMs - ((& $io.now) - $start)
+      if ($left -le 0) { return @{ ok = $false; last = $v } }
+      & $io.sleep ([Math]::Max(1, [Math]::Min(500, [int]$left)))
+    }
+  }
+  $st = & $io.state
+  if ($st -eq 'Saved') { & $io.removeSaved } elseif ($st -ne 'Off') { & $io.turnOff }
+  $off = & $poll $io.state 'Off' 20000
+  if (-not $off.ok) { return @{ ok = $false; phase = 'off'; timedOut = $true; last = [string]$off.last; waitedMs = [int]((& $io.now) - $t0) } }
+  & $io.restore
+  $par = & $poll $io.parent $cpId 45000
+  if (-not $par.ok) { return @{ ok = $false; phase = 'parent'; timedOut = $true; last = [string]$par.last; waitedMs = [int]((& $io.now) - $t0) } }
+  @{ ok = $true; phase = 'done'; timedOut = $false; last = [string]$par.last; waitedMs = [int]((& $io.now) - $t0) }
+}
+
+# MC-1536: the real io for $RestoreTo: Get-VM, Stop-VM, Remove-VMSavedState, Restore-VMSnapshot, Start-Sleep, a Stopwatch.
+function RestoreIo($vm, $cp) {
+  $id = $vm.Id
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  @{
+    state = { [string](Get-VM -Id $id).State }.GetNewClosure()
+    parent = { $p = (Get-VM -Id $id).ParentCheckpointId; if ($p) { $p.ToString() } else { $null } }.GetNewClosure()
+    turnOff = { Stop-VM -VM (Get-VM -Id $id) -TurnOff -Force }.GetNewClosure()
+    removeSaved = { Remove-VMSavedState -VM (Get-VM -Id $id) }.GetNewClosure()
+    restore = { Restore-VMSnapshot -VMSnapshot $cp -Confirm:$false }.GetNewClosure()
+    sleep = { param($ms) Start-Sleep -Milliseconds $ms }
+    now = { $sw.Elapsed.TotalMilliseconds }.GetNewClosure()
+  }
+}
+
 function Facts($vm) {
   $vm = Get-VM -Id $vm.Id
   $nic = @(Get-VMNetworkAdapter -VM $vm)
@@ -619,10 +663,10 @@ try {
       $vm = Get-OwnVm $a
       $cp = Get-VMSnapshot -VM $vm | Where-Object { $_.Id.ToString() -eq [string]$a.checkpointId }
       if (-not $cp) { throw "its $(if ($a.label) { [string]$a.label } else { 'clean' }) checkpoint (by id) is missing" }
-      if ($vm.State -eq 'Saved') { Remove-VMSavedState -VM $vm }
-      elseif ($vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -Force }
-      Restore-VMSnapshot -VMSnapshot $cp -Confirm:$false
-      Facts $vm
+      $r = & $RestoreTo $cp.Id.ToString() (RestoreIo $vm $cp)
+      $f = Facts $vm
+      $f.restore = $r
+      $f
     }
     # MC-1529: a lease's own checkpoints. Each is a production checkpoint (disk-consistent through VSS in the guest, no
     # memory state), taken only while the VM runs, under its unique name hvmcp-lease-<opId>; the VM's checkpoint type is
@@ -657,10 +701,10 @@ try {
       $vm = Get-OwnVm $a
       $cp = Get-VMSnapshot -VM $vm | Where-Object { $_.Id.ToString() -eq [string]$a.checkpointId -and [string]$_.Name -ceq [string]$a.snapName }
       if (-not $cp) { throw "checkpoint $($a.snapName) (by id) is missing on this VM" }
-      if ($vm.State -eq 'Saved') { Remove-VMSavedState -VM $vm }
-      elseif ($vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -Force }
-      Restore-VMSnapshot -VMSnapshot $cp -Confirm:$false
-      Facts $vm
+      $r = & $RestoreTo $cp.Id.ToString() (RestoreIo $vm $cp)
+      $f = Facts $vm
+      $f.restore = $r
+      $f
     }
     # MC-1532: a pool checkpoint's steps. The guest is shut down cleanly (never turned off), its network disconnected only
     # (net-off would turn the VM off too), and the checkpoint taken of the Off VM, so it holds no runtime state.
