@@ -328,6 +328,7 @@ non-evaluation Windows 11 ISO (see "Windows licences").
 | `vm_stop({ keep=false })` | Turns the VM off and restores the clean checkpoint, then **verifies** it: Off, at the checkpoint (by id), adapter disconnected, reserve 0. It says "Reverted" only then. Otherwise **CLEANUP FAILED**, and the VM is quarantined. The lease stays. `keep` (or a failed run with `keepOnFailure`) leaves it as it is until release or the deadline. |
 | `vm_checkpoint({ name })` | Takes a named checkpoint of your leased VM as it runs now: files, installed software and the registry (a production checkpoint, disk only: not running programs or a logon session). Yours only, removed when the lease ends. See "Checkpoints within a lease". |
 | `vm_restore({ name })` | Restores one of your lease's checkpoints and starts the VM from it, with the lease's current network and CPU reserve. No one is logged on interactively afterwards, and C:\build is unconfirmed until a full `vm_sync`. |
+| `pool_checkpoint({ planId })` | Carries out an approved pool-checkpoint plan: publishes (or replaces, or removes) a named checkpoint of each VM a lease prepared. See "Pool checkpoints". |
 | `vm_release()` | Restores the VM (as `vm_stop`) and ends the lease. |
 | `vm_status()` | The pool, every lease, your VM, any pool job, the policy, and where builds may come from. Works with the server turned off. |
 | `pool_plan({ action='create'\|'resize'\|'remove', vms?, cores?, memoryGB?, diskGB?, location?, network?, image?, activate? })` | Plans a pool change and changes nothing (see "Building the pool"). `image` is a new ISO to check (`{ iso \| download, edition? }`), or a verified image's SHA-256: build from it, or resize only its group (see "A pool from more than one image"). An evaluation image's plan always activates Windows online once per new VM; `activate: true` asks the same for your own copy (see "Windows licences"). |
@@ -336,6 +337,39 @@ non-evaluation Windows 11 ISO (see "Windows licences").
 
 The server's MCP instructions tell agents to use the pool tools only when the user asks, and never to run the approve
 line themselves.
+
+### Pool checkpoints: a prepared state any lease can start from
+
+A pool checkpoint (MC-1532) is a named state one lease prepared (an OS set up, a suite of tools installed) that
+later leases, in any project, start from with no reinstall. Publishing, replacing and removing one each need the
+user's approve line, because they change what later leases start from.
+
+- **Publishing:** prepare the state in a lease, then `pool_plan({ action: 'checkpoint', name, targets: [vm, ...] })`.
+  Each listed VM must be leased now by your project, which owns the checkpoint. After approval,
+  `pool_checkpoint({ planId })` handles each VM on its own (the reply lists each outcome). It undoes the guest's
+  logon (no autologon, no saved password, UAC back on, `C:\hvmcp` emptied, all verified), disconnects its network
+  (read back), shuts the guest down cleanly and checkpoints it Off, so the checkpoint holds no runtime state. Only
+  then is it published. If a step fails nothing is published, and the reply says what had already changed. A VM that
+  was shut down is started again from its current disk (no restore), so what you prepared is still there. Your lease
+  goes on, now starting from the new checkpoint.
+- **Using one:** `vm_acquire({ checkpoint: 'tools' })` takes a free VM that has it (in the same fair line, with the
+  same project caps and image lists). Give `os` if the name is on VMs of more than one OS, and `vm` or `image` to
+  narrow it. The lease then starts from it: `vm_start` and `vm_reset` restore it by default.
+  `vm_start({ checkpoint: 'clean' })` gives clean, and another name the VM has gives that one. A name the VM doesn't
+  have is refused, never replaced by clean. A lease keeps the exact checkpoint it started from. `vm_release` always
+  returns the VM to clean.
+- **Replacing and removing:** only the owning project, by plan (`replace: true`, or
+  `action: 'checkpoint-remove'`). A replace is published from its own lease, and the old checkpoint is never offered
+  again. Removal is the same: retired at once (never offered again); a lease already using it keeps it, and it's
+  removed when that lease ends (Hyper-V merges it into its children, so a replacement built on it survives).
+- **What a name promises:** each VM's checkpoint is its own (Hyper-V checkpoints belong to one VM). vm_status lists
+  each with its owner, OS, image, when it was taken and from which lease. The same name on two VMs doesn't promise
+  identical contents.
+- **Limits:** at most the policy's `maxCheckpointsPerVm` (default 4) per VM, counting ones being retired or taken,
+  and the free-space floor `minFreeGBForCheckpoint`. A checkpoint never changes the VM's evaluation end.
+- **Crashes:** until it's published, a checkpoint being taken is journalled as its lease's, and removed with it
+  (as in "Checkpoints within a lease"). Once published it survives restarts. A retired one is removed at the VM's next
+  free restore, or the VM stays quarantined until it is.
 
 ### Checkpoints within a lease
 
@@ -739,7 +773,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
 ```
 
 - `units.test.js`:
@@ -876,6 +910,19 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   project at its Windows cap still gets Linux, a forbidden OS or image refused, never queued); a waiter never given
   another kind; and, through `server.js`, no
   acquire at all sent to a helper without `images` for an image or Linux.
+- `poolcheckpoints.test.js`, pool checkpoints (MC-1532):
+  - published from a lease, then another project starting from it, clean on demand and released to clean;
+  - binding and ownership refusals, and an ended lease publishing nothing;
+  - failures at the undo, the shutdown and the take, each publishing nothing and saying what changed (the take's
+    failure leaving the VM running again with the prepared file);
+  - replacing from its own lease (the old one retiring, then removed with the new child kept) and removing on a
+    leased VM (pinned until that lease ends);
+  - acquire by checkpoint (unknown name, a `vm` that lacks it, image, a waiter served), and a name on Windows and
+    Linux VMs needing `os`;
+  - a lease ending during the take, with another VM leased meanwhile;
+  - the cap; a two-VM plan's partial success; a lease checkpoint on a pool checkpoint; the evaluation end unchanged;
+  - recovery at each journal boundary;
+  - the feature gate.
 - `checkpoints.test.js`, a lease's own checkpoints (MC-1529) against the stub's snapshot tree: a then b, restoring
   each (a file's state follows), kept across the lease's own reset, removed child-first at release; the refusals (not
   running, reserved or bad name, duplicate, cap, disk floor, unknown name, unconfirmed C:\build after a restore); the

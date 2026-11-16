@@ -618,7 +618,7 @@ try {
     'restore' {
       $vm = Get-OwnVm $a
       $cp = Get-VMSnapshot -VM $vm | Where-Object { $_.Id.ToString() -eq [string]$a.checkpointId }
-      if (-not $cp) { throw 'its clean checkpoint (by id) is missing' }
+      if (-not $cp) { throw "its $(if ($a.label) { [string]$a.label } else { 'clean' }) checkpoint (by id) is missing" }
       if ($vm.State -eq 'Saved') { Remove-VMSavedState -VM $vm }
       elseif ($vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -Force }
       Restore-VMSnapshot -VMSnapshot $cp -Confirm:$false
@@ -661,6 +661,28 @@ try {
       elseif ($vm.State -ne 'Off') { Stop-VM -VM $vm -TurnOff -Force }
       Restore-VMSnapshot -VMSnapshot $cp -Confirm:$false
       Facts $vm
+    }
+    # MC-1532: a pool checkpoint's steps. The guest is shut down cleanly (never turned off), its network disconnected only
+    # (net-off would turn the VM off too), and the checkpoint taken of the Off VM, so it holds no runtime state.
+    'net-disconnect' {
+      $vm = Get-OwnVm $a
+      Get-VMNetworkAdapter -VM $vm | Disconnect-VMNetworkAdapter
+      Facts $vm
+    }
+    'guest-shutdown' {
+      $vm = Get-OwnVm $a
+      if ($vm.State -eq 'Running') { Stop-VM -VM $vm -Force -ErrorAction Stop }
+      $t = (Get-Date).AddMinutes(5)
+      while ((Get-VM -Id $vm.Id).State -ne 'Off' -and (Get-Date) -lt $t) { Start-Sleep 2 }
+      Facts $vm
+    }
+    'pool-take' {
+      $vm = Get-OwnVm $a
+      if ($vm.State -ne 'Off') { throw "the VM is $($vm.State), not Off" }
+      if ([string]$a.snapName -notmatch '^hvmcp-pool-[0-9a-f]{12}$') { throw 'bad checkpoint name' }
+      $cp = $null; $err = $null
+      try { $cp = Checkpoint-VM -VM $vm -SnapshotName ([string]$a.snapName) -Passthru -ErrorAction Stop } catch { $err = $_.Exception.Message }
+      if ($err) { @{ failed = $true; error = $err } } else { @{ checkpointId = $cp.Id.ToString() } }
     }
     'checkpoint-type' {
       # MC-1529: the VM's checkpoint type, read, or set and read back (an interrupted take's type is put back by this).

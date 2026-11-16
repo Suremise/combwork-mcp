@@ -28,7 +28,7 @@ test('tools, instructions and the kill switch', async t => {
   assert.strictEqual(init.result.serverInfo.name, 'hyper-v')
   assert.match(init.result.instructions, /turned off/)
   const list = await off.request('tools/list')
-  assert.deepStrictEqual(list.result.tools.map(x => x.name), ['vm_acquire', 'vm_start', 'vm_renew', 'vm_sync', 'vm_reset', 'vm_run', 'vm_read_out', 'vm_stop', 'vm_checkpoint', 'vm_restore', 'vm_release', 'vm_status', 'pool_plan', 'pool_create', 'pool_resize', 'pool_remove', 'pool_status'])
+  assert.deepStrictEqual(list.result.tools.map(x => x.name), ['vm_acquire', 'vm_start', 'vm_renew', 'vm_sync', 'vm_reset', 'vm_run', 'vm_read_out', 'vm_stop', 'vm_checkpoint', 'vm_restore', 'vm_release', 'vm_status', 'pool_plan', 'pool_checkpoint', 'pool_create', 'pool_resize', 'pool_remove', 'pool_status'])
   assert.match((await off.call('vm_acquire')).text, /turned off: set HYPERV_MCP_ENABLED=1/)
   assert.match((await off.call('vm_status')).text, /Mode: direct.*TURNED OFF/)
   assert.ok(fs.existsSync(sc.stateDir))

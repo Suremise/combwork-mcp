@@ -264,6 +264,22 @@ function run(s, op, a) {
       return facts(vm)
     }
     case 'facts-vm': return facts(own(s, a))
+    // MC-1532: a pool checkpoint's steps. Knobs: disconnectFails (the adapter stays connected), shutdownFails (the guest
+    // stays Running), poolTakeFail (Hyper-V's terminal failure), poolTakeEntered + poolTakeGate (held before the take).
+    case 'net-disconnect': { const vm = own(s, a); if (!s.disconnectFails) vm.switchName = null; return facts(vm) }
+    case 'guest-shutdown': { const vm = own(s, a); if (!s.shutdownFails) { vm.state = 'Off'; vm.loggedOn = null; vm.watcher = false } return facts(vm) }
+    case 'pool-take': {
+      const vm = own(s, a)
+      if (s.poolTakeEntered) fs.writeFileSync(s.poolTakeEntered, 'entered')
+      if (s.poolTakeGate) while (!fs.existsSync(s.poolTakeGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25)
+      if (vm.state !== 'Off') throw new Error(`the VM is ${vm.state}, not Off`)
+      if (!/^hvmcp-pool-[0-9a-f]{12}$/.test(a.snapName)) throw new Error('bad checkpoint name')
+      if (s.poolTakeFail) return { failed: true, error: 'injected: Hyper-V could not take it' }
+      const id = crypto.randomUUID()
+      vm.checkpoints.push({ id, name: a.snapName, parentId: vm.parent, disk: { ...vm.disk }, userinit: vm.userinit ?? null, enableLUA: vm.enableLUA ?? 1 })
+      vm.parent = id
+      return { checkpointId: id }
+    }
     // A take Hyper-V hasn't finished (productionFailDelayed) is a running job until it appears; jobsUnreadable fails.
     case 'jobs-idle': {
       if (s.jobsUnreadable) throw new Error('injected: the job state is unreadable')
