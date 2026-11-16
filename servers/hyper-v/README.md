@@ -37,7 +37,8 @@ Hyper-V Administrators, so agents running as you can't drive Hyper-V directly.
   **Hyper-V**, then restart) and virtualisation on in the firmware.
 - **Node 18+**, installed for all users (under `Program Files`): the service runs it, so it must be a copy only
   administrators can change. Setup checks this.
-- A **Windows 11 Enterprise evaluation ISO** for the pool's VMs (see "The image").
+- A **Windows 11 x64 ISO** for the pool's VMs: Microsoft's Enterprise evaluation, or your own non-evaluation copy
+  (Enterprise, Pro or Education) with its product key (see "The image").
 - Disk space: about 40 GB per VM, plus the ISO (7 GB).
 
 ## Safety at a glance
@@ -76,6 +77,11 @@ and test accounts.
   - Anything at all against a determined agent, in **direct mode** (below).
 
 ## Setup
+
+**Upgrading from an earlier release:** run setup again (step 2, the same line) in an admin Windows PowerShell before
+using the new server: the helper's protocol and features changed, and an older helper refuses each newer feature with
+"run setup again". The pool's VMs and images are kept; pass the same options you used before (`-DiskFolder`,
+`-BuildRoot` and the rest), since a rerun replaces them.
 
 1. Turn on Hyper-V (see Requirements), and check `Get-Service vmms` says Running.
 2. In an **admin PowerShell**, run setup once (one line). Name a folder for the VMs' disks on a drive with room:
@@ -570,7 +576,7 @@ names it, so a newer helper keeps serving older servers:
 - feature `images` (protocol 3): image groups, `vm_acquire`'s `os` and `image`, shares by OS, a project's image list.
   The server sends no `vm_acquire` at all for an `image`, or an OS other than Windows, to a helper without it.
 
-The helper stays at protocol 3 for these features because hyper-v 1.2.0's server asks for exactly hyperv-mcp/3 before an
+The helper stays at protocol 3 for these features because an earlier server (MC-1503's) asks for exactly hyperv-mcp/3 before an
 interactive run: it keeps working with this helper. An older helper refuses each newer feature with "run setup again"
 rather than quietly ignoring it. A newer feature also needs the newer server: an agent's server loads at its start, so
 update the server (and restart the agent) as well as the helper.
