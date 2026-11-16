@@ -151,6 +151,9 @@ async function hardKill(env) {
     const runDir = fs.readdirSync(path.join(DIR, 'sandbox')).map(d => path.join(DIR, 'sandbox', d)).find(d => fs.existsSync(path.join(d, 'state.json')) && JSON.parse(fs.readFileSync(path.join(d, 'state.json'), 'utf8')).id === hk.id)
     let w = null
     for (let i = 0; i < 20 && !w; i++) { try { w = JSON.parse(fs.readFileSync(path.join(runDir, 'watchdog.json'), 'utf8')) } catch { await new Promise(r => setTimeout(r, 500)) } }
+    // MC-1538: the watchdog's report as it stood before the fallback stop (below, in finally): a watchdog still
+    // retrying afterwards can find the Sandbox gone and rewrite its report as stopped.
+    hk.watchdog = w
     check('hard kill: watchdog.json says stopped', w?.stopped === true && w.reason === 'server gone', JSON.stringify(w))
   } catch (e) {
     check('hard kill: no exception', false, e.stack)

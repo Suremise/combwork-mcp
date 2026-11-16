@@ -14,6 +14,10 @@ const { readFileSync, writeFileSync, appendFileSync, renameSync } = require('fs'
 const { join } = require('path')
 const { stopConfirmed } = require('./wsb')
 
+// MC-1538: tags the wsb calls this process makes (inherited by each one it spawns): the tests' wsb stub can then fail
+// only the watchdog's stops. wsb.exe ignores it.
+process.env.WSB_CALLER = 'watchdog'
+
 const runDir = process.argv[2]
 const state = JSON.parse(readFileSync(join(runDir, 'state.json'), 'utf8'))
 const CHECK_MS = Number(process.env.WSB_WATCHDOG_CHECK_MS || 2000)
