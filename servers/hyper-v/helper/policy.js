@@ -62,6 +62,8 @@ function problems(p) {
   // VM folder's drive must keep for a take.
   if (p.maxLeaseCheckpoints !== undefined && !int(p.maxLeaseCheckpoints, 0, 8)) out.push('maxLeaseCheckpoints must be 0-8')
   if (p.minFreeGBForCheckpoint !== undefined && !int(p.minFreeGBForCheckpoint, 1, 1024)) out.push('minFreeGBForCheckpoint must be 1-1024')
+  // MC-1532: pool checkpoints per VM, optional (default 4), counting retiring ones and ones being taken.
+  if (p.maxCheckpointsPerVm !== undefined && !int(p.maxCheckpointsPerVm, 0, 8)) out.push('maxCheckpointsPerVm must be 0-8')
   if (typeof p.allowUnpinnedIso !== 'boolean') out.push('allowUnpinnedIso must be true or false')
   // Build folders an admin named at setup (install.ps1 -BuildRoot): optional, so a policy from before it stays usable.
   if (p.buildRoots !== undefined) {
