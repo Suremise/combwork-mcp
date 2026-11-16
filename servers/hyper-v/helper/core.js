@@ -128,6 +128,7 @@ class Helper {
     this.poolLock = mutex()
     this.vmLocks = new Map()
     this.unknownSnapshots = new Map() // MC-1529: vmId -> names of checkpoints neither clean nor a lease's: left alone
+    this.pcpBusy = new Set() // MC-1532: VMs a pool-checkpoint operation has reserved: never leased or cleaned meanwhile
     this.leases = new Map() // vmId -> lease
     this.conns = new Map() // connId -> { pid, vmId }
     this.job = null // the pool job in progress: { jobId, op, progress, promise }
@@ -334,7 +335,7 @@ class Helper {
   freeVms() {
     const s = this.state
     const now = this.now()
-    return [...s.vms.values()].filter(v => v.ready && !v.removing && !s.quarantined.has(v.vmId) && !this.leases.has(v.vmId) && (evalEnd(v) ?? Infinity) - now >= EVAL_LAST_MS)
+    return [...s.vms.values()].filter(v => v.ready && !v.removing && !s.quarantined.has(v.vmId) && !this.leases.has(v.vmId) && !this.pcpBusy.has(v.vmId) && (evalEnd(v) ?? Infinity) - now >= EVAL_LAST_MS)
   }
 
   // ---------- projects, fair share and the queue (MC-1502) ----------
@@ -426,10 +427,38 @@ class Helper {
       const img = this.imageOf(v)
       if (this.osOf(v) !== want.os) return false
       if (want.vm && v.vmName !== want.vm) return false
+      if (want.checkpoint && !this.poolCheckpointOn(v.vmId, want.checkpoint)) return false
       if (want.image && img !== want.image) return false
       if (p?.images.length && !p.images.includes(img)) return false
       return true
     }).sort((a, b) => failedAt(a) - failedAt(b))
+  }
+
+  /**
+   * MC-1532: what a lease's start or reset restores: null (clean) for 'clean'; with no name, the lease's own start
+   * point; a name, this VM's published checkpoint of it, or one this lease already pinned (even retiring). Never another
+   * VM's, and never clean in place of a missing one.
+   */
+  startTarget(lease, checkpoint) {
+    if (checkpoint !== undefined && checkpoint.toLowerCase() === 'clean') return null
+    if (checkpoint === undefined) return lease.startFrom ? { ...lease.startFrom } : null
+    const p = this.poolCheckpointOn(lease.vmId, checkpoint)
+    if (p) return { name: p.name, checkpointId: p.checkpointId }
+    const pinned = [...lease.refs].map(id => this.state.poolSnaps.get(id)).find(x => x && x.name.toLowerCase() === checkpoint.toLowerCase())
+    if (pinned) return { name: pinned.name, checkpointId: pinned.checkpointId }
+    throw new Error(`${lease.vmName} has no pool checkpoint "${checkpoint}" (nothing was restored; vm_start({ checkpoint: 'clean' }) for clean).`)
+  }
+
+  /** MC-1532: the published, not retiring, pool checkpoints of this name (case-insensitive), on any VM. */
+  poolCheckpointsNamed(name) {
+    const n = String(name).toLowerCase()
+    return [...this.state.poolSnaps.values()].filter(x => !x.retiring && x.name.toLowerCase() === n && this.state.vms.get(x.vmId)?.ready)
+  }
+
+  /** MC-1532: this VM's published, not retiring, pool checkpoint of this name, or null. */
+  poolCheckpointOn(vmId, name) {
+    const n = String(name).toLowerCase()
+    return [...this.state.poolSnaps.values()].find(x => x.vmId === vmId && !x.retiring && x.name.toLowerCase() === n) || null
   }
 
   /** A VM's failed last start, for the lease text and vm_status, or ''. */
@@ -451,6 +480,7 @@ class Helper {
     if (cap !== undefined && this.held(project, want.os) >= cap) return `project ${project} holds its ${want.os} cap of ${cap}`
     if (this.candidates(project, want).length) return null
     if (want.vm) return this.namedWhy(want.vm) || `${want.vm} is not free`
+    if (want.checkpoint) return this.poolCheckpointsNamed(want.checkpoint).length ? `no VM with the pool checkpoint "${want.checkpoint}" is free` : `no VM has the pool checkpoint "${want.checkpoint}" now (it was removed)`
     return want.image ? `none of image ${want.image.slice(0, 12)} is free` : this.freeVms().some(v => this.osOf(v) === want.os) || want.os === 'windows' ? 'none is free' : `the pool has no free ${want.os} VM`
   }
 
@@ -472,18 +502,24 @@ class Helper {
       project, os: this.osOf(vm), image: this.imageOf(vm),
       // interactive: the account logged on in the guest by this start ('user' or 'admin'), or null.
       interactive: null,
+      // MC-1532: the pool checkpoint this lease starts from by default ({ name, checkpointId }, exact; null = clean), and
+      // every pool checkpoint id it has started or reset from (pinned: a retiring one stays usable by this lease).
+      startFrom: null, refs: new Set(),
       // What the helper knows of the guest's C:\build (vm_sync): the files it placed, by canonical key; gen moves on at
       // every start, sync and the lease's end (a plan from an earlier gen is stale); trusted is false while an apply
       // is unfinished or after one failed, when only a full sync or a reset may follow.
       sync: { record: new Map(), gen: 0, trusted: false, plan: null }
     }
+    // MC-1532: a lease acquired by a pool checkpoint starts from that exact checkpoint by default (pinned).
+    if (want.checkpoint) { const p = this.poolCheckpointOn(vm.vmId, want.checkpoint); lease.startFrom = { name: p.name, checkpointId: p.checkpointId }; lease.refs.add(p.checkpointId) }
     this.leases.set(vm.vmId, lease)
     c.vmId = vm.vmId
     this.armDeadline(lease)
     const share = `${project === 'other' ? '' : ` for project ${project}`}${this.osOf(vm) === 'windows' && !want.image ? '' : ` (${this.osOf(vm)}, image ${this.imageOf(vm).slice(0, 12)})`}`
     const failed = this.failedNote(vm)
     const cap = licenceEnd !== null && sessionEnd === licenceEnd ? `its Windows evaluation's end` : `the policy's work-session cap`
-    return { text: `Leased ${vm.vmName} (lease ${lease.leaseId})${share} until ${new Date(lease.deadline).toISOString()}; vm_renew can extend it up to ${new Date(sessionEnd).toISOString()} (${cap}). Call vm_start next; always vm_release when done.${failed ? ` Note: ${failed}; every free VM that fitted had a failed start, and this one's was the longest ago.` : ''}`, data: { lease: lease.leaseId, vm: vm.vmName, deadline: lease.deadline, sessionEnd, project, os: lease.os, image: lease.image } }
+    const from = lease.startFrom ? ` It starts from the pool checkpoint "${lease.startFrom.name}" (vm_start({ checkpoint: 'clean' }) for clean).` : ''
+    return { text: `Leased ${vm.vmName} (lease ${lease.leaseId})${share} until ${new Date(lease.deadline).toISOString()}; vm_renew can extend it up to ${new Date(sessionEnd).toISOString()} (${cap}). Call vm_start next; always vm_release when done.${from}${failed ? ` Note: ${failed}; every free VM that fitted had a failed start, and this one's was the longest ago.` : ''}`, data: { lease: lease.leaseId, vm: vm.vmName, deadline: lease.deadline, sessionEnd, project, os: lease.os, image: lease.image } }
   }
 
   /** Settles an entry's waiting request once: with a result, or an error. Its token makes a late timer a no-op. */
@@ -542,10 +578,11 @@ class Helper {
    * the next call. A newer call from the same connection supersedes a waiting one. The pool lock is held only for these
    * decisions, never while waiting.
    */
-  async acquire(connId, { minutes = 60, keepOnFailure = false, wait = false, roots, os: osAsked, image, vm: named } = {}) {
+  async acquire(connId, { minutes = 60, keepOnFailure = false, wait = false, roots, os: osAsked, image, vm: named, checkpoint } = {}) {
     // MC-1523: an omitted os stays omitted until a named VM is resolved (its own OS then); unnamed, it means windows.
     if (osAsked !== undefined && !OSES.includes(osAsked)) throw new Error(`os must be ${OSES.join(' or ')}`)
     if (named !== undefined && (typeof named !== 'string' || !named || named.length > 64)) throw new Error('vm must be a VM name from vm_status.')
+    if (checkpoint !== undefined && (typeof checkpoint !== 'string' || !POOL_CHECKPOINT_RE.test(checkpoint))) throw new Error("checkpoint must be a pool checkpoint's name (vm_status lists them).")
     const os = osAsked ?? 'windows'
     const step = await this.poolLock(async () => {
       if (this.quiesced) throw new Error('The helper is being uninstalled: no new leases.')
@@ -571,6 +608,17 @@ class Helper {
       } else {
         want = { os, ...(image !== undefined ? { image: this.verifiedImage(image).sha256 } : {}) }
         if (want.image && (this.state.images.get(want.image)?.os || 'windows') !== os) throw new Error(`image ${want.image.slice(0, 12)} is a ${this.state.images.get(want.image)?.os || 'windows'} image, not ${os}.`)
+      }
+      if (checkpoint !== undefined) {
+        // MC-1532: only VMs with this published (not retiring) pool checkpoint. A vm narrows first; then os and image.
+        let have = this.poolCheckpointsNamed(checkpoint)
+        if (named !== undefined) have = have.filter(x => s.vms.get(x.vmId)?.vmName === named)
+        if (!have.length) throw new Error(named !== undefined ? `${named} has no pool checkpoint "${checkpoint}" (vm_status lists each VM's).` : `No VM has a pool checkpoint "${checkpoint}" (vm_status lists them).`)
+        if (osAsked !== undefined) { have = have.filter(x => this.osOf(s.vms.get(x.vmId)) === osAsked); if (!have.length) throw new Error(`No ${osAsked} VM has a pool checkpoint "${checkpoint}".`) }
+        if (want.image) { have = have.filter(x => this.imageOf(s.vms.get(x.vmId)) === want.image); if (!have.length) throw new Error(`No VM of image ${want.image.slice(0, 12)} has a pool checkpoint "${checkpoint}".`) }
+        const oses = [...new Set(have.map(x => this.osOf(s.vms.get(x.vmId))))]
+        if (oses.length > 1) throw new Error(`The pool checkpoint "${checkpoint}" is on ${oses.join(' and ')} VMs: give os to choose.`)
+        want = { ...want, os: oses[0], checkpoint: have[0].name }
       }
       this.dropExpired()
       let e = this.queue.find(x => x.connId === connId)
@@ -698,12 +746,15 @@ class Helper {
    * Turns the VM off, restores the clean checkpoint by id, and verifies the baseline. Quarantines it on failure.
    * Returns { ok, text }.
    */
-  async restore(vm) {
+  async restore(vm, target = null) {
     let facts = null
     let why = null
+    // MC-1532: a lease's start may restore one of the VM's pool checkpoints instead of clean (by its exact id); the
+    // baseline is then checked against that id. Everything else (release, recovery, retries) restores clean.
+    const to = target ? target.checkpointId : vm.cleanCheckpointId
     try {
-      facts = await this.hv('restore', { ...this.ident(vm), checkpointId: vm.cleanCheckpointId })
-      why = baselineProblem(facts, vm)
+      facts = await this.hv('restore', { ...this.ident(vm), checkpointId: to, label: target ? `"${target.name}"` : 'clean' })
+      why = baselineProblem(facts, { ...vm, cleanCheckpointId: to })
     } catch (e) {
       why = e.message
     }
@@ -716,7 +767,7 @@ class Helper {
       return { ok: false, text: `CLEANUP FAILED: ${vm.vmName} could not be confirmed clean (${why}). It is quarantined (never leased) until a restore confirms it; the helper retries every few minutes.` }
     }
     if (s.quarantined.has(vm.vmId)) this.journal.append({ t: 'unquarantine', vmId: vm.vmId })
-    return { ok: true, text: `${vm.vmName} restored to clean (Off, at its clean checkpoint, network disconnected, no CPU reserve).` }
+    return { ok: true, text: target ? `${vm.vmName} restored to its pool checkpoint "${target.name}".` : `${vm.vmName} restored to clean (Off, at its clean checkpoint, network disconnected, no CPU reserve).` }
   }
 
   /**
@@ -730,17 +781,21 @@ class Helper {
     const keep = live && !live.ending ? live.leaseId : null
     const all = [...this.state.leaseSnaps.values()].filter(x => x.vmId === vm.vmId)
     const mine = all.filter(x => x.leaseId !== keep)
+    // MC-1532: the VM's pool checkpoints are owned too. Published ones are never removed here; retiring ones are,
+    // once no live lease holds the VM (a lease that pinned one keeps using it until it ends).
+    const pool = [...this.state.poolSnaps.values()].filter(x => x.vmId === vm.vmId)
+    const retiring = live && !live.ending ? [] : pool.filter(x => x.retiring)
     // A start within a live lease with nothing to drop doesn't look (one Hyper-V call fewer on every start).
-    if (!mine.length && keep) return null
+    if (!mine.length && !retiring.length && keep) return null
     let list
-    try { list = (await this.hv('snapshots', this.ident(vm))).snapshots || [] } catch (e) { return mine.length ? `lease checkpoint cleanup pending: ${e.message}` : null }
+    try { list = (await this.hv('snapshots', this.ident(vm))).snapshots || [] } catch (e) { return mine.length || retiring.length ? `lease checkpoint cleanup pending: ${e.message}` : null }
     // Ownership by identity: a confirmed take by its id, an unconfirmed one by its unique name. Anything else that
     // isn't clean (a same-named snapshot with another id included) is unknown: reported, never deleted.
-    const ownedIds = new Set(all.filter(x => x.checkpointId).map(x => x.checkpointId))
+    const ownedIds = new Set([...all.filter(x => x.checkpointId).map(x => x.checkpointId), ...pool.map(x => x.checkpointId)])
     const pendingNames = new Set(all.filter(x => !x.checkpointId).map(x => x.snapName))
     const unknown = list.filter(x => x.id !== vm.cleanCheckpointId && !ownedIds.has(x.id) && !pendingNames.has(x.name)).map(x => `${x.name} (${x.id})`)
     if (unknown.length) this.unknownSnapshots.set(vm.vmId, unknown); else this.unknownSnapshots.delete(vm.vmId)
-    if (!mine.length) return null
+    if (!mine.length && !retiring.length) return null
     const byId = new Map(list.map(x => [x.id, x]))
     const depth = x => { let d = 0; for (let p = x.parentId; p && byId.has(p) && d < 64; p = byId.get(p).parentId) d++; return d }
     const targets = []
@@ -770,8 +825,24 @@ class Helper {
         targets.push({ x, snap: ys[0] || null })
       }
     }
+    // Retiring pool checkpoints (MC-1532): by their exact id and name; the known id under another name is left alone.
+    for (const p of retiring) {
+      const y = byId.get(p.checkpointId)
+      if (y && y.name !== p.snapName) return `pool checkpoint cleanup pending: "${p.name}"'s id ${p.checkpointId} now has the name "${y.name}"`
+      targets.push({ x: { ...p, pool: true }, snap: y || null })
+    }
     targets.sort((a, b) => (b.snap ? depth(b.snap) : -1) - (a.snap ? depth(a.snap) : -1))
     for (const { x, snap } of targets) {
+      if (x.pool) {
+        // A retiring pool checkpoint: removed, or already gone (its id was confirmed, so absence is definitive).
+        if (snap) {
+          let gone = false
+          try { gone = (await this.hv('snapshot-remove', { ...this.ident(vm), checkpointId: snap.id, snapName: x.snapName })).removed === true } catch (e) { return `pool checkpoint cleanup pending: removing "${x.name}" failed (${e.message})` }
+          if (!gone) return `pool checkpoint cleanup pending: "${x.name}" is still there`
+        }
+        this.journal.append({ t: 'pcp-retired', checkpointId: x.checkpointId })
+        continue
+      }
       if (snap) {
         if (!x.dropping) this.journal.append({ t: 'lcp-drop', opId: x.opId })
         let gone = false
@@ -1045,9 +1116,10 @@ class Helper {
 
   // ---------- runs ----------
 
-  async start(connId, { network = false, reserveCpu = 0, interactive = false } = {}) {
+  async start(connId, { network = false, reserveCpu = 0, interactive = false, checkpoint } = {}) {
     const lease = this.leaseOf(connId)
     const c = this.conns.get(connId)
+    if (checkpoint !== undefined && (typeof checkpoint !== 'string' || !POOL_CHECKPOINT_RE.test(checkpoint))) throw new Error("checkpoint must be 'clean' or one of this VM's pool checkpoints (vm_status lists them).")
     if (![false, 'user', 'admin'].includes(interactive)) throw new Error("interactive must be false, 'user' or 'admin'")
     if (lease.kept) throw new Error(`${lease.vmName} is kept for inspection: vm_release it, then vm_acquire again (a release restores it).`)
     if (network && !this.policy.allowNetwork) throw new Error('The policy does not allow networking.')
@@ -1058,6 +1130,9 @@ class Helper {
     const vm = this.vmOf(lease)
     return this.vmLock(vm.vmId)(async () => {
       this.stillHeld(lease)
+      // MC-1532: what to start from (resolved under the lock): 'clean', a name, or the lease's own start point.
+      const target = this.startTarget(lease, checkpoint)
+      if (target) lease.refs.add(target.checkpointId) // pinned before the restore, so a pending one counts
       const t0 = this.now()
       lease.running = false
       lease.failed = false
@@ -1069,7 +1144,7 @@ class Helper {
       s.plan = null
       s.trusted = false
       s.record = new Map()
-      const r = await this.restore(vm) // unconditionally, before every run
+      const r = await this.restore(vm, target) // unconditionally, before every run
       if (!r.ok) { lease.dirty = true; throw new Error(`${r.text} The start was refused.`) }
       const tRestore = this.now()
       // Every stage of a start is the lease's: its Hyper-V calls are registered with it (ending the lease kills them), and
@@ -1114,7 +1189,7 @@ class Helper {
       }
       s.trusted = true
       return {
-        text: `Started ${vm.vmName} from its clean checkpoint: restore ${((tRestore - t0) / 1000).toFixed(1)} s, guest ready after ${(waited / 1000).toFixed(1)} s${logon}; ${build}; network ${network ? `ON (internal switch ${this.state.switch.name})` : 'off'}; CPU reserve ${reserveCpu}%. C:\\out is empty. Deadline ${new Date(lease.deadline).toISOString()}.`,
+        text: `Started ${vm.vmName} from ${target ? `its pool checkpoint "${target.name}"` : 'its clean checkpoint'}: restore ${((tRestore - t0) / 1000).toFixed(1)} s, guest ready after ${(waited / 1000).toFixed(1)} s${logon}; ${build}; network ${network ? `ON (internal switch ${this.state.switch.name})` : 'off'}; CPU reserve ${reserveCpu}%. C:\\out is empty. Deadline ${new Date(lease.deadline).toISOString()}.`,
         data: { vm: vm.vmName, network: !!network, reserveCpu, interactive }
       }
     })
@@ -1380,7 +1455,7 @@ class Helper {
 
   /** MC-1529: this lease's checkpoints, journalled and not dropped (a take not yet confirmed included). */
   leaseCheckpoints(lease) {
-    return [...this.state.leaseSnaps.values()].filter(x => x.leaseId === lease.leaseId && x.vmId === lease.vmId && !x.dropping)
+    return [...this.state.leaseSnaps.values()].filter(x => x.leaseId === lease.leaseId && x.vmId === lease.vmId && !x.dropping && !x.snapName.startsWith('hvmcp-pool-'))
   }
 
   /**
@@ -1530,9 +1605,14 @@ class Helper {
       // MC-1529: the caller's own lease checkpoints (only theirs), and checkpoints neither clean nor a lease's, left alone.
       const cps = l && v.vmId === mine ? this.leaseCheckpoints(l) : []
       const cpNote = cps.length ? `; your checkpoints: ${cps.map(x => `"${x.name}" (${x.checkpointId ? `taken ${x.at}` : 'unconfirmed'})`).join(', ')}` : ''
+      // MC-1532: the VM's pool checkpoints, with their provenance (a shared name doesn't mean identical contents), and a
+      // lease's start point.
+      const pcs = [...s.poolSnaps.values()].filter(x => x.vmId === v.vmId)
+      const pcNote = pcs.length ? `; pool checkpoints: ${pcs.map(x => `"${x.name}" (owner ${x.owner}, ${x.os}, image ${x.image === 'legacy' ? 'unknown' : String(x.image).slice(0, 12)}, taken ${x.at} from lease ${x.sourceLease}${x.retiring ? ', RETIRING: no longer offered' : ''})`).join(', ')}` : ''
+      const fromNote = l?.startFrom ? `; starts from "${l.startFrom.name}"` : ''
       const unknown = this.unknownSnapshots.get(v.vmId)
       const unknownNote = unknown?.length ? `; unknown checkpoints left alone: ${unknown.join(', ')}` : ''
-      return `- ${v.vmName}: ${this.osOf(v)}, image ${img === 'legacy' ? 'unknown (made before images were recorded)' : img.slice(0, 12)}; ${v.cores} cores, ${v.memoryMB} MB, ${v.diskGB} GB disk; ${state}${v.vmId === mine ? ' (yours)' : ''}${expiry(v, this.now())}${failed ? `; ${failed}` : ''}${cpNote}${unknownNote}`
+      return `- ${v.vmName}: ${this.osOf(v)}, image ${img === 'legacy' ? 'unknown (made before images were recorded)' : img.slice(0, 12)}; ${v.cores} cores, ${v.memoryMB} MB, ${v.diskGB} GB disk; ${state}${v.vmId === mine ? ' (yours)' : ''}${expiry(v, this.now())}${failed ? `; ${failed}` : ''}${fromNote}${pcNote}${cpNote}${unknownNote}`
     })
     const img = [...s.images.values()].at(-1)
     const lines = [
@@ -1557,7 +1637,8 @@ class Helper {
   /** pool_plan: read-only apart from writing the plan record (and starting an image check if one is needed). */
   async plan(args = {}) {
     const op = args.action ?? 'create'
-    if (!['create', 'resize', 'remove'].includes(op)) throw new Error('action must be create, resize or remove')
+    if (op === 'checkpoint' || op === 'checkpoint-remove') return this.planCheckpoint(args)
+    if (!['create', 'resize', 'remove'].includes(op)) throw new Error('action must be create, resize, remove, checkpoint or checkpoint-remove')
     const s = this.state
     const pool = [...s.vms.values()]
     const facts = await this.hv('facts', { folders: this.policy.diskFolders })
@@ -1620,6 +1701,58 @@ class Helper {
     const bytes = Buffer.from(canonical(plan), 'utf8')
     const file = join(this.dir, 'plans', `${plan.id}.json`)
     fs.writeFileSync(file, bytes, { flag: 'wx' })
+    const digest = sha256(bytes)
+    return { text: describePlan(plan, digest, this.approveLine(plan.id)), data: { planId: plan.id, digest } }
+  }
+
+  /**
+   * MC-1532: a pool-checkpoint plan. Publish (or replace, replace: true) a named checkpoint of each listed VM's current
+   * state: each must be leased now by a live lease of the caller's project, which owns it. Remove (checkpoint-remove):
+   * each VM's published checkpoint of the name, owned by the caller's project. Bound to the exact VM ids, lease ids,
+   * owner, images and (replace, remove) the checkpoint ids; checked against the cap and the disk floor.
+   */
+  async planCheckpoint(args) {
+    const mode = args.action === 'checkpoint-remove' ? 'remove' : args.replace === true ? 'replace' : 'publish'
+    const name = args.name
+    if (typeof name !== 'string' || !POOL_CHECKPOINT_RE.test(name) || name.toLowerCase() === 'clean') throw new Error('name must be 1-40 letters, digits, spaces, dots, dashes, pluses or underscores, starting with a letter or digit, and not "clean".')
+    const list = Array.isArray(args.targets) ? args.targets : Array.isArray(args.vms) ? args.vms : []
+    const names = [...new Set(list)]
+    if (!names.length || names.length > 16 || names.some(n => typeof n !== 'string')) throw new Error('targets must list 1-16 VM names (vm_status lists them).')
+    const project = this.projectOf(args.roots)
+    const s = this.state
+    const cap = this.policy.maxCheckpointsPerVm ?? 4
+    const floor = this.policy.minFreeGBForCheckpoint ?? 20
+    const facts = mode === 'remove' ? null : await this.hv('facts', { folders: this.policy.diskFolders })
+    const entries = []
+    for (const n of names) {
+      const vm = [...s.vms.values()].find(v => v.vmName === n)
+      if (!vm || !vm.ready) throw new Error(`No ready VM named ${n} in the pool.`)
+      const mine = [...s.poolSnaps.values()].filter(x => x.vmId === vm.vmId)
+      const same = mine.find(x => !x.retiring && x.name.toLowerCase() === name.toLowerCase())
+      const e = { vmId: vm.vmId, name: vm.vmName, image: this.imageOf(vm), os: this.osOf(vm) }
+      if (mode === 'remove') {
+        if (!same) throw new Error(`${n} has no pool checkpoint "${name}".`)
+        if (same.owner !== project) throw new Error(`"${name}" on ${n} belongs to project ${same.owner}: only its owner removes it.`)
+        entries.push({ ...e, checkpointId: same.checkpointId, owner: same.owner })
+        continue
+      }
+      const lease = this.leases.get(vm.vmId)
+      if (!lease || lease.ending) throw new Error(`${n} isn't leased: a pool checkpoint is taken of the state a lease prepared on it.`)
+      if (lease.project !== project) throw new Error(`${n} is leased by project ${lease.project}, not yours (${project}).`)
+      if (mode === 'publish' && mine.some(x => x.name.toLowerCase() === name.toLowerCase())) throw new Error(`${n} already has a pool checkpoint "${name}"${mine.find(x => x.name.toLowerCase() === name.toLowerCase()).retiring ? ' (retiring)' : ''}: use replace: true to replace it.`)
+      if (mode === 'replace') {
+        if (!same) throw new Error(`${n} has no pool checkpoint "${name}" to replace.`)
+        if (same.owner !== project) throw new Error(`"${name}" on ${n} belongs to project ${same.owner}: only its owner replaces it.`)
+      }
+      const pending = [...s.leaseSnaps.values()].filter(x => x.vmId === vm.vmId && x.snapName.startsWith('hvmcp-pool-')).length
+      if (mine.length + pending + 1 > cap) throw new Error(`${n} would hold more than the policy's maxCheckpointsPerVm (${cap}) pool checkpoints (${mine.length} now, retiring included${pending ? `, ${pending} being taken` : ''}).`)
+      const folder = (facts.folders || []).find(x => vm.folder.toLowerCase().startsWith(x.folder.toLowerCase()))
+      if (!folder || folder.freeGB < floor) throw new Error(`${n}'s drive has ${folder?.freeGB ?? 'unknown'} GB free, under the ${floor} GB a checkpoint must leave.`)
+      entries.push({ ...e, leaseId: lease.leaseId, owner: project, ...(same ? { replaces: same.checkpointId } : {}) })
+    }
+    const plan = { id: `p-${hex(8)}`, op: 'checkpoint', mode, checkpoint: name, epoch: this.journal.epoch, created: this.now(), expires: this.now() + PLAN_TTL_MS, prefix: this.policy.prefix, vms: entries }
+    const bytes = Buffer.from(canonical(plan), 'utf8')
+    fs.writeFileSync(join(this.dir, 'plans', `${plan.id}.json`), bytes, { flag: 'wx' })
     const digest = sha256(bytes)
     return { text: describePlan(plan, digest, this.approveLine(plan.id)), data: { planId: plan.id, digest } }
   }
@@ -1698,6 +1831,161 @@ class Helper {
       ).finally(() => { this.job = null; this.kick() })
       return { text: `Approved plan ${planId} accepted: pool job ${jobId} (${op}) is running. ${op === 'remove' ? '' : 'Creating a VM installs Windows unattended: about 20-40 minutes each, one at a time. '}Follow it with pool_status.`, data: { jobId } }
     })
+  }
+
+  /**
+   * MC-1532: pool_checkpoint. Carries out an approved pool-checkpoint plan, VM by VM (each commits on its own; the reply
+   * lists each one's outcome). The approval's nonce is used up whatever happens.
+   */
+  async poolCheckpoint(connId, { planId } = {}) {
+    if (typeof planId !== 'string' || !PLAN_ID_RE.test(planId)) throw new Error('planId must be a plan id from pool_plan (p- and 16 hex digits)')
+    // The approval, checked and used up under the pool lock (briefly): never held across Hyper-V work.
+    const plan = await this.poolLock(async () => {
+      if (this.quiesced) throw new Error('The helper is being uninstalled: no pool changes.')
+      let bytes
+      try { bytes = fs.readFileSync(join(this.dir, 'plans', `${planId}.json`)) } catch { throw new Error(`No plan ${planId}.`) }
+      const p = JSON.parse(bytes.toString('utf8'))
+      if (p.op !== 'checkpoint') throw new Error(`Plan ${planId} is a ${p.op} plan, not a pool-checkpoint plan.`)
+      if (p.epoch !== this.journal.epoch) throw new Error(`Plan ${planId} belongs to an earlier pool state: make a new plan.`)
+      if (this.now() > p.expires) throw new Error(`Plan ${planId} has expired: make a new plan (pool_plan) and approve it.`)
+      const nonce = await this.checkApproval(p, sha256(bytes))
+      const jobId = `j-${hex(6)}`
+      this.journal.append({ t: 'job', jobId, op: 'checkpoint', planId, nonce })
+      this.journal.append({ t: 'jobEnd', jobId, ok: true, note: `pool checkpoint "${p.checkpoint}" (${p.mode}): carried out VM by VM` })
+      return p
+    })
+    const out = []
+    for (const e of plan.vms) {
+      let r
+      try { r = plan.mode === 'remove' ? await this.pcpRemove(plan, e) : await this.pcpPublish(plan, e) } catch (err) { r = `FAILED: ${err.message}` }
+      out.push(`- ${e.name}: ${r}`)
+    }
+    this.kick()
+    return { text: `Pool checkpoint "${plan.checkpoint}" (${plan.mode}), plan ${planId}:\n${out.join('\n')}`, isError: out.some(l => l.includes(': FAILED: ')) }
+  }
+
+  /**
+   * MC-1532: publishes (or replaces) one VM's pool checkpoint from its bound lease's state: the build's verified undo,
+   * network disconnected and read back, a clean guest shutdown, a checkpoint of the Off VM (an lcp-take of the lease,
+   * so unpublished it's removed with the lease), verified, then pcp-select: published, with the replaced one retiring.
+   * Hyper-V work runs under the VM's lock only; the bound lease is checked after every await and just before publishing.
+   */
+  async pcpPublish(plan, e) {
+    const s = this.state
+    const vm = s.vms.get(e.vmId)
+    const bound = () => {
+      const l = this.leases.get(e.vmId)
+      if (!vm || vm.vmName !== e.name || !l || l.leaseId !== e.leaseId || l.ending || l.project !== e.owner || this.imageOf(vm) !== e.image) throw new Error('the lease the plan was made from has ended or changed: nothing was published (make a new plan)')
+      if (e.replaces) { const old = s.poolSnaps.get(e.replaces); if (!old || old.retiring || old.vmId !== e.vmId || old.name.toLowerCase() !== plan.checkpoint.toLowerCase()) throw new Error('the checkpoint to replace has changed: nothing was published (make a new plan)') }
+      return l
+    }
+    let lease = bound()
+    if (this.pcpBusy.has(e.vmId)) throw new Error('another pool-checkpoint operation is running on it')
+    const cap = this.policy.maxCheckpointsPerVm ?? 4
+    const held = [...s.poolSnaps.values()].filter(x => x.vmId === e.vmId).length + [...s.leaseSnaps.values()].filter(x => x.vmId === e.vmId && x.snapName.startsWith('hvmcp-pool-')).length
+    if (held + 1 > cap) throw new Error(`it would hold more than maxCheckpointsPerVm (${cap}) pool checkpoints`)
+    this.pcpBusy.add(e.vmId)
+    try {
+      return await this.vmLock(e.vmId)(async () => {
+        lease = bound()
+        const opts = () => this.forLease(lease)
+        const creds = this.creds()
+        let stage = 'undo'
+        try {
+          // 1. The logon undone and verified (no autologon, no LSA secret, UAC on, Userinit, C:\hvmcp empty and plain).
+          await this.undoLogon(vm, creds, opts())
+          lease = bound()
+          lease.interactive = null
+          // 2. The network disconnected, read back.
+          stage = 'network'
+          const f1 = await this.hv('net-disconnect', this.ident(vm), opts())
+          lease = bound()
+          lease.network = false
+          if (f1.switchName) throw new Error(`its network adapter is still connected to ${f1.switchName}`)
+          // 3. A clean guest shutdown, verified Off.
+          stage = 'shutdown'
+          const f2 = await this.hv('guest-shutdown', this.ident(vm), this.forLease(lease, 6 * 60_000))
+          lease = bound()
+          if (f2.state !== 'Off') throw new Error(`the guest didn't shut down (the VM is ${f2.state})`)
+          lease.running = false
+          // 4. The checkpoint of the Off VM, journalled as the lease's until it's published.
+          stage = 'take'
+          const opId = hex(6)
+          const snapName = `hvmcp-pool-${opId}`
+          this.journal.append({ t: 'lcp-take', opId, vmId: vm.vmId, leaseId: lease.leaseId, name: `pool:${plan.checkpoint}`, snapName, at: new Date(this.now()).toISOString() })
+          let r
+          try { r = await this.hv('pool-take', { ...this.ident(vm), snapName }, this.forLease(lease, 10 * 60_000)) } catch (err) {
+            const list = await this.hv('snapshots', this.ident(vm)).then(x => x.snapshots || [], () => null)
+            const found = list ? list.filter(x => x.name === snapName) : []
+            if (found.length === 1) this.journal.append({ t: 'lcp-taken', opId, checkpointId: found[0].id })
+            throw err
+          }
+          if (r.failed) {
+            const list = await this.hv('snapshots', this.ident(vm)).then(x => x.snapshots || [], () => null)
+            const found = list ? list.filter(x => x.name === snapName) : null
+            if (found?.length === 1) this.journal.append({ t: 'lcp-taken', opId, checkpointId: found[0].id })
+            else if (found?.length === 0) this.journal.append({ t: 'lcp-dropped', opId })
+            throw new Error(`Hyper-V couldn't take the checkpoint (${r.error})`)
+          }
+          this.journal.append({ t: 'lcp-taken', opId, checkpointId: r.checkpointId })
+          // 5. Verified: Off, at the new checkpoint.
+          stage = 'verify'
+          const f3 = await this.hv('facts-vm', this.ident(vm), opts())
+          if (f3.state !== 'Off' || f3.parentCheckpointId !== r.checkpointId) throw new Error(`the new checkpoint didn't verify (the VM is ${f3.state}, at ${f3.parentCheckpointId})`)
+          // 6. Published: checked and journalled with no await between, so no acquire decision sees a half state.
+          lease = bound()
+          this.journal.append({ t: 'pcp-select', opId, name: plan.checkpoint, vmId: vm.vmId, checkpointId: r.checkpointId, snapName, owner: e.owner, image: e.image, os: e.os, at: new Date(this.now()).toISOString(), sourceLease: lease.leaseId, ...(e.replaces ? { replaces: e.replaces } : {}) })
+          lease.startFrom = { name: plan.checkpoint, checkpointId: r.checkpointId }
+          lease.refs.add(r.checkpointId)
+          Object.assign(lease.sync, { gen: lease.sync.gen + 1, plan: null, trusted: false })
+          return `published "${plan.checkpoint}" (${r.checkpointId}); the VM is Off at it, and this lease now starts from it (vm_start)${e.replaces ? '; the old one is no longer offered and is removed when this lease ends' : ''}.`
+        } catch (err) {
+          // Nothing was published. Say what changed, and get the prepared state running again if it's safely Off.
+          const done = { undo: 'nothing changed', network: 'its logon was undone (no interactive session)', shutdown: 'its logon was undone and its network disconnected', take: 'its logon was undone, its network disconnected and it was shut down', verify: 'it was shut down and checkpointed, but that checkpoint is unpublished (removed with this lease)' }[stage]
+          if (this.leases.get(e.vmId)?.leaseId !== e.leaseId || this.leases.get(e.vmId)?.ending) throw new Error(`${err.message}; the lease ended meanwhile, so nothing was published (its release cleans up)`)
+          let state = null
+          try { state = (await this.hv('facts-vm', this.ident(vm), this.forLease(lease))).state } catch { state = null }
+          if (state === 'Off' && stage !== 'undo') {
+            let again = null
+            try {
+              await this.hv('configure-start', { ...this.ident(vm), switchName: null, switchId: null, reserve: lease.reserve || 0 }, this.forLease(lease))
+              const waited = await this.waitGuest(vm, creds.admin, READY_WAIT_MS, lease)
+              if (waited === null) throw new Error('its guest didn\'t answer')
+            } catch (e2) { again = e2 }
+            if (again) {
+              lease.running = false
+              throw new Error(`${err.message}. Nothing was published; ${done}. Starting it again failed (${again.message}): the VM is Off, and vm_start would restore its start point and lose what you prepared (take a lease checkpoint, vm_checkpoint, before pool_checkpoint next time).`)
+            }
+            lease.running = true
+            lease.sync.trusted = false
+            throw new Error(`${err.message}. Nothing was published; ${done}. The VM was started again from its current disk (no restore), so what you prepared is still there (no logon session, network off; C:\\build unconfirmed until a full vm_sync).`)
+          }
+          if (state === 'Running') { lease.running = true; throw new Error(`${err.message}. Nothing was published; ${done}. The VM is still running with what you prepared.`) }
+          lease.running = false
+          throw new Error(`${err.message}. Nothing was published; ${done}. Its state is ${state ?? 'unknown'}: no further runs until vm_start or vm_reset (which restore its start point).`)
+        }
+      })
+    } finally { this.pcpBusy.delete(e.vmId) }
+  }
+
+  /**
+   * MC-1532: retires one VM's pool checkpoint by plan: no new consumers from now (pcp-retire, journalled with no await
+   * after the checks). If the VM is free, it's removed now (child-first, identity-checked); otherwise when it's next
+   * restored with no lease (the lease using it keeps it until it ends).
+   */
+  async pcpRemove(plan, e) {
+    const s = this.state
+    const vm = s.vms.get(e.vmId)
+    const p = s.poolSnaps.get(e.checkpointId)
+    if (!vm || !p || p.vmId !== e.vmId || p.retiring || p.owner !== e.owner || p.name.toLowerCase() !== plan.checkpoint.toLowerCase()) throw new Error('the checkpoint has changed or is already retiring: nothing was done (make a new plan)')
+    this.journal.append({ t: 'pcp-retire', vmId: e.vmId, checkpointId: e.checkpointId })
+    if (this.leases.has(e.vmId)) return `retired: no longer offered; the lease holding ${vm.vmName} keeps it until it ends, then it's removed.`
+    if (this.pcpBusy.has(e.vmId)) return 'retired: no longer offered; it is removed at the VM\'s next restore.'
+    this.pcpBusy.add(e.vmId)
+    try {
+      const r = await this.vmLock(e.vmId)(() => this.restore(vm))
+      return r.ok ? 'retired and removed.' : `retired (no longer offered), but removal is pending: ${r.text}`
+    } finally { this.pcpBusy.delete(e.vmId) }
   }
 
   /**
@@ -1934,8 +2222,8 @@ class Helper {
   }
 
   /** MC-1516: hv.ps1 'guest-logon-undo', every value read back and checked; any mismatch fails the build. */
-  async undoLogon(vm, creds) {
-    const r = await this.hv('guest-logon-undo', { ...this.ident(vm), cred: creds.admin }, { timeoutMs: 120_000 })
+  async undoLogon(vm, creds, opts = { timeoutMs: 120_000 }) {
+    const r = await this.hv('guest-logon-undo', { ...this.ident(vm), cred: creds.admin }, opts)
     const bad = []
     if (r?.autoAdminLogon !== '0') bad.push(`AutoAdminLogon is ${r?.autoAdminLogon}`)
     if (r?.defaultUserName) bad.push('DefaultUserName is still set')
@@ -2033,6 +2321,7 @@ class Helper {
       case 'pool_create': return this.apply('create', args)
       case 'pool_resize': return this.apply('resize', args)
       case 'pool_remove': return this.apply('remove', args)
+      case 'pool_checkpoint': return this.poolCheckpoint(connId, args)
       case 'quiesce': return this.quiesce()
       case 'version': return { text: PROTOCOL, data: { protocol: PROTOCOL, features: [...FEATURES], buildRoots: [...this.policy.buildRoots] } }
       case 'whoami': return this.whoami(args.roots)
@@ -2047,8 +2336,11 @@ const PROTOCOL = 'hyperv-mcp/3' // 2: renew, sync_plan, sync (MC-1497); 3: start
 // acquire's os and image, per-OS shares, a project's image allowlist (MC-1502).
 // 'named' = acquire's vm, one VM by name (MC-1523).
 // 'checkpoints' = vm_checkpoint and vm_restore, a lease's own checkpoints (MC-1529).
-const FEATURES = ['projects', 'images', 'named', 'checkpoints']
+// 'pool-checkpoints' = pool_plan's checkpoint actions, pool_checkpoint, acquire's and start's checkpoint (MC-1532).
+const FEATURES = ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints']
 const LEASE_CHECKPOINT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$/
+// MC-1532: a pool checkpoint's name.
+const POOL_CHECKPOINT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._+-]{0,39}$/
 const DAY_MS = 24 * 60 * 60 * 1000
 
 /**
@@ -2189,6 +2481,8 @@ function describePlan(plan, digest, approve) {
   const lines = [`Plan ${plan.id} (${plan.op}), valid for 30 minutes. Digest ${digest}; its first 6 characters are ${digest.slice(0, 6)}.`]
   for (const a of plan.add || []) lines.push(`- create ${a.name}: ${a.cores} cores, ${a.memoryMB} MB static memory, ${a.diskGB} GB dynamic disk, in ${a.folder}; network adapter disconnected`)
   for (const r of plan.remove || []) lines.push(`- remove ${r.name} and its folder ${r.folder}`)
+  // MC-1532: pool-checkpoint plans.
+  if (plan.op === 'checkpoint') for (const v of plan.vms) lines.push(plan.mode === 'remove' ? `- remove the pool checkpoint "${plan.checkpoint}" of ${v.name} (owner ${v.owner}); a lease already using it keeps it until that lease ends` : `- ${plan.mode === 'replace' ? 'replace' : 'publish'} the pool checkpoint "${plan.checkpoint}" of ${v.name} (owner ${v.owner}, ${v.os}, image ${v.image === 'legacy' ? 'unknown' : v.image.slice(0, 12)}), from lease ${v.leaseId}'s state: its logon undone and verified, network disconnected, the guest shut down, then checkpointed Off; any project's lease may then start from it${plan.mode === 'replace' ? '; the old one stops being offered at once and is removed when no lease uses it' : ''}`)
   if (plan.switch) lines.push(`- create the internal switch ${plan.switch} (host and guests only; no internet, no LAN)`)
   if (plan.removeSwitch) lines.push(`- remove the switch ${plan.removeSwitch}`)
   if (plan.image) lines.push(`- image: ${plan.image.edition}${plan.image.imageIndex > 1 ? ` (index ${plan.image.imageIndex})` : ''} build ${plan.image.build}, SHA-256 ${plan.image.sha256} (${plan.image.pinned ? 'pinned: a known Microsoft download' : plan.image.source === 'download' ? 'downloaded by the helper over HTTPS from Microsoft' : 'NOT AUTHENTICATED: a local file you chose to trust'})`)
@@ -2198,7 +2492,7 @@ function describePlan(plan, digest, approve) {
   if (plan.activation === 'online-once') lines.push('- activation: each new VM goes online once, through Windows\' Default Switch, to activate Windows; it is disconnected (verified) before its clean checkpoint, and no start ever uses that switch')
   else if (plan.add?.length) lines.push('- activation: none (each new VM stays offline; its licence is read and shown)')
   if (plan.add?.length && plan.image && !plan.image.evaluation) lines.push(`- product key: ${plan.productKey ? 'the pool\'s (set by install.ps1 -ProductKeyFile), written only into the answer file' : 'none'}`)
-  lines.push(`Host: ${plan.host.logicalCpus} logical CPUs, ${plan.host.memoryMB} MB.`)
+  if (plan.host) lines.push(`Host: ${plan.host.logicalCpus} logical CPUs, ${plan.host.memoryMB} MB.`)
   lines.push('', 'Nothing is changed until the user approves this exact plan, in an admin PowerShell (one UAC prompt):', approve,
     'It shows the plan from the helper\'s own record and asks for the 6 characters above. Then call ' + `pool_${plan.op}({ planId: "${plan.id}" }).`,
     'Don\'t approve it for the user: only they can, and only they should.')

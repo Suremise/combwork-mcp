@@ -26,6 +26,10 @@
  *   lcp-take  { opId, vmId, leaseId, name, snapName, origType }  MC-1529: before a lease checkpoint's take (its Hyper-V
  *             name is snapName, hvmcp-lease-<opId>; origType the VM's checkpoint type before it); lcp-taken { opId, checkpointId } once confirmed; lcp-drop { opId }
  *             before its removal; lcp-dropped { opId } once confirmed gone (or never made)
+ *   pcp-select { opId, name, vmId, checkpointId, snapName, owner, image, os, at, sourceLease, replaces? }  MC-1532: a
+ *             pool checkpoint published (its take, an lcp-take of the source lease, leaves the lease's records); the one
+ *             it replaces starts retiring; pcp-retire { vmId, checkpointId } retires one by plan; pcp-retired
+ *             { checkpointId } once its removal is confirmed
  */
 const fs = require('fs')
 const crypto = require('crypto')
@@ -112,7 +116,9 @@ class Journal {
   state() {
     // leaseSnaps (MC-1529): lease checkpoints not yet confirmed removed, by opId: { opId, vmId, leaseId, name, snapName,
     // checkpointId (null until its take is confirmed), at, dropping }.
-    const s = { vms: new Map(), intents: new Map(), jobs: new Map(), usedNonces: new Set(), images: new Map(), switch: null, quarantined: new Map(), leaseSnaps: new Map() }
+    // poolSnaps (MC-1532): published pool checkpoints by checkpointId: { checkpointId, opId, name, vmId, snapName, owner,
+    // image, os, at, sourceLease, retiring }.
+    const s = { vms: new Map(), intents: new Map(), jobs: new Map(), usedNonces: new Set(), images: new Map(), switch: null, quarantined: new Map(), leaseSnaps: new Map(), poolSnaps: new Map() }
     for (const r of this.records) {
       switch (r.t) {
         case 'image': s.images.set(r.sha256, r); break
@@ -141,7 +147,7 @@ class Journal {
           break
         }
         case 'removing': { const vm = s.vms.get(r.vmId); if (vm) vm.removing = true; break }
-        case 'removed': s.vms.delete(r.vmId); s.quarantined.delete(r.vmId); for (const [k, x] of s.leaseSnaps) if (x.vmId === r.vmId) s.leaseSnaps.delete(k); break
+        case 'removed': s.vms.delete(r.vmId); s.quarantined.delete(r.vmId); for (const [k, x] of s.leaseSnaps) if (x.vmId === r.vmId) s.leaseSnaps.delete(k); for (const [k, x] of s.poolSnaps) if (x.vmId === r.vmId) s.poolSnaps.delete(k); break
         case 'switch':
           if (r.phase === 'removed') s.switch = null
           else s.switch = { name: r.name, switchId: r.switchId ?? s.switch?.switchId ?? null, token: r.token ?? s.switch?.token ?? null, phase: r.phase, jobId: r.jobId }
@@ -151,6 +157,17 @@ class Journal {
         case 'lcp-taken': { const x = s.leaseSnaps.get(r.opId); if (x) x.checkpointId = r.checkpointId; break }
         case 'lcp-drop': { const x = s.leaseSnaps.get(r.opId); if (x) x.dropping = true; break }
         case 'lcp-dropped': s.leaseSnaps.delete(r.opId); break
+        // MC-1532: a pool checkpoint published (out of the lease's records, durably), the one it replaces retiring in the
+        // same record; retired by plan; gone once its removal is confirmed.
+        case 'pcp-select': {
+          const x = s.leaseSnaps.get(r.opId)
+          s.leaseSnaps.delete(r.opId)
+          s.poolSnaps.set(r.checkpointId, { checkpointId: r.checkpointId, opId: r.opId, name: r.name, vmId: r.vmId, snapName: x?.snapName ?? r.snapName, owner: r.owner, image: r.image, os: r.os, at: r.at, sourceLease: r.sourceLease, retiring: false })
+          if (r.replaces && s.poolSnaps.has(r.replaces)) s.poolSnaps.get(r.replaces).retiring = true
+          break
+        }
+        case 'pcp-retire': { const x = s.poolSnaps.get(r.checkpointId); if (x) x.retiring = true; break }
+        case 'pcp-retired': s.poolSnaps.delete(r.checkpointId); break
         case 'quarantine': s.quarantined.set(r.vmId, r.why); break
         case 'unquarantine': s.quarantined.delete(r.vmId); break
       }

@@ -45,6 +45,13 @@ Write-Host ''
 Write-Host "Plan ${Plan}: $($p.op) the hyper-v pool" -ForegroundColor Cyan
 foreach ($a in @($p.add)) { if ($a) { Write-Host ("  create {0}: {1} cores, {2} MB memory, {3} GB disk, in {4}" -f $a.name, $a.cores, $a.memoryMB, $a.diskGB, $a.folder) } }
 foreach ($r in @($p.remove)) { if ($r) { Write-Host ("  remove {0} and its folder {1}" -f $r.name, $r.folder) } }
+# MC-1532: a pool-checkpoint plan.
+if ($p.op -eq 'checkpoint') {
+  foreach ($v in @($p.vms)) {
+    if ($p.mode -eq 'remove') { Write-Host ("  remove the pool checkpoint ""{0}"" of {1} (owner {2})" -f $p.checkpoint, $v.name, $v.owner) }
+    else { Write-Host ("  {0} the pool checkpoint ""{1}"" of {2} (owner {3}) from lease {4}'s prepared state, which every project's leases may then start from" -f $p.mode, $p.checkpoint, $v.name, $v.owner, $v.leaseId) }
+  }
+}
 if ($p.switch) { Write-Host "  create the internal switch $($p.switch) (host and guests only)" }
 if ($p.removeSwitch) { Write-Host "  remove the switch $($p.removeSwitch)" }
 if ($p.image) {

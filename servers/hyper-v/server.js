@@ -283,22 +283,23 @@ const text = r => (typeof r === 'string' ? r : r?.text ?? '')
 const session = { start: null, build: null }
 const skippedNote = list => list?.length ? `\nLinks skipped (never followed): ${list.slice(0, 20).join(', ')}${list.length > 20 ? ', …' : ''}` : ''
 
-async function vmStart({ build, network = false, reserveCpu = 0, interactive = false } = {}) {
+async function vmStart({ build, network = false, reserveCpu = 0, interactive = false, checkpoint } = {}) {
   if (interactive) await needInteractive()
+  if (checkpoint !== undefined) await needFeature('pool-checkpoints', 'starting from a pool checkpoint (checkpoint)')
   let staged = null
   if (build !== undefined) {
     if (typeof build !== 'string' || !build.trim()) throw new Error('build must be a folder path')
     staged = await stage(await buildFolder(build))
   }
-  const r = await helper.request('start', { network: !!network, reserveCpu, ...(interactive ? { interactive } : {}) })
-  if (!r.isError) { session.start = { network: !!network, reserveCpu, interactive: interactive || false }; session.build = build ?? null }
+  const r = await helper.request('start', { network: !!network, reserveCpu, ...(interactive ? { interactive } : {}), ...(checkpoint !== undefined ? { checkpoint } : {}) })
+  if (!r.isError) { session.start = { network: !!network, reserveCpu, interactive: interactive || false, checkpoint }; session.build = build ?? null }
   return { text: text(r) + skippedNote(staged?.skipped), isError: r.isError }
 }
 
 /** vm_reset: a start (restore first, always), with this session's last start's options and build unless given. */
-async function vmReset({ build, network, reserveCpu, interactive } = {}) {
+async function vmReset({ build, network, reserveCpu, interactive, checkpoint } = {}) {
   const last = session.start || { network: false, reserveCpu: 0, interactive: false }
-  return vmStart({ build: build ?? session.build ?? undefined, network: network ?? last.network, reserveCpu: reserveCpu ?? last.reserveCpu, interactive: interactive ?? last.interactive })
+  return vmStart({ build: build ?? session.build ?? undefined, network: network ?? last.network, reserveCpu: reserveCpu ?? last.reserveCpu, interactive: interactive ?? last.interactive, checkpoint: checkpoint ?? last.checkpoint })
 }
 
 /**
@@ -391,16 +392,18 @@ const tools = [
         wait: { type: 'boolean', description: 'Wait in line for a VM (each call waits about 20 s; repeat it within 2 minutes to keep your place). Default false.' },
         os: { type: 'string', enum: ['windows', 'linux'], description: 'The kind of VM. Default windows. (Linux VMs come with a Linux image in the pool.)' },
         image: { type: 'string', description: 'Only a VM built from this image: its SHA-256, or its first 12+ hex digits (vm_status lists them). Default: any image of the OS your project may use.' },
+        checkpoint: { type: 'string', description: 'Only a VM with this pool checkpoint (MC-1532: a state someone prepared and published, vm_status lists them with their owner and provenance); the lease then starts from it by default. A common name doesn\'t promise identical contents on every VM. Give os if the name is on VMs of more than one OS.' },
         vm: { type: 'string', description: 'One particular VM, by its name from vm_status: for trials and censuses on a specific VM, not for normal use (leave it out and the pool picks). Refused, saying why, when that VM isn\'t free for you; with wait: true it waits in line for that VM only.' }
       }
     },
-    run: async ({ minutes, keepOnFailure, wait, os, image, vm } = {}) => {
+    run: async ({ minutes, keepOnFailure, wait, os, image, vm, checkpoint } = {}) => {
+      if (checkpoint !== undefined) await needFeature('pool-checkpoints', 'asking for a pool checkpoint (checkpoint)')
       const p = await helperProtocol()
       if (wait) await needFeature('projects', 'waiting in line (wait: true)')
       // A filter the helper can't honour is refused before anything is sent: dropped, it could lease the wrong kind.
       if (image !== undefined || (os !== undefined && os !== 'windows')) await needFeature('images', `asking for ${image !== undefined ? 'an image' : `a ${os} VM`}`)
       if (vm !== undefined) await needFeature('named', 'asking for a VM by name (vm)')
-      const args = { minutes, keepOnFailure, ...(p.features.includes('projects') ? { wait: !!wait, roots: await rootList() } : {}), ...(p.features.includes('images') ? { os, image } : {}), ...(vm !== undefined ? { vm } : {}) }
+      const args = { minutes, keepOnFailure, ...(p.features.includes('projects') ? { wait: !!wait, roots: await rootList() } : {}), ...(p.features.includes('images') ? { os, image } : {}), ...(vm !== undefined ? { vm } : {}), ...(checkpoint !== undefined ? { checkpoint } : {}) }
       const r = await helper.request('acquire', args)
       return { text: text(r), isError: r?.isError }
     }
@@ -414,6 +417,7 @@ const tools = [
         build: { type: 'string', description: 'A folder inside your project (your MCP roots), or inside a build folder an admin set (vm_status lists them), to copy in to C:\\build. Links are skipped.' },
         network: { type: 'boolean', description: 'Connect to the pool\'s internal switch. Default false.' },
         reserveCpu: { type: 'number', description: 'Reserve this percentage of the VM\'s cores for timed runs (up to the policy\'s cap). Default 0.' },
+        checkpoint: { type: 'string', description: 'Start from one of this VM\'s pool checkpoints instead of clean, or "clean". Default: the lease\'s start point (the pool checkpoint it was acquired by, else clean). A name the VM doesn\'t have is refused, never replaced by clean.' },
         interactive: { enum: [false, 'user', 'admin'], description: 'Log a guest account on interactively (autologon, then one guest restart; the start waits up to 10 minutes for its session), so vm_run with session: \'interactive\' can run in its desktop session: \'user\' (the standard user, UAC on) or \'admin\' (the guest admin, elevated: UAC is off in that guest until its next restore). For programs that need a real logged-on session (their own desktops, windows). Default false.' }
       }
     },
@@ -447,7 +451,8 @@ const tools = [
         build: { type: 'string', description: 'Default: the build last started or synced in this session.' },
         network: { type: 'boolean' },
         reserveCpu: { type: 'number' },
-        interactive: { enum: [false, 'user', 'admin'] }
+        interactive: { enum: [false, 'user', 'admin'] },
+        checkpoint: { type: 'string', description: 'As vm_start\'s. Default: this session\'s last start\'s.' }
       }
     },
     run: vmReset
@@ -521,7 +526,10 @@ const tools = [
     inputSchema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['create', 'resize', 'remove'], description: 'Default create.' },
+        action: { type: 'string', enum: ['create', 'resize', 'remove', 'checkpoint', 'checkpoint-remove'], description: 'Default create. checkpoint: publish (or with replace: true, replace) a pool checkpoint of the state your lease prepared on each of targets; checkpoint-remove: remove your project\'s pool checkpoint from targets (MC-1532).' },
+        name: { type: 'string', description: 'checkpoint, checkpoint-remove: the pool checkpoint\'s name.' },
+        targets: { type: 'array', items: { type: 'string' }, description: 'checkpoint, checkpoint-remove: the VMs, by name (for checkpoint, each leased now by your project).' },
+        replace: { type: 'boolean', description: 'checkpoint: replace your project\'s existing checkpoint of that name.' },
         vms: { type: 'number', description: 'How many VMs the pool should have.' },
         cores: { type: 'number' },
         memoryGB: { type: 'number' },
@@ -532,7 +540,16 @@ const tools = [
         image: { type: ['object', 'string'], description: 'A new image to check: { iso: "<path to the ISO>" } or { download: "<https URL on microsoft.com>" }, with edition: "Enterprise" | "Professional" | "Education" | "EnterpriseEval" when the ISO holds several (one edition per ISO). Or a verified image\'s SHA-256 (or its first 12+ hex digits): create from it, or resize only the VMs built from it (its group). Omit to use the newest verified image (and, for resize, the whole pool).' }
       }
     },
-    run: pass('pool_plan')
+    run: async (args = {}) => {
+      if (args.action === 'checkpoint' || args.action === 'checkpoint-remove') { await needFeature('pool-checkpoints', 'pool checkpoints'); return pass('pool_plan')({ ...args, roots: await rootList() }) }
+      return pass('pool_plan')(args)
+    }
+  },
+  {
+    name: 'pool_checkpoint',
+    description: 'Carry out an approved pool-checkpoint plan (pool_plan with action checkpoint or checkpoint-remove), VM by VM. Publishing undoes the guest\'s logon (verified), disconnects its network, shuts it down and checkpoints it Off; the reply says each VM\'s outcome. Refused unless the user approved that exact plan (approve.ps1).',
+    inputSchema: { type: 'object', properties: { planId: { type: 'string' } }, required: ['planId'] },
+    run: async args => { await needFeature('pool-checkpoints', 'pool_checkpoint'); return pass('pool_checkpoint')(args) }
   },
   ...['create', 'resize', 'remove'].map(op => ({
     name: `pool_${op}`,
