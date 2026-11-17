@@ -108,6 +108,35 @@ test('MC-1550: the seed turns off systemd-resolved\'s LLMNR and mDNS responders 
   }
 })
 
+test('MC-1551: under the Hyper-V socket transport (no network) the seed masks the wait-online units, harmless where absent; under the internal switch it doesn\'t', () => {
+  const mask = 'sh -c systemctl mask systemd-networkd-wait-online.service NetworkManager-wait-online.service 2>/dev/null || true'
+  const a = userData(seed.files({ instanceId: 'i-0123456789abcdef', hostname: 'h', keys: keys(), dispatcher: 'x' })).runcmd.map(c => c.join(' '))
+  assert.ok(a.includes(mask), 'A: masked, and a missing unit never fails cloud-init')
+  assert.ok(a.indexOf(mask) < a.findIndex(s => / socket-up$/.test(s)))
+  const b = userData(seed.files({ instanceId: 'i-0123456789abcdef', hostname: 'h', keys: keys(), dispatcher: 'x', transport: 'internal-switch', address: '10.47.0.11/24' })).runcmd.map(c => c.join(' '))
+  assert.ok(!b.some(s => /wait-online/.test(s)), 'B: its address comes up, so its wait is real')
+})
+
+test('MC-1551: a run\'s command and captured output live in its own folder, private to the run\'s account, never in /out', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'helper', 'guest.py'), 'utf8')
+  const start = src.slice(src.indexOf('def op_run_start'), src.indexOf('def op_run_poll'))
+  const poll = src.slice(src.indexOf('def op_run_poll'), src.indexOf('def op_run_kill'))
+  assert.doesNotMatch(start + poll, /\.run-/, 'no capture file in /out')
+  assert.match(start, /os\.mkdir\(d, 0o711\)/, 'the run folder is traversable, not listable')
+  assert.match(start, /private_file\(script, owner, command \+ '\\n'\)/)
+  assert.match(start, /out = d \+ '\/out'/)
+  assert.match(start, /err = d \+ '\/err'/)
+  assert.match(start, /'--property=StandardOutput=truncate:' \+ out/)
+  assert.match(poll, /read_capped\('%s\/%d\/out' % \(RUNS, n\), cap\)/)
+  const pf = src.slice(src.indexOf('def private_file'), src.indexOf('def op_run_start'))
+  assert.match(pf, /O_EXCL \| os\.O_NOFOLLOW/, 'a new file, never through a link')
+  assert.match(pf, /0o600/)
+  assert.match(pf, /os\.fchown\(fd, owner\[0\], owner\[1\]\)/)
+  const fin = src.slice(src.indexOf('def op_finish'), src.indexOf('def sshd_check'))
+  assert.match(fin, /'\/var\/lib\/cloud\/instance', '\/var\/lib\/cloud\/instances'/, 'the finish removes cloud-init\'s cached seed')
+  assert.match(fin, /os\.path\.islink\(x\):\s+os\.unlink\(x\)/, 'links removed, never followed')
+})
+
 /** A Linux Python: HYPERV_TEST_LINUX_PYTHON ("wsl -d Debian -e python3", say), or the first WSL distro that has one. */
 function linuxPython() {
   if (process.env.HYPERV_TEST_LINUX_PYTHON) return { argv: process.env.HYPERV_TEST_LINUX_PYTHON.split(' '), wsl: /^wsl(\.exe)?$/i.test(process.env.HYPERV_TEST_LINUX_PYTHON.split(' ')[0]) }

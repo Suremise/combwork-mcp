@@ -491,12 +491,15 @@ differ: how a VM is built, and how the helper talks to its guest.
        (`helper/guest.py`) and nothing else. `hvuser` has no key and no sudo;
      - sshd only on the Hyper-V socket, the distro's own sshd masked;
      - systemd-resolved's LLMNR and mDNS responders off (a drop-in, MC-1550), since Debian's cloud image otherwise
-       answers LLMNR on port 5355 on every address.
+       answers LLMNR on port 5355 on every address;
+     - the wait-online units masked (MC-1551), since the guest has no network. Ubuntu's otherwise held every boot for
+       2 minutes.
   3. Its first boot writes allowlisted diagnostics to COM1, a pipe for the build only.
   4. The build waits for the authenticated round trip to the dispatcher, then for cloud-init to finish.
   5. It checks the guest: its distro and release, the keys, the sudoers rule, the units, no address and nothing listening
      beyond loopback.
-  6. It turns cloud-init off for good, removes the seed and the COM port (verified), and takes the clean checkpoint Off.
+  6. It turns cloud-init off for good and removes cloud-init's cached copy of the seed (MC-1551), the seed and the COM
+     port (verified), then takes the clean checkpoint Off.
 
   A guest that never answers fails the build, saying why from its diagnostics (for example "no hv_sock driver"), or
   that the cause is unknown. Either way the VM is rolled back, and nothing switches to another transport: that's the
@@ -539,7 +542,8 @@ differ: how a VM is built, and how the helper talks to its guest.
   - the build goes to `/build` (root's, read-only to `hvuser`; a file is executable if it starts with `#!` or is an ELF
     binary), and runs write to `/out`;
   - `vm_run` takes `bash` (the default) or `sh`, as root or `hvuser`. Each run is its own systemd unit: a timeout kills its
-    whole cgroup;
+    whole cgroup. Its command and captured output stay in its own run folder, readable only by the run's account
+    (MC-1551), so `/out` holds only what runs write there, and a user run can't read an admin run's command or output;
   - `vm_sync` streams only the changed files to the dispatcher, which checks each file's size and hash, never follows a
     symlink (an `openat` walk with `O_NOFOLLOW`), and keeps `vm_sync`'s rules;
   - `vm_read_out`, `vm_reset`, `vm_stop` and `vm_release` behave as for Windows;

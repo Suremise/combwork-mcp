@@ -167,7 +167,10 @@ class LinuxDriver {
     const bad = verifyProblem(g, { keys, transport, img })
     if (bad.length) throw new Error(`the guest's checks failed: ${bad.join('; ')}`)
     step('turning cloud-init off, then shutting down')
-    await this.dispatch(vm, { op: 'finish' })
+    const fin = await this.dispatch(vm, { op: 'finish' })
+    // MC-1551: cloud-init's cached seed (a second copy of the host key's private half) must be gone before the clean
+    // checkpoint. An older dispatcher says nothing of it; this one lists what it couldn't remove.
+    if (Array.isArray(fin?.seedCacheLeft) && fin.seedCacheLeft.length) throw new Error(`cloud-init's cached seed is still there: ${fin.seedCacheLeft.join(', ')}`)
     const off = await h.hv('guest-shutdown', h.ident(vm), { timeoutMs: 6 * 60_000 })
     if (off.state !== 'Off') throw new Error(`the guest didn't shut down (the VM is ${off.state})`)
     const com = await h.hv('com-detach', h.ident(vm))

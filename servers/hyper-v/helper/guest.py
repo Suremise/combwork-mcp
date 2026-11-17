@@ -294,6 +294,26 @@ def run_number(req):
     return n
 
 
+def run_owner(as_):
+    """(uid, gid) of the account a run runs as: root for admin, hvuser for user."""
+    if as_ != 'user':
+        return (0, 0)
+    import pwd
+    p = pwd.getpwnam(USER)
+    return (p.pw_uid, p.pw_gid)
+
+
+def private_file(path, owner, text):
+    """A new file (never through a link) only its owner can read and write, holding text."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        if os.geteuid() == 0:
+            os.fchown(fd, owner[0], owner[1])
+        os.write(fd, text.encode('utf-8'))
+    finally:
+        os.close(fd)
+
+
 def op_run_start(req, _):
     n = run_number(req)
     command = req.get('command')
@@ -316,15 +336,18 @@ def op_run_start(req, _):
     if os.path.lexists(d):
         shutil.rmtree(d)
     os.makedirs(RUNS, mode=0o711, exist_ok=True)
-    os.mkdir(d, 0o755)
+    # MC-1551: the run's command and its captured output live in its own folder, never in /out (where vm_read_out
+    # would list them), and only the run's account can read them: a user run can't read an admin run's command or
+    # output. The folder is traversable (0711, not listable) so a user run's shell can open its own script.
+    os.mkdir(d, 0o711)
+    owner = run_owner(as_)
     script = d + '/cmd.sh'
-    fd = os.open(script, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644)
-    with os.fdopen(fd, 'w', encoding='utf-8') as f:
-        f.write(command)
-        f.write('\n')
+    private_file(script, owner, command + '\n')
+    out = d + '/out'
+    err = d + '/err'
+    private_file(out, owner, '')
+    private_file(err, owner, '')
     os.makedirs(OUT, exist_ok=True)
-    out = '%s/.run-%d.out' % (OUT, n)
-    err = '%s/.run-%d.err' % (OUT, n)
     argv = ['systemd-run', '--unit=' + unit_of(n), '--quiet', '--no-block', '--service-type=exec',
             '--property=RemainAfterExit=yes', '--working-directory=' + cwd,
             '--property=StandardOutput=truncate:' + out, '--property=StandardError=truncate:' + err,
@@ -348,8 +371,8 @@ def op_run_poll(req, _):
         raise Refused('no run %d' % n)
     exited = p.get('ExecMainExitTimestampMonotonic', '0') not in ('', '0')
     done = exited and p.get('SubState') in ('exited', 'failed', 'dead')
-    stdout, so_cut = read_capped('%s/.run-%d.out' % (OUT, n), cap)
-    stderr, se_cut = read_capped('%s/.run-%d.err' % (OUT, n), cap)
+    stdout, so_cut = read_capped('%s/%d/out' % (RUNS, n), cap)
+    stderr, se_cut = read_capped('%s/%d/err' % (RUNS, n), cap)
     r = {'done': done, 'pending': False, 'stdout': stdout, 'stdoutCut': so_cut, 'stderr': stderr, 'stderrCut': se_cut}
     if done:
         # ExecMainCode 1: exited with ExecMainStatus; otherwise killed by the signal ExecMainStatus (128 + it, as a shell
@@ -545,15 +568,23 @@ def op_verify(req, _):
 
 
 def op_finish(req, _):
-    """The build's last guest step: cloud-init never runs again (no key regeneration at a later boot), and no other host
-    key is left."""
+    """The build's last guest step: cloud-init never runs again (no key regeneration at a later boot), no other host
+    key is left, and cloud-init's cached seed is gone."""
     with open('/etc/cloud/cloud-init.disabled', 'w') as f:
         f.write('hyper-v MCP: built; cloud-init stays off\n')
     for x in os.listdir('/etc/ssh'):
         if x.startswith('ssh_host_') and not x.startswith('ssh_host_ed25519_key'):
             os.unlink('/etc/ssh/' + x)
+    # MC-1551: cloud-init's cached copy of the seed (user-data, cloud-config, obj.pkl: root-only, but holding the host
+    # key's private half a second time) goes with the seed ISO. Links are removed, never followed.
+    for x in ('/var/lib/cloud/instance', '/var/lib/cloud/instances'):
+        if os.path.islink(x):
+            os.unlink(x)
+        elif os.path.isdir(x):
+            shutil.rmtree(x)
+    left = [x for x in ('/var/lib/cloud/instance', '/var/lib/cloud/instances') if os.path.lexists(x)]
     os.sync()
-    return {'finished': True}
+    return {'finished': True, 'seedCacheLeft': left}
 
 
 def sshd_check():
