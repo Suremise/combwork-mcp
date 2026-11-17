@@ -20,7 +20,8 @@ const seed = require('../seed')
 const READY_MS = Number(process.env.HYPERV_MCP_LINUX_READY_MS || 10 * 60_000)
 const CLOUD_INIT_MS = Number(process.env.HYPERV_MCP_LINUX_CLOUD_INIT_MS || 15 * 60_000)
 const POLL_MS = Number(process.env.HYPERV_MCP_POLL_MS || 3000)
-const DIAG_KEYS = ['stage', 'vmbus', 'hv_sock_driver', 'hv_sock_modinfo', 'vsock_listen', 'sshd_config_ok', 'sshd_error', 'kernel']
+const ATTEMPT_MS = Number(process.env.HYPERV_MCP_LINUX_ATTEMPT_MS || 60_000) // one readiness attempt's bound (test-only override)
+const DIAG_KEYS = ['stage', 'vmbus', 'hv_sock_driver', 'hv_sock_modinfo', 'vsock_listen', 'sshd_config_ok', 'sshd_error', 'kernel', 'n', 'result', 'code', 'status']
 const PATHS = { build: '/build', out: '/out' }
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 
@@ -40,7 +41,7 @@ class LinuxDriver {
   }
 
   dispatch(vm, request, opts = {}, files = []) {
-    return ssh.call(this.target(vm), request, { files, timeoutMs: opts.timeoutMs ?? 120_000, onChild: opts.onChild })
+    return ssh.call(this.target(vm), request, { files, timeoutMs: opts.timeoutMs ?? 120_000, onChild: opts.onChild, verbose: !!opts.verbose })
   }
 
   /** The Windows guest ops core.js uses, answered for a Linux guest. */
@@ -132,22 +133,29 @@ class LinuxDriver {
     const pipe = `hvmcp-diag-${crypto.randomBytes(8).toString('hex')}`
     await h.hv('com-attach', { ...h.ident(vm), pipe })
     step('first boot from its seed (network off), with its serial diagnostics')
+    // MC-1545: COM1 is read through the whole readiness wait (the guest reports each SSH connection's start and end),
+    // and ended by a stop file the build writes when the wait is over, so its answer is never lost to a kill.
     let reader = null
-    const diag = h.hv('com-read', { pipe, ms: READY_MS }, { timeoutMs: READY_MS + 60_000, onChild: c => { reader = c } }).then(r => r, e => ({ lines: [], error: e.message }))
+    const stopFile = join(h.dir, 'runs', `${pipe}.stop`)
+    fs.rmSync(stopFile, { force: true })
+    const diag = h.hv('com-read', { pipe, ms: READY_MS + 30_000, through: true, stopFile }, { timeoutMs: READY_MS + 90_000, onChild: c => { reader = c } }).then(r => r, e => ({ lines: [], error: e.message }))
+    const stopReading = async () => {
+      try { fs.writeFileSync(stopFile, 'stop') } catch { /* the reader still ends at its deadline */ }
+      const r = await Promise.race([diag, sleep(20_000).then(() => ({ lines: [], late: true }))])
+      try { reader?.kill() } catch { /* ended */ }
+      fs.rmSync(stopFile, { force: true })
+      return r
+    }
     let ready = null
     const attempts = {} // MC-1544: the readiness wait's last error, for the reason if it never answers
     try {
       await h.hv('start-vm', { ...h.ident(vm), noKeys: true })
-      ready = await this.waitReady(vm, READY_MS, null, attempts)
+      ready = await this.waitReady(vm, READY_MS, null, attempts, { verbose: true })
     } catch (e) {
-      try { reader?.kill() } catch { /* ended */ }
-      await diag
+      await stopReading()
       throw e
     }
-    // Not ready: the diagnostics are read to their own end (the same deadline). Ready: they end at the seed's last
-    // stage; given a minute more, then the reader is stopped (by its handle) and the build goes on without them.
-    const facts = parseDiag(ready === null ? await diag : await Promise.race([diag, sleep(60_000).then(() => ({ lines: [], late: true }))]))
-    try { reader?.kill() } catch { /* ended */ }
+    const facts = parseDiag(await stopReading())
     if (ready === null) {
       const why = notReadyWhy(facts, attempts)
       h.log(`${vm.vmName}: Linux build never ready: ${why}`)
@@ -176,13 +184,15 @@ class LinuxDriver {
    * the attempts' count and the last one's error (ssh.exe's exit code and stderr, which carries HvMcpVsock.exe's own
    * message), cleaned by sshError, so a build that never answers can say why.
    */
-  async waitReady(vm, ms, lease = null, out = {}) {
+  async waitReady(vm, ms, lease = null, out = {}, { verbose = false } = {}) {
     const t0 = Date.now()
     out.attempts = 0
     while (Date.now() - t0 < ms) {
       if (lease) this.h.stillHeld(lease)
       out.attempts++
-      const r = await this.call(vm, 'guest-ready', {}, lease ? this.h.forLease(lease, 60_000) : { timeoutMs: 60_000 }).catch(e => { out.error = sshError(e.message); return null })
+      // MC-1545: verbose (a build's wait only) asks ssh for its DEBUG1 lines; the error keeps the last 10, cleaned.
+      const opts = { ...(lease ? this.h.forLease(lease, ATTEMPT_MS) : { timeoutMs: ATTEMPT_MS }), verbose }
+      const r = await this.call(vm, 'guest-ready', {}, opts).catch(e => { out.error = sshError(e.message, verbose ? 1500 : 400); return null })
       if (r?.ready) return Date.now() - t0
       if (r && !r.ready) out.error = 'the VM is not running'
       await sleep(POLL_MS)
@@ -221,13 +231,22 @@ function knownHostKey(text) { const p = String(text).trim().split(/\s+/); return
 /** The allowlisted HVMCP-DIAG facts: the last value of each known key, from a fixed alphabet; everything else dropped. */
 function parseDiag(r) {
   const facts = {}
+  let starts = 0
+  let ends = 0
   for (const line of Array.isArray(r?.lines) ? r.lines.slice(0, 64) : []) {
     if (typeof line !== 'string' || !line.startsWith('HVMCP-DIAG ')) continue
-    for (const kv of line.slice(11).split(' ')) {
-      const m = /^([a-z_]+)=([A-Za-z0-9._+-]{1,64})$/.exec(kv)
-      if (m && DIAG_KEYS.includes(m[1])) facts[m[1]] = m[2]
+    const kv = {}
+    for (const pair of line.slice(11).split(' ')) {
+      const m = /^([a-z_]+)=([A-Za-z0-9._+-]{1,64})$/.exec(pair)
+      if (m && DIAG_KEYS.includes(m[1])) kv[m[1]] = m[2]
     }
+    // MC-1545: each SSH connection the guest saw (its socket unit's instance starting and ending) is counted, and the
+    // last one's end kept (result, code, status), apart from the seed's stages.
+    if (kv.stage === 'conn-start') { starts++; continue }
+    if (kv.stage === 'conn-end') { ends++; for (const k of ['result', 'code', 'status']) if (kv[k] !== undefined) facts[`conn_${k}`] = kv[k]; continue }
+    for (const [k, v] of Object.entries(kv)) if (!['n', 'result', 'code', 'status'].includes(k)) facts[k] = v
   }
+  if (starts || ends) Object.assign(facts, { conn_starts: String(starts), conn_ends: String(ends) })
   if (!Object.keys(facts).length) facts.unavailable = r?.late ? 'still reading' : r?.error ? 'unreadable' : r?.connected === false ? 'no connection' : 'no lines'
   return facts
 }
@@ -236,14 +255,28 @@ function parseDiag(r) {
  * MC-1544: an SSH attempt's error, fit for a reason and a log. Printable ASCII only, whitespace collapsed, anything that
  * looks like key material (a PEM line, or a base64 run of 40+ characters) replaced, at most 400 characters.
  */
-function sshError(text) {
+function sshError(text, max = 400) {
   return String(text ?? '')
     .replace(/-----BEGIN[\s\S]*?(-----END[^-]*-----|$)/g, '[key material removed]')
     .replace(/[A-Za-z0-9+/=]{40,}/g, '[removed]')
     .replace(/[^\x20-\x7e]+/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
-    .slice(0, 400)
+    .slice(0, max)
+}
+
+/**
+ * MC-1545: where an SSH connection stopped, from the host's side (HvMcpVsock.exe's lines in the SSH error) and the
+ * guest's (its socket unit's connections on COM1). null when neither says.
+ */
+function connectionStop(d, attempts) {
+  const e = attempts.error || ''
+  const starts = Number(d.conn_starts || 0)
+  if (/HvMcpVsock: (connect timed out|can't connect)/.test(e)) return 'connect never completed (host side)'
+  if (/HvMcpVsock: connected to /.test(e) && !starts) return 'connected, guest saw no connection'
+  if (starts && d.conn_result && d.conn_result !== 'success') return `guest started sshd, which exited ${d.conn_result}${d.conn_code ? `/${d.conn_code}` : ''}${d.conn_status ? `/${d.conn_status}` : ''}`
+  if (starts) return 'guest started sshd, no SSH banner'
+  return null
 }
 
 /**
@@ -256,6 +289,8 @@ function notReadyWhy(d, attempts = {}) {
   if (d.hv_sock_driver === 'absent') return `the guest kernel has no hv_sock driver (kernel ${d.kernel || 'unknown'}): this image can't use the Hyper-V socket transport. Moving to the internal-switch transport is the user's decision (docs/linux-guests.md §4.1). Diagnostics: ${seen}.${ssh}`
   if (d.vsock_listen && d.vsock_listen !== 'active') return `the guest's sshd socket on vsock isn't listening (${d.vsock_listen}). Diagnostics: ${seen}.${ssh}`
   if (d.sshd_config_ok === 'no') return `the guest's sshd config doesn't parse${d.sshd_error ? ` (${d.sshd_error})` : ''}. Diagnostics: ${seen}.${ssh}`
+  const stop = connectionStop(d, attempts)
+  if (stop) return `the guest never answered over SSH: ${stop}. Diagnostics: ${seen}.${ssh}`
   return `the guest never answered over SSH, and the diagnostics don't say why (inconclusive): ${seen}.${ssh} The build stops here: the transport is the user's decision`
 }
 
@@ -287,4 +322,4 @@ function verifyProblem(g, { keys, transport, img, built = false }) {
   return bad
 }
 
-module.exports = { LinuxDriver, parseDiag, notReadyWhy, verifyProblem, sshError, PATHS }
+module.exports = { LinuxDriver, parseDiag, notReadyWhy, verifyProblem, sshError, connectionStop, PATHS }

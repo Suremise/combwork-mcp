@@ -429,6 +429,7 @@ class Helper {
     if (!v) return `${name} is no longer in the pool`
     if (s.quarantined.has(v.vmId)) return `${name} is quarantined (${s.quarantined.get(v.vmId)})`
     if (v.removing) return `${name} is being removed`
+    if (v.debugKept) return `${name} is a failed build kept for debugging: it is never leased`
     if (!v.ready) return `${name} is being created`
     const l = this.leases.get(v.vmId)
     if (l) return `${name} is leased until ${new Date(l.deadline).toISOString()}`
@@ -1957,7 +1958,7 @@ class Helper {
     const vms = [...s.vms.values()].map(v => {
       const l = this.leases.get(v.vmId)
       const state = s.quarantined.has(v.vmId) ? `QUARANTINED (${s.quarantined.get(v.vmId)})`
-        : v.removing ? 'removing' : !v.ready ? 'creating'
+        : v.removing ? 'removing' : v.debugKept ? 'KEPT FOR DEBUG (a failed Linux build: running, disconnected, never leased; an administrator can inspect it in Hyper-V Manager; a remove plan, or the next create or resize, removes it)' : !v.ready ? 'creating'
           : l ? `leased${l.kept ? ', kept for inspection' : ''}${l.running ? ', running' : ''}${l.interactive ? `, ${l.interactive === 'user' ? 'the standard user' : 'the admin'} logged on interactively` : ''} until ${new Date(l.deadline).toISOString()} (session ends by ${new Date(l.sessionEnd).toISOString()})` : 'free'
       const img = this.imageOf(v)
       const failed = this.failedNote(v)
@@ -2002,13 +2003,17 @@ class Helper {
     if (op === 'refresh-clean') return this.planRefresh(args)
     if (!['create', 'resize', 'remove'].includes(op)) throw new Error('action must be create, resize, remove, checkpoint, checkpoint-remove or refresh-clean')
     const s = this.state
-    const pool = [...s.vms.values()]
+    const all = [...s.vms.values()]
+    // MC-1545: a failed Linux build kept for debugging is in no group and counts toward nothing: every create or resize
+    // removes it (the next build replaces it), as a remove does.
+    const kept = all.filter(v => v.debugKept)
+    const pool = all.filter(v => !v.debugKept)
     const facts = await this.hv('facts', { folders: this.policy.diskFolders })
     if (!facts.hyperv) throw new Error('Hyper-V is not available on this host (its service or PowerShell module is missing).')
     const plan = { id: `p-${hex(8)}`, op, epoch: this.journal.epoch, created: this.now(), expires: this.now() + PLAN_TTL_MS, prefix: this.policy.prefix, host: { logicalCpus: facts.logicalCpus, memoryMB: facts.memoryMB } }
     if (op === 'remove') {
-      if (!pool.length && !s.switch) throw new Error('There is no pool to remove.')
-      plan.remove = pool.map(v => ({ vmId: v.vmId, name: v.vmName, folder: v.folder }))
+      if (!all.length && !s.switch) throw new Error('There is no pool to remove.')
+      plan.remove = all.map(v => ({ vmId: v.vmId, name: v.vmName, folder: v.folder }))
       plan.removeSwitch = s.switch ? s.switch.name : null
     } else {
       if (op === 'create' && pool.length) throw new Error(`The pool already has ${pool.length} VM(s): use action "resize" (or "remove" first).`)
@@ -2034,7 +2039,7 @@ class Helper {
         const intentId = `i-${hex(8)}`
         return { intentId, name: `${this.policy.prefix}-${hex(4)}`, folder: `${location}\\pool\\${intentId}`, cores, memoryMB, diskGB }
       })
-      plan.remove = group.slice(n).map(v => ({ vmId: v.vmId, name: v.vmName, folder: v.folder }))
+      plan.remove = [...kept, ...group.slice(n)].map(v => ({ vmId: v.vmId, name: v.vmName, folder: v.folder }))
       plan.switch = op === 'create' && network ? `${this.policy.prefix}-internal` : null
       const bad = policyMod.checkPool(this.policy, [...others, ...keep, ...plan.add], { network })
       if (bad.length) throw new Error(`That plan is outside the policy: ${bad.join('; ')}.`)
@@ -2058,6 +2063,13 @@ class Helper {
         if (online && !facts.defaultSwitch) throw new Error(`This host has no Default Switch, so Windows can't be activated online when a VM is built${evaluation ? ' (an evaluation image needs that)' : ''}.`)
         plan.activation = online ? 'online-once' : 'none'
         plan.productKey = plan.image.os !== 'linux' && !evaluation && !!this.productKey()
+      }
+      // MC-1545 (the user's decision, debug only, off by default): a Linux build that fails keeps its VM, turned on,
+      // disconnected and never leased, for an administrator to inspect in Hyper-V Manager. The plan says so.
+      if (args.debugKeepFailedBuild !== undefined) {
+        if (args.debugKeepFailedBuild !== true) throw new Error('debugKeepFailedBuild must be true, or left out.')
+        if (!plan.add.length || plan.image?.os !== 'linux') throw new Error('debugKeepFailedBuild is only for a plan that builds Linux VMs.')
+        plan.debugKeepFailedBuild = true
       }
       if (!plan.add.length && !plan.remove.length) throw new Error(`The pool already has ${pool.length} VM(s): nothing to change.`)
     }
@@ -2452,6 +2464,12 @@ class Helper {
       } catch (e) {
         job.progress = `${label} failed (${e.message}); rolling it back`
         const intent = this.state.intents.get(a.intentId)
+        // MC-1545: a Linux build whose plan keeps a failure for debugging keeps its VM as it is (on, disconnected, never
+        // leased); its intent is settled by that record, so no start rolls it back.
+        if (plan.debugKeepFailedBuild && intent && !intent.done && intent.vmId && this.state.vms.has(intent.vmId)) {
+          this.journal.append({ t: 'debugKept', intentId: a.intentId, vmId: intent.vmId, why: String(e.message).slice(0, 2000) })
+          throw new Error(`${label}: ${e.message} KEPT FOR DEBUG: ${a.name} is left running and disconnected, never leased, for an administrator to inspect in Hyper-V Manager; a remove plan, or the next create or resize, removes it.${done.length ? ` (done before it: ${done.join(', ')})` : ''}`)
+        }
         if (intent && !intent.done) await this.rollBack(intent).catch(e2 => done.push(`rollback of ${a.name} failed (${e2.message}): retried at the next start`))
         throw new Error(`${label}: ${e.message}${done.length ? ` (done before it: ${done.join(', ')})` : ''}`)
       }
@@ -2754,7 +2772,7 @@ const PROTOCOL = 'hyperv-mcp/3' // 2: renew, sync_plan, sync (MC-1497); 3: start
 // 'checkpoints' = vm_checkpoint and vm_restore, a lease's own checkpoints (MC-1529).
 // 'pool-checkpoints' = pool_plan's checkpoint actions, pool_checkpoint, acquire's and start's checkpoint (MC-1532).
 // 'refresh-clean' = pool_plan's refresh-clean and pool_refresh (MC-1531).
-const FEATURES = ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean', 'linux']
+const FEATURES = ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean', 'linux', 'debug-keep']
 const LEASE_CHECKPOINT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$/
 // MC-1532: a pool checkpoint's name.
 const POOL_CHECKPOINT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._+-]{0,39}$/
@@ -2941,6 +2959,7 @@ function describePlan(plan, digest, approve) {
   const linux = plan.image?.os === 'linux' // MC-1501
   if (linux) lines.push(`- image: ${linuxImages.describe(plan.image)}; checksums: ${plan.image.checksums || 'unknown'}`)
   if (linux && plan.add?.length) lines.push('- Linux build: each new VM is a copy of the image\'s verified base VHDX with a cloud-init seed (users hvadmin and hvuser with locked passwords; SSH keys made by the helper and held only by it; sshd only on the Hyper-V socket, for the helper\'s forced command), first booted offline; cloud-init is turned off and the seed removed before its clean checkpoint')
+  if (plan.debugKeepFailedBuild) lines.push('- DEBUG (MC-1545): if a Linux build fails, its VM is kept, turned on, network disconnected, never leased, for an administrator to inspect in Hyper-V Manager (its seed, with its host key, stays with it); a remove plan, or the next create or resize, removes it')
   if (plan.image && !linux) lines.push(`- image: ${plan.image.edition}${plan.image.imageIndex > 1 ? ` (index ${plan.image.imageIndex})` : ''} build ${plan.image.build}, SHA-256 ${plan.image.sha256} (${plan.image.pinned ? 'pinned: a known Microsoft download' : plan.image.source === 'download' ? 'downloaded by the helper over HTTPS from Microsoft' : 'NOT AUTHENTICATED: a local file you chose to trust'})`)
   if (plan.add?.length && !linux) lines.push('- registry: a user\'s registry isn\'t forcibly unloaded at logoff (the DisableForceUnload policy): the suspected cause of runs losing their HKCU after the short PowerShell Direct session that started them ends (MC-1522; its real-build trial is MC-1521)')
   if (plan.add?.length && !linux) lines.push(`- Defender: the test work folders ${DEFENDER_EXCLUSIONS.join(', ')} are excluded from Defender's scanning (real-time and scheduled scans) in the guest image; Defender stays on otherwise`)

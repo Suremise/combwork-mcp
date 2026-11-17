@@ -18,6 +18,7 @@
  *             { kind: 'evaluation', expiresAt } or { kind: 'own', activated, status } (absent: built before MC-1513), or
  *             { kind: 'linux' } with transport, guest { id, versionId, serial, kernel } and diag (MC-1501)
  *   rolledBack{ intentId }                                an unfinished create was undone
+ *   debugKept { intentId, vmId, why }                    MC-1545: a failed Linux build kept, on its plan's debug flag
  *   removing  { jobId, vmId }                             about to remove this VM
  *   removed   { vmId }
  *   switch    { jobId, name, phase: 'creating'|'created'|'removing'|'removed', token, switchId? }   token: written
@@ -144,6 +145,15 @@ class Journal {
           if (vm) Object.assign(vm, { ready: true, cleanCheckpointId: r.cleanCheckpointId, readyAt: r.at, licence: r.licence ?? null, transport: r.transport ?? null, guest: r.guest ?? null })
           const i = s.intents.get(r.intentId)
           if (i) i.done = true
+          break
+        }
+        // MC-1545: a failed Linux build kept for debugging: its intent is settled (no start rolls it back), and the VM,
+        // never ready, is never leased or restored; a remove plan, or the next create or resize, removes it.
+        case 'debugKept': {
+          const i = s.intents.get(r.intentId)
+          if (i) i.done = true
+          const vm = s.vms.get(r.vmId)
+          if (vm) vm.debugKept = { why: r.why, at: r.at }
           break
         }
         case 'rolledBack': {

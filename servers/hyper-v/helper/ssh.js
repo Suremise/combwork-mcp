@@ -25,11 +25,12 @@ const BRIDGE = join(INSTALL_DIR, 'HvMcpVsock.exe')
 const VMID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 
 /** The ssh.exe arguments for a target: { vmId, keyFile, knownHosts, transport, address }. Fixed but for those. */
-function argv(t) {
+function argv(t, { verbose = false } = {}) {
   if (!VMID_RE.test(t.vmId)) throw new Error('a bad VM id')
+  // MC-1545: verbose (a build's readiness attempts only, never a lease's calls) logs at DEBUG1, as ssh -v does.
   const common = ['-F', 'none', '-T', '-x', '-a', '-i', t.keyFile, '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes',
     '-o', `UserKnownHostsFile=${t.knownHosts}`, '-o', 'GlobalKnownHostsFile=none', '-o', 'HostKeyAlias=hvmcp', '-o', 'ConnectTimeout=20',
-    '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4', '-o', 'LogLevel=ERROR', '-o', 'UpdateHostKeys=no', '-o', 'ClearAllForwardings=yes']
+    '-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4', '-o', `LogLevel=${verbose ? 'DEBUG1' : 'ERROR'}`, '-o', 'UpdateHostKeys=no', '-o', 'ClearAllForwardings=yes']
   if (t.transport === 'internal-switch') {
     if (!/^(\d{1,3}\.){3}\d{1,3}$/.test(t.address || '')) throw new Error('a bad guest address')
     return [...common, `hvadmin@${t.address}`]
@@ -41,9 +42,9 @@ function argv(t) {
  * Sends `request` to the target's dispatcher; then, when `files` is given (absolute host paths, in order), each file's
  * bytes. Resolves the dispatcher's result, or rejects with its error. onChild(child): so an ending lease can kill it.
  */
-function call(target, request, { files = [], timeoutMs = 120_000, onChild } = {}) {
+function call(target, request, { files = [], timeoutMs = 120_000, onChild, verbose = false } = {}) {
   const stub = process.env.HYPERV_MCP_SSH_STUB
-  const [cmd, args] = stub ? [process.execPath, [stub, target.vmId]] : [SSH, argv(target)]
+  const [cmd, args] = stub ? [process.execPath, [stub, target.vmId, ...(verbose ? ['-v'] : [])]] : [SSH, argv(target, { verbose })]
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
     if (onChild) onChild(child)
@@ -51,9 +52,16 @@ function call(target, request, { files = [], timeoutMs = 120_000, onChild } = {}
     let err = ''
     let done = false
     const finish = (fn, v) => { if (!done) { done = true; clearTimeout(timer); fn(v) } }
+    // MC-1545: what ssh (and its ProxyCommand, HvMcpVsock.exe) said, kept for every failure, a timeout included: verbose,
+    // its last 10 lines; otherwise its first 400 characters, as before.
+    const said = () => {
+      const lines = err.split(/\r?\n/).map(l => l.trim()).filter(Boolean)
+      if (!lines.length) return ''
+      return `: ${verbose ? lines.slice(-10).join(' | ') : err.trim().slice(0, 400)}`
+    }
     const timer = setTimeout(() => {
       try { child.kill() } catch { /* gone */ }
-      finish(reject, new Error(`the guest call ${request.op} timed out after ${Math.round(timeoutMs / 1000)} s`))
+      finish(reject, new Error(`the guest call ${request.op} timed out after ${Math.round(timeoutMs / 1000)} s${said()}`))
     }, timeoutMs)
     child.stdout.on('data', d => { if (out.length < OUT_CAP) out += d })
     child.stderr.on('data', d => { if (err.length < 16 * 1024) err += d })
@@ -62,7 +70,7 @@ function call(target, request, { files = [], timeoutMs = 120_000, onChild } = {}
       const line = out.split(/\r?\n/).reverse().find(l => l.startsWith(MARK))
       let ans = null
       try { ans = line ? JSON.parse(line.slice(MARK.length)) : null } catch { /* below */ }
-      if (!ans) return finish(reject, new Error(`the guest call ${request.op} gave no answer (ssh exit ${code})${err.trim() ? `: ${err.trim().slice(0, 400)}` : ''}`))
+      if (!ans) return finish(reject, new Error(`the guest call ${request.op} gave no answer (ssh exit ${code})${said()}`))
       if (ans.error) return finish(reject, new Error(`${request.op}: ${ans.error}`))
       finish(resolve, ans.result ?? {})
     })
