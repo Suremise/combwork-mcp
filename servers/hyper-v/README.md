@@ -876,7 +876,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\restorewait.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js test\linux-image.test.js test\linux-guest-files.test.js test\linux.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\restorewait.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js test\linux-image.test.js test\linux-guest-files.test.js test\linux.test.js test\linux-ps.test.js
 ```
 
 - `units.test.js`:
@@ -1106,6 +1106,11 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   - a timeout killed by its unit; a lease checkpoint taken Off;
   - the helper killed mid-run and recovered;
   - pool checkpoints and refresh-clean on Linux, and the feature gate.
+- `linux-ps.test.js`: hv.ps1's Linux actions run for real under Windows PowerShell 5.1, with the Hyper-V cmdlets
+  mocked:
+  - `com-attach` and `com-detach` (the exact `\\.\pipe\<name>` path, read back) and `vhd-convert`'s path checks;
+  - `com-read` on a real named pipe: a quiet spell longer than its wait, a line split across writes, the pipe coming
+    back after a guest restart, 64 KB without a newline, and a silent guest until the deadline.
 
 **The trial** on a real host (not automated): setup, then `pool_plan` → approval → `pool_create` from the pinned 25H2
 ISO, then:

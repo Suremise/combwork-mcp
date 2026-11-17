@@ -56,7 +56,22 @@ test('the seed: locked users, the helper\'s key only behind the forced command, 
   assert.doesNotMatch(sshd, /Subsystem/, 'no sftp')
   assert.ok(u.runcmd.some(c => c.join(' ') === 'systemctl mask ssh.service ssh.socket'))
   assert.ok(u.runcmd.some(c => c.join(' ') === 'systemctl enable --now hvmcp-sshd.socket'))
-  assert.deepStrictEqual(u.bootcmd, [['/usr/local/libexec/hvmcp/dispatch', '--diag', 'seed-read']])
+  // cloud-init's order (cloud.cfg): bootcmd in the init stage, before write_files; runcmd's script at the final
+  // stage. So bootcmd may use nothing the seed writes, and must not fail (a failing bootcmd fails cloud-init, and the
+  // build then waits for "done" in vain).
+  const written = u.write_files.map(w => w.path)
+  assert.strictEqual(u.bootcmd.length, 1)
+  const early = u.bootcmd[0]
+  assert.deepStrictEqual(early.slice(0, 2), ['sh', '-c'])
+  for (const p of [...written, 'hvmcp/dispatch']) assert.ok(!early[2].includes(p), `bootcmd uses ${p} before write_files`)
+  assert.match(early[2], /echo "HVMCP-DIAG stage=seed-read vmbus=\$v hv_sock_driver=\$h kernel=\$k" > \/dev\/ttyS0 2>\/dev\/null; true$/, 'it ends true')
+  const sh = spawnSync('sh', ['-n', '-c', early[2]], { encoding: 'utf8' })
+  if (!sh.error) assert.strictEqual(sh.status, 0, `the early diagnostic parses: ${sh.stderr}`)
+  // runcmd steps that may rightly fail on one distro can't fail cloud-init; the dispatcher's diagnostics run after
+  // write_files installed it.
+  assert.ok(u.runcmd.some(c => c.join(' ') === 'sh -c systemctl disable --now ssh.service ssh.socket 2>/dev/null || true'))
+  assert.ok(u.runcmd.some(c => c.join(' ') === 'sh -c modprobe hv_sock || true'))
+  assert.deepStrictEqual(u.runcmd.filter(c => c[0] === '/usr/local/libexec/hvmcp/dispatch').map(c => c[2]), ['units-written', 'socket-up'])
   assert.match(f['meta-data'], /^instance-id: i-0123456789abcdef\nlocal-hostname: hvmcp-ab12\n$/)
 })
 

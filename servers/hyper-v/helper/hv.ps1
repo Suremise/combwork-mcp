@@ -581,6 +581,52 @@ $GuestSession = {
   @{ boot = $boot; sessions = $ids; user = $user; armed = $armed; logons = $c.logons; logoffs = $c.logoffs }
 }
 
+# MC-1501: a Linux VM's build COM1 pipe, by its random name: \\.\pipe\hvmcp-diag-<16 hex>.
+$ComPipePath = {
+  param([string]$name)
+  if ($name -notmatch '^hvmcp-diag-[0-9a-f]{16}$') { throw 'bad pipe name' }
+  '\\.\pipe\' + $name
+}
+
+# MC-1501: vhd-convert's paths, nothing but the helper's own: <folder>\convert-<12 hex>.vhd to <folder>\<SHA-256>.vhdx.
+$ConvertPathsOk = {
+  param([string]$vhd, [string]$vhdx)
+  ($vhd -match '\\convert-[0-9a-f]{12}\.vhd$') -and ($vhdx -match '\\[0-9a-f]{64}\.vhdx$')
+}
+
+# MC-1501: reads HVMCP-DIAG lines from a stream (COM1's pipe) until the seed's last stage (stage=socket-up), the
+# deadline, the stream's end, or 64 KB in all ($state.bytes, across reconnections). One read is pending at a time: a
+# quiet spell only waits on it again, never starts another. Partial lines are kept, bounded by the same 64 KB; at most
+# 64 lines are kept, and nothing but the part of a line from its HVMCP-DIAG marker.
+$ComReadStream = {
+  param($stream, [DateTime]$deadline, $lines, $state)
+  $buf = New-Object byte[] 4096
+  $acc = ''
+  $pending = $null
+  while (-not $state.done) {
+    $left = ($deadline - [DateTime]::UtcNow).TotalMilliseconds
+    if ($left -le 0) { break }
+    if ($null -eq $pending) { $pending = $stream.ReadAsync($buf, 0, $buf.Length) }
+    try { if (-not $pending.Wait([int][Math]::Max(1, [Math]::Min($left, 5000)))) { continue } } catch { break }
+    $n = $pending.Result
+    $pending = $null
+    if ($n -le 0) { break }
+    $state.bytes += $n
+    if ($state.bytes -gt 65536) { $state.over = $true; $state.done = $true; break }
+    $acc += [Text.Encoding]::ASCII.GetString($buf, 0, $n)
+    $i = $acc.LastIndexOf("`n")
+    if ($i -lt 0) { continue }
+    foreach ($line in $acc.Substring(0, $i).Split("`n")) {
+      $j = $line.IndexOf('HVMCP-DIAG ')
+      if ($j -lt 0) { continue }
+      $l = $line.Substring($j).TrimEnd("`r")
+      if ($lines.Count -lt 64) { $lines.Add($l) }
+      if ($l -match '(^| )stage=socket-up( |$)') { $state.stage = $true; $state.done = $true }
+    }
+    $acc = $acc.Substring($i + 1)
+  }
+}
+
 # Windows' built-in NAT switch (fixed id). Used only by a build's one approved online step (guest-activate) and by
 # net-off; no start ever connects it (configure-start takes only the pool's internal switch).
 $DEFAULT_SWITCH = 'c08cb7b8-9b3c-408e-8e30-5e16a3aeb444'
@@ -943,35 +989,24 @@ try {
     # bounded in bytes and time, until the seed's last stage or its deadline; com-detach unsets the port, read back.
     'com-attach' {
       $vm = Get-OwnVm $a
-      if ([string]$a.pipe -notmatch '^hvmcp-diag-[0-9a-f]{16}$') { throw 'bad pipe name' }
-      Set-VMComPort -VM $vm -Number 1 -Path ('\.\pipe' + [string]$a.pipe)
+      Set-VMComPort -VM $vm -Number 1 -Path (& $ComPipePath ([string]$a.pipe))
       @{ path = [string](Get-VMComPort -VM $vm -Number 1).Path }
     }
     'com-read' {
-      if ([string]$a.pipe -notmatch '^hvmcp-diag-[0-9a-f]{16}$') { throw 'bad pipe name' }
+      # Connected again whenever the pipe closes (Hyper-V serves it per VM run); lines and bytes count across them.
+      $null = & $ComPipePath ([string]$a.pipe)
       $deadline = [DateTime]::UtcNow.AddMilliseconds([int]$a.ms)
       $lines = New-Object Collections.Generic.List[string]
-      $bytes = 0; $done = $false; $connected = $false
-      while (-not $done -and [DateTime]::UtcNow -lt $deadline) {
+      $state = @{ bytes = 0; done = $false; connected = $false; stage = $false; over = $false }
+      while (-not $state.done -and [DateTime]::UtcNow -lt $deadline) {
         $pipe = New-Object IO.Pipes.NamedPipeClientStream('.', [string]$a.pipe, [IO.Pipes.PipeDirection]::In)
         try {
           try { $pipe.Connect(2000) } catch { Start-Sleep -Milliseconds 500; continue }
-          $connected = $true
-          $reader = New-Object IO.StreamReader($pipe, [Text.Encoding]::ASCII)
-          while (-not $done -and [DateTime]::UtcNow -lt $deadline) {
-            $t = $reader.ReadLineAsync()
-            $left = [int][Math]::Max(1, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)
-            if (-not $t.Wait([Math]::Min($left, 5000))) { continue }
-            $line = $t.Result
-            if ($null -eq $line) { break }
-            $bytes += $line.Length
-            if ($bytes -gt 65536) { $done = $true; break }
-            $i = $line.IndexOf('HVMCP-DIAG ')
-            if ($i -ge 0) { $l = $line.Substring($i); if ($lines.Count -lt 64) { $lines.Add($l) }; if ($l -match '(^| )stage=socket-up( |$)') { $done = $true } }
-          }
+          $state.connected = $true
+          & $ComReadStream $pipe $deadline $lines $state
         } finally { $pipe.Dispose() }
       }
-      @{ lines = @($lines); connected = $connected; complete = $done }
+      @{ lines = @($lines); connected = $state.connected; complete = $state.stage; overflow = $state.over }
     }
     'com-detach' {
       $vm = Get-OwnVm $a
@@ -980,7 +1015,7 @@ try {
     }
     'vhd-convert' {
       # MC-1501: the helper's own VHD (from a verified qcow2 image) to the base VHDX, with Hyper-V's own cmdlet.
-      if ([string]$a.vhd -notmatch '\convert-[0-9a-f]{12}\.vhd$' -or [string]$a.vhdx -notmatch '\[0-9a-f]{64}\.vhdx$') { throw 'bad conversion paths' }
+      if (-not (& $ConvertPathsOk ([string]$a.vhd) ([string]$a.vhdx))) { throw 'bad conversion paths' }
       if (Test-Path -LiteralPath ([string]$a.vhdx)) { throw 'the base VHDX already exists' }
       Convert-VHD -Path ([string]$a.vhd) -DestinationPath ([string]$a.vhdx) -VHDType Dynamic
       @{ vhdx = [string]$a.vhdx }

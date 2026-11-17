@@ -19,6 +19,10 @@ const { join } = require('path')
 const DISPATCH = '/usr/local/libexec/hvmcp/dispatch'
 const FORCED = `sudo -n ${DISPATCH}`
 const TRANSPORTS = ['hvsocket', 'internal-switch']
+// The seed's first diagnostic (bootcmd, before the dispatcher exists): the image's sh, test and uname only; the kernel's
+// name reduced to the diagnostics' alphabet; it can't fail.
+const EARLY_DIAG = 'k=$(uname -r | tr -cd "A-Za-z0-9._+-"); v=absent; [ -d /sys/bus/vmbus ] && v=present; h=absent; [ -d /sys/bus/vmbus/drivers/hv_sock ] && h=present; ' +
+  'echo "HVMCP-DIAG stage=seed-read vmbus=$v hv_sock_driver=$h kernel=$k" > /dev/ttyS0 2>/dev/null; true'
 
 const SSHD_CONFIG = `# hyper-v MCP (MC-1501): sshd for the helper only, started per connection by hvmcp-sshd.socket.
 HostKey /etc/ssh/ssh_host_ed25519_key
@@ -95,7 +99,11 @@ function files({ instanceId, hostname, keys, transport = 'hvsocket', address = n
       { path: '/etc/sudoers.d/hvmcp', owner: 'root:root', permissions: '0440', content: `hvadmin ALL=(root) NOPASSWD: ${DISPATCH} ""\n` },
       ...(transport === 'hvsocket' ? [{ path: '/etc/modules-load.d/hvmcp.conf', owner: 'root:root', permissions: '0644', content: 'hv_sock\n' }] : [])
     ],
-    bootcmd: [diag('seed-read')],
+    // bootcmd runs before write_files (cloud-init's init stage), so the dispatcher isn't there yet: this first
+    // diagnostic uses only the image's own shell and files, and never fails (a failing bootcmd fails cloud-init).
+    bootcmd: [['sh', '-c', EARLY_DIAG]],
+    // runcmd runs after write_files. Steps that may rightly fail on one distro (no ssh.socket on Debian, no hv_sock
+    // module) are made harmless, so cloud-init still reports done; the checks after it say what matters.
     runcmd: [
       diag('units-written'),
       ['install', '-d', '-o', 'root', '-g', 'root', '-m', '0755', '/build'],
@@ -103,8 +111,8 @@ function files({ instanceId, hostname, keys, transport = 'hvsocket', address = n
       ['install', '-d', '-o', 'root', '-g', 'root', '-m', '0711', '/hvmcp'],
       ['install', '-d', '-o', 'root', '-g', 'root', '-m', '0711', '/hvmcp/runs'],
       ['install', '-d', '-o', 'root', '-g', 'root', '-m', '0700', '/hvmcp/staging'],
-      ...(transport === 'hvsocket' ? [['modprobe', 'hv_sock']] : []),
-      ['systemctl', 'disable', '--now', 'ssh.service', 'ssh.socket'],
+      ...(transport === 'hvsocket' ? [['sh', '-c', 'modprobe hv_sock || true']] : []),
+      ['sh', '-c', 'systemctl disable --now ssh.service ssh.socket 2>/dev/null || true'],
       ['systemctl', 'mask', 'ssh.service', 'ssh.socket'],
       ['systemctl', 'daemon-reload'],
       ['systemctl', 'enable', '--now', 'hvmcp-sshd.socket'],
