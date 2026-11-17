@@ -92,7 +92,8 @@ test('a Linux build: seed and keys, first boot with its diagnostics, readiness, 
   assert.match(fs.readFileSync(path.join(keys, 'client'), 'utf8'), /^-----BEGIN OPENSSH PRIVATE KEY-----/)
   assert.strictEqual(fs.readFileSync(path.join(keys, 'known_hosts'), 'utf8').trim(), `hvmcp ${vm.seed.hostKey}`)
   assert.match(vm.seed.authorized[0], /^restrict,command="sudo -n \/usr\/local\/libexec\/hvmcp\/dispatch" ssh-ed25519 /)
-  for (const f of [sc.stubState, path.join(sc.stateDir, 'journal.jsonl'), ...fs.readdirSync(path.join(sc.stateDir, 'plans')).map(p => path.join(sc.stateDir, 'plans', p))]) {
+  assert.doesNotMatch(sc.stubText(), /PRIVATE KEY/, 'no private key in the stub\'s state (read whole: MC-1546)')
+  for (const f of [path.join(sc.stateDir, 'journal.jsonl'), ...fs.readdirSync(path.join(sc.stateDir, 'plans')).map(p => path.join(sc.stateDir, 'plans', p))]) {
     assert.doesNotMatch(fs.readFileSync(f, 'utf8'), /PRIVATE KEY/, `no private key in ${path.basename(f)}`)
   }
   assert.doesNotMatch(h.stderr(), /PRIVATE KEY/)
