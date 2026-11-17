@@ -148,7 +148,7 @@ class Journal {
           break
         }
         // MC-1545: a failed Linux build kept for debugging: its intent is settled (no start rolls it back), and the VM,
-        // never ready, is never leased or restored; a remove plan, or the next create or resize, removes it.
+        // never ready, is never leased or restored; the next create or resize removes it (MC-1549: a remove plan removes the whole pool).
         case 'debugKept': {
           const i = s.intents.get(r.intentId)
           if (i) i.done = true
