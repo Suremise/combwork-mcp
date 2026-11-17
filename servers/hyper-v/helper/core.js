@@ -2202,7 +2202,7 @@ class Helper {
         note => { this.journal.append({ t: 'jobEnd', jobId, ok: true, note }); this.lastJob = { op, ok: true, note } },
         e => { this.journal.append({ t: 'jobEnd', jobId, ok: false, note: e.message }); this.lastJob = { op, ok: false, note: e.message } }
       ).finally(() => { this.job = null; this.kick() })
-      return { text: `Approved plan ${planId} accepted: pool job ${jobId} (${op}) is running. ${op === 'remove' ? '' : op === 'refresh' ? "Each VM's guest steps are rerun offline: about 20-40 minutes each, one at a time. " : 'Creating a VM installs Windows unattended: about 20-40 minutes each, one at a time. '}Follow it with pool_status.`, data: { jobId } }
+      return { text: `Approved plan ${planId} accepted: pool job ${jobId} (${op}) is running. ${op === 'remove' ? '' : op === 'refresh' ? "Each VM's guest steps are rerun offline: about 20-40 minutes each, one at a time. " : plan.image?.os === 'linux' ? 'Creating a Linux VM copies its verified image and first boots it offline from its cloud-init seed: a few minutes each, one at a time. ' : 'Creating a VM installs Windows unattended: about 20-40 minutes each, one at a time. '}Follow it with pool_status.`, data: { jobId } }
     })
   }
 

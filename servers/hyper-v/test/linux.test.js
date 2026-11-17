@@ -39,7 +39,7 @@ async function change(sc, admin, args, { expectFail = false } = {}) {
   const plan = await admin.request('pool_plan', args)
   assert.ok(plan.data?.planId, plan.text)
   approve(sc, plan.data.planId)
-  await admin.request(`pool_${args.action}`, { planId: plan.data.planId })
+  const accepted = await admin.request(`pool_${args.action}`, { planId: plan.data.planId })
   let line = null
   await waitFor(async () => {
     const st = await statusText(admin)
@@ -47,7 +47,7 @@ async function change(sc, admin, args, { expectFail = false } = {}) {
     return !/Pool job in progress/.test(st) && line && line.includes(plan.data.planId.slice(0, 0))
   }, 30_000, 'the pool job')
   if (!expectFail && /FAILED/.test(line)) throw new Error(line)
-  return { plan, line }
+  return { plan, line, accepted }
 }
 
 /** A pool of one Windows VM, then one Debian VM built through the Linux driver. */
@@ -65,6 +65,9 @@ async function mixedPool(name, stub = {}) {
 test('a Linux build: seed and keys, first boot with its diagnostics, readiness, checks, cloud-init off, seed and COM gone, clean checkpoint', async () => {
   const { sc, h, admin, built, linux } = await mixedPool('lx-build')
   assert.match(built.line, /created hvmcp-[0-9a-f]+ \(debian 13, kernel 6\.12\.117\+deb13-cloud-amd64; SSH over the Hyper-V socket \(hv_sock present\)\)/)
+  // MC-1544: the job's reply names the Linux build, not Windows' unattended install.
+  assert.match(built.accepted.text, /Creating a Linux VM copies its verified image and first boots it offline from its cloud-init seed/)
+  assert.doesNotMatch(built.accepted.text, /installs Windows/)
   assert.match(built.plan.text, /- image: Debian 13 test, build t, SHA-256 dededededede, pinned; checksums: SHA512SUMS, unsigned/)
   assert.match(built.plan.text, /- Linux build: each new VM is a copy of the image's verified base VHDX with a cloud-init seed/)
   assert.doesNotMatch(built.plan.text, /Defender|activation|provisioning|product key/, 'none of the Windows steps')
@@ -102,7 +105,11 @@ test('a Linux build: seed and keys, first boot with its diagnostics, readiness, 
 test('a Linux build that never answers: diagnosed from its serial lines (conclusive, or inconclusive), rolled back, never retried over another transport', async () => {
   const cases = [
     [{ linuxNeverReady: true, diagLines: ['HVMCP-DIAG stage=socket-up vmbus=present hv_sock_driver=absent hv_sock_modinfo=absent vsock_listen=failed sshd_config_ok=yes kernel=6.12.1-cloud'] }, /the guest kernel has no hv_sock driver \(kernel 6\.12\.1-cloud\): this image can't use the Hyper-V socket transport\. Moving to the internal-switch transport is the user's decision/],
-    [{ linuxNeverReady: true, diagLines: [] }, /the guest never answered over SSH, and the diagnostics don't say why \(inconclusive\): unavailable=no lines\. The build stops here: the transport is the user's decision/],
+    [{ linuxNeverReady: true, diagLines: [] }, /the guest never answered over SSH, and the diagnostics don't say why \(inconclusive\): unavailable=no lines\. Last SSH error \(attempt \d+\): the guest call ready gave no answer \(ssh exit 255\): ssh: connect to host hvmcp port 22: Connection refused The build stops here: the transport is the user's decision/],
+    // MC-1544: the last attempt's SSH error (HvMcpVsock.exe's own message through ssh.exe's stderr), cleaned: one line,
+    // anything key-like replaced, bounded.
+    [{ linuxNeverReady: true, sshStderr: "HvMcpVsock: can't connect to the guest's vsock port 22: The requested address is not valid in its context\r\nAAAAC3NzaC1lZDI1NTE5AAAAIF3oK2l918LTL3Ymh1W1hFMF9WxkL96L1TQ7LF1+Kww6\n" + 'x'.repeat(600) }, /\(inconclusive\): stage=socket-up .*\. Last SSH error \(attempt \d+\): the guest call ready gave no answer \(ssh exit 255\): HvMcpVsock: can't connect to the guest's vsock port 22: The requested address is not valid in its context \[removed\] \[removed\] The build stops here/],
+    [{ linuxNeverReady: true, diagLines: ['HVMCP-DIAG stage=socket-up vmbus=present hv_sock_driver=present vsock_listen=active sshd_config_ok=no sshd_error=Bad_configuration_option_Foo kernel=6.12'] }, /the guest's sshd config doesn't parse \(Bad_configuration_option_Foo\)\. Diagnostics: .*sshd_error=Bad_configuration_option_Foo.*\. Last SSH error/],
     [{ linuxNeverReady: true, comReadFails: true }, /inconclusive\): unavailable=unreadable/],
     [{ verifyOverride: { addresses: ['eth0 10.0.0.5'], listeners: ['tcp 0.0.0.0:22'] } }, /the guest's checks failed: it has addresses: eth0 10\.0\.0\.5; something listens beyond loopback: tcp 0\.0\.0\.0:22/],
     [{ cloudInitStatus: 'error' }, /cloud-init finished with status error/],

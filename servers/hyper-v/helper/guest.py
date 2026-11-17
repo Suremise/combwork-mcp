@@ -33,7 +33,7 @@ CAP_DEFAULT = 16 * 1024
 MAX_FILES = 200000
 MAX_LIST = 1000
 NOFOLLOW_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-DIAG_KEYS = ('stage', 'vmbus', 'hv_sock_driver', 'hv_sock_modinfo', 'vsock_listen', 'sshd_config_ok', 'kernel')
+DIAG_KEYS = ('stage', 'vmbus', 'hv_sock_driver', 'hv_sock_modinfo', 'vsock_listen', 'sshd_config_ok', 'sshd_error', 'kernel')
 
 
 class Refused(Exception):
@@ -526,7 +526,7 @@ def op_verify(req, _):
             sudoers = f.read()
     except OSError:
         sudoers = None
-    code, _, _ = run(['sshd', '-t', '-f', '/etc/ssh/hvmcp_sshd_config'])
+    code, sshd_err = sshd_check()
     modes = {}
     for p in (BUILD, OUT, HVMCP):
         try:
@@ -537,7 +537,7 @@ def op_verify(req, _):
     return {
         'id': rel.get('ID'), 'versionId': rel.get('VERSION_ID'), 'serial': build_serial(), 'kernel': os.uname().release,
         'cloudInit': m.group(1) if m else 'unknown', 'hostKey': host_key, 'otherHostKeys': other_host_keys,
-        'authorizedKeys': authorized, 'sudoers': sudoers, 'sshdConfigOk': code == 0,
+        'authorizedKeys': authorized, 'sudoers': sudoers, 'sshdConfigOk': code == 0, 'sshdConfigError': sshd_err[:200] or None,
         'socket': unit_state('hvmcp-sshd.socket'), 'ssh': unit_state('ssh.service'), 'sshSocket': unit_state('ssh.socket'),
         'addresses': addresses(), 'listeners': listeners(), 'hvSockDriver': os.path.isdir('/sys/bus/vmbus/drivers/hv_sock'),
         'cloudInitDisabled': os.path.exists('/etc/cloud/cloud-init.disabled'), 'paths': modes, 'boot': boot_id()
@@ -556,17 +556,31 @@ def op_finish(req, _):
     return {'finished': True}
 
 
+def sshd_check():
+    """sshd's own check of our config: (exit code, its first error line). MC-1544: /run/sshd is made first, as each
+    connection's unit makes it (the distro's ssh.service, which would, is masked), so a missing privilege-separation
+    folder is never reported as a config that doesn't parse."""
+    os.makedirs('/run/sshd', mode=0o755, exist_ok=True)
+    code, out, err = run(['sshd', '-t', '-f', '/etc/ssh/hvmcp_sshd_config'])
+    first = next((l.strip() for l in (err + '\n' + out).splitlines() if l.strip()), '')
+    return code, ('' if code == 0 else first)
+
+
 def diag_facts(stage):
     def ok(b):
         return 'present' if b else 'absent'
     code, _, _ = run(['modinfo', 'hv_sock'])
     _, active, _ = run(['systemctl', 'is-active', 'hvmcp-sshd.socket'])
-    sc, _, _ = run(['sshd', '-t', '-f', '/etc/ssh/hvmcp_sshd_config'])
-    return {
+    sc, sshd_err = sshd_check()
+    facts = {
         'stage': stage, 'vmbus': ok(os.path.isdir('/sys/bus/vmbus')), 'hv_sock_driver': ok(os.path.isdir('/sys/bus/vmbus/drivers/hv_sock')),
         'hv_sock_modinfo': ok(code == 0), 'vsock_listen': re.sub(r'[^A-Za-z0-9._+-]', '', active.strip())[:64] or 'unknown',
         'sshd_config_ok': 'yes' if sc == 0 else 'no', 'kernel': re.sub(r'[^A-Za-z0-9._+-]', '', os.uname().release)[:64]
     }
+    if sshd_err:
+        # The diagnostics' alphabet: spaces become underscores, anything else outside it is dropped; 64 characters.
+        facts['sshd_error'] = re.sub(r'[^A-Za-z0-9._+-]', '', sshd_err.replace(' ', '_'))[:64] or 'unknown'
+    return facts
 
 
 def op_diag(stage):
@@ -574,7 +588,7 @@ def op_diag(stage):
     if not re.fullmatch(r'[a-z-]{1,32}', stage or ''):
         stage = 'unknown'
     facts = diag_facts(stage)
-    line = 'HVMCP-DIAG ' + ' '.join('%s=%s' % (k, facts[k]) for k in DIAG_KEYS) + '\n'
+    line = 'HVMCP-DIAG ' + ' '.join('%s=%s' % (k, facts[k]) for k in DIAG_KEYS if k in facts) + '\n'
     try:
         with open('/dev/ttyS0', 'w') as tty:
             tty.write(line)

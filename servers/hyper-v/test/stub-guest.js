@@ -40,7 +40,8 @@ process.stdin.on('end', () => {
   const vm = s.vms?.[vmId]
   if (!vm || vm.state !== 'Running' || vm.installed === false || s.linuxNeverReady) {
     save(s)
-    process.stderr.write('ssh: connect to host hvmcp port 22: Connection refused\n')
+    // sshStderr (MC-1544): what this failed attempt writes instead, as ssh.exe and HvMcpVsock.exe would.
+    process.stderr.write(s.sshStderr ?? 'ssh: connect to host hvmcp port 22: Connection refused\n')
     process.exit(255)
   }
   if (s.sshFail?.[req.op] > 0) { s.sshFail[req.op]--; save(s); answer({ error: `injected failure of ${req.op}` }); return }
