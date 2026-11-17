@@ -341,11 +341,18 @@ test('sync is refused when the VM is stopped or kept, and a disconnect mid-sync 
   const pidFile = path.join(sc.dir, 'sync.pid')
   sc.patchStub(s => { s.syncGate = gate; s.syncPidFile = pidFile })
   const pending = syncWith(a, { 'a.txt': 'A2' }).catch(e => e)
-  const pid = await waitFor(() => fs.existsSync(pidFile) && Number(fs.readFileSync(pidFile, 'utf8')), 10_000, 'the apply to start')
+  // MC-1554: each step waits for what the helper itself signals (the apply's PID, the VM free in its status, the apply
+  // gone), not for a time budget. What proves the lease ended "without waiting for the sync" is the gate: it stays shut
+  // until after the lease ended, so a helper that waited for the apply would never free the VM. HANG_MS only stops a
+  // test that would otherwise hang; it is no claim about speed (15 s timed out once in a loaded full run, 17 Nov,
+  // while this step takes about 0.5 s alone and 0.7 s beside three other hyper-v test files).
+  const HANG_MS = 120_000
+  const pid = await waitFor(() => fs.existsSync(pidFile) && Number(fs.readFileSync(pidFile, 'utf8')), HANG_MS, 'the apply to start')
   a.close()
-  await waitFor(async () => /; free/.test((await admin.request('status')).text), 15_000, 'the lease to end without waiting for the sync')
+  await waitFor(async () => /; free/.test((await admin.request('status')).text), HANG_MS, 'the lease to end without waiting for the sync')
+  assert.ok(!fs.existsSync(gate), 'the gate was still shut when the VM came free: the lease didn\'t wait for the apply')
   const alive = p => { try { process.kill(p, 0); return true } catch (e) { return e.code === 'EPERM' } }
-  await waitFor(() => !alive(pid), 10_000, 'the apply to be killed')
+  await waitFor(() => !alive(pid), HANG_MS, 'the apply to be killed')
   const v = vmOf(sc, vm)
   assert.strictEqual(v.state, 'Off')
   assert.strictEqual(v.parent, v.checkpoints[0].id)

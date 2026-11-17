@@ -174,6 +174,12 @@ test('a helper from before admin-set build folders: none are used, and status sa
   assert.match((await s.call('vm_renew', { minutes: 10 })).text, /predates warm sessions .*run setup again/)
 })
 
+// MC-1554: a call that may outlast the 1 s bound on a loaded machine, settled through vm_wait as an agent would.
+async function settled(a, r) {
+  while (/still in progress after/.test(r.text)) r = await a.call('vm_wait')
+  return r.text.replace(/^\S+ finished \(\d+ s after it was called\):\n/, '')
+}
+
 // MC-1553: a slow tool replies within HYPERV_MCP_REPLY_MS (1 s here) instead of outlasting the client's patience: it
 // says it's still in progress and that vm_wait is the next call, and vm_wait gives the result once it settles.
 test('MC-1553: a slow vm_start says "still in progress" and vm_wait gives its result; only vm_wait and status run beside it', async t => {
@@ -199,7 +205,7 @@ test('MC-1553: a slow vm_start says "still in progress" and vm_wait gives its re
   for (let i = 0; i < 30 && !/finished/.test((done = await a.call('vm_wait')).text); i++) { /* each call waits up to 1 s */ }
   assert.match(done.text, /^vm_start finished \(\d+ s after it was called\):\nStarted hvmcp-/)
   assert.match((await a.call('vm_wait')).text, /Nothing is in progress/, 'collected once')
-  assert.match((await a.call('vm_run', { command: 'echo hi' })).text, /Exit code 0/, 'tools run again once it is collected')
+  assert.match(await settled(a, await a.call('vm_run', { command: 'echo hi' })), /Exit code 0/, 'tools run again once it is collected')
 })
 
 test('MC-1553: a long vm_run replies "still in progress"; its result, if nobody waited, comes with the next call', async t => {
@@ -207,7 +213,7 @@ test('MC-1553: a long vm_run replies "still in progress"; its result, if nobody 
   const a = server({ ...env, HYPERV_MCP_REPLY_MS: '1000' }, { roots: [sc.builds] })
   t.after(() => a.close())
   await a.call('vm_acquire')
-  await a.call('vm_start')
+  await settled(a, await a.call('vm_start'))
   // "sleep" never ends: its 3 s timeout ends it, after the 1 s reply bound.
   const run = await a.call('vm_run', { command: 'sleep', timeoutSec: 3 })
   assert.match(run.text, /vm_run is still in progress after \d+ s/)
