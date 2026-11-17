@@ -501,9 +501,16 @@ differ: how a VM is built, and how the helper talks to its guest.
 - **Keeping a failed build, for debugging only** (MC-1545, off by default):
   - `pool_plan({ action: 'create' | 'resize', image, debugKeepFailedBuild: true })`, for a Linux plan, and only when the
     user asks; the plan says so, and the user's approval covers it.
-  - A failed build then keeps its VM, running and disconnected, flagged KEPT FOR DEBUG, never leased or restored, so an
-    administrator can open its console in Hyper-V Manager and read the guest's journal (for example
-    `journalctl -u 'hvmcp-sshd@*'`). Its seed, which holds its host key, stays with it.
+  - A failed build then keeps its VM: put in that state and read back as running and disconnected, flagged KEPT FOR
+    DEBUG, never leased or restored. If that state can't be confirmed, it's rolled back as usual, and the reason says
+    so. Its seed, which holds its host key, stays with it.
+  - **No new access comes with it.** The guest's accounts stay locked, and SSH stays the helper's forced command
+    only. An administrator can still:
+    - watch its console in Hyper-V Manager (boot and kernel messages);
+    - open its COM1 pipe (`Get-VMComPort -VMName <vm> -Number 1` in an admin PowerShell shows its name) to see the
+      guest's diagnostics, each connection included;
+    - run `HvMcpVsock.exe <vmId> 22` in an admin PowerShell, to retry the Hyper-V socket from the host and see whether
+      it connects and whether sshd's banner comes back.
   - A remove plan, or the next create or resize, removes it.
 - **Talking to the guest** is SSH over a **Hyper-V socket**, the channel PowerShell Direct uses, so a Linux guest has no
   network path at all.

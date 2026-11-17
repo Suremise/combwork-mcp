@@ -272,10 +272,18 @@ function sshError(text, max = 400) {
 function connectionStop(d, attempts) {
   const e = attempts.error || ''
   const starts = Number(d.conn_starts || 0)
+  const ends = Number(d.conn_ends || 0)
+  // Round 2: only what the evidence shows. The guest's COM1 trace counts only when it was read (a stage line seen);
+  // a banner is ssh -v's "Remote protocol version" line; any recorded end is reported with its result, code and
+  // status, a "success" included (the unit's ExecStart=- hides sshd's own exit status from SERVICE_RESULT).
+  const trace = !d.unavailable && d.stage !== undefined
+  const banner = /Remote protocol version/.test(e)
+  const ended = ends ? `; the guest's sshd ended ${d.conn_result || 'unknown'}/${d.conn_code || 'unknown'}/${d.conn_status || 'unknown'}` : ''
   if (/HvMcpVsock: (connect timed out|can't connect)/.test(e)) return 'connect never completed (host side)'
-  if (/HvMcpVsock: connected to /.test(e) && !starts) return 'connected, guest saw no connection'
-  if (starts && d.conn_result && d.conn_result !== 'success') return `guest started sshd, which exited ${d.conn_result}${d.conn_code ? `/${d.conn_code}` : ''}${d.conn_status ? `/${d.conn_status}` : ''}`
+  if (banner) return `sshd answered (its banner arrived), then SSH failed: see the last SSH error${ended}`
+  if (ends) return `guest started sshd, which ended ${d.conn_result || 'unknown'}/${d.conn_code || 'unknown'}/${d.conn_status || 'unknown'}, with no SSH banner seen`
   if (starts) return 'guest started sshd, no SSH banner'
+  if (/HvMcpVsock: connected to /.test(e) && trace) return 'connected, guest saw no connection'
   return null
 }
 

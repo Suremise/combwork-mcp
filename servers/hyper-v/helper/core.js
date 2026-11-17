@@ -2198,7 +2198,9 @@ class Helper {
         const after = [...s.vms.values()].filter(v => !(plan.remove || []).some(r => r.vmId === v.vmId))
         const bad = policyMod.checkPool(this.policy, [...after, ...plan.add], { network: !!plan.switch || !!s.switch })
         if (bad.length) throw new Error(`Plan ${planId} is outside the policy now: ${bad.join('; ')}.`)
-        if (op === 'create' && s.vms.size) throw new Error('The pool is no longer empty: make a new plan.')
+        // MC-1545: a create's pool must be empty after its approved removals (a kept failed build it replaces goes first);
+        // any other VM, a real one or one kept after the plan was made, refuses it.
+        if (op === 'create' && after.length) throw new Error('The pool is no longer empty: make a new plan.')
         const rec = s.images.get(plan.image?.sha256)
         if (!rec) throw new Error('The plan\'s image is no longer verified: make a new plan.')
         if (rec.os !== 'linux' && (rec.edition !== plan.image.edition || (rec.imageIndex ?? 1) !== (plan.image.imageIndex ?? 1))) throw new Error('The plan\'s image edition no longer matches its record: make a new plan.')
@@ -2467,8 +2469,21 @@ class Helper {
         // MC-1545: a Linux build whose plan keeps a failure for debugging keeps its VM as it is (on, disconnected, never
         // leased); its intent is settled by that record, so no start rolls it back.
         if (plan.debugKeepFailedBuild && intent && !intent.done && intent.vmId && this.state.vms.has(intent.vmId)) {
-          this.journal.append({ t: 'debugKept', intentId: a.intentId, vmId: intent.vmId, why: String(e.message).slice(0, 2000) })
-          throw new Error(`${label}: ${e.message} KEPT FOR DEBUG: ${a.name} is left running and disconnected, never leased, for an administrator to inspect in Hyper-V Manager; a remove plan, or the next create or resize, removes it.${done.length ? ` (done before it: ${done.join(', ')})` : ''}`)
+          // MC-1545 (round 2): the approved debug state is made and read back, never assumed: started if it isn't
+          // running (a failure before the first start, or after the shutdown), its network disconnected, then its facts.
+          // Only a VM confirmed running and disconnected is kept; otherwise it's rolled back as usual, saying why.
+          const vm = this.state.vms.get(intent.vmId)
+          const state = await (async () => {
+            let f = await this.hv('facts-vm', this.ident(vm))
+            if (f.state !== 'Running') { await this.hv('start-vm', { ...this.ident(vm), noKeys: true }); f = await this.hv('facts-vm', this.ident(vm)) }
+            const d = await this.hv('net-disconnect', this.ident(vm))
+            return { state: d.state ?? f.state, switchName: d.switchName ?? null }
+          })().catch(err => ({ error: err.message }))
+          if (state.state === 'Running' && !state.switchName) {
+            this.journal.append({ t: 'debugKept', intentId: a.intentId, vmId: intent.vmId, why: String(e.message).slice(0, 2000), state: 'Running, disconnected' })
+            throw new Error(`${label}: ${e.message} KEPT FOR DEBUG: ${a.name} is running and disconnected (read back), never leased, for an administrator to inspect in Hyper-V Manager; a remove plan, or the next create or resize, removes it.${done.length ? ` (done before it: ${done.join(', ')})` : ''}`)
+          }
+          done.push(`it couldn't be kept for debugging (${state.error ? state.error : `it read back ${state.state}${state.switchName ? `, connected to ${state.switchName}` : ''}`}), so it's rolled back`)
         }
         if (intent && !intent.done) await this.rollBack(intent).catch(e2 => done.push(`rollback of ${a.name} failed (${e2.message}): retried at the next start`))
         throw new Error(`${label}: ${e.message}${done.length ? ` (done before it: ${done.join(', ')})` : ''}`)
@@ -2959,7 +2974,7 @@ function describePlan(plan, digest, approve) {
   const linux = plan.image?.os === 'linux' // MC-1501
   if (linux) lines.push(`- image: ${linuxImages.describe(plan.image)}; checksums: ${plan.image.checksums || 'unknown'}`)
   if (linux && plan.add?.length) lines.push('- Linux build: each new VM is a copy of the image\'s verified base VHDX with a cloud-init seed (users hvadmin and hvuser with locked passwords; SSH keys made by the helper and held only by it; sshd only on the Hyper-V socket, for the helper\'s forced command), first booted offline; cloud-init is turned off and the seed removed before its clean checkpoint')
-  if (plan.debugKeepFailedBuild) lines.push('- DEBUG (MC-1545): if a Linux build fails, its VM is kept, turned on, network disconnected, never leased, for an administrator to inspect in Hyper-V Manager (its seed, with its host key, stays with it); a remove plan, or the next create or resize, removes it')
+  if (plan.debugKeepFailedBuild) lines.push('- DEBUG (MC-1545): if a Linux build fails, its VM is kept, turned on, network disconnected, never leased, for an administrator to inspect in Hyper-V Manager (its console, its COM1 diagnostics, a host-side HvMcpVsock retry; no login or other access to the guest is added; its seed, with its host key, stays with it); a remove plan, or the next create or resize, removes it')
   if (plan.image && !linux) lines.push(`- image: ${plan.image.edition}${plan.image.imageIndex > 1 ? ` (index ${plan.image.imageIndex})` : ''} build ${plan.image.build}, SHA-256 ${plan.image.sha256} (${plan.image.pinned ? 'pinned: a known Microsoft download' : plan.image.source === 'download' ? 'downloaded by the helper over HTTPS from Microsoft' : 'NOT AUTHENTICATED: a local file you chose to trust'})`)
   if (plan.add?.length && !linux) lines.push('- registry: a user\'s registry isn\'t forcibly unloaded at logoff (the DisableForceUnload policy): the suspected cause of runs losing their HKCU after the short PowerShell Direct session that started them ends (MC-1522; its real-build trial is MC-1521)')
   if (plan.add?.length && !linux) lines.push(`- Defender: the test work folders ${DEFENDER_EXCLUSIONS.join(', ')} are excluded from Defender's scanning (real-time and scheduled scans) in the guest image; Defender stays on otherwise`)
