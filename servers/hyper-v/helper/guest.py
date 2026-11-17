@@ -28,6 +28,10 @@ HVMCP = ROOT + '/hvmcp'
 RUNS = HVMCP + '/runs'
 STAGING = HVMCP + '/staging'
 DISPATCH = '/usr/local/libexec/hvmcp/dispatch'
+# The build's finish (op_finish): fixed system paths, names here so the host's unit check can point them elsewhere.
+CLOUD_DISABLED = '/etc/cloud/cloud-init.disabled'
+ETC_SSH = '/etc/ssh'
+CLOUD_CACHE = ('/var/lib/cloud/instance', '/var/lib/cloud/instances')
 USER = 'hvuser'
 CAP_DEFAULT = 16 * 1024
 MAX_FILES = 200000
@@ -570,19 +574,19 @@ def op_verify(req, _):
 def op_finish(req, _):
     """The build's last guest step: cloud-init never runs again (no key regeneration at a later boot), no other host
     key is left, and cloud-init's cached seed is gone."""
-    with open('/etc/cloud/cloud-init.disabled', 'w') as f:
+    with open(CLOUD_DISABLED, 'w') as f:
         f.write('hyper-v MCP: built; cloud-init stays off\n')
-    for x in os.listdir('/etc/ssh'):
+    for x in os.listdir(ETC_SSH):
         if x.startswith('ssh_host_') and not x.startswith('ssh_host_ed25519_key'):
-            os.unlink('/etc/ssh/' + x)
+            os.unlink(ETC_SSH + '/' + x)
     # MC-1551: cloud-init's cached copy of the seed (user-data, cloud-config, obj.pkl: root-only, but holding the host
     # key's private half a second time) goes with the seed ISO. Links are removed, never followed.
-    for x in ('/var/lib/cloud/instance', '/var/lib/cloud/instances'):
+    for x in CLOUD_CACHE:
         if os.path.islink(x):
             os.unlink(x)
         elif os.path.isdir(x):
             shutil.rmtree(x)
-    left = [x for x in ('/var/lib/cloud/instance', '/var/lib/cloud/instances') if os.path.lexists(x)]
+    left = [x for x in CLOUD_CACHE if os.path.lexists(x)]
     os.sync()
     return {'finished': True, 'seedCacheLeft': left}
 

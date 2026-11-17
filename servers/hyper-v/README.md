@@ -1138,7 +1138,12 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   - the helper's ed25519 keys read by Windows' own ssh-keygen;
   - the seed for each transport;
   - the dispatcher run for real (`guest_py_check.py`, real symlinks) under a Linux Python, which needs WSL with python3
-    or `HYPERV_TEST_LINUX_PYTHON`. It's skipped, and says so, where there's none: the trial runs it inside a Linux VM.
+    or `HYPERV_TEST_LINUX_PYTHON`. It's skipped, and says so, where there's none: the trial runs it inside a Linux VM;
+  - the dispatcher's run files and the build's finish executed on any host Python 3, Windows' included
+    (`guest_unit_check.py`, MC-1551). systemd, accounts and process calls are mocked, and files go to a temp folder.
+    It checks the files' flags, modes and owners for admin and user runs, that start and poll name the same files,
+    capped output, and the cached seed removed with links unfollowed. `HYPERV_TEST_PYTHON` picks the Python; the test
+    is skipped where there's none.
 - `linux.test.js`, through the stub guest (`stub-guest.js`, in place of `ssh.exe`):
   - the build, step by step: no private key anywhere but the secrets folder, allowlisted diagnostics, no seed or COM
     port left;

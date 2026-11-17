@@ -117,24 +117,25 @@ test('MC-1551: under the Hyper-V socket transport (no network) the seed masks th
   assert.ok(!b.some(s => /wait-online/.test(s)), 'B: its address comes up, so its wait is real')
 })
 
-test('MC-1551: a run\'s command and captured output live in its own folder, private to the run\'s account, never in /out', () => {
-  const src = fs.readFileSync(path.join(__dirname, '..', 'helper', 'guest.py'), 'utf8')
-  const start = src.slice(src.indexOf('def op_run_start'), src.indexOf('def op_run_poll'))
-  const poll = src.slice(src.indexOf('def op_run_poll'), src.indexOf('def op_run_kill'))
-  assert.doesNotMatch(start + poll, /\.run-/, 'no capture file in /out')
-  assert.match(start, /os\.mkdir\(d, 0o711\)/, 'the run folder is traversable, not listable')
-  assert.match(start, /private_file\(script, owner, command \+ '\\n'\)/)
-  assert.match(start, /out = d \+ '\/out'/)
-  assert.match(start, /err = d \+ '\/err'/)
-  assert.match(start, /'--property=StandardOutput=truncate:' \+ out/)
-  assert.match(poll, /read_capped\('%s\/%d\/out' % \(RUNS, n\), cap\)/)
-  const pf = src.slice(src.indexOf('def private_file'), src.indexOf('def op_run_start'))
-  assert.match(pf, /O_EXCL \| os\.O_NOFOLLOW/, 'a new file, never through a link')
-  assert.match(pf, /0o600/)
-  assert.match(pf, /os\.fchown\(fd, owner\[0\], owner\[1\]\)/)
-  const fin = src.slice(src.indexOf('def op_finish'), src.indexOf('def sshd_check'))
-  assert.match(fin, /'\/var\/lib\/cloud\/instance', '\/var\/lib\/cloud\/instances'/, 'the finish removes cloud-init\'s cached seed')
-  assert.match(fin, /os\.path\.islink\(x\):\s+os\.unlink\(x\)/, 'links removed, never followed')
+/**
+ * A host Python for guest_unit_check.py (MC-1551 round 2), which needs no Linux: HYPERV_TEST_PYTHON, else `python`,
+ * else `py -3`, the first that really runs (Windows' Store alias for python doesn't). null when there's none.
+ */
+function hostPython() {
+  const tries = [process.env.HYPERV_TEST_PYTHON && process.env.HYPERV_TEST_PYTHON.split(' '), ['python'], ['py', '-3'], ['python3']].filter(Boolean)
+  for (const argv of tries) {
+    const r = spawnSync(argv[0], [...argv.slice(1), '-c', 'import sys; print(sys.version_info[0])'], { encoding: 'utf8', timeout: 20_000, windowsHide: true })
+    if (r.status === 0 && r.stdout.trim() === '3') return argv
+  }
+  return null
+}
+const HOST_PY = hostPython()
+
+test('MC-1551 round 2: guest.py\'s run files and the build\'s finish, executed on a host Python with systemd and accounts mocked (guest_unit_check.py)', { skip: HOST_PY ? false : 'no host Python 3 (HYPERV_TEST_PYTHON, python or py -3)' }, () => {
+  const r = spawnSync(HOST_PY[0], [...HOST_PY.slice(1), '-I', path.join(__dirname, 'guest_unit_check.py'), path.join(__dirname, '..', 'helper', 'guest.py'), BASE], { encoding: 'utf8', timeout: 120_000, windowsHide: true })
+  assert.strictEqual(r.status, 0, `${r.stdout}${r.stderr}`)
+  const m = /^OK (\d+)$/m.exec(r.stdout)
+  assert.ok(m && Number(m[1]) >= 48, r.stdout)
 })
 
 /** A Linux Python: HYPERV_TEST_LINUX_PYTHON ("wsl -d Debian -e python3", say), or the first WSL distro that has one. */
