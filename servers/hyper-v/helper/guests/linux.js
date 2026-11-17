@@ -20,7 +20,7 @@ const seed = require('../seed')
 const READY_MS = Number(process.env.HYPERV_MCP_LINUX_READY_MS || 10 * 60_000)
 const CLOUD_INIT_MS = Number(process.env.HYPERV_MCP_LINUX_CLOUD_INIT_MS || 15 * 60_000)
 const POLL_MS = Number(process.env.HYPERV_MCP_POLL_MS || 3000)
-const DIAG_KEYS = ['stage', 'vmbus', 'hv_sock_driver', 'hv_sock_modinfo', 'vsock_listen', 'sshd_config_ok', 'kernel']
+const DIAG_KEYS = ['stage', 'vmbus', 'hv_sock_driver', 'hv_sock_modinfo', 'vsock_listen', 'sshd_config_ok', 'sshd_error', 'kernel']
 const PATHS = { build: '/build', out: '/out' }
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 
@@ -135,9 +135,10 @@ class LinuxDriver {
     let reader = null
     const diag = h.hv('com-read', { pipe, ms: READY_MS }, { timeoutMs: READY_MS + 60_000, onChild: c => { reader = c } }).then(r => r, e => ({ lines: [], error: e.message }))
     let ready = null
+    const attempts = {} // MC-1544: the readiness wait's last error, for the reason if it never answers
     try {
       await h.hv('start-vm', { ...h.ident(vm), noKeys: true })
-      ready = await this.waitReady(vm, READY_MS)
+      ready = await this.waitReady(vm, READY_MS, null, attempts)
     } catch (e) {
       try { reader?.kill() } catch { /* ended */ }
       await diag
@@ -147,7 +148,11 @@ class LinuxDriver {
     // stage; given a minute more, then the reader is stopped (by its handle) and the build goes on without them.
     const facts = parseDiag(ready === null ? await diag : await Promise.race([diag, sleep(60_000).then(() => ({ lines: [], late: true }))]))
     try { reader?.kill() } catch { /* ended */ }
-    if (ready === null) throw new Error(notReadyWhy(facts))
+    if (ready === null) {
+      const why = notReadyWhy(facts, attempts)
+      h.log(`${vm.vmName}: Linux build never ready: ${why}`)
+      throw new Error(why)
+    }
     step('waiting for cloud-init to finish')
     const g = await this.waitCloudInit(vm)
     step('checking the guest')
@@ -166,13 +171,20 @@ class LinuxDriver {
     }
   }
 
-  /** Polls the authenticated round trip until the dispatcher answers: ms to ready, or null. */
-  async waitReady(vm, ms, lease = null) {
+  /**
+   * Polls the authenticated round trip until the dispatcher answers: ms to ready, or null. MC-1544: out (optional) gets
+   * the attempts' count and the last one's error (ssh.exe's exit code and stderr, which carries HvMcpVsock.exe's own
+   * message), cleaned by sshError, so a build that never answers can say why.
+   */
+  async waitReady(vm, ms, lease = null, out = {}) {
     const t0 = Date.now()
+    out.attempts = 0
     while (Date.now() - t0 < ms) {
       if (lease) this.h.stillHeld(lease)
-      const r = await this.call(vm, 'guest-ready', {}, lease ? this.h.forLease(lease, 60_000) : { timeoutMs: 60_000 }).catch(() => null)
+      out.attempts++
+      const r = await this.call(vm, 'guest-ready', {}, lease ? this.h.forLease(lease, 60_000) : { timeoutMs: 60_000 }).catch(e => { out.error = sshError(e.message); return null })
       if (r?.ready) return Date.now() - t0
+      if (r && !r.ready) out.error = 'the VM is not running'
       await sleep(POLL_MS)
     }
     return null
@@ -220,13 +232,31 @@ function parseDiag(r) {
   return facts
 }
 
-/** Why a build's guest never answered: conclusive from the diagnostics, or inconclusive. Never retried over B. */
-function notReadyWhy(d) {
+/**
+ * MC-1544: an SSH attempt's error, fit for a reason and a log. Printable ASCII only, whitespace collapsed, anything that
+ * looks like key material (a PEM line, or a base64 run of 40+ characters) replaced, at most 400 characters.
+ */
+function sshError(text) {
+  return String(text ?? '')
+    .replace(/-----BEGIN[\s\S]*?(-----END[^-]*-----|$)/g, '[key material removed]')
+    .replace(/[A-Za-z0-9+/=]{40,}/g, '[removed]')
+    .replace(/[^\x20-\x7e]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 400)
+}
+
+/**
+ * Why a build's guest never answered: conclusive from the diagnostics, or inconclusive. Never retried over B. MC-1544:
+ * the readiness wait's last SSH error comes with it, whichever it is.
+ */
+function notReadyWhy(d, attempts = {}) {
   const seen = Object.entries(d).map(([k, v]) => `${k}=${v}`).join(' ')
-  if (d.hv_sock_driver === 'absent') return `the guest kernel has no hv_sock driver (kernel ${d.kernel || 'unknown'}): this image can't use the Hyper-V socket transport. Moving to the internal-switch transport is the user's decision (docs/linux-guests.md §4.1). Diagnostics: ${seen}`
-  if (d.vsock_listen && d.vsock_listen !== 'active') return `the guest's sshd socket on vsock isn't listening (${d.vsock_listen}). Diagnostics: ${seen}`
-  if (d.sshd_config_ok === 'no') return `the guest's sshd config doesn't parse. Diagnostics: ${seen}`
-  return `the guest never answered over SSH, and the diagnostics don't say why (inconclusive): ${seen}. The build stops here: the transport is the user's decision`
+  const ssh = attempts.error ? ` Last SSH error (attempt ${attempts.attempts}): ${attempts.error}` : attempts.attempts ? ` No SSH error was seen in ${attempts.attempts} attempt(s).` : ''
+  if (d.hv_sock_driver === 'absent') return `the guest kernel has no hv_sock driver (kernel ${d.kernel || 'unknown'}): this image can't use the Hyper-V socket transport. Moving to the internal-switch transport is the user's decision (docs/linux-guests.md §4.1). Diagnostics: ${seen}.${ssh}`
+  if (d.vsock_listen && d.vsock_listen !== 'active') return `the guest's sshd socket on vsock isn't listening (${d.vsock_listen}). Diagnostics: ${seen}.${ssh}`
+  if (d.sshd_config_ok === 'no') return `the guest's sshd config doesn't parse${d.sshd_error ? ` (${d.sshd_error})` : ''}. Diagnostics: ${seen}.${ssh}`
+  return `the guest never answered over SSH, and the diagnostics don't say why (inconclusive): ${seen}.${ssh} The build stops here: the transport is the user's decision`
 }
 
 /** The build's checks (§3, §4.1's row for A): what must hold before the clean checkpoint. */
@@ -257,4 +287,4 @@ function verifyProblem(g, { keys, transport, img, built = false }) {
   return bad
 }
 
-module.exports = { LinuxDriver, parseDiag, notReadyWhy, verifyProblem, PATHS }
+module.exports = { LinuxDriver, parseDiag, notReadyWhy, verifyProblem, sshError, PATHS }
