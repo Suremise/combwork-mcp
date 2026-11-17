@@ -189,18 +189,53 @@ function guest(name, script) {
   return { run, out }
 }
 
-test('hv.ps1\'s start, for real: a running command\'s PID and creation time (read before its object is disposed), polled, then killed by them', { skip: !windows || START.some(b => !b) || !KILL }, async () => {
+/**
+ * MC-1543: ends a process the test started, only if it is still that process (its PID and creation time, within a
+ * second), never by name. For an after hook: whatever a failed assertion left running.
+ */
+function endIfStill(pid, created) {
+  if (!pid || !created) return
+  spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+    `$p = Get-Process -Id ${Number(pid)} -ErrorAction SilentlyContinue; if ($p -and [Math]::Abs(($p.StartTime.ToUniversalTime() - [DateTime]::Parse('${String(created).replace(/'/g, '')}').ToUniversalTime()).TotalSeconds) -lt 1) { $p.Kill() }`],
+  { encoding: 'utf8', env: ps51Env(), windowsHide: true, timeout: 30_000 })
+}
+
+test('hv.ps1\'s start, for real: a running command\'s PID and creation time (read before its object is disposed), polled, then killed by them, with everything it started', { skip: !windows || START.some(b => !b) || !KILL }, async t => {
+  // MC-1543: this test once killed the run's tree while cmd was still starting PING.EXE. The ping lost its console
+  // mid-initialisation, failed with 0xc0000142 and showed Windows' error dialog on the desktop, and a ping created just
+  // after taskkill's snapshot was left running. Now:
+  // - the test's PowerShell turns error dialogs off (SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX |
+  //   SEM_NOOPENFILEERRORBOX), which its children inherit, so no failure can show one;
+  // - the kill waits until the run's own PING.EXE (outer cmd, then the wrapper's cmd, then ping) is running;
+  // - the ping (a target only this test uses) is reported by its PID and creation time, must be gone after the kill,
+  //   and is ended by that identity in an after hook if an assertion left it.
   const g = guest('runs-startps', `param($Dir, $Out, $Cwd)
-$j = @{ n = 1; command = 'ping -n 120 127.0.0.1 >nul'; shell = 'cmd'; cwd = $Cwd; dir = $Dir; out = $Out }
+Add-Type -Namespace HvMcpTest -Name ErrorMode -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint SetErrorMode(uint mode);'
+[void][HvMcpTest.ErrorMode]::SetErrorMode(0x8003)
+$j = @{ n = 1; command = 'ping -n 120 127.15.43.1 >nul'; shell = 'cmd'; cwd = $Cwd; dir = $Dir; out = $Out }
 $s = & $GuestRunStart $j $RunFiles.ToString()
 ConvertTo-Json -InputObject $s -Compress
+$ping = $null
+$t = (Get-Date).AddSeconds(30)
+do {
+  Start-Sleep -Milliseconds 100
+  $inner = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($s.pid)" | ForEach-Object { $_.ProcessId })
+  if ($inner.Count) { $ping = @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" | Where-Object { $inner -contains $_.ParentProcessId })[0] }
+} until ($ping -or (Get-Date) -gt $t)
+ConvertTo-Json -InputObject @{ pid = $(if ($ping) { [int]$ping.ProcessId } else { $null }); created = $(if ($ping) { $ping.CreationDate.ToUniversalTime().ToString('o') } else { $null }) } -Compress
 ConvertTo-Json -InputObject (& $GuestRunPoll @{ n = 1; cap = 1024; out = $Out }) -Compress
-ConvertTo-Json -InputObject (& $GuestRunKill @{ pid = $s.pid; started = $s.started }) -Compress`)
-  const [started, poll, killed] = g.run()
+ConvertTo-Json -InputObject (& $GuestRunKill @{ pid = $s.pid; started = $s.started }) -Compress
+$gone = $true
+if ($ping) { $t = (Get-Date).AddSeconds(10); do { Start-Sleep -Milliseconds 100; $gone = -not (Get-Process -Id $ping.ProcessId -ErrorAction SilentlyContinue) } until ($gone -or (Get-Date) -gt $t) }
+ConvertTo-Json -InputObject @{ pingGone = $gone } -Compress`)
+  const [started, ping, poll, killed, after] = g.run()
+  t.after(() => { endIfStill(ping?.pid, ping?.created); endIfStill(started?.pid, started?.started) })
   assert.ok(Number.isInteger(started.pid) && started.pid > 0, `a real PID: ${JSON.stringify(started)}`)
   assert.match(String(started.started), /^\d{4}-\d\d-\d\dT/, 'its creation time')
+  assert.ok(Number.isInteger(ping.pid) && ping.pid > 0, `the run's own PING.EXE was seen running before the kill: ${JSON.stringify(ping)}`)
   assert.strictEqual(poll.done, false)
   assert.deepStrictEqual(killed, { killed: true })
+  assert.deepStrictEqual(after, { pingGone: true }, 'the kill took the whole tree, the ping included')
   await waitFor(() => !alive(started.pid), 10_000, 'the run gone')
 })
 
