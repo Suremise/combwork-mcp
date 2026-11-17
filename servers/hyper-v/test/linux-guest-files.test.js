@@ -92,6 +92,22 @@ test('the seed per transport: A listens on vsock only with no addresses and hv_s
   assert.throws(() => seed.files({ instanceId: 'bad', hostname: 'h', keys: keys(), dispatcher: 'x' }), /instance id/)
 })
 
+test('MC-1550: the seed turns off systemd-resolved\'s LLMNR and mDNS responders (a drop-in, then a restart harmless where resolved is absent), on either transport', () => {
+  for (const opts of [{}, { transport: 'internal-switch', address: '10.47.0.11/24' }]) {
+    const u = userData(seed.files({ instanceId: 'i-0123456789abcdef', hostname: 'h', keys: keys(), dispatcher: 'x', ...opts }))
+    const dropin = u.write_files.find(w => w.path === '/etc/systemd/resolved.conf.d/hvmcp.conf')
+    assert.ok(dropin, 'the drop-in')
+    assert.deepStrictEqual([dropin.owner, dropin.permissions], ['root:root', '0644'])
+    assert.match(dropin.content, /^\[Resolve\]$/m)
+    assert.match(dropin.content, /^LLMNR=no$/m)
+    assert.match(dropin.content, /^MulticastDNS=no$/m)
+    const steps = u.runcmd.map(c => c.join(' '))
+    const restart = steps.indexOf('sh -c systemctl try-restart systemd-resolved.service 2>/dev/null || true')
+    assert.ok(restart > 0, 'try-restart, made harmless: it starts nothing where resolved is not running, and never fails cloud-init')
+    assert.ok(restart < steps.findIndex(s => / socket-up$/.test(s)), 'before the last diagnostic, so the checks see it applied')
+  }
+})
+
 /** A Linux Python: HYPERV_TEST_LINUX_PYTHON ("wsl -d Debian -e python3", say), or the first WSL distro that has one. */
 function linuxPython() {
   if (process.env.HYPERV_TEST_LINUX_PYTHON) return { argv: process.env.HYPERV_TEST_LINUX_PYTHON.split(' '), wsl: /^wsl(\.exe)?$/i.test(process.env.HYPERV_TEST_LINUX_PYTHON.split(' ')[0]) }

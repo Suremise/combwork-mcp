@@ -11,7 +11,9 @@
  * - sshd only from hvmcp-sshd.socket, on the transport's one endpoint (A: vsock port 22; B: the guest's address, port
  *   22), with its own config; the distro's ssh.service and ssh.socket disabled and masked;
  * - the dispatcher (guest.py), /build (root's, read-only to hvuser), /out (both may write), /hvmcp (root's);
- * - hv_sock loaded at every boot (A), and HVMCP-DIAG lines written to COM1 at each stage of the first boot (§4.2).
+ * - hv_sock loaded at every boot (A), and HVMCP-DIAG lines written to COM1 at each stage of the first boot (§4.2);
+ * - MC-1550: systemd-resolved's LLMNR and mDNS responders off (a drop-in, then a restart where resolved runs), so the
+ *   guest listens on nothing beyond loopback (Debian's genericcloud image answers LLMNR on 0.0.0.0:5355 by default).
  */
 const fs = require('fs')
 const { join } = require('path')
@@ -23,6 +25,12 @@ const TRANSPORTS = ['hvsocket', 'internal-switch']
 // name reduced to the diagnostics' alphabet; it can't fail.
 const EARLY_DIAG = 'k=$(uname -r | tr -cd "A-Za-z0-9._+-"); v=absent; [ -d /sys/bus/vmbus ] && v=present; h=absent; [ -d /sys/bus/vmbus/drivers/hv_sock ] && h=present; ' +
   'echo "HVMCP-DIAG stage=seed-read vmbus=$v hv_sock_driver=$h kernel=$k" > /dev/ttyS0 2>/dev/null; true'
+
+// MC-1550: a drop-in in resolved's own folder (its stub resolver on 127.0.0.53/54, loopback, stays), and a restart
+// that is harmless where resolved isn't installed or isn't running (try-restart starts nothing).
+const RESOLVED_DROPIN = '/etc/systemd/resolved.conf.d/hvmcp.conf'
+const RESOLVED_CONF = '# hyper-v MCP (MC-1550): no LLMNR or mDNS responder, so nothing listens beyond loopback.\n[Resolve]\nLLMNR=no\nMulticastDNS=no\n'
+const RESOLVED_RESTART = ['sh', '-c', 'systemctl try-restart systemd-resolved.service 2>/dev/null || true']
 
 const SSHD_CONFIG = `# hyper-v MCP (MC-1501): sshd for the helper only, started per connection by hvmcp-sshd.socket.
 HostKey /etc/ssh/ssh_host_ed25519_key
@@ -102,6 +110,7 @@ function files({ instanceId, hostname, keys, transport = 'hvsocket', address = n
       { path: '/etc/systemd/system/hvmcp-sshd.socket', owner: 'root:root', permissions: '0644', content: socketUnit(listen) },
       { path: '/etc/systemd/system/hvmcp-sshd@.service', owner: 'root:root', permissions: '0644', content: SERVICE_UNIT },
       { path: '/etc/sudoers.d/hvmcp', owner: 'root:root', permissions: '0440', content: `hvadmin ALL=(root) NOPASSWD: ${DISPATCH} ""\n` },
+      { path: RESOLVED_DROPIN, owner: 'root:root', permissions: '0644', content: RESOLVED_CONF },
       ...(transport === 'hvsocket' ? [{ path: '/etc/modules-load.d/hvmcp.conf', owner: 'root:root', permissions: '0644', content: 'hv_sock\n' }] : [])
     ],
     // bootcmd runs before write_files (cloud-init's init stage), so the dispatcher isn't there yet: this first
@@ -121,6 +130,7 @@ function files({ instanceId, hostname, keys, transport = 'hvsocket', address = n
       ['systemctl', 'mask', 'ssh.service', 'ssh.socket'],
       ['systemctl', 'daemon-reload'],
       ['systemctl', 'enable', '--now', 'hvmcp-sshd.socket'],
+      RESOLVED_RESTART,
       diag('socket-up')
     ],
     final_message: 'hyper-v MCP: cloud-init finished'

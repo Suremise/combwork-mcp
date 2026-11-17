@@ -114,7 +114,10 @@ network; under B the one static address on eth0) and `user-data`:
   The socket listens on the transport's one endpoint (§4.1): `ListenStream=vsock::22` under A, or
   `ListenStream=<guest address>:22` under B, never both. That config allows only public-key auth for
   `AllowUsers hvadmin`, with no passwords, no keyboard-interactive and no forwarding. The distro's own `ssh.service`
-  and `ssh.socket` are disabled and masked, so nothing else ever listens;
+  and `ssh.socket` are disabled and masked, so nothing else ever listens. MC-1550: so are systemd-resolved's LLMNR
+  and mDNS responders (`/etc/systemd/resolved.conf.d/hvmcp.conf`: `LLMNR=no`, `MulticastDNS=no`, then a try-restart).
+  Debian's genericcloud image otherwise answers LLMNR on 0.0.0.0:5355, which failed the listener check in MC-1542's
+  fourth window;
 - `/build` is owned by root and read-only to `hvuser`, as `C:\build` is. `/out` is writable by both, and `/hvmcp`
   (staging, runs) is root's.
 
