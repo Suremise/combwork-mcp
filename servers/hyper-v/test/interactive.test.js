@@ -191,7 +191,7 @@ test('the logon password goes to the guest on stdin only: never in a reply, the 
   const { user } = JSON.parse(fs.readFileSync(path.join(sc.stateDir, 'secrets', 'guest.json'), 'utf8'))
   for (const r of replies) assert.ok(!JSON.stringify(r).includes(user.password))
   assert.ok(!fs.readFileSync(path.join(sc.stateDir, 'journal.jsonl'), 'utf8').includes(user.password))
-  assert.ok(!fs.readFileSync(sc.stubState, 'utf8').includes(user.password))
+  assert.ok(!sc.stubText().includes(user.password))
   assert.ok(sc.stub().calls.some(c => c.op === 'guest-logon'))
 })
 

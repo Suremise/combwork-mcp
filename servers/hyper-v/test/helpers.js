@@ -22,6 +22,21 @@ const SERVER = path.join(__dirname, '..', 'server.js')
 const started = new Set()
 require('node:test').after(async () => { await Promise.all([...started].map(c => { c.kill(); return new Promise(r => (c.exitCode !== null || c.signalCode !== null) ? r() : c.on('exit', r)) })) })
 
+/**
+ * MC-1546: the stub's state file, as text that parses. A stub process may be mid-write (writeFileSync truncates, then
+ * writes), so a read that doesn't parse is retried, as the stubs' own loads do: up to 50 times, 10 ms apart, then the
+ * parse error is thrown. Never a half-written file taken as the state, nor a torn text searched for a secret.
+ */
+function readState(file) {
+  let last
+  for (let i = 0; i < 50; i++) {
+    const text = fs.readFileSync(file, 'utf8')
+    try { JSON.parse(text); return text } catch (e) { last = e }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10)
+  }
+  throw last
+}
+
 let seq = 0
 /** A fresh folder: state (policy.json), disks, a fake profile and builds, and the stub's state. */
 function scratch(name, { policy = {}, stub = {} } = {}) {
@@ -68,8 +83,9 @@ function scratch(name, { policy = {}, stub = {} } = {}) {
       HYPERV_MCP_RETRY_MS: '600000',
       HYPERV_MCP_CRASH_AT: ''
     },
-    stub: () => JSON.parse(fs.readFileSync(state, 'utf8')),
-    patchStub: fn => { const s = JSON.parse(fs.readFileSync(state, 'utf8')); fn(s); fs.writeFileSync(state, JSON.stringify(s)) },
+    stub: () => JSON.parse(readState(state)),
+    stubText: () => readState(state),
+    patchStub: fn => { const s = JSON.parse(readState(state)); fn(s); fs.writeFileSync(state, JSON.stringify(s)) },
     journal: () => fs.readFileSync(path.join(dir, 'state', 'journal.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
   }
 }
