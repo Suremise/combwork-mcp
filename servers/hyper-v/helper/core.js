@@ -1635,10 +1635,10 @@ class Helper {
         // Timed out: killed by its PID only if that PID is still the run's process (its recorded creation time), then
         // a last read of its output. Both are cleanup after the run's own budget, each bounded by CLEANUP_MS.
         this.stillHeld(lease)
-        const k = await this.guestCall(vm, 'guest-run-kill', { ...this.ident(vm), cred: creds.admin, pid: started.pid, started: started.started, n }, this.forLease(lease, CLEANUP_MS)).catch(e => ({ killed: false, why: e.message }))
+        const k = await this.guestCall(vm, 'guest-run-kill', { ...this.ident(vm), cred: creds.admin, pid: started.pid, started: started.started, n, job: started.job ?? null }, this.forLease(lease, CLEANUP_MS)).catch(e => ({ killed: false, why: e.message }))
         this.stillHeld(lease)
         const last = await this.guestCall(vm, 'guest-run-poll', { ...this.ident(vm), cred: creds.admin, n, cap: OUTPUT_CAP }, this.forLease(lease, CLEANUP_MS)).catch(() => null)
-        r = last?.done && k.gone ? last : { ...(last || {}), exitCode: null, timedOut: true, killed: !!k.killed, killWhy: k.why }
+        r = last?.done && k.gone ? last : { ...(last || {}), exitCode: null, timedOut: true, killed: !!k.killed, killVia: k.via, killWhy: k.why }
       } else if (interactive && !r) {
         const pending = polled.last?.pending
         r = { ...(polled.last || {}), exitCode: null, clean: false, timedOut: !started?.lost, why: started?.lost ? `its request wasn't confirmed (${started.lost})` : pending ? 'the session\'s watcher never took the run (is the account still logged on?)' : `no exit within ${timeoutSec} s` }
@@ -1647,12 +1647,18 @@ class Helper {
       if (r.timedOut || exit !== 0) lease.failed = true
       const out = s => (typeof s === 'string' ? s : '').slice(0, OUTPUT_CAP)
       // An interactive run that didn't finish cleanly isn't chased: the VM is restored, which ends whatever it started.
-      const restored = interactive && r.clean !== true ? await this.restoreAfterRun(lease, vm) : null
+      // MC-1547: a Windows run in its own job whose timeout kill couldn't be confirmed through that job is never chased
+      // process by process (a PID-tree kill could miss a child created as it ran): the VM is restored, as for an
+      // interactive run that didn't finish cleanly, which ends everything the run started.
+      const jobUnconfirmed = !interactive && !linux && !!r.timedOut && !r.killed && !!started?.job
+      const restored = (interactive && r.clean !== true) || jobUnconfirmed ? await this.restoreAfterRun(lease, vm) : null
       const lines = [
         interactive
           ? (restored ? `The interactive run didn't finish cleanly (${r.why || 'no exit code'}). ${restored}` : `Exit code ${exit} (in the interactive session).`)
-          : r.timedOut
-            ? `Timed out after ${timeoutSec} s: ${r.killed ? (linux ? 'killed inside the guest with everything it started (its systemd unit' + "'" + 's cgroup).' : 'killed inside the guest by its PID (taskkill /T /F).') : `not confirmed killed${r.killWhy ? ` (${r.killWhy})` : ''}; vm_stop is the fallback.`}`
+          : jobUnconfirmed
+            ? `Timed out after ${timeoutSec} s, and its job's kill couldn't be confirmed${r.killWhy ? ` (${r.killWhy})` : ''}. ${restored}`
+            : r.timedOut
+            ? `Timed out after ${timeoutSec} s: ${r.killed ? (linux ? 'killed inside the guest with everything it started (its systemd unit' + "'" + 's cgroup).' : r.killVia === 'job' ? 'killed inside the guest with everything it started (its job object, MC-1547).' : 'killed inside the guest by its PID (taskkill /T /F).') : `not confirmed killed${r.killWhy ? ` (${r.killWhy})` : ''}; vm_stop is the fallback.`}`
             : `Exit code ${exit === null ? 'unknown' : exit}.`,
         `--- stdout${r.stdoutCut ? ` (first ${OUTPUT_CAP} bytes)` : ''} ---`, out(r.stdout),
         `--- stderr${r.stderrCut ? ` (first ${OUTPUT_CAP} bytes)` : ''} ---`, out(r.stderr)

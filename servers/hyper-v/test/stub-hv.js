@@ -495,7 +495,8 @@ function run(s, op, a) {
       // An interactive run is taken by the session's watcher: its account then, if the watcher is there.
       vm.runs[a.n] = { command: String(a.command), interactive, as: interactive ? null : (a.runAs ? a.runAs.user : 'admin'), polls: 0, taken: interactive ? (vm.watcher ? vm.loggedOn : null) : true }
       if (interactive) return { published: true }
-      return { pid: 4000 + a.n, started: String(a.command) === 'fast' ? null : `2026-11-13T00:00:${String(a.n).padStart(2, '0')}.0000000Z` }
+      // runJobs (MC-1547): the run is started in its own job, named as hv.ps1 names it.
+      return { pid: 4000 + a.n, started: String(a.command) === 'fast' ? null : `2026-11-13T00:00:${String(a.n).padStart(2, '0')}.0000000Z`, ...(s.runJobs ? { job: `hvmcp-run-${a.n}-${'0123456789abcdef'}` } : {}) }
     }
     case 'guest-run-poll': {
       const vm = own(s, a)
@@ -544,7 +545,14 @@ function run(s, op, a) {
     case 'guest-run-kill': {
       const vm = own(s, a)
       const run = Object.entries(vm.runs || {}).find(([n]) => 4000 + Number(n) === a.pid)?.[1]
-      s.kills = [...(s.kills || []), { pid: a.pid, started: a.started }]
+      s.kills = [...(s.kills || []), { pid: a.pid, started: a.started, job: a.job ?? null }]
+      // MC-1547: a run with a job is killed through it; jobKillFails: that can't be confirmed (never a PID fallback).
+      if (a.job) {
+        if (!run || run.result) return { killed: false, gone: true }
+        if (s.jobKillFails) return { killed: false, jobFailed: true, why: 'processes were still in its job 10 s after it was terminated' }
+        run.killed = true
+        return { killed: true, via: 'job' }
+      }
       if (!run || run.result) return { killed: false, gone: true }
       if (!a.started) return { killed: false, why: 'its identity was never recorded' }
       if (s.killMismatch) return { killed: false, why: `PID ${a.pid} is no longer the run's process (it exited and the PID was reused)` }

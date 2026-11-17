@@ -124,22 +124,154 @@ $RunFiles = {
   "$dir\wrap-$n.cmd"
 }
 
+# MC-1547: each session-0 run in its own Job object, so a timeout's kill ends everything the run started, whenever it
+# was created (taskkill /T, from a snapshot of parent PIDs, misses a child created as it runs). Compiled in the guest by
+# Add-Type (passed in as text). Design:
+# - The job is named (hvmcp-run-<n>-<16 hex>, random, so never reused) and made with a DACL for SYSTEM, Administrators
+#   and its owner only, so the admin's kill call can open a standard user's run's job, and nobody else can.
+# - Not kill-on-close: a run starts in one short PowerShell Direct call and outlives it, so the job must too. A run that
+#   finishes still leaves its processes running, as before.
+# - Its name lasts only while a handle to it is open (the kernel drops an object's name with its last handle, whatever
+#   still references it). So the run's processes hold one: the job's handle is inheritable, the wrapper's cmd inherits
+#   exactly that handle (an explicit handle list, nothing else of this process), and cmd's children inherit it from it.
+#   The name lasts as long as any process of the run holding it; the kill finds no job only once they've all ended.
+# - The wrapper's cmd is created suspended, put in the job, then resumed: nothing it starts is ever outside the job.
+#   No breakaway is allowed (a program that asks for CREATE_BREAKAWAY_FROM_JOB gets access denied for that child). A
+#   program that makes its own job gets a nested one (Windows 8 and later), inside ours: terminating ours ends it too.
+# - Kill: open the job by name, TerminateJobObject, then confirm no process is left in it. No job by that name means its
+#   processes have all ended. If the job can't be made, or opened at the kill, the PID-checked taskkill below remains.
+$RunJob = @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+public static class HvMcpRunJob
+{
+    [StructLayout(LayoutKind.Sequential)] struct SECURITY_ATTRIBUTES { public int nLength; public IntPtr lpSecurityDescriptor; public bool bInheritHandle; }
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct STARTUPINFO { public int cb; public string lpReserved, lpDesktop, lpTitle; public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags; public short wShowWindow, cbReserved2; public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError; }
+    [StructLayout(LayoutKind.Sequential)] struct STARTUPINFOEX { public STARTUPINFO StartupInfo; public IntPtr lpAttributeList; }
+    [StructLayout(LayoutKind.Sequential)] struct PROCESS_INFORMATION { public IntPtr hProcess, hThread; public int dwProcessId, dwThreadId; }
+    [StructLayout(LayoutKind.Sequential)] struct ACCOUNTING { public long TotalUserTime, TotalKernelTime, ThisPeriodTotalUserTime, ThisPeriodTotalKernelTime; public uint TotalPageFaultCount, TotalProcesses, ActiveProcesses, TotalTerminatedProcesses; }
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(string sddl, int rev, out IntPtr sd, IntPtr size);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern IntPtr CreateJobObject(ref SECURITY_ATTRIBUTES sa, string name);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern IntPtr OpenJobObject(uint access, bool inherit, string name);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool TerminateJobObject(IntPtr job, uint code);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool QueryInformationJobObject(IntPtr job, int cls, out ACCOUNTING info, int size, IntPtr ret);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool CreateProcess(string app, System.Text.StringBuilder cmd, IntPtr pa, IntPtr ta, bool inherit, uint flags, IntPtr env, string dir, ref STARTUPINFOEX si, out PROCESS_INFORMATION pi);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, int flags, ref IntPtr size);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool UpdateProcThreadAttribute(IntPtr list, uint flags, IntPtr attr, IntPtr value, IntPtr size, IntPtr prev, IntPtr ret);
+    [DllImport("kernel32.dll")] static extern void DeleteProcThreadAttributeList(IntPtr list);
+    [DllImport("kernel32.dll")] static extern uint ResumeThread(IntPtr thread);
+    [DllImport("kernel32.dll")] static extern bool TerminateProcess(IntPtr process, uint code);
+    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll")] static extern IntPtr LocalFree(IntPtr h);
+
+    const uint CREATE_SUSPENDED = 0x4, CREATE_NO_WINDOW = 0x08000000, EXTENDED_STARTUPINFO_PRESENT = 0x80000, JOB_TERMINATE = 0x8, JOB_QUERY = 0x4;
+    static readonly IntPtr PROC_THREAD_ATTRIBUTE_HANDLE_LIST = (IntPtr)0x20002;
+    const int ERROR_FILE_NOT_FOUND = 2, ERROR_ALREADY_EXISTS = 183;
+
+    // Starts cmdLine suspended, in a new job of this name, then resumes it. Returns its PID; throws when it can't.
+    public static int Start(string cmdLine, string jobName)
+    {
+        IntPtr sd;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptor("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)", 1, out sd, IntPtr.Zero)) throw new Win32Exception();
+        // Inheritable: the run's processes hold it, so its name lasts while they do.
+        var sa = new SECURITY_ATTRIBUTES { nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)), lpSecurityDescriptor = sd, bInheritHandle = true };
+        IntPtr job = CreateJobObject(ref sa, jobName);
+        int err = Marshal.GetLastWin32Error();
+        LocalFree(sd);
+        if (job == IntPtr.Zero) throw new Win32Exception(err);
+        if (err == ERROR_ALREADY_EXISTS) { CloseHandle(job); throw new Win32Exception(err, "a job of that name already exists"); }
+        IntPtr list = IntPtr.Zero, handles = IntPtr.Zero;
+        try
+        {
+            // Inherit exactly the job's handle, nothing else of this process.
+            IntPtr size = IntPtr.Zero;
+            InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
+            list = Marshal.AllocHGlobal(size);
+            if (!InitializeProcThreadAttributeList(list, 1, 0, ref size)) throw new Win32Exception();
+            handles = Marshal.AllocHGlobal(IntPtr.Size);
+            Marshal.WriteIntPtr(handles, job);
+            if (!UpdateProcThreadAttribute(list, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handles, (IntPtr)IntPtr.Size, IntPtr.Zero, IntPtr.Zero)) throw new Win32Exception();
+            var si = new STARTUPINFOEX();
+            si.StartupInfo.cb = Marshal.SizeOf(typeof(STARTUPINFOEX));
+            si.lpAttributeList = list;
+            PROCESS_INFORMATION pi;
+            if (!CreateProcess(null, new System.Text.StringBuilder(cmdLine), IntPtr.Zero, IntPtr.Zero, true, CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, IntPtr.Zero, null, ref si, out pi)) throw new Win32Exception();
+            try
+            {
+                if (!AssignProcessToJobObject(job, pi.hProcess)) { int e = Marshal.GetLastWin32Error(); TerminateProcess(pi.hProcess, 1); throw new Win32Exception(e); }
+                ResumeThread(pi.hThread);
+                return pi.dwProcessId;
+            }
+            finally { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
+        }
+        finally
+        {
+            if (list != IntPtr.Zero) { DeleteProcThreadAttributeList(list); Marshal.FreeHGlobal(list); }
+            if (handles != IntPtr.Zero) Marshal.FreeHGlobal(handles);
+            CloseHandle(job); // this process's own handle; the run's processes hold theirs (not kill-on-close)
+        }
+    }
+
+    // Ends every process in the job of this name: 0 no such job (its processes have all ended), 1 terminated and
+    // confirmed empty, 2 terminated but processes still listed after waitMs, -1 couldn't open or terminate it.
+    public static int Kill(string jobName, int waitMs)
+    {
+        IntPtr job = OpenJobObject(JOB_TERMINATE | JOB_QUERY, false, jobName);
+        if (job == IntPtr.Zero) return Marshal.GetLastWin32Error() == ERROR_FILE_NOT_FOUND ? 0 : -1;
+        try
+        {
+            if (!TerminateJobObject(job, 1)) return -1;
+            var deadline = DateTime.UtcNow.AddMilliseconds(waitMs);
+            for (;;)
+            {
+                ACCOUNTING a;
+                if (!QueryInformationJobObject(job, 1, out a, Marshal.SizeOf(typeof(ACCOUNTING)), IntPtr.Zero)) return -1;
+                if (a.ActiveProcesses == 0) return 1;
+                if (DateTime.UtcNow > deadline) return 2;
+                System.Threading.Thread.Sleep(50);
+            }
+        }
+        finally { CloseHandle(job); }
+    }
+}
+'@
+
 # A session-0 run's start, as the run's own account (its admin, or its standard user in its own PowerShell Direct
-# session): the files, then the wrapper with Start-Process. Returns its PID and its creation time, read from the started
-# process's own handle; a process that has already exited has no creation time to read: the exit file then decides.
+# session): the files, then the wrapper, in the run's own job (MC-1547; $jobSource is $RunJob's text). Returns its PID,
+# its creation time, read from the started process's own handle (a process that has already exited has none to read:
+# the exit file then decides), and its job's name (null when the job couldn't be made: the run then starts as before,
+# with Start-Process, and the kill falls back to taskkill).
 $GuestRunStart = {
-  param($j, $files)
+  param($j, $files, $jobSource)
   $ErrorActionPreference = 'Stop'
   $wrapper = & ([scriptblock]::Create($files)) $j ([string]$j.dir)
-  $p = Start-Process -FilePath 'cmd.exe' -ArgumentList "/d /c `"$wrapper`"" -PassThru -WindowStyle Hidden
-  # The PID and the creation time are read while the object still holds the process (Windows PowerShell's Id is null
-  # once it is disposed), then it is disposed.
-  $id = $p.Id
-  $started = $null
+  $jobName = $null
+  $p = $null
+  # MC-1547 (round 2): fail closed. A run that can't be put in its job isn't started (HvMcpRunJob.Start ends any process
+  # it made before failing): the error says why, and nothing uncontained runs.
+  if (-not $jobSource) { throw 'no job type was given: a run is only started in its own job' }
   try {
-    try { [void]$p.Handle; $started = $p.StartTime.ToUniversalTime().ToString('o') } catch { }
-  } finally { try { $p.Dispose() } catch { } }
-  @{ pid = $id; started = $started }
+    if (-not ('HvMcpRunJob' -as [type])) { Add-Type -TypeDefinition $jobSource }
+    $name = 'hvmcp-run-{0}-{1}' -f [int]$j.n, ([guid]::NewGuid().ToString('N').Substring(0, 16))
+    $runPid = [HvMcpRunJob]::Start("cmd.exe /d /c `"$wrapper`"", $name)
+  } catch { throw "the run couldn't be put in its own job, so it wasn't started: $($_.Exception.Message)" }
+  $jobName = $name
+  $id = $runPid
+  try { $p = [Diagnostics.Process]::GetProcessById($runPid) } catch { $p = $null }
+  $started = $null
+  if ($p) {
+    try {
+      try { [void]$p.Handle; $started = $p.StartTime.ToUniversalTime().ToString('o') } catch { }
+    } finally { try { $p.Dispose() } catch { } }
+  }
+  # The PID and the creation time were read while the object still held the process (Windows PowerShell's Id is null
+  # once it is disposed), then it was disposed.
+  @{ pid = $id; started = $started; job = $jobName }
 }
 
 # A run's poll, as the guest's admin: the capped output so far, and the exit file, read whole: done with its exit code,
@@ -169,7 +301,25 @@ $GuestRunPoll = {
 # or with another creation time (exited and its PID reused), or with no recorded identity, is never killed: the exit
 # file decides.
 $GuestRunKill = {
-  param($j)
+  param($j, $jobSource)
+  # MC-1547: a run with a job is killed through its job only: everything in it ends, whenever it was started. No job by
+  # that name means every process of the run has ended. A job kill that can't be confirmed is reported as such (jobFailed),
+  # never retried as a PID-tree taskkill, which could miss a child created as it ran: the helper restores the VM instead.
+  # The PID path below is only for a run started without a job (an older helper's).
+  if ($j.job) {
+    if ([string]$j.job -notmatch '^hvmcp-run-\d{1,9}-[0-9a-f]{16}$') { return @{ killed = $false; jobFailed = $true; why = 'its job name is malformed' } }
+    $r = -1
+    $err = $null
+    try {
+      if (-not $jobSource) { throw 'no job type was given' }
+      if (-not ('HvMcpRunJob' -as [type])) { Add-Type -TypeDefinition $jobSource }
+      $r = [HvMcpRunJob]::Kill([string]$j.job, 10000)
+    } catch { $r = -1; $err = $_.Exception.Message }
+    if ($r -eq 1) { return @{ killed = $true; via = 'job' } }
+    if ($r -eq 0) { return @{ killed = $false; gone = $true } }
+    if ($r -eq 2) { return @{ killed = $false; jobFailed = $true; why = 'processes were still in its job 10 s after it was terminated' } }
+    return @{ killed = $false; jobFailed = $true; why = "its job couldn't be opened or terminated$(if ($err) { " ($err)" })" }
+  }
   $p = $null
   try { $p = [Diagnostics.Process]::GetProcessById([int]$j.pid) } catch { return @{ killed = $false; gone = $true } }
   try {
@@ -934,7 +1084,7 @@ try {
         } -ArgumentList $user
         $as = Cred $a.runAs
       }
-      Invoke-Command -VMId $vm.Id -Credential $as -ScriptBlock $GuestRunStart -ArgumentList $j, $RunFiles.ToString()
+      Invoke-Command -VMId $vm.Id -Credential $as -ScriptBlock $GuestRunStart -ArgumentList $j, $RunFiles.ToString(), $RunJob
     }
     'guest-run-publish' {
       $vm = Get-OwnVm $a
@@ -947,7 +1097,7 @@ try {
     }
     'guest-run-kill' {
       $vm = Get-OwnVm $a
-      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestRunKill -ArgumentList @{ pid = [int]$a.pid; started = $a.started }
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestRunKill -ArgumentList @{ pid = [int]$a.pid; started = $a.started; job = $a.job }, $RunJob
     }
     'guest-list' { $vm = Get-OwnVm $a; Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestList }
     'guest-read' {
