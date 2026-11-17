@@ -204,7 +204,10 @@ only.**
 - Before the first boot, hv.ps1 runs `Set-VMComPort -VMName <own VM> -Number 1 -Path \\.\pipe\hvmcp-diag-<random>`.
   This is a VM setting on a pool VM, like the others, and it works on Gen 2 through PowerShell. The helper's hv.ps1
   reads that pipe as a client into a bounded buffer (64 KB, discarded past that) for the build's duration.
-- The seed's `runcmd` (as root, early, and again once the socket unit is up) writes fixed lines to `/dev/ttyS0`:
+- The seed writes fixed lines to `/dev/ttyS0`. First its `bootcmd` writes one (stage seed-read). That runs before
+  `write_files` installs the dispatcher, so it uses only the image's own `sh`, `test` and `uname`, and never fails,
+  since a failing bootcmd fails cloud-init. Then the dispatcher's `--diag` writes lines from `runcmd`, after
+  `write_files` (MC-1501, round 2). The keys:
   `HVMCP-DIAG key=value ...` with keys from a fixed set:
   - `stage` (seed-read, units-written, socket-up, cloud-init-done);
   - `vmbus` (`/sys/bus/vmbus` present);

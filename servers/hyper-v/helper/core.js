@@ -23,6 +23,8 @@ const { Journal } = require('./journal')
 const policyMod = require('./policy')
 const { segments, globMatcher } = require('./paths')
 const images = require('./images')
+const linuxImages = require('./linux-images')
+const { LinuxDriver, PATHS: LINUX_PATHS } = require('./guests/linux')
 
 const PLAN_ID_RE = /^p-[0-9a-f]{16}$/
 const PLAN_TTL_MS = 30 * 60_000
@@ -150,6 +152,7 @@ class Helper {
     this.tokens = 0
     this.timers = new Set()
     this.ready = false
+    this.linux = new LinuxDriver(this) // MC-1501: a Linux VM's guest ops (SSH to its dispatcher)
   }
 
   // ---------- start-up ----------
@@ -174,6 +177,15 @@ class Helper {
 
   /** The VM operations' identity: what hv.ps1 re-checks before touching a VM. */
   ident(vm) { return { vmId: vm.vmId, name: vm.vmName, folder: vm.folder } }
+
+  /**
+   * MC-1501: a guest op, by the VM's guest driver: a Windows VM's go to hv.ps1 (PowerShell Direct), a Linux VM's to its
+   * dispatcher over SSH (guests/linux.js), under the same names and with the same answers.
+   */
+  guestCall(vm, op, args, opts) { return this.osOf(vm) === 'linux' ? this.linux.call(vm, op, args, opts) : this.hv(op, args, opts) }
+  isLinux(vm) { return this.osOf(vm) === 'linux' }
+  /** The guest's build and output folders, as the agent sees them. */
+  paths(vm) { return this.isLinux(vm) ? LINUX_PATHS : { build: 'C:\\build', out: 'C:\\out' } }
 
   vmLock(vmId) {
     if (!this.vmLocks.has(vmId)) this.vmLocks.set(vmId, mutex())
@@ -245,12 +257,14 @@ class Helper {
     }
     if (found?.vmId) await this.hv('remove-vm', { vmId: found.vmId, name: intent.vmName, folder: intent.folder })
     this.removeFolder(intent.folder)
+    this.linux.dropKeys(intent.vmName) // MC-1501: a Linux VM's SSH keys (none for Windows)
     this.journal.append({ t: 'rolledBack', intentId: intent.intentId })
   }
 
   async removeVm(vm) {
     await this.hv('remove-vm', this.ident(vm))
     this.removeFolder(vm.folder)
+    this.linux.dropKeys(vm.vmName) // MC-1501: a Linux VM's SSH keys (none for Windows)
     this.journal.append({ t: 'removed', vmId: vm.vmId })
   }
 
@@ -402,6 +416,7 @@ class Helper {
     if (!p) return null
     if (p.maxVms?.[want.os] === 0) return `project ${project} may not use ${want.os} VMs`
     if (want.image && p.images.length && !p.images.includes(want.image)) return `project ${project} may not use image ${want.image.slice(0, 12)}`
+    if (want.distro && p.images.length && !p.images.some(sha => this.state.images.get(sha)?.distro === want.distro)) return `project ${project} may not use any ${want.distro} image`
     // MC-1523: a named VM made before images were recorded (legacy) can't be on an image allowlist.
     if (want.vm && want.vmImage === 'legacy' && p.images.length) return `project ${project} may not use ${want.vm}: its image is unknown (made before images were recorded), so it isn't on the project's image list`
     return null
@@ -434,6 +449,7 @@ class Helper {
       if (want.vm && v.vmName !== want.vm) return false
       if (want.checkpoint && !this.poolCheckpointOn(v.vmId, want.checkpoint)) return false
       if (want.image && img !== want.image) return false
+      if (want.distro && this.state.images.get(img)?.distro !== want.distro) return false
       if (p?.images.length && !p.images.includes(img)) return false
       return true
     }).sort((a, b) => failedAt(a) - failedAt(b))
@@ -583,12 +599,15 @@ class Helper {
    * the next call. A newer call from the same connection supersedes a waiting one. The pool lock is held only for these
    * decisions, never while waiting.
    */
-  async acquire(connId, { minutes = 60, keepOnFailure = false, wait = false, roots, os: osAsked, image, vm: named, checkpoint } = {}) {
+  async acquire(connId, { minutes = 60, keepOnFailure = false, wait = false, roots, os: osAsked, image, vm: named, checkpoint, distro } = {}) {
     // MC-1523: an omitted os stays omitted until a named VM is resolved (its own OS then); unnamed, it means windows.
     if (osAsked !== undefined && !OSES.includes(osAsked)) throw new Error(`os must be ${OSES.join(' or ')}`)
     if (named !== undefined && (typeof named !== 'string' || !named || named.length > 64)) throw new Error('vm must be a VM name from vm_status.')
     if (checkpoint !== undefined && (typeof checkpoint !== 'string' || !POOL_CHECKPOINT_RE.test(checkpoint))) throw new Error("checkpoint must be a pool checkpoint's name (vm_status lists them).")
-    const os = osAsked ?? 'windows'
+    // MC-1501: distro ('debian' | 'ubuntu') narrows a Linux request to that distro's images, and implies os 'linux'.
+    if (distro !== undefined && !linuxImages.DISTROS.includes(distro)) throw new Error(`distro must be ${linuxImages.DISTROS.join(' or ')}`)
+    if (distro !== undefined && osAsked !== undefined && osAsked !== 'linux') throw new Error(`distro is for Linux VMs: ${distro} isn't a ${osAsked} distro.`)
+    const os = osAsked ?? (distro !== undefined ? 'linux' : 'windows')
     const step = await this.poolLock(async () => {
       if (this.quiesced) throw new Error('The helper is being uninstalled: no new leases.')
       const c = this.conns.get(connId)
@@ -609,9 +628,11 @@ class Helper {
         const tImg = this.imageOf(target)
         if (osAsked !== undefined && osAsked !== tOs) throw new Error(`${named} is a ${tOs} VM, not ${osAsked}.`)
         if (image !== undefined && this.verifiedImage(image).sha256 !== tImg) throw new Error(`${named} wasn't built from image ${String(image).slice(0, 12)}${tImg === 'legacy' ? ' (its image is unknown: made before images were recorded)' : ` (its image is ${tImg.slice(0, 12)})`}.`)
+        if (distro !== undefined && s.images.get(tImg)?.distro !== distro) throw new Error(`${named} isn't a ${distro} VM.`)
         want = { os: tOs, ...(tImg !== 'legacy' ? { image: tImg } : {}), vm: named, vmImage: tImg }
       } else {
-        want = { os, ...(image !== undefined ? { image: this.verifiedImage(image).sha256 } : {}) }
+        want = { os, ...(image !== undefined ? { image: this.verifiedImage(image).sha256 } : {}), ...(distro !== undefined ? { distro } : {}) }
+        if (want.image && distro !== undefined && s.images.get(want.image)?.distro !== distro) throw new Error(`image ${want.image.slice(0, 12)} isn't a ${distro} image.`)
         // MC-1532: with a checkpoint and no os, the OS comes from the checkpoint's VMs (filtered by this image below).
         if (want.image && !(checkpoint !== undefined && osAsked === undefined) && (this.state.images.get(want.image)?.os || 'windows') !== os) throw new Error(`image ${want.image.slice(0, 12)} is a ${this.state.images.get(want.image)?.os || 'windows'} image, not ${os}.`)
       }
@@ -622,6 +643,7 @@ class Helper {
         if (!have.length) throw new Error(named !== undefined ? `${named} has no pool checkpoint "${checkpoint}" (vm_status lists each VM's).` : `No VM has a pool checkpoint "${checkpoint}" (vm_status lists them).`)
         if (osAsked !== undefined) { have = have.filter(x => this.osOf(s.vms.get(x.vmId)) === osAsked); if (!have.length) throw new Error(`No ${osAsked} VM has a pool checkpoint "${checkpoint}".`) }
         if (want.image) { have = have.filter(x => this.imageOf(s.vms.get(x.vmId)) === want.image); if (!have.length) throw new Error(`No VM of image ${want.image.slice(0, 12)} has a pool checkpoint "${checkpoint}".`) }
+        if (want.distro) { have = have.filter(x => s.images.get(this.imageOf(s.vms.get(x.vmId)))?.distro === want.distro); if (!have.length) throw new Error(`No ${want.distro} VM has a pool checkpoint "${checkpoint}".`) }
         const oses = [...new Set(have.map(x => this.osOf(s.vms.get(x.vmId))))]
         if (oses.length > 1) throw new Error(`The pool checkpoint "${checkpoint}" is on ${oses.join(' and ')} VMs: give os to choose.`)
         want = { ...want, os: oses[0], checkpoint: have[0].name }
@@ -1015,22 +1037,31 @@ class Helper {
           if (bad0) throw new Error(`its clean checkpoint doesn't verify: ${bad0}`)
           await this.hv('configure-start', { ...this.ident(vm), switchName: null, switchId: null, reserve: 0 })
           if (await this.waitGuest(vm, creds.admin, READY_WAIT_MS) === null) throw new Error('its guest didn\'t answer')
-          step('rerunning the guest setup')
-          const g = await this.hv('guest-setup', { ...this.ident(vm), cred: creds.admin, userName: creds.user.user }, { timeoutMs: 15 * 60_000 })
-          const img = this.state.images.get(this.imageOf(vm))
-          const why = img ? images.guestReportProblem(g, img) : (g?.disableForceUnload === 1 ? null : 'DisableForceUnload is not 1')
-          if (why) throw new Error(`the guest's sanity check failed: ${why}`)
-          // MC-1539 (the user's decision): no account logs on. The test accounts' profiles are carried unchanged in the
-          // clean checkpoint (an already-provisioned account's re-logon makes App Readiness log nothing at all, so the
-          // build's first-logon wait could never complete here); fixes to the build's profile setup need a rebuild.
-          step('excluding the test folders from Defender\'s scanning (offline)')
-          await this.defenderStep(vm, creds)
-          // The licence, read while it runs, for the record only: nothing is activated, and the host's evaluation end
-          // (vm.licence.expiresAt) is never rewritten.
-          const lic = await this.hv('guest-licence', { ...this.ident(vm), cred: creds.admin }, { timeoutMs: 120_000 })
-          const licBad = refreshLicenceProblem(lic, vm, this.now())
-          if (licBad) throw new Error(`its licence doesn't check out: ${licBad}`)
-          const licNote = `licence status ${lic.status}`
+          let licNote
+          if (this.isLinux(vm)) {
+            // MC-1501: a Linux VM's guest steps: its seed's files, sshd and keys checked again (they aren't rewritten in
+            // place; a change to them needs a rebuild). No Defender, no licence.
+            step('rechecking the guest (its dispatcher, sshd and keys)')
+            await this.linux.guestSteps(vm)
+            licNote = 'Linux, no licence'
+          } else {
+            step('rerunning the guest setup')
+            const g = await this.hv('guest-setup', { ...this.ident(vm), cred: creds.admin, userName: creds.user.user }, { timeoutMs: 15 * 60_000 })
+            const img = this.state.images.get(this.imageOf(vm))
+            const why = img ? images.guestReportProblem(g, img) : (g?.disableForceUnload === 1 ? null : 'DisableForceUnload is not 1')
+            if (why) throw new Error(`the guest's sanity check failed: ${why}`)
+            // MC-1539 (the user's decision): no account logs on. The test accounts' profiles are carried unchanged in the
+            // clean checkpoint (an already-provisioned account's re-logon makes App Readiness log nothing at all, so the
+            // build's first-logon wait could never complete here); fixes to the build's profile setup need a rebuild.
+            step('excluding the test folders from Defender\'s scanning (offline)')
+            await this.defenderStep(vm, creds)
+            // The licence, read while it runs, for the record only: nothing is activated, and the host's evaluation end
+            // (vm.licence.expiresAt) is never rewritten.
+            const lic = await this.hv('guest-licence', { ...this.ident(vm), cred: creds.admin }, { timeoutMs: 120_000 })
+            const licBad = refreshLicenceProblem(lic, vm, this.now())
+            if (licBad) throw new Error(`its licence doesn't check out: ${licBad}`)
+            licNote = `licence status ${lic.status}`
+          }
           await freeOk()
           step('shutting down and taking the new clean checkpoint')
           const f1 = await this.hv('guest-shutdown', this.ident(vm), { timeoutMs: 6 * 60_000 })
@@ -1354,9 +1385,10 @@ class Helper {
       const t0 = this.now()
       try {
         const creds = this.creds()
-        const r = await this.hv('sync-in', {
+        const r = await this.guestCall(vm, 'sync-in', {
           ...this.ident(vm), cred: creds.admin, source: plan.need.size ? st.dir : null, guestStage: `C:\\hvmcp\\sync-${gen}`,
-          files: [...plan.need.values()].map(f => f.path), remove: plan.remove, full: plan.full, delete: plan.delete
+          files: [...plan.need.values()].map(f => f.path), remove: plan.remove, full: plan.full, delete: plan.delete,
+          ...(this.isLinux(vm) ? { entries: [...plan.need.values()], gen } : {})
         }, this.forLease(lease, 30 * 60_000))
         this.stillHeld(lease)
         if (plan.full) s.record = new Map(plan.manifest)
@@ -1370,7 +1402,7 @@ class Helper {
         s.trusted = true
         const copied = Number(r.copied) || 0
         return {
-          text: `Synced into ${vm.vmName}'s C:\\build without a restore: ${copied} file(s) copied (${[...plan.need.values()].reduce((n, f) => n + f.size, 0)} bytes), ${plan.full ? 'after clearing it' : `${Number(r.removed) || 0} removed, ${plan.manifest.size - plan.need.size} unchanged`}; ${((this.now() - t0) / 1000).toFixed(1)} s. C:\\out and everything else in the guest are as the last run left them.`,
+          text: `Synced into ${vm.vmName}'s ${this.paths(vm).build} without a restore: ${copied} file(s) copied (${[...plan.need.values()].reduce((n, f) => n + f.size, 0)} bytes), ${plan.full ? 'after clearing it' : `${Number(r.removed) || 0} removed, ${plan.manifest.size - plan.need.size} unchanged`}; ${((this.now() - t0) / 1000).toFixed(1)} s. ${this.paths(vm).out} and everything else in the guest are as the last run left them.`,
           data: { copied, removed: Number(r.removed) || 0, full: plan.full }
         }
       } catch (e) {
@@ -1389,6 +1421,7 @@ class Helper {
     if (checkpoint !== undefined && (typeof checkpoint !== 'string' || !POOL_CHECKPOINT_RE.test(checkpoint))) throw new Error("checkpoint must be 'clean' or one of this VM's pool checkpoints (vm_status lists them).")
     if (![false, 'user', 'admin'].includes(interactive)) throw new Error("interactive must be false, 'user' or 'admin'")
     if (lease.kept) throw new Error(`${lease.vmName} is kept for inspection: vm_release it, then vm_acquire again (a release restores it).`)
+    if (interactive && lease.os === 'linux') throw new Error('Linux guests have no desktop session: interactive is for Windows guests.')
     if (network && !this.policy.allowNetwork) throw new Error('The policy does not allow networking.')
     if (network && this.state.switch?.phase !== 'created') throw new Error('The pool has no internal switch: create the pool with network on to use networking.')
     if (!Number.isInteger(reserveCpu) || reserveCpu < 0 || reserveCpu > this.policy.maxReservePercent) throw new Error(`reserveCpu must be a whole percentage, 0-${this.policy.maxReservePercent} (the policy's cap).`)
@@ -1448,15 +1481,15 @@ class Helper {
       if (interactive || !this.startFailed.get(vm.vmId)?.interactive) this.startFailed.delete(vm.vmId)
       let build = 'no build'
       if (c.stage?.done) {
-        const res = await this.hv('copy-in', { ...this.ident(vm), cred: creds.admin, userName: creds.user.user, source: c.stage.dir }, this.forLease(lease, 30 * 60_000))
+        const res = await this.guestCall(vm, 'copy-in', { ...this.ident(vm), cred: creds.admin, userName: creds.user.user, source: c.stage.dir, ...(this.isLinux(vm) ? { entries: c.stage.hashes, gen: s.gen } : {}) }, this.forLease(lease, 30 * 60_000))
         this.stillHeld(lease)
-        build = `build copied in to C:\\build (${c.stage.files} files, ${c.stage.bytes} bytes${res.ms ? `, ${(res.ms / 1000).toFixed(1)} s` : ''})`
+        build = `build copied in to ${this.paths(vm).build} (${c.stage.files} files, ${c.stage.bytes} bytes${res.ms ? `, ${(res.ms / 1000).toFixed(1)} s` : ''})`
         s.record = new Map(c.stage.hashes)
         this.dropStage(c)
       }
       s.trusted = true
       return {
-        text: `Started ${vm.vmName} from ${target ? `its pool checkpoint "${target.name}"` : 'its clean checkpoint'}: restore ${((tRestore - t0) / 1000).toFixed(1)} s, guest ready after ${(waited / 1000).toFixed(1)} s${logon}; ${build}; network ${network ? `ON (internal switch ${this.state.switch.name})` : 'off'}; CPU reserve ${reserveCpu}%. C:\\out is empty. Deadline ${new Date(lease.deadline).toISOString()}.`,
+        text: `Started ${vm.vmName} from ${target ? `its pool checkpoint "${target.name}"` : 'its clean checkpoint'}: restore ${((tRestore - t0) / 1000).toFixed(1)} s, guest ready after ${(waited / 1000).toFixed(1)} s${logon}; ${build}; network ${network ? `ON (internal switch ${this.state.switch.name})` : 'off'}; CPU reserve ${reserveCpu}%. ${this.paths(vm).out} is empty. Deadline ${new Date(lease.deadline).toISOString()}.`,
         data: { vm: vm.vmName, network: !!network, reserveCpu, interactive }
       }
     })
@@ -1470,7 +1503,7 @@ class Helper {
     const t0 = this.now()
     while (this.now() - t0 < ms) {
       if (lease) this.stillHeld(lease)
-      const r = await this.hv('guest-ready', { ...this.ident(vm), cred }, lease ? this.forLease(lease, 60_000) : undefined).catch(() => null)
+      const r = await this.guestCall(vm, 'guest-ready', { ...this.ident(vm), cred }, lease ? this.forLease(lease, 60_000) : undefined).catch(() => null)
       if (lease) this.stillHeld(lease)
       if (r?.ready) return this.now() - t0
       await sleep(POLL_MS)
@@ -1551,16 +1584,22 @@ class Helper {
     return c
   }
 
-  async run(connId, { command, shell = 'cmd', as = 'admin', timeoutSec = 120, cwd, session = 'service' } = {}) {
+  async run(connId, { command, shell, as = 'admin', timeoutSec = 120, cwd, session = 'service' } = {}) {
     const lease = this.leaseOf(connId)
     if (!lease.running) throw new Error('The VM is not running: call vm_start first.')
     if (!['service', 'interactive'].includes(session)) throw new Error("session must be 'service' or 'interactive'")
     if (typeof command !== 'string' || !command.trim()) throw new Error('command is required')
     if (command.length > MAX_COMMAND) throw new Error(`command is over ${MAX_COMMAND} characters: put it in a script in the build`)
-    if (!['cmd', 'powershell'].includes(shell)) throw new Error('shell must be cmd or powershell')
+    // MC-1501: a Linux guest runs bash (its default) or sh; a Windows guest cmd (its default) or powershell.
+    const linux = lease.os === 'linux'
+    shell ??= linux ? 'bash' : 'cmd'
+    if (linux && !['bash', 'sh'].includes(shell)) throw new Error('shell must be bash or sh in a Linux guest')
+    if (!linux && !['cmd', 'powershell'].includes(shell)) throw new Error('shell must be cmd or powershell in a Windows guest (bash and sh are for Linux guests)')
+    if (linux && session === 'interactive') throw new Error("Linux guests have no desktop session: session must be 'service'.")
     if (!['admin', 'user'].includes(as)) throw new Error('as must be admin or user')
     if (!Number.isFinite(timeoutSec) || timeoutSec < 1 || timeoutSec > 3600) throw new Error('timeoutSec must be 1-3600')
-    if (cwd !== undefined && (typeof cwd !== 'string' || !/^[a-zA-Z]:\\/.test(cwd) || cwd.length > 260 || /[\0-\x1f"]/.test(cwd))) throw new Error('cwd must be an absolute guest folder such as C:\\build')
+    if (cwd !== undefined && linux && (typeof cwd !== 'string' || !cwd.startsWith('/') || cwd.length > 1024 || /[\0-\x1f]/.test(cwd))) throw new Error('cwd must be an absolute guest folder such as /build')
+    if (cwd !== undefined && !linux && (typeof cwd !== 'string' || !/^[a-zA-Z]:\\/.test(cwd) || cwd.length > 260 || /[\0-\x1f"]/.test(cwd))) throw new Error('cwd must be an absolute guest folder such as C:\\build')
     const vm = this.vmOf(lease)
     return this.vmLock(vm.vmId)(async () => {
       this.stillHeld(lease)
@@ -1574,7 +1613,7 @@ class Helper {
       }
       const n = ++lease.runs
       const creds = this.creds()
-      const args = { ...this.ident(vm), cred: creds.admin, n, command, shell, cwd: cwd || 'C:\\build', cap: OUTPUT_CAP }
+      const args = { ...this.ident(vm), cred: creds.admin, n, command, shell, cwd: cwd || this.paths(vm).build, cap: OUTPUT_CAP }
       // Started (or published), then polled with short calls against one deadline, counted from the start's reply
       // (MC-1510): no PowerShell Direct call is held for the run, since one call ends after 10 minutes.
       let started = null
@@ -1586,7 +1625,7 @@ class Helper {
           started = { lost: e.message } // unproven: restored below, never chased
         }
       } else {
-        started = await this.hv('guest-run-start', { ...args, runAs: as === 'user' ? creds.user : null }, this.forLease(lease, CALL_MS))
+        started = await this.guestCall(vm, 'guest-run-start', { ...args, runAs: as === 'user' ? creds.user : null }, this.forLease(lease, CALL_MS))
       }
       const deadline = this.now() + timeoutSec * 1000
       const polled = started?.lost ? { result: null, last: null } : await this.pollRun(lease, vm, creds, n, deadline)
@@ -1595,9 +1634,9 @@ class Helper {
         // Timed out: killed by its PID only if that PID is still the run's process (its recorded creation time), then
         // a last read of its output. Both are cleanup after the run's own budget, each bounded by CLEANUP_MS.
         this.stillHeld(lease)
-        const k = await this.hv('guest-run-kill', { ...this.ident(vm), cred: creds.admin, pid: started.pid, started: started.started }, this.forLease(lease, CLEANUP_MS)).catch(e => ({ killed: false, why: e.message }))
+        const k = await this.guestCall(vm, 'guest-run-kill', { ...this.ident(vm), cred: creds.admin, pid: started.pid, started: started.started, n }, this.forLease(lease, CLEANUP_MS)).catch(e => ({ killed: false, why: e.message }))
         this.stillHeld(lease)
-        const last = await this.hv('guest-run-poll', { ...this.ident(vm), cred: creds.admin, n, cap: OUTPUT_CAP }, this.forLease(lease, CLEANUP_MS)).catch(() => null)
+        const last = await this.guestCall(vm, 'guest-run-poll', { ...this.ident(vm), cred: creds.admin, n, cap: OUTPUT_CAP }, this.forLease(lease, CLEANUP_MS)).catch(() => null)
         r = last?.done && k.gone ? last : { ...(last || {}), exitCode: null, timedOut: true, killed: !!k.killed, killWhy: k.why }
       } else if (interactive && !r) {
         const pending = polled.last?.pending
@@ -1612,7 +1651,7 @@ class Helper {
         interactive
           ? (restored ? `The interactive run didn't finish cleanly (${r.why || 'no exit code'}). ${restored}` : `Exit code ${exit} (in the interactive session).`)
           : r.timedOut
-            ? `Timed out after ${timeoutSec} s: ${r.killed ? 'killed inside the guest by its PID (taskkill /T /F).' : `not confirmed killed${r.killWhy ? ` (${r.killWhy})` : ''}; vm_stop is the fallback.`}`
+            ? `Timed out after ${timeoutSec} s: ${r.killed ? (linux ? 'killed inside the guest with everything it started (its systemd unit' + "'" + 's cgroup).' : 'killed inside the guest by its PID (taskkill /T /F).') : `not confirmed killed${r.killWhy ? ` (${r.killWhy})` : ''}; vm_stop is the fallback.`}`
             : `Exit code ${exit === null ? 'unknown' : exit}.`,
         `--- stdout${r.stdoutCut ? ` (first ${OUTPUT_CAP} bytes)` : ''} ---`, out(r.stdout),
         `--- stderr${r.stderrCut ? ` (first ${OUTPUT_CAP} bytes)` : ''} ---`, out(r.stderr)
@@ -1638,7 +1677,7 @@ class Helper {
       if (polls > 0 || left > 0) await sleep(Math.max(0, Math.min(left, this.now() - t0 < 10_000 ? Math.min(1000, POLL_MS) : POLL_MS)))
       this.stillHeld(lease)
       const bound = Math.max(MIN_POLL_MS, Math.min(CALL_MS, deadline - this.now()))
-      const r = await this.hv('guest-run-poll', { ...this.ident(vm), cred: creds.admin, n, cap: OUTPUT_CAP }, this.forLease(lease, bound)).catch(() => null)
+      const r = await this.guestCall(vm, 'guest-run-poll', { ...this.ident(vm), cred: creds.admin, n, cap: OUTPUT_CAP }, this.forLease(lease, bound)).catch(() => null)
       if (r) last = r
       if (r?.done) return { result: r, last }
     }
@@ -1660,12 +1699,12 @@ class Helper {
       this.stillHeld(lease)
       if (!lease.running) throw new Error('The VM is not running (it was stopped or restored while this read waited): its C:\\out is gone.')
       const creds = this.creds()
-      const listing = await this.hv('guest-list', { ...this.ident(vm), cred: creds.admin }, this.forLease(lease))
+      const listing = await this.guestCall(vm, 'guest-list', { ...this.ident(vm), cred: creds.admin }, this.forLease(lease))
       this.stillHeld(lease)
       const files = (Array.isArray(listing.files) ? listing.files : []).filter(f => f && typeof f.path === 'string' && Number.isFinite(f.size)).slice(0, 1000)
       const skipped = Array.isArray(listing.skipped) ? listing.skipped.slice(0, 50).map(String) : []
       if (!want.length && !match) {
-        return { text: files.length ? files.map(f => `${f.path}  ${f.size} bytes`).join('\n') + (skipped.length ? `\nSkipped (links): ${skipped.join(', ')}` : '') : 'C:\\out is empty.', data: { files } }
+        return { text: files.length ? files.map(f => `${f.path}  ${f.size} bytes`).join('\n') + (skipped.length ? `\nSkipped (links): ${skipped.join(', ')}` : '') : `${this.paths(vm).out} is empty.`, data: { files } }
       }
       const byPath = new Map(files.map(f => [f.path.toLowerCase(), f]))
       const chosen = []
@@ -1673,7 +1712,7 @@ class Helper {
       for (const p of want) { const f = byPath.get(p.toLowerCase()); if (f) chosen.push(f); else missing.push(p) }
       if (match) for (const f of files) if (match(f.path) && !chosen.includes(f)) chosen.push(f)
       const r = chosen.length
-        ? await this.hv('guest-read', { ...this.ident(vm), cred: creds.admin, paths: chosen.map(f => f.path), maxBytes, maxTotalBytes }, this.forLease(lease))
+        ? await this.guestCall(vm, 'guest-read', { ...this.ident(vm), cred: creds.admin, paths: chosen.map(f => f.path), maxBytes, maxTotalBytes }, this.forLease(lease))
         : { files: [] }
       let total = 0
       const got = []
@@ -1739,7 +1778,7 @@ class Helper {
       this.stillHeld(lease)
       if (lease.kept) throw new Error(`${vm.vmName} is kept for inspection: vm_release it first.`)
       if (!lease.running) throw new Error('The VM is not running: vm_start it first (a checkpoint is taken of a running VM).')
-      if (lease.sync.trusted === false) throw new Error('C:\\build is unconfirmed (a copy or sync didn\'t finish): run a full vm_sync or vm_reset first.')
+      if (lease.sync.trusted === false) throw new Error(`${this.paths(vm).build} is unconfirmed (a copy or sync didn't finish): run a full vm_sync or vm_reset first.`)
       const mine = this.leaseCheckpoints(lease)
       if (mine.some(x => x.name === name)) throw new Error(`This lease already has a checkpoint "${name}".`)
       const cap = this.policy.maxLeaseCheckpoints ?? 3
@@ -1751,6 +1790,7 @@ class Helper {
       if (!Number.isFinite(free) || free < floor) throw new Error(`The VM folder's drive has ${free ?? 'unknown'} GB free, under the ${floor} GB a checkpoint must leave (minFreeGBForCheckpoint).`)
       const opId = hex(6)
       const snapName = `hvmcp-lease-${opId}`
+      if (lease.os === 'linux') return this.checkpointOff(lease, vm, name, opId, snapName)
       // The VM's checkpoint type before the take, journalled: the take sets ProductionOnly and puts it back, and if that
       // is interrupted (the call killed), the lease's end puts it back from this record.
       const origType = (await this.hv('checkpoint-type', this.ident(vm), this.forLease(lease))).type
@@ -1789,6 +1829,56 @@ class Helper {
       this.stillHeld(lease) // a lease that ended meanwhile gets no success; its release removes the checkpoint
       return { text: `Checkpoint "${name}" taken of ${vm.vmName} (files, installed software and the registry; not running programs or a logon session). vm_restore({ name: "${name}" }) brings it back; it's removed when this lease ends.${typeNote}`, data: { name, checkpointId: id } }
     })
+  }
+
+  /**
+   * MC-1501: a Linux lease checkpoint (design §6). Linux guests have no VSS (hv_vss_daemon isn't in the images and can't
+   * be installed offline), so it is taken of the Off VM: the guest shut down cleanly, a standard checkpoint of the Off
+   * VM under the same journalled name and the same unconfirmed-take rules, then the VM started again with the lease's
+   * network and CPU reserve, the guest awaited and read back. The promise is the same as Windows': files, installed
+   * software and configuration, no memory or running programs. /build stays confirmed (its disk is unchanged).
+   */
+  async checkpointOff(lease, vm, name, opId, snapName) {
+    this.journal.append({ t: 'lcp-take', opId, vmId: vm.vmId, leaseId: lease.leaseId, name, snapName, origType: null, at: new Date(this.now()).toISOString() })
+    const restart = async () => {
+      const sw = lease.network ? this.state.switch : null
+      await this.hv('configure-start', { ...this.ident(vm), switchName: sw ? sw.name : null, switchId: sw ? sw.switchId : null, reserve: lease.reserve || 0 }, this.forLease(lease))
+      this.stillHeld(lease)
+      const waited = await this.waitGuest(vm, null, READY_WAIT_MS, lease)
+      this.stillHeld(lease)
+      if (waited === null) throw new Error(`${vm.vmName}'s guest didn't answer after the checkpoint: vm_reset to go on from clean`)
+      lease.running = true
+    }
+    let r = null
+    try {
+      const off = await this.hv('guest-shutdown', this.ident(vm), this.forLease(lease, 6 * 60_000))
+      this.stillHeld(lease)
+      if (off.state !== 'Off') { this.journal.append({ t: 'lcp-dropped', opId }); throw new Error(`the guest didn't shut down (the VM is ${off.state})`) }
+      lease.running = false
+      r = await this.hv('pool-take', { ...this.ident(vm), snapName }, this.forLease(lease, 10 * 60_000))
+    } catch (e) {
+      if (lease.running === false && !this.leases.get(vm.vmId)?.ending) {
+        const list = await this.hv('snapshots', this.ident(vm)).then(x => x.snapshots || [], () => null)
+        const found = list ? list.filter(x => x.name === snapName) : []
+        if (found.length === 1) this.journal.append({ t: 'lcp-taken', opId, checkpointId: found[0].id })
+        await restart().catch(() => {})
+      }
+      throw new Error(`The checkpoint "${name}" couldn't be taken (${e.message}).`)
+    }
+    if (r.failed) {
+      const list = await this.hv('snapshots', this.ident(vm)).then(x => x.snapshots || [], () => null)
+      const found = list ? list.filter(x => x.name === snapName) : null
+      if (found?.length === 1) this.journal.append({ t: 'lcp-taken', opId, checkpointId: found[0].id })
+      else if (found?.length === 0) this.journal.append({ t: 'lcp-dropped', opId })
+      await restart().catch(() => {})
+      throw new Error(`The checkpoint "${name}" couldn't be taken (${r.error}).`)
+    }
+    this.journal.append({ t: 'lcp-taken', opId, checkpointId: r.checkpointId })
+    await restart()
+    const f = await this.hv('facts-vm', this.ident(vm), this.forLease(lease))
+    this.stillHeld(lease)
+    if (f.state !== 'Running' || f.parentCheckpointId !== r.checkpointId) throw new Error(`${vm.vmName} took the checkpoint "${name}", but didn't read back as running from it (${f.state}, at ${f.parentCheckpointId}): vm_reset to go on from clean.`)
+    return { text: `Checkpoint "${name}" taken of ${vm.vmName} with the guest shut down (Linux: files, installed software and configuration; not running programs). The guest was started again from it. vm_restore({ name: "${name}" }) brings it back; it's removed when this lease ends.`, data: { name, checkpointId: r.checkpointId } }
   }
 
   /**
@@ -1881,11 +1971,13 @@ class Helper {
       const fromNote = l?.startFrom ? `; starts from "${l.startFrom.name}"` : ''
       const unknown = this.unknownSnapshots.get(v.vmId)
       const unknownNote = unknown?.length ? `; unknown checkpoints left alone: ${unknown.join(', ')}` : ''
-      return `- ${v.vmName}: ${this.osOf(v)}, image ${img === 'legacy' ? 'unknown (made before images were recorded)' : img.slice(0, 12)}; ${v.cores} cores, ${v.memoryMB} MB, ${v.diskGB} GB disk; ${state}${v.vmId === mine ? ' (yours)' : ''}${expiry(v, this.now())}${failed ? `; ${failed}` : ''}${fromNote}${pcNote}${cpNote}${unknownNote}`
+      const li = this.isLinux(v) ? s.images.get(img) : null
+      const osLabel = li?.distro ? `linux (${li.name || `${li.distro} ${li.release}`}, build ${li.serial})` : this.osOf(v)
+      return `- ${v.vmName}: ${osLabel}, image ${img === 'legacy' ? 'unknown (made before images were recorded)' : img.slice(0, 12)}; ${v.cores} cores, ${v.memoryMB} MB, ${v.diskGB} GB disk; ${state}${v.vmId === mine ? ' (yours)' : ''}${expiry(v, this.now())}${failed ? `; ${failed}` : ''}${fromNote}${pcNote}${cpNote}${unknownNote}`
     })
     const img = [...s.images.values()].at(-1)
     const lines = [
-      `Pool: ${vms.length ? `${vms.length} VM(s)` : 'no VMs'}; switch: ${s.switch ? `${s.switch.name} (${s.switch.phase})` : 'none'}; image: ${img ? `${img.edition} ${img.build} (${img.sha256.slice(0, 12)}…, ${img.pinned ? 'pinned' : img.source})` : 'none'}.`,
+      `Pool: ${vms.length ? `${vms.length} VM(s)` : 'no VMs'}; switch: ${s.switch ? `${s.switch.name} (${s.switch.phase})` : 'none'}; image: ${img ? (img.os === 'linux' ? linuxImages.describe(img) : `${img.edition} ${img.build} (${img.sha256.slice(0, 12)}…, ${img.pinned ? 'pinned' : img.source})`) : 'none'}.`,
       ...vms,
       ...this.shareLines(),
       this.job ? `Pool job in progress: ${this.job.op} (${this.job.jobId}): ${this.job.progress}` : this.lastJob ? `Last pool job: ${this.lastJob.op} ${this.lastJob.ok ? 'finished' : 'FAILED'}: ${this.lastJob.note}` : null,
@@ -1960,11 +2052,12 @@ class Helper {
         // The build's one online step, bound here (MC-1513): an evaluation image always (it lasts about a day
         // unactivated); an own copy only when asked. Nothing else ever connects the Default Switch.
         const evaluation = plan.image.evaluation
+        if (plan.image.os === 'linux' && args.activate !== undefined) throw new Error('activate is for Windows images: a Linux VM is built offline, with no licence to activate.')
         if (evaluation && args.activate === false) throw new Error('An evaluation image must be activated online once when each VM is built (unactivated, it stops allowing interactive logons after about a day): leave activate out.')
         const online = evaluation || args.activate === true
         if (online && !facts.defaultSwitch) throw new Error(`This host has no Default Switch, so Windows can't be activated online when a VM is built${evaluation ? ' (an evaluation image needs that)' : ''}.`)
         plan.activation = online ? 'online-once' : 'none'
-        plan.productKey = !evaluation && !!this.productKey()
+        plan.productKey = plan.image.os !== 'linux' && !evaluation && !!this.productKey()
       }
       if (!plan.add.length && !plan.remove.length) throw new Error(`The pool already has ${pool.length} VM(s): nothing to change.`)
     }
@@ -2042,18 +2135,28 @@ class Helper {
       if (!img) throw new Error('No verified image yet: pass image { iso: "<path to the Windows 11 Enterprise evaluation ISO>" } or image { download: "win11-enterprise-eval" }.')
       return { ready: true, image: pick(img) }
     }
+    // MC-1501: a Linux image: { distro, release? } or { pin }, downloaded, or { file }, a local copy of a pinned one.
+    const linux = typeof want === 'object' && want !== null && (want.distro !== undefined || want.pin !== undefined || want.file !== undefined)
+    if (linux && want.file === undefined) {
+      const pin = linuxImages.pinFor(want)
+      const ready = have.find(i => i.pin === pin.id)
+      if (ready) return { ready: true, image: pick(ready) }
+    }
     const job = { progress: 'starting' }
     this.imageJob = job
-    const p = images.prepare({
+    const p = linux
+      ? linuxImages.prepare({ want, dir: join(location, 'images'), hv: this.hv, known: s.images, ownDirs: [this.dir], progress: t => { job.progress = t }, maxVirtualBytes: this.policy.maxDiskGBPerVm * 1024 ** 3 })
+      : images.prepare({
       want, dir: join(location, 'images'), hv: this.hv, policy: this.policy, known: s.images, ownDirs: [this.dir],
       progress: t => { job.progress = t }
     })
     p.then(img => {
-      if (img.existing) { this.lastImage = `ready: ${img.edition} ${img.build} (${img.sha256.slice(0, 12)}…)`; return }
+      const what = img.os === 'linux' ? linuxImages.describe(img) : `${img.edition} ${img.build} (${img.sha256.slice(0, 12)}…${img.existing ? '' : `, ${img.pinned ? 'pinned' : img.source}`})`
+      if (img.existing) { this.lastImage = `ready: ${what}`; return }
       this.journal.append({ t: 'image', ...img })
-      this.lastImage = `verified: ${img.edition} ${img.build} (${img.sha256.slice(0, 12)}…, ${img.pinned ? 'pinned' : img.source})`
+      this.lastImage = `verified: ${what}`
     }, e => { this.lastImage = `REFUSED: ${e.message}` }).finally(() => { this.imageJob = null })
-    return { ready: false, text: 'Checking the image now (copied into the helper\'s folder while hashed, then its files and signatures checked before anything runs). This takes a few minutes for a 7 GB ISO: call pool_status, then pool_plan again with no image to use it.' }
+    return { ready: false, text: linux ? 'Checking the Linux image now (downloaded or copied while hashed, its pin and the distro\'s published checksums checked, then converted to the base VHDX with nothing installed on the host). This takes a few minutes: call pool_status, then pool_plan again with the same image to use it.' : 'Checking the image now (copied into the helper\'s folder while hashed, then its files and signatures checked before anything runs). This takes a few minutes for a 7 GB ISO: call pool_status, then pool_plan again with no image to use it.' }
   }
 
   // ---------- pool changes (approved) ----------
@@ -2086,7 +2189,7 @@ class Helper {
         if (op === 'create' && s.vms.size) throw new Error('The pool is no longer empty: make a new plan.')
         const rec = s.images.get(plan.image?.sha256)
         if (!rec) throw new Error('The plan\'s image is no longer verified: make a new plan.')
-        if (rec.edition !== plan.image.edition || (rec.imageIndex ?? 1) !== (plan.image.imageIndex ?? 1)) throw new Error('The plan\'s image edition no longer matches its record: make a new plan.')
+        if (rec.os !== 'linux' && (rec.edition !== plan.image.edition || (rec.imageIndex ?? 1) !== (plan.image.imageIndex ?? 1))) throw new Error('The plan\'s image edition no longer matches its record: make a new plan.')
         if (isEval(plan.image) && plan.activation !== 'online-once') throw new Error(`Plan ${planId} doesn't activate its evaluation image (it was made before activation was planned): make a new plan.`)
         if (plan.productKey && !this.productKey()) throw new Error(`Plan ${planId} uses the pool's product key, but setup holds none now: make a new plan.`)
       }
@@ -2179,7 +2282,7 @@ class Helper {
           // From here no interactive run may start: the undo removes the watcher's start and files, verified or not.
           stage = 'undo'
           lease.interactive = null
-          await this.undoLogon(vm, creds, opts())
+          if (!this.isLinux(vm)) await this.undoLogon(vm, creds, opts()) // MC-1501: a Linux guest has no logon to undo
           lease = bound()
           // 2. The network disconnected, read back. Assumed off from the attempt on, whatever the call's outcome.
           stage = 'network'
@@ -2368,6 +2471,8 @@ class Helper {
     this.journal.append({ t: 'intent', jobId: job.jobId, intentId: a.intentId, vmName: a.name, folder: a.folder, cores: a.cores, memoryMB: a.memoryMB, diskGB: a.diskGB, image: plan.image?.sha256 })
     if (!policyMod.underDiskFolder(this.policy, a.folder)) throw new Error('its folder is outside the policy')
     fs.mkdirSync(a.folder, { recursive: true })
+    const linuxImg = this.state.images.get(plan.image.sha256)
+    if ((linuxImg?.os || 'windows') === 'linux') return this.createLinuxVm(job, plan, a, linuxImg, step)
     const creds = this.creds()
     step('writing its answer file')
     const media = join(a.folder, 'setup-media')
@@ -2402,6 +2507,23 @@ class Helper {
     if (bad) throw new Error(`its clean baseline doesn't verify: ${bad}`)
     this.journal.append({ t: 'ready', intentId: a.intentId, vmId: vm.vmId, cleanCheckpointId: cp.checkpointId, licence, profiles, defender })
     return buildNote(profiles)
+  }
+
+  /**
+   * MC-1501: a Linux VM's create (design §3): the driver's build (seed, first boot with its diagnostics, readiness by the
+   * authenticated round trip, cloud-init, the checks, cloud-init off, the seed and COM port gone), then the clean
+   * checkpoint and its verification, as for Windows. Nothing goes online, nothing is activated.
+   */
+  async createLinuxVm(job, plan, a, img, step) {
+    const { vm, record } = await this.linux.build(job, plan, a, img, step)
+    step('taking the clean checkpoint')
+    const cp = await this.hv('make-clean', { ...this.ident(vm) }, { timeoutMs: 15 * 60_000 })
+    const facts = await this.restoreVia(vm, 'restore', { ...this.ident(vm), checkpointId: cp.checkpointId })
+    const bad = baselineProblem(facts, { ...vm, cleanCheckpointId: cp.checkpointId })
+    if (bad) throw new Error(`its clean baseline doesn't verify: ${bad}`)
+    this.journal.append({ t: 'ready', intentId: a.intentId, vmId: vm.vmId, cleanCheckpointId: cp.checkpointId, ...record })
+    const d = record.diag || {}
+    return `${record.guest.id} ${record.guest.versionId}${record.guest.serial ? ` build ${record.guest.serial}` : ''}, kernel ${record.guest.kernel}; SSH over the Hyper-V socket${d.hv_sock_driver ? ` (hv_sock ${d.hv_sock_driver})` : ''}`
   }
 
   /**
@@ -2632,7 +2754,7 @@ const PROTOCOL = 'hyperv-mcp/3' // 2: renew, sync_plan, sync (MC-1497); 3: start
 // 'checkpoints' = vm_checkpoint and vm_restore, a lease's own checkpoints (MC-1529).
 // 'pool-checkpoints' = pool_plan's checkpoint actions, pool_checkpoint, acquire's and start's checkpoint (MC-1532).
 // 'refresh-clean' = pool_plan's refresh-clean and pool_refresh (MC-1531).
-const FEATURES = ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean']
+const FEATURES = ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean', 'linux']
 const LEASE_CHECKPOINT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$/
 // MC-1532: a pool checkpoint's name.
 const POOL_CHECKPOINT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._+-]{0,39}$/
@@ -2725,6 +2847,7 @@ function evalEnd(vm) {
 function expiry(vm, now) {
   const l = vm.licence
   if (!l) return vm.readyAt ? '; licence unknown (built before Windows activation was recorded: an unactivated evaluation stops allowing interactive logons about a day after its build; a rebuild records it)' : ''
+  if (l.kind === 'linux') return '; Linux, no licence to track' // MC-1501
   if (l.kind === 'own') return l.activated ? '; own copy of Windows, activated' : `; own copy of Windows, not activated (licence status ${l.status})`
   const end = Date.parse(l.expiresAt)
   const date = new Date(end).toISOString().slice(0, 10)
@@ -2800,7 +2923,9 @@ function baselineProblem(f, vm) {
 }
 
 const isEval = img => img.evaluation ?? img.edition === images.EVAL
-const pick = img => ({ sha256: img.sha256, size: img.size, edition: img.edition, build: img.build, imageIndex: img.imageIndex ?? 1, evaluation: isEval(img), pinned: img.pinned, source: img.source, os: img.os || 'windows' })
+const pick = img => img.os === 'linux'
+  ? { sha256: img.sha256, size: img.size, imageIndex: 1, evaluation: false, pinned: img.pinned, source: img.source, os: 'linux', distro: img.distro ?? null, release: img.release ?? null, serial: img.serial ?? null, name: img.name ?? null, checksums: img.checksums ?? null } // MC-1501
+  : { sha256: img.sha256, size: img.size, edition: img.edition, build: img.build, imageIndex: img.imageIndex ?? 1, evaluation: isEval(img), pinned: img.pinned, source: img.source, os: img.os || 'windows' }
 const OSES = ['windows', 'linux']
 
 function describePlan(plan, digest, approve) {
@@ -2813,13 +2938,16 @@ function describePlan(plan, digest, approve) {
   if (plan.op === 'checkpoint') for (const v of plan.vms) lines.push(plan.mode === 'remove' ? `- remove the pool checkpoint "${plan.checkpoint}" of ${v.name} (owner ${v.owner}); a lease already using it keeps it until that lease ends` : `- ${plan.mode === 'replace' ? 'replace' : 'publish'} the pool checkpoint "${plan.checkpoint}" of ${v.name} (owner ${v.owner}, ${v.os}, image ${v.image === 'legacy' ? 'unknown' : v.image.slice(0, 12)}), from lease ${v.leaseId}'s state: its logon undone and verified, network disconnected, the guest shut down, then checkpointed Off; any project's lease may then start from it${plan.mode === 'replace' ? '; the old one stops being offered at once and is removed when no lease uses it' : ''}`)
   if (plan.switch) lines.push(`- create the internal switch ${plan.switch} (host and guests only; no internet, no LAN)`)
   if (plan.removeSwitch) lines.push(`- remove the switch ${plan.removeSwitch}`)
-  if (plan.image) lines.push(`- image: ${plan.image.edition}${plan.image.imageIndex > 1 ? ` (index ${plan.image.imageIndex})` : ''} build ${plan.image.build}, SHA-256 ${plan.image.sha256} (${plan.image.pinned ? 'pinned: a known Microsoft download' : plan.image.source === 'download' ? 'downloaded by the helper over HTTPS from Microsoft' : 'NOT AUTHENTICATED: a local file you chose to trust'})`)
-  if (plan.add?.length) lines.push('- registry: a user\'s registry isn\'t forcibly unloaded at logoff (the DisableForceUnload policy): the suspected cause of runs losing their HKCU after the short PowerShell Direct session that started them ends (MC-1522; its real-build trial is MC-1521)')
-  if (plan.add?.length) lines.push(`- Defender: the test work folders ${DEFENDER_EXCLUSIONS.join(', ')} are excluded from Defender's scanning (real-time and scheduled scans) in the guest image; Defender stays on otherwise`)
-  if (plan.add?.length) lines.push(`- provisioning: each new VM logs hvadmin and hvuser on interactively once (offline), waits for Windows' first-logon setup to finish, then turns autologon off and resets UAC and the watcher's start before its clean checkpoint; each account within ${Math.round(PROVISION_WAIT_MS / 60_000)} min (a logon attempt up to ${Math.round(BUILD_LOGON_WAIT_MS / 60_000)} min once it has begun, one with no sign of a logon ${Math.round(FIRST_LOGON_SIGN_MS / 60_000)} min after its new boot is seen retried at once, then accepted once Windows' App Readiness reports the account's first-logon app setup finished and ${Math.round(PROVISION_QUIET_MS / 60_000)} min of observed quiet follow, one retry if needed)`)
+  const linux = plan.image?.os === 'linux' // MC-1501
+  if (linux) lines.push(`- image: ${linuxImages.describe(plan.image)}; checksums: ${plan.image.checksums || 'unknown'}`)
+  if (linux && plan.add?.length) lines.push('- Linux build: each new VM is a copy of the image\'s verified base VHDX with a cloud-init seed (users hvadmin and hvuser with locked passwords; SSH keys made by the helper and held only by it; sshd only on the Hyper-V socket, for the helper\'s forced command), first booted offline; cloud-init is turned off and the seed removed before its clean checkpoint')
+  if (plan.image && !linux) lines.push(`- image: ${plan.image.edition}${plan.image.imageIndex > 1 ? ` (index ${plan.image.imageIndex})` : ''} build ${plan.image.build}, SHA-256 ${plan.image.sha256} (${plan.image.pinned ? 'pinned: a known Microsoft download' : plan.image.source === 'download' ? 'downloaded by the helper over HTTPS from Microsoft' : 'NOT AUTHENTICATED: a local file you chose to trust'})`)
+  if (plan.add?.length && !linux) lines.push('- registry: a user\'s registry isn\'t forcibly unloaded at logoff (the DisableForceUnload policy): the suspected cause of runs losing their HKCU after the short PowerShell Direct session that started them ends (MC-1522; its real-build trial is MC-1521)')
+  if (plan.add?.length && !linux) lines.push(`- Defender: the test work folders ${DEFENDER_EXCLUSIONS.join(', ')} are excluded from Defender's scanning (real-time and scheduled scans) in the guest image; Defender stays on otherwise`)
+  if (plan.add?.length && !linux) lines.push(`- provisioning: each new VM logs hvadmin and hvuser on interactively once (offline), waits for Windows' first-logon setup to finish, then turns autologon off and resets UAC and the watcher's start before its clean checkpoint; each account within ${Math.round(PROVISION_WAIT_MS / 60_000)} min (a logon attempt up to ${Math.round(BUILD_LOGON_WAIT_MS / 60_000)} min once it has begun, one with no sign of a logon ${Math.round(FIRST_LOGON_SIGN_MS / 60_000)} min after its new boot is seen retried at once, then accepted once Windows' App Readiness reports the account's first-logon app setup finished and ${Math.round(PROVISION_QUIET_MS / 60_000)} min of observed quiet follow, one retry if needed)`)
   if (plan.activation === 'online-once') lines.push('- activation: each new VM goes online once, through Windows\' Default Switch, to activate Windows; it is disconnected (verified) before its clean checkpoint, and no start ever uses that switch')
-  else if (plan.add?.length) lines.push('- activation: none (each new VM stays offline; its licence is read and shown)')
-  if (plan.add?.length && plan.image && !plan.image.evaluation) lines.push(`- product key: ${plan.productKey ? 'the pool\'s (set by install.ps1 -ProductKeyFile), written only into the answer file' : 'none'}`)
+  else if (plan.add?.length && !linux) lines.push('- activation: none (each new VM stays offline; its licence is read and shown)')
+  if (plan.add?.length && plan.image && !plan.image.evaluation && !linux) lines.push(`- product key: ${plan.productKey ? 'the pool\'s (set by install.ps1 -ProductKeyFile), written only into the answer file' : 'none'}`)
   if (plan.host) lines.push(`Host: ${plan.host.logicalCpus} logical CPUs, ${plan.host.memoryMB} MB.`)
   lines.push('', 'Nothing is changed until the user approves this exact plan, in an admin PowerShell (one UAC prompt):', approve,
     'It shows the plan from the helper\'s own record and asks for the 6 characters above. Then call ' + `pool_${plan.op}({ planId: "${plan.id}" }).`,

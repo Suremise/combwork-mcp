@@ -15,7 +15,8 @@
  *                                                         to activate Windows (the approved plan's one online step)
  *   offline   { intentId }                                its adapter confirmed disconnected again
  *   ready     { intentId, vmId, cleanCheckpointId, licence }   installed, set up, clean checkpoint taken; licence:
- *             { kind: 'evaluation', expiresAt } or { kind: 'own', activated, status } (absent: built before MC-1513)
+ *             { kind: 'evaluation', expiresAt } or { kind: 'own', activated, status } (absent: built before MC-1513), or
+ *             { kind: 'linux' } with transport, guest { id, versionId, serial, kernel } and diag (MC-1501)
  *   rolledBack{ intentId }                                an unfinished create was undone
  *   removing  { jobId, vmId }                             about to remove this VM
  *   removed   { vmId }
@@ -140,7 +141,7 @@ class Journal {
         }
         case 'ready': {
           const vm = s.vms.get(r.vmId)
-          if (vm) Object.assign(vm, { ready: true, cleanCheckpointId: r.cleanCheckpointId, readyAt: r.at, licence: r.licence ?? null })
+          if (vm) Object.assign(vm, { ready: true, cleanCheckpointId: r.cleanCheckpointId, readyAt: r.at, licence: r.licence ?? null, transport: r.transport ?? null, guest: r.guest ?? null })
           const i = s.intents.get(r.intentId)
           if (i) i.done = true
           break

@@ -43,7 +43,8 @@ param(
   [switch]$AllowUnpinnedIso,
   [string[]]$BuildRoot = @(),
   [string]$ProjectsFile = '',
-  [string]$ProductKeyFile = ''
+  [string]$ProductKeyFile = '',
+  [string]$LinuxTransport = 'HvSocket'
 )
 # Windows PowerShell 5.1 only (MC-1506), refused before any check or change:
 # setup's storage and ACL routines use .NET Framework calls that PowerShell 7
@@ -205,11 +206,27 @@ $bad = @(Test-ExclusiveAcl $install -Allowed $SYSTEM, $ADMINS, $USERS -Writers $
 if ($bad.Count) { throw "$install isn't admin-only after setting its ACL: $($bad -join '; ')" }
 # Nothing earlier in it is kept: every file the service runs is copied fresh below (a stray file could be loaded instead).
 Get-ChildItem -LiteralPath $install -Force | Remove-Item -Recurse -Force
-foreach ($f in 'core.js', 'helper.js', 'hv.js', 'hv.ps1', 'guest-sync.ps1', 'guest-agent.ps1', 'images.js', 'iso.js', 'journal.js', 'paths.js', 'policy.js', 'unattend.js', 'approve.ps1') {
+New-Item -ItemType Directory -Path (Join-Path $install 'guests') -Force | Out-Null
+foreach ($f in 'core.js', 'helper.js', 'hv.js', 'hv.ps1', 'guest-sync.ps1', 'guest-agent.ps1', 'images.js', 'iso.js', 'journal.js', 'paths.js', 'policy.js', 'unattend.js', 'approve.ps1', 'linux-images.js', 'openpgp.js', 'qcow2.js', 'seed.js', 'ssh.js', 'sshkeys.js', 'guest.py', 'guests\linux.js') {
   Copy-Item -LiteralPath (Join-Path $src "helper\$f") -Destination (Join-Path $install $f) -Force
 }
 Copy-Item -LiteralPath (Join-Path $src 'meta.json') -Destination (Join-Path $install 'meta.json') -Force
 Step "Helper code copied to $install (only Administrators and SYSTEM can write there)."
+
+# MC-1501: Linux guests. The helper reaches a Linux guest by SSH (Windows' in-box OpenSSH Client) over a Hyper-V
+# socket: HvMcpVsock.exe, compiled here, is ssh.exe's ProxyCommand, and the vsock port 22's service id is registered as
+# a guest communication service. Nothing is turned on or installed: without the OpenSSH Client, only Linux guests are
+# unavailable, and setup says how to add it.
+if ($LinuxTransport -ne 'HvSocket') { throw "-LinuxTransport $LinuxTransport isn't provided by this release: Linux guests use the Hyper-V socket (HvSocket). The internal switch is only on the user's decision after the trial (docs\linux-guests.md, 4.1)." }
+$cscL = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+if (-not (Test-Path $cscL)) { throw "The .NET Framework compiler is missing ($cscL)." }
+$outL = & $cscL -nologo -target:exe -optimize "-out:$(Join-Path $install 'HvMcpVsock.exe')" (Join-Path $src 'helper\host\HvMcpVsock.cs') 2>&1
+if ($LASTEXITCODE -ne 0) { throw "Compiling the Hyper-V socket bridge failed:`n$($outL -join "`n")" }
+$gcs = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices\00000016-facb-11e6-bd58-64006a7986d3'
+if (-not (Test-Path $gcs)) { New-Item -Path $gcs -Force | Out-Null }
+Set-ItemProperty -Path $gcs -Name ElementName -Value 'hyper-v MCP: SSH to Linux guests (vsock port 22)'
+$sshExe = Join-Path $env:SystemRoot 'System32\OpenSSH\ssh.exe'
+Step $(if (Test-Path $sshExe) { "Linux guests: SSH over the Hyper-V socket (HvMcpVsock.exe compiled; vsock port 22 registered); Windows' OpenSSH Client is present." } else { "Linux guests: HvMcpVsock.exe compiled and vsock port 22 registered, but Windows' OpenSSH Client is missing, so Linux guests can't be reached: add it in Settings, System, Optional features (OpenSSH Client), then run setup again. Setup doesn't add it." })
 
 if ($Mode -eq 'Service') {
   $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
@@ -253,6 +270,7 @@ $policy = [ordered]@{
   maxReservePercent = $MaxReservePercent; maxLeaseMinutes = $MaxLeaseMinutes; maxBuildMB = $MaxBuildMB
   allowUnpinnedIso = [bool]$AllowUnpinnedIso
   buildRoots = @($buildRoots)
+  linuxTransport = 'hvsocket'
 }
 if ($projects.Count) { $policy.projects = @($projects) } # checked, against this maxVms, before anything changed
 if ($MaxSessionMinutes) { $policy.maxSessionMinutes = $MaxSessionMinutes }

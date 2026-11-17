@@ -13,6 +13,7 @@ const { createInterface } = require('readline')
 const BASE = require('../../../test/clean-scratch').TARGETS['hyper-v'].base
 
 const STUB = path.join(__dirname, 'stub-hv.js')
+const SSH_STUB = path.join(__dirname, 'stub-guest.js') // MC-1501: a Linux guest, in place of ssh.exe
 const HELPER = path.join(__dirname, '..', 'helper', 'helper.js')
 const SERVER = path.join(__dirname, '..', 'server.js')
 
@@ -48,6 +49,9 @@ function scratch(name, { policy = {}, stub = {} } = {}) {
       ...process.env,
       HYPERV_MCP_STATE_DIR: path.join(dir, 'state'),
       HYPERV_MCP_PS_STUB: STUB,
+      HYPERV_MCP_SSH_STUB: SSH_STUB,
+      HYPERV_MCP_LINUX_READY_MS: '3000',
+      HYPERV_MCP_LINUX_CLOUD_INIT_MS: '3000',
       HYPERV_MCP_STUB_STATE: state,
       HYPERV_MCP_POLL_MS: '10',
       HYPERV_MCP_READY_WAIT_MS: '3000',
@@ -177,4 +181,4 @@ async function withPool(sc, n = 2, planArgs = {}) {
   return { h, admin }
 }
 
-module.exports = { scratch, startHelper, approve, seedImage, waitFor, withPool, STUB, HELPER, SERVER, BASE }
+module.exports = { scratch, startHelper, approve, seedImage, waitFor, withPool, STUB, SSH_STUB, HELPER, SERVER, BASE }
