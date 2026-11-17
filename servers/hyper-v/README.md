@@ -88,6 +88,15 @@ using the new server: the helper's protocol and features changed, and an older h
 "run setup again". The pool's VMs and images are kept; pass the same options you used before (`-DiskFolder`,
 `-BuildRoot` and the rest), since a rerun replaces them.
 
+**From 2.0.0 to 2.1.0 (Linux guests):**
+- Without the rerun, 2.1.0 still serves Windows guests, and refuses Linux ones with "run setup again".
+- The rerun copies the new helper, compiles `HvMcpVsock.exe` (the Hyper-V socket bridge) and registers vsock port 22's
+  service id.
+- For Linux guests, Windows' OpenSSH Client must be present: Settings, System, Optional features. Setup says if it's
+  missing, and adds nothing.
+- Then plan Linux VMs: `pool_plan` with `action: "resize"`, the new `vms` count and `image: { distro: "debian" }` or
+  `{ distro: "ubuntu" }`. Approve it, then call `pool_resize`.
+
 1. Turn on Hyper-V (see Requirements), and check `Get-Service vmms` says Running.
 2. In an **admin PowerShell**, run setup once (one line). Name a folder for the VMs' disks on a drive with room:
    ```
