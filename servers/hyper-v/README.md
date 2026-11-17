@@ -478,8 +478,10 @@ projects start from (MC-1532) and refreshing the clean checkpoint in place (MC-1
 
 ## Linux guests
 
-A pool can hold **Debian** and **Ubuntu** VMs beside Windows ones (MC-1500's design, [docs/linux-guests.md](docs/linux-guests.md);
-built in MC-1501), behind the same tools. Everything that doesn't depend on the OS is the same: the helper and its
+A pool can hold **Debian 13** and **Ubuntu 26.04 LTS** VMs beside Windows ones, from 2.1.0 (MC-1500's design,
+[docs/linux-guests.md](docs/linux-guests.md); built in MC-1501, proven in MC-1542), behind the same tools: an agent asks
+for one with `vm_acquire({ distro: 'debian' })` or `({ distro: 'ubuntu' })`, and reaches it by SSH over the Hyper-V
+socket, with no network path. It needs Windows' OpenSSH Client. Everything that doesn't depend on the OS is the same: the helper and its
 approvals, the policy, trusted storage, leases and the line, the journal, the restore before every start, quarantine,
 warm sessions, lease and pool checkpoints. Each OS has a small **guest driver** inside the helper for the two things that
 differ: how a VM is built, and how the helper talks to its guest.
