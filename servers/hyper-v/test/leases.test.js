@@ -47,9 +47,11 @@ test('the deadline ends a lease and restores the VM', async t => {
   const { h, admin } = await withPool(sc, 1)
   t.after(() => h.stop())
   const a = h.conn(10)
-  const vm = await leased(a, { minutes: 5 }) // 1.5 s here: time for the start, which a deadline would now cut short
-  await a.request('start')
-  await waitFor(async () => /; free/.test((await admin.request('status')).text), 8000, 'the deadline')
+  const vm = await leased(a, { minutes: 5 }) // 1.5 s here: usually time for the start
+  // MC-1554: on a loaded machine the start can outlast those 1.5 s; the deadline then cuts it short, which is this
+  // test's subject too: either way the deadline ends the lease and restores the VM. 120 s only stops a hang.
+  await a.request('start').catch(e => assert.match(e.message, /lease on \S+ (ended while the request waited|is ending)/))
+  await waitFor(async () => /; free/.test((await admin.request('status')).text), 120_000, 'the deadline')
   assert.strictEqual(vmOf(sc, vm).state, 'Off')
   await assert.rejects(a.request('run', { command: 'echo x' }), /no VM: call vm_acquire/)
 })
