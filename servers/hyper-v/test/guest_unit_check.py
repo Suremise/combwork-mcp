@@ -3,12 +3,14 @@
 # or Windows with the few os names Linux has and Windows lacks shimmed. systemd, accounts and process calls are mocked;
 # files go to a temp folder. Prints "OK <n>" when every check passes, or raises with the failing one. Run by
 # linux-guest-files.test.js. Real Linux permissions are checked in a trial window (MC-1542's next).
-import importlib.util
-import os
-import shutil
 import sys
-import tempfile
-import types
+# Round 3: importing guest.py must never write bytecode beside it (helper/ ships whole in the server's zip).
+sys.dont_write_bytecode = True
+import importlib.util  # noqa: E402
+import os  # noqa: E402
+import shutil  # noqa: E402
+import tempfile  # noqa: E402
+import types  # noqa: E402
 
 GUEST = sys.argv[1]
 checks = 0

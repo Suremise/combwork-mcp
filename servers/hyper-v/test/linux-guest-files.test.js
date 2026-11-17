@@ -132,10 +132,12 @@ function hostPython() {
 const HOST_PY = hostPython()
 
 test('MC-1551 round 2: guest.py\'s run files and the build\'s finish, executed on a host Python with systemd and accounts mocked (guest_unit_check.py)', { skip: HOST_PY ? false : 'no host Python 3 (HYPERV_TEST_PYTHON, python or py -3)' }, () => {
-  const r = spawnSync(HOST_PY[0], [...HOST_PY.slice(1), '-I', path.join(__dirname, 'guest_unit_check.py'), path.join(__dirname, '..', 'helper', 'guest.py'), BASE], { encoding: 'utf8', timeout: 120_000, windowsHide: true })
+  // -B: no bytecode written anywhere (round 3: an import beside helper/guest.py would ship in the zip).
+  const r = spawnSync(HOST_PY[0], [...HOST_PY.slice(1), '-I', '-B', path.join(__dirname, 'guest_unit_check.py'), path.join(__dirname, '..', 'helper', 'guest.py'), BASE], { encoding: 'utf8', timeout: 120_000, windowsHide: true })
   assert.strictEqual(r.status, 0, `${r.stdout}${r.stderr}`)
   const m = /^OK (\d+)$/m.exec(r.stdout)
   assert.ok(m && Number(m[1]) >= 48, r.stdout)
+  for (const d of ['helper', 'test']) assert.ok(!fs.existsSync(path.join(__dirname, '..', d, '__pycache__')), `no bytecode cache in ${d}/`)
 })
 
 /** A Linux Python: HYPERV_TEST_LINUX_PYTHON ("wsl -d Debian -e python3", say), or the first WSL distro that has one. */
