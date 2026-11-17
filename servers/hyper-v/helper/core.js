@@ -1926,7 +1926,10 @@ class Helper {
       const wantSw = sw ? sw.name : null
       if (facts.state !== 'Running' || facts.parentCheckpointId !== cp.checkpointId || (facts.switchName ?? null) !== wantSw || facts.reserve !== (lease.reserve || 0)) throw new Error(`${vm.vmName} restored to "${name}", but its state didn't read back as expected (${facts.state}, network ${facts.switchName ?? 'none'}, reserve ${facts.reserve}): vm_reset to go on from clean.`)
       lease.running = true // the sync record stays cleared and untrusted: only a full sync or a reset follows
-      return { text: `Restored ${vm.vmName} to its checkpoint "${name}" and started it (${((this.now() - t0) / 1000).toFixed(1)} s; guest ready after ${(waited / 1000).toFixed(1)} s); network ${wantSw ? `ON (internal switch ${wantSw})` : 'off'}; CPU reserve ${lease.reserve || 0}%. Files, installed software and the registry are as at the checkpoint; running programs and any logon session aren't (no one is logged on interactively: vm_start or vm_reset with interactive restores clean instead). C:\\build is as the checkpoint left it but unconfirmed: run a full vm_sync before relying on it.`, data: { name, vm: vm.vmName } }
+      return { text: `Restored ${vm.vmName} to its checkpoint "${name}" and started it (${((this.now() - t0) / 1000).toFixed(1)} s; guest ready after ${(waited / 1000).toFixed(1)} s); network ${wantSw ? `ON (internal switch ${wantSw})` : 'off'}; CPU reserve ${lease.reserve || 0}%. ${this.isLinux(vm)
+        // MC-1551: a Linux guest's words (no registry, no logon session; its build folder is /build).
+        ? 'Files, installed software and configuration are as at the checkpoint; running programs aren\'t (the guest booted fresh).'
+        : 'Files, installed software and the registry are as at the checkpoint; running programs and any logon session aren\'t (no one is logged on interactively: vm_start or vm_reset with interactive restores clean instead).'} ${this.paths(vm).build} is as the checkpoint left it but unconfirmed: run a full vm_sync before relying on it.`, data: { name, vm: vm.vmName } }
     })
   }
 

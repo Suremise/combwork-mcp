@@ -118,6 +118,9 @@ network; under B the one static address on eth0) and `user-data`:
   and mDNS responders (`/etc/systemd/resolved.conf.d/hvmcp.conf`: `LLMNR=no`, `MulticastDNS=no`, then a try-restart).
   Debian's genericcloud image otherwise answers LLMNR on 0.0.0.0:5355, which failed the listener check in MC-1542's
   fourth window;
+- MC-1551, under transport A only (no network): the wait-online units (`systemd-networkd-wait-online`,
+  `NetworkManager-wait-online`) are masked. Ubuntu's held every boot for its 2-minute timeout (`systemd-analyze blame`,
+  MC-1542's fifth window);
 - `/build` is owned by root and read-only to `hvuser`, as `C:\build` is. `/out` is writable by both, and `/hvmcp`
   (staging, runs) is root's.
 
@@ -249,9 +252,12 @@ ssh.exe child by its handle on timeout. The README's "runs no program but powers
 
 **`vm_run`:** `shell` is `bash` (the default on a Linux lease) or `sh`. `cmd` and `powershell` are refused, and so is
 `bash` on Windows. `as` is `admin` (root, through the dispatcher) or `user` (`hvuser`). `cwd` defaults to `/build`.
-- **Start:** the command arrives as JSON data and is written to `/hvmcp/runs/<n>/cmd.sh` (0644). It's started as
-  `systemd-run --unit=hvmcp-run-<n> --uid=<root|hvuser> --working-directory=<cwd> --collect`
-  `-p StandardOutput=file:/out/.run-<n>.out -p StandardError=file:/out/.run-<n>.err /bin/bash /hvmcp/runs/<n>/cmd.sh`.
+- **Start:** the command arrives as JSON data and is written to `/hvmcp/runs/<n>/cmd.sh`. It's started as
+  `systemd-run --unit=hvmcp-run-<n> --uid=<root|hvuser> --working-directory=<cwd>`
+  `-p StandardOutput=truncate:/hvmcp/runs/<n>/out -p StandardError=truncate:/hvmcp/runs/<n>/err /bin/bash …/cmd.sh`.
+  MC-1551: the run folder is 0711 (not listable). `cmd.sh`, `out` and `err` are 0600, owned by the run's account, so
+  a user run can't read an admin run's command or output. Nothing of the run's own is in `/out`, which holds only what
+  the command writes there.
   A wrapper writes the exit code aside and renames it into place, as on Windows.
 - **Poll:** with short SSH calls, as on Windows: the same start-then-poll shape and the same deadline. There's no
   10-minute limit on SSH, but one shape keeps the server and the tests the same, and survives a dropped call.

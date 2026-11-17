@@ -117,7 +117,9 @@ test('a Linux build that never answers: diagnosed from its serial lines (conclus
     [{ verifyOverride: { listeners: ['udp 0.0.0.0:5355', 'tcp [::]:5355'] } }, /the guest's checks failed: something listens beyond loopback: udp 0\.0\.0\.0:5355, tcp \[::\]:5355/],
     [{ cloudInitStatus: 'error' }, /cloud-init finished with status error/],
     [{ linuxGuest: { id: 'ubuntu', versionId: '26.04' } }, /the guest says it is ubuntu, the image debian/],
-    [{ verifyOverride: { hostKey: 'ssh-ed25519 AAAAother' } }, /its host key is not the one made for it/]
+    [{ verifyOverride: { hostKey: 'ssh-ed25519 AAAAother' } }, /its host key is not the one made for it/],
+    // MC-1551: the build fails, before its clean checkpoint, when cloud-init's cached seed couldn't be removed.
+    [{ seedCacheLeft: ['/var/lib/cloud/instances'] }, /cloud-init's cached seed is still there: \/var\/lib\/cloud\/instances/]
   ]
   for (const [stub, re] of cases) {
     const sc = scratch('lx-notready', { policy: { maxVms: 4, maxMemoryMBTotal: 65536 } })
@@ -236,6 +238,9 @@ test('a Linux run that times out is killed with its unit; a lease checkpoint is 
   await c.request('run', { command: 'write /build/state.txt after' })
   const back = await c.request('restore-checkpoint', { name: 'a' })
   assert.match(back.text, /Restored .* to its checkpoint "a"/)
+  // MC-1551: a Linux guest's words: no registry or logon session, and its build folder is /build.
+  assert.match(back.text, /Files, installed software and configuration are as at the checkpoint; running programs aren't \(the guest booted fresh\)\. \/build is as the checkpoint left it but unconfirmed/)
+  assert.doesNotMatch(back.text, /registry|C:\\build|logon/)
   assert.match((await c.request('run', { command: 'cat /build/state.txt' })).text, /before/)
   // Released: back to clean, the lease's checkpoint removed.
   await c.request('release')

@@ -108,6 +108,38 @@ test('MC-1550: the seed turns off systemd-resolved\'s LLMNR and mDNS responders 
   }
 })
 
+test('MC-1551: under the Hyper-V socket transport (no network) the seed masks the wait-online units, harmless where absent; under the internal switch it doesn\'t', () => {
+  const mask = 'sh -c systemctl mask systemd-networkd-wait-online.service NetworkManager-wait-online.service 2>/dev/null || true'
+  const a = userData(seed.files({ instanceId: 'i-0123456789abcdef', hostname: 'h', keys: keys(), dispatcher: 'x' })).runcmd.map(c => c.join(' '))
+  assert.ok(a.includes(mask), 'A: masked, and a missing unit never fails cloud-init')
+  assert.ok(a.indexOf(mask) < a.findIndex(s => / socket-up$/.test(s)))
+  const b = userData(seed.files({ instanceId: 'i-0123456789abcdef', hostname: 'h', keys: keys(), dispatcher: 'x', transport: 'internal-switch', address: '10.47.0.11/24' })).runcmd.map(c => c.join(' '))
+  assert.ok(!b.some(s => /wait-online/.test(s)), 'B: its address comes up, so its wait is real')
+})
+
+/**
+ * A host Python for guest_unit_check.py (MC-1551 round 2), which needs no Linux: HYPERV_TEST_PYTHON, else `python`,
+ * else `py -3`, the first that really runs (Windows' Store alias for python doesn't). null when there's none.
+ */
+function hostPython() {
+  const tries = [process.env.HYPERV_TEST_PYTHON && process.env.HYPERV_TEST_PYTHON.split(' '), ['python'], ['py', '-3'], ['python3']].filter(Boolean)
+  for (const argv of tries) {
+    const r = spawnSync(argv[0], [...argv.slice(1), '-c', 'import sys; print(sys.version_info[0])'], { encoding: 'utf8', timeout: 20_000, windowsHide: true })
+    if (r.status === 0 && r.stdout.trim() === '3') return argv
+  }
+  return null
+}
+const HOST_PY = hostPython()
+
+test('MC-1551 round 2: guest.py\'s run files and the build\'s finish, executed on a host Python with systemd and accounts mocked (guest_unit_check.py)', { skip: HOST_PY ? false : 'no host Python 3 (HYPERV_TEST_PYTHON, python or py -3)' }, () => {
+  // -B: no bytecode written anywhere (round 3: an import beside helper/guest.py would ship in the zip).
+  const r = spawnSync(HOST_PY[0], [...HOST_PY.slice(1), '-I', '-B', path.join(__dirname, 'guest_unit_check.py'), path.join(__dirname, '..', 'helper', 'guest.py'), BASE], { encoding: 'utf8', timeout: 120_000, windowsHide: true })
+  assert.strictEqual(r.status, 0, `${r.stdout}${r.stderr}`)
+  const m = /^OK (\d+)$/m.exec(r.stdout)
+  assert.ok(m && Number(m[1]) >= 48, r.stdout)
+  for (const d of ['helper', 'test']) assert.ok(!fs.existsSync(path.join(__dirname, '..', d, '__pycache__')), `no bytecode cache in ${d}/`)
+})
+
 /** A Linux Python: HYPERV_TEST_LINUX_PYTHON ("wsl -d Debian -e python3", say), or the first WSL distro that has one. */
 function linuxPython() {
   if (process.env.HYPERV_TEST_LINUX_PYTHON) return { argv: process.env.HYPERV_TEST_LINUX_PYTHON.split(' '), wsl: /^wsl(\.exe)?$/i.test(process.env.HYPERV_TEST_LINUX_PYTHON.split(' ')[0]) }

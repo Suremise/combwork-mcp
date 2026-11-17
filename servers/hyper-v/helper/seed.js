@@ -13,7 +13,8 @@
  * - the dispatcher (guest.py), /build (root's, read-only to hvuser), /out (both may write), /hvmcp (root's);
  * - hv_sock loaded at every boot (A), and HVMCP-DIAG lines written to COM1 at each stage of the first boot (§4.2);
  * - MC-1550: systemd-resolved's LLMNR and mDNS responders off (a drop-in, then a restart where resolved runs), so the
- *   guest listens on nothing beyond loopback (Debian's genericcloud image answers LLMNR on 0.0.0.0:5355 by default).
+ *   guest listens on nothing beyond loopback (Debian's genericcloud image answers LLMNR on 0.0.0.0:5355 by default);
+ * - MC-1551 (A only): the wait-online units masked, so a boot never waits for a network that A never gives it.
  */
 const fs = require('fs')
 const { join } = require('path')
@@ -31,6 +32,11 @@ const EARLY_DIAG = 'k=$(uname -r | tr -cd "A-Za-z0-9._+-"); v=absent; [ -d /sys/
 const RESOLVED_DROPIN = '/etc/systemd/resolved.conf.d/hvmcp.conf'
 const RESOLVED_CONF = '# hyper-v MCP (MC-1550): no LLMNR or mDNS responder, so nothing listens beyond loopback.\n[Resolve]\nLLMNR=no\nMulticastDNS=no\n'
 const RESOLVED_RESTART = ['sh', '-c', 'systemctl try-restart systemd-resolved.service 2>/dev/null || true']
+
+// MC-1551: under the Hyper-V socket transport the guest has no network, so a wait-online unit only waits out its
+// timeout. Ubuntu's systemd-networkd-wait-online held every boot for 2 min (systemd-analyze blame, MC-1542's fifth
+// window). Masked, harmless where a unit is absent; under the internal-switch transport the guest's address comes up.
+const WAIT_ONLINE_MASK = ['sh', '-c', 'systemctl mask systemd-networkd-wait-online.service NetworkManager-wait-online.service 2>/dev/null || true']
 
 const SSHD_CONFIG = `# hyper-v MCP (MC-1501): sshd for the helper only, started per connection by hvmcp-sshd.socket.
 HostKey /etc/ssh/ssh_host_ed25519_key
@@ -125,7 +131,7 @@ function files({ instanceId, hostname, keys, transport = 'hvsocket', address = n
       ['install', '-d', '-o', 'root', '-g', 'root', '-m', '0711', '/hvmcp'],
       ['install', '-d', '-o', 'root', '-g', 'root', '-m', '0711', '/hvmcp/runs'],
       ['install', '-d', '-o', 'root', '-g', 'root', '-m', '0700', '/hvmcp/staging'],
-      ...(transport === 'hvsocket' ? [['sh', '-c', 'modprobe hv_sock || true']] : []),
+      ...(transport === 'hvsocket' ? [['sh', '-c', 'modprobe hv_sock || true'], WAIT_ONLINE_MASK] : []),
       ['sh', '-c', 'systemctl disable --now ssh.service ssh.socket 2>/dev/null || true'],
       ['systemctl', 'mask', 'ssh.service', 'ssh.socket'],
       ['systemctl', 'daemon-reload'],
