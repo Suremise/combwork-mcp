@@ -410,32 +410,38 @@ test('MC-1545: debugKeepFailedBuild keeps a failed Linux build (on, never leased
   await helper.stop()
 })
 
-test('MC-1549: a resize to the other VMs\' count removes only the kept VM, and its accept text promises no build; the texts say a remove plan removes the whole pool', async () => {
+test('MC-1549: a no-image resize to the other VMs\' count removes only the kept VM (its accept text promises no build); a smaller one removes others too; the texts say so and that a remove plan removes the whole pool', async () => {
   const sc = scratch('lx-keep-drop', { policy: { maxVms: 4, maxMemoryMBTotal: 65536 } })
-  const { h } = await withPool(sc, 1)
+  const { h } = await withPool(sc, 2)
   await h.stop()
   addDebian(sc)
   sc.patchStub(s => { s.linuxNeverReady = true })
   const helper = await startHelper(sc)
   const admin = helper.conn(99)
   const { plan, line } = await change(sc, admin, { action: 'resize', image: D, vms: 1, debugKeepFailedBuild: true }, { expectFail: true })
-  assert.match(plan.text, /a resize plan keeping the other VMs \(vms: their count\), or any create or resize, removes only it, while a remove plan removes the whole pool/)
-  assert.match(line, /KEPT FOR DEBUG: .*removes only it, while a remove plan removes the whole pool/)
+  const advice = /a resize plan with no image and vms equal to the number of other VMs in the pool removes only it; any other create or resize removes it too, along with the changes it asks for; a remove plan removes the whole pool/
+  assert.match(plan.text, advice)
+  assert.match(line, advice)
+  assert.match(await statusText(admin), advice)
   const kept = linuxVm(sc)
-  const windowsVm = Object.values(sc.stub().vms).find(v => v.name !== kept.name)
-  assert.ok(windowsVm, 'the Windows VM')
+  const others = Object.values(sc.stub().vms).filter(v => v.name !== kept.name).map(v => v.name)
+  assert.strictEqual(others.length, 2, 'two Windows VMs')
+  const steps = text => text.match(/^- .*/gm)
   // A remove plan lists every VM: that is why the texts no longer point to it.
   const all = await admin.request('pool_plan', { action: 'remove' })
-  assert.match(all.text, new RegExp(`- remove ${windowsVm.name}`))
-  // The pool's other VMs' count (1), no image: only the kept VM goes, and nothing is said about creating one.
-  const drop = await change(sc, admin, { action: 'resize', vms: 1 })
-  const steps = drop.plan.text.match(/^- .*/gm)
-  assert.strictEqual(steps.length, 1, drop.plan.text)
-  assert.ok(steps[0].startsWith(`- remove ${kept.name} `), steps[0])
+  for (const n of [kept.name, ...others]) assert.match(all.text, new RegExp(`- remove ${n}`))
+  // A smaller resize (vms 1) removes the kept VM and a Windows VM: "any other resize" does its own changes too.
+  const smaller = await admin.request('pool_plan', { action: 'resize', vms: 1 })
+  assert.strictEqual(steps(smaller.text).length, 2, smaller.text)
+  assert.match(smaller.text, new RegExp(`- remove ${kept.name} `))
+  // The other VMs' count (2), no image: only the kept VM goes, and nothing is said about creating one.
+  const drop = await change(sc, admin, { action: 'resize', vms: 2 })
+  assert.strictEqual(steps(drop.plan.text).length, 1, drop.plan.text)
+  assert.ok(steps(drop.plan.text)[0].startsWith(`- remove ${kept.name} `), drop.plan.text)
   assert.doesNotMatch(drop.accepted.text, /Creating|installs Windows|copies its verified image/)
   assert.match(drop.accepted.text, /pool job \S+ \(resize\) is running\. Follow it with pool_status\./)
   assert.strictEqual(vmOf(sc, kept.name), undefined, 'the kept VM is gone')
-  assert.ok(vmOf(sc, windowsVm.name), 'the Windows VM stays')
+  for (const n of others) assert.ok(vmOf(sc, n), `${n} stays`)
   await helper.stop()
 })
 

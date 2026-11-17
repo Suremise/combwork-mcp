@@ -90,14 +90,30 @@ function ssh(bridge, vmId, port, ms = 30_000) {
   const opts = ['BatchMode=yes', 'StrictHostKeyChecking=no', 'UserKnownHostsFile=NUL', 'GlobalKnownHostsFile=none', 'PubkeyAuthentication=no',
     'PasswordAuthentication=no', 'KbdInteractiveAuthentication=no', 'ConnectTimeout=20', 'LogLevel=DEBUG1']
   const line = [q(SSH), '-F', 'none', '-T', '-x', '-a', ...opts.flatMap(o => ['-o', o]), '-o', q(`ProxyCommand="${bridge}" ${vmId} ${port}`), 'probe@fake', 'true'].join(' ')
-  return new Promise(resolve => {
-    const p = spawn(b.jobrun, [line], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, windowsVerbatimArguments: true })
-    let err = ''
+  return collect(spawn(b.jobrun, [line], { stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true, windowsVerbatimArguments: true }), ms)
+}
+
+/**
+ * Round 2: a launched child's result once it has exited AND its streams have closed ('close', not 'exit', which can
+ * come before the last stderr bytes: the bridge's close line is exactly those). At ms it is killed by its handle
+ * (ending jobrun closes its job: ssh and the bridge end with it); if its streams still haven't closed 10 s later, it
+ * resolves with streamsOpen, which fails the test. A spawn error rejects.
+ */
+function collect(p, ms, graceMs = 10_000) {
+  return new Promise((resolve, reject) => {
+    let err = '', timedOut = false, exitCode
     p.stderr.on('data', d => { err += d })
     p.stdout.resume()
-    // Ending jobrun (by its handle) closes its job: ssh and the bridge end with it.
-    const t = setTimeout(() => p.kill(), ms)
-    p.on('exit', code => { clearTimeout(t); resolve({ code, err, timedOut: code === null }) })
+    let grace = null
+    const t = setTimeout(() => {
+      timedOut = true
+      p.kill()
+      grace = setTimeout(() => resolve({ code: exitCode ?? null, err, timedOut, streamsOpen: true }), graceMs)
+    }, ms)
+    const done = () => { clearTimeout(t); clearTimeout(grace) }
+    p.on('error', e => { done(); reject(e) })
+    p.on('exit', code => { exitCode = code })
+    p.on('close', code => { done(); resolve({ code, err, timedOut, streamsOpen: false }) })
   })
 }
 
@@ -109,6 +125,7 @@ test('MC-1549: the bridge passes everything ssh.exe writes, not just its banner:
   assert.match(s.seen.banner || '', /^SSH-2\.0-OpenSSH_for_Windows/, 'the client\'s banner arrived')
   assert.deepStrictEqual(s.seen.types.slice(0, 2), [20, 30], `the client's KEXINIT and ECDH init arrived (types seen: ${s.seen.types}); ssh said:\n${r.err}`)
   assert.strictEqual(r.timedOut, false, 'ssh ended when the server closed, without being killed')
+  assert.strictEqual(r.streamsOpen, false, 'its streams closed, so all it wrote was read')
   const m = /HvMcpVsock: closed after \d+ ms, (\d+) bytes in, (\d+) bytes out/.exec(r.err)
   assert.ok(m, `the bridge's close line: ${r.err}`)
   assert.ok(Number(m[2]) > 1000, `more than the banner went out (${m[2]} bytes: banner, KEXINIT and ECDH init)`)
@@ -123,4 +140,39 @@ test('MC-1549: the build setup ships has no TCP mode: the all-zero VM id never r
   assert.strictEqual(s.seen.connections, 0, 'nothing connected to 127.0.0.1')
   assert.doesNotMatch(r.err, /HvMcpVsock: connected/)
   assert.match(r.err, /HvMcpVsock: (can't connect|connect timed out)/, `the bridge says why: ${r.err}`)
+})
+
+// Round 2: collect() with a mock child, no process: the order Node allows (exit, then the last stderr, then close).
+function mockChild() {
+  const { EventEmitter } = require('events')
+  const { PassThrough } = require('stream')
+  const c = new EventEmitter()
+  c.stdout = new PassThrough()
+  c.stderr = new PassThrough()
+  c.killed = 0
+  c.kill = () => { c.killed++ }
+  return c
+}
+
+test('MC-1549 round 2: the result waits for close, so a final stderr line after exit is kept; a spawn error rejects; a hung child is killed, bounded', async () => {
+  const c = mockChild()
+  const r = collect(c, 5_000)
+  c.stderr.write('debug1: expecting SSH2_MSG_KEX_ECDH_REPLY\n')
+  c.emit('exit', 255)
+  await new Promise(res => setImmediate(res))
+  c.stderr.write('HvMcpVsock: closed after 36 ms, 253 bytes in, 1513 bytes out\n')
+  await new Promise(res => setImmediate(res))
+  c.emit('close', 255)
+  const got = await r
+  assert.match(got.err, /HvMcpVsock: closed after 36 ms, 253 bytes in, 1513 bytes out/, 'the line written after exit is kept')
+  assert.deepStrictEqual([got.code, got.timedOut, got.streamsOpen, c.killed], [255, false, false, 0])
+
+  const e = mockChild()
+  const re = collect(e, 5_000)
+  e.emit('error', new Error('spawn ENOENT'))
+  await assert.rejects(re, /spawn ENOENT/)
+
+  const h = mockChild()
+  const got2 = await collect(h, 20, 20)
+  assert.deepStrictEqual([got2.timedOut, got2.streamsOpen, h.killed], [true, true, 1], 'killed once at its bound, then reported with its streams open')
 })

@@ -511,8 +511,9 @@ differ: how a VM is built, and how the helper talks to its guest.
       guest's diagnostics, each connection included;
     - run `HvMcpVsock.exe <vmId> 22` in an admin PowerShell, to retry the Hyper-V socket from the host and see whether
       it connects and whether sshd's banner comes back.
-  - A resize plan keeping the other VMs (`pool_plan` with `action: "resize"` and `vms` their count), or any create or
-    resize, removes it and nothing else. A remove plan removes the whole pool, kept VM and all (MC-1549).
+  - A resize plan with no image and `vms` equal to the number of other VMs in the pool (`pool_plan` with
+    `action: "resize"`) removes it and nothing else. Any other create or resize removes it too, along with the changes
+    it asks for. A remove plan removes the whole pool, kept VM and all (MC-1549).
 - **Talking to the guest** is SSH over a **Hyper-V socket**, the channel PowerShell Direct uses, so a Linux guest has no
   network path at all.
   - The helper runs Windows' in-box `ssh.exe` with fixed arguments: no config file, the VM's own key and pinned
