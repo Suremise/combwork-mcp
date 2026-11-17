@@ -274,10 +274,11 @@ function connectionStop(d, attempts) {
   const starts = Number(d.conn_starts || 0)
   const ends = Number(d.conn_ends || 0)
   // Round 2: only what the evidence shows. The guest's COM1 trace counts only when it was read (a stage line seen);
-  // a banner is ssh -v's "Remote protocol version" line; any recorded end is reported with its result, code and
-  // status, a "success" included (the unit's ExecStart=- hides sshd's own exit status from SERVICE_RESULT).
+  // a banner is ssh -v's "Remote protocol version" line, or (MC-1549) its "compat_banner: match" or "remote software
+  // version" (the error keeps only ssh's last lines, so the first may be gone); any recorded end is reported with its
+  // result, code and status, a "success" included (the unit's ExecStart=- hides sshd's own exit status).
   const trace = !d.unavailable && d.stage !== undefined
-  const banner = /Remote protocol version/.test(e)
+  const banner = /Remote protocol version|remote software version|compat_banner: match/.test(e)
   const ended = ends ? `; the guest's sshd ended ${d.conn_result || 'unknown'}/${d.conn_code || 'unknown'}/${d.conn_status || 'unknown'}` : ''
   if (/HvMcpVsock: (connect timed out|can't connect)/.test(e)) return 'connect never completed (host side)'
   if (banner) return `sshd answered (its banner arrived), then SSH failed: see the last SSH error${ended}`

@@ -410,6 +410,35 @@ test('MC-1545: debugKeepFailedBuild keeps a failed Linux build (on, never leased
   await helper.stop()
 })
 
+test('MC-1549: a resize to the other VMs\' count removes only the kept VM, and its accept text promises no build; the texts say a remove plan removes the whole pool', async () => {
+  const sc = scratch('lx-keep-drop', { policy: { maxVms: 4, maxMemoryMBTotal: 65536 } })
+  const { h } = await withPool(sc, 1)
+  await h.stop()
+  addDebian(sc)
+  sc.patchStub(s => { s.linuxNeverReady = true })
+  const helper = await startHelper(sc)
+  const admin = helper.conn(99)
+  const { plan, line } = await change(sc, admin, { action: 'resize', image: D, vms: 1, debugKeepFailedBuild: true }, { expectFail: true })
+  assert.match(plan.text, /a resize plan keeping the other VMs \(vms: their count\), or any create or resize, removes only it, while a remove plan removes the whole pool/)
+  assert.match(line, /KEPT FOR DEBUG: .*removes only it, while a remove plan removes the whole pool/)
+  const kept = linuxVm(sc)
+  const windowsVm = Object.values(sc.stub().vms).find(v => v.name !== kept.name)
+  assert.ok(windowsVm, 'the Windows VM')
+  // A remove plan lists every VM: that is why the texts no longer point to it.
+  const all = await admin.request('pool_plan', { action: 'remove' })
+  assert.match(all.text, new RegExp(`- remove ${windowsVm.name}`))
+  // The pool's other VMs' count (1), no image: only the kept VM goes, and nothing is said about creating one.
+  const drop = await change(sc, admin, { action: 'resize', vms: 1 })
+  const steps = drop.plan.text.match(/^- .*/gm)
+  assert.strictEqual(steps.length, 1, drop.plan.text)
+  assert.ok(steps[0].startsWith(`- remove ${kept.name} `), steps[0])
+  assert.doesNotMatch(drop.accepted.text, /Creating|installs Windows|copies its verified image/)
+  assert.match(drop.accepted.text, /pool job \S+ \(resize\) is running\. Follow it with pool_status\./)
+  assert.strictEqual(vmOf(sc, kept.name), undefined, 'the kept VM is gone')
+  assert.ok(vmOf(sc, windowsVm.name), 'the Windows VM stays')
+  await helper.stop()
+})
+
 test('MC-1545 round 2: the reason classes claim only what the evidence shows (a banner, any recorded end, a trace that was read)', () => {
   const { connectionStop } = require('../helper/guests/linux')
   const seedSeen = { stage: 'socket-up' }
@@ -423,6 +452,16 @@ test('MC-1545 round 2: the reason classes claim only what the evidence shows (a 
   assert.strictEqual(connectionStop({ ...seedSeen }, { error: connected }), 'connected, guest saw no connection')
   assert.strictEqual(connectionStop({ ...seedSeen, conn_starts: '1' }, { error: connected }), 'guest started sshd, no SSH banner')
   assert.strictEqual(connectionStop({ ...seedSeen }, { error: 'HvMcpVsock: connect timed out after 20000 ms' }), 'connect never completed (host side)')
+})
+
+test('MC-1549: a banner is also seen in OpenSSH 10\'s "compat_banner: match" line, when the error\'s kept tail has lost "Remote protocol version"', () => {
+  const { connectionStop } = require('../helper/guests/linux')
+  const d = { stage: 'socket-up', conn_starts: '8', conn_ends: '6', conn_result: 'success', conn_code: 'exited', conn_status: '3' }
+  // MC-1542's third window, as it was logged: the kept tail starts at compat_banner and ends at the ECDH wait.
+  const tail = 'the guest call ready timed out after 60 s: debug1: compat_banner: match: OpenSSH_10.0p2 Debian-7+deb13u4 pat OpenSSH* compat 0x04000000 | debug1: Authenticating to hvmcp:22 as \'hvadmin\' | debug1: SSH2_MSG_KEXINIT sent | debug1: SSH2_MSG_KEXINIT received | debug1: expecting SSH2_MSG_KEX_ECDH_REPLY'
+  assert.strictEqual(connectionStop(d, { error: tail }), 'sshd answered (its banner arrived), then SSH failed: see the last SSH error; the guest\'s sshd ended success/exited/3')
+  assert.match(connectionStop(d, { error: 'x | debug1: Remote protocol version 2.0, remote software version OpenSSH_10.0p2' }), /^sshd answered/)
+  assert.match(connectionStop(d, { error: 'x | remote software version OpenSSH_10.0p2' }), /^sshd answered/)
 })
 
 test('MC-1545 round 2: a kept build is put in its debug state and read back: started when a failure left it off (before the first start, after the shutdown); rolled back, saying why, when that fails', async () => {

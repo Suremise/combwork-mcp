@@ -511,11 +511,15 @@ differ: how a VM is built, and how the helper talks to its guest.
       guest's diagnostics, each connection included;
     - run `HvMcpVsock.exe <vmId> 22` in an admin PowerShell, to retry the Hyper-V socket from the host and see whether
       it connects and whether sshd's banner comes back.
-  - A remove plan, or the next create or resize, removes it.
+  - A resize plan keeping the other VMs (`pool_plan` with `action: "resize"` and `vms` their count), or any create or
+    resize, removes it and nothing else. A remove plan removes the whole pool, kept VM and all (MC-1549).
 - **Talking to the guest** is SSH over a **Hyper-V socket**, the channel PowerShell Direct uses, so a Linux guest has no
   network path at all.
   - The helper runs Windows' in-box `ssh.exe` with fixed arguments: no config file, the VM's own key and pinned
     `known_hosts`, batch mode. Its ProxyCommand is setup's `HvMcpVsock.exe`, which connects to the VM's vsock port 22.
+  - The bridge reads and writes ssh.exe's pipes with overlapped I/O (MC-1549). ssh.exe hands its ProxyCommand
+    overlapped pipes, and synchronous reads on them passed only ssh's first write. A host-only test runs the real
+    ssh.exe through a test build of the bridge against a local fake SSH server.
   - Each request goes on stdin, as JSON, and the remote command is always the forced one.
   - The keys stay in the helper's secrets folder: never in a reply, plan, journal or log.
 - **The tools on Linux:**
@@ -898,7 +902,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\restorewait.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js test\linux-image.test.js test\linux-guest-files.test.js test\linux.test.js test\linux-ps.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\restorewait.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js test\linux-image.test.js test\linux-guest-files.test.js test\linux.test.js test\linux-ps.test.js test\bridge.test.js
 ```
 
 - `units.test.js`:
@@ -1133,6 +1137,10 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   - `com-attach` and `com-detach` (the exact `\\.\pipe\<name>` path, read back) and `vhd-convert`'s path checks;
   - `com-read` on a real named pipe: a quiet spell longer than its wait, a line split across writes, the pipe coming
     back after a guest restart, 64 KB without a newline, and a silent guest until the deadline.
+- `bridge.test.js` (MC-1549): the real in-box `ssh.exe` with a test build of `HvMcpVsock.exe` as its ProxyCommand
+  (compiled with `HVMCP_TEST`, TCP to a local fake SSH server instead of a VM). The client's KEXINIT and ECDH init reach
+  the server, and the bridge's byte counts show it. The build setup ships has no TCP mode. ssh runs in the kill-on-close
+  job of `jobrun.exe`.
 
 **The trial** on a real host (not automated): setup, then `pool_plan` → approval → `pool_create` from the pinned 25H2
 ISO, then:
