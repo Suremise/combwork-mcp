@@ -480,7 +480,9 @@ differ: how a VM is built, and how the helper talks to its guest.
      - an SSH host key and a client key, both made by the helper, so the host key is pinned before the first boot;
      - `hvadmin`'s only key is the helper's, restricted to a forced command, `sudo` of the guest's fixed dispatcher
        (`helper/guest.py`) and nothing else. `hvuser` has no key and no sudo;
-     - sshd only on the Hyper-V socket, the distro's own sshd masked.
+     - sshd only on the Hyper-V socket, the distro's own sshd masked;
+     - systemd-resolved's LLMNR and mDNS responders off (a drop-in, MC-1550), since Debian's cloud image otherwise
+       answers LLMNR on port 5355 on every address.
   3. Its first boot writes allowlisted diagnostics to COM1, a pipe for the build only.
   4. The build waits for the authenticated round trip to the dispatcher, then for cloud-init to finish.
   5. It checks the guest: its distro and release, the keys, the sudoers rule, the units, no address and nothing listening

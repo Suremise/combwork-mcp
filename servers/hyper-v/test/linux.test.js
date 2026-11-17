@@ -113,6 +113,8 @@ test('a Linux build that never answers: diagnosed from its serial lines (conclus
     [{ linuxNeverReady: true, diagLines: ['HVMCP-DIAG stage=socket-up vmbus=present hv_sock_driver=present vsock_listen=active sshd_config_ok=no sshd_error=Bad_configuration_option_Foo kernel=6.12'] }, /the guest's sshd config doesn't parse \(Bad_configuration_option_Foo\)\. Diagnostics: .*sshd_error=Bad_configuration_option_Foo.*\. Last SSH error/],
     [{ linuxNeverReady: true, comReadFails: true }, /inconclusive\): unavailable=unreadable/],
     [{ verifyOverride: { addresses: ['eth0 10.0.0.5'], listeners: ['tcp 0.0.0.0:22'] } }, /the guest's checks failed: it has addresses: eth0 10\.0\.0\.5; something listens beyond loopback: tcp 0\.0\.0\.0:22/],
+    // MC-1550: no allowlist: resolved's LLMNR on 5355 (MC-1542's fourth window) still fails the build if it listens.
+    [{ verifyOverride: { listeners: ['udp 0.0.0.0:5355', 'tcp [::]:5355'] } }, /the guest's checks failed: something listens beyond loopback: udp 0\.0\.0\.0:5355, tcp \[::\]:5355/],
     [{ cloudInitStatus: 'error' }, /cloud-init finished with status error/],
     [{ linuxGuest: { id: 'ubuntu', versionId: '26.04' } }, /the guest says it is ubuntu, the image debian/],
     [{ verifyOverride: { hostKey: 'ssh-ed25519 AAAAother' } }, /its host key is not the one made for it/]
