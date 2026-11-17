@@ -238,6 +238,10 @@ below don't rely on that; the smoke test checks it so a Windows change is notice
   It keeps trying in bounded rounds and records the outcome in `watchdog.json`.
 - `state.json` keeps the id until a stop is confirmed. A restarted server stops any Sandbox an earlier run of it left
   unconfirmed (whose server is no longer running), and never touches one it didn't start.
+- `state.json` and `watchdog.json` are each replaced whole: a temp file, then a rename. Windows refuses that rename while
+  another process has the file open, such as the watchdog reading `state.json` as it starts. So the rename is retried
+  for about 2 s (MC-1548). A watchdog report that still can't be written is logged in `watchdog.log`, and the watchdog
+  carries on stopping the Sandbox.
 
 ## Limits
 

@@ -142,4 +142,25 @@ function windowOp(id, op) {
   })
 }
 
-module.exports = { WSB, LAUNCH_DIR, ID_RE, wsb, list, stopConfirmed, configXml, hostProblem, hint, connect, windowOp, SAC_KEY, SAC_QUERY, SAC_OFF, sacState }
+/**
+ * MC-1548: writes text to a file by replacing it whole (a temp file beside it, then a rename), shared by the server's
+ * state.json and the watchdog's watchdog.json. Windows refuses a rename over a file another process has open at that
+ * moment (EPERM, EACCES or EBUSY): the watchdog reading state.json as it starts, a test or smoke run polling a report,
+ * a scanner. The rename is retried for a bounded time (about 2 s, backing off), then the last error is thrown.
+ */
+const REPLACE_BUSY = new Set(['EPERM', 'EACCES', 'EBUSY'])
+const REPLACE_MS = 2000
+function replaceFile(file, text, { renameSync = require('fs').renameSync, waitMs = REPLACE_MS } = {}) {
+  const fs = require('fs')
+  const tmp = `${file}.tmp`
+  fs.writeFileSync(tmp, text)
+  const t0 = Date.now()
+  for (let delay = 10; ; delay = Math.min(delay * 2, 200)) {
+    try { return renameSync(tmp, file) } catch (e) {
+      if (!REPLACE_BUSY.has(e.code) || Date.now() - t0 >= waitMs) throw e
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay)
+    }
+  }
+}
+
+module.exports = { WSB, LAUNCH_DIR, ID_RE, wsb, list, stopConfirmed, configXml, hostProblem, hint, connect, windowOp, SAC_KEY, SAC_QUERY, SAC_OFF, sacState, replaceFile }

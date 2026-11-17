@@ -70,3 +70,57 @@ test('a stop that is never confirmed is retried in bounded rounds and reported, 
     t.dummy.kill()
   }
 })
+
+// MC-1548: a state or report file replaced while another process has it open. Windows refuses that rename (EPERM):
+// the watchdog reading state.json as it starts, a smoke run polling watchdog.json. replaceFile retries, bounded.
+const { replaceFile } = require('../wsb')
+const { spawnSync } = require('child_process')
+const windows = process.platform === 'win32'
+
+// A process that opens file (as Node opens it for a read) and holds it for ms, then exits. Resolves once it holds it.
+function holdOpen(file, ms) {
+  const p = spawn(process.execPath, ['-e', `const fs=require('fs');const fd=fs.openSync(process.argv[1],'r');process.stdout.write('held');setTimeout(()=>{fs.closeSync(fd);process.exit(0)},${ms})`, file], { stdio: ['ignore', 'pipe', 'ignore'] })
+  test.after(() => p.kill())
+  return new Promise((res, rej) => { p.stdout.once('data', () => res(p)); p.once('exit', c => rej(new Error(`holder exited ${c}`))) })
+}
+
+test('MC-1548: replaceFile replaces a file another process holds open, once it lets go (a plain rename fails there)', { skip: !windows && 'a Windows sharing rule' }, async () => {
+  const s = scratch('wd-replace')
+  const file = path.join(s.dir, 'state.json')
+  fs.writeFileSync(file, '{"v":1}')
+  const holder = await holdOpen(file, 700)
+  fs.writeFileSync(`${file}.plain`, '{"v":0}')
+  // The premise: while it's held, Windows refuses a plain rename over it.
+  assert.throws(() => fs.renameSync(`${file}.plain`, file), e => ['EPERM', 'EACCES', 'EBUSY'].includes(e.code))
+  const t0 = Date.now()
+  replaceFile(file, '{"v":2}')
+  assert.ok(Date.now() - t0 >= 100, 'it waited for the holder')
+  assert.strictEqual(fs.readFileSync(file, 'utf8'), '{"v":2}')
+  assert.ok(!fs.existsSync(`${file}.tmp`), 'no temp file left')
+  await new Promise(r => holder.once('exit', r).exitCode !== null && r())
+})
+
+test('MC-1548: replaceFile is bounded, and throws at once on an error that isn\'t a sharing one', () => {
+  const s = scratch('wd-replace-bound')
+  const file = path.join(s.dir, 'r.json')
+  let tries = 0
+  const busy = () => { tries++; const e = new Error('busy'); e.code = 'EPERM'; throw e }
+  const t0 = Date.now()
+  assert.throws(() => replaceFile(file, 'x', { renameSync: busy, waitMs: 150 }), /busy/)
+  assert.ok(Date.now() - t0 >= 150 && Date.now() - t0 < 2000 && tries > 2, `retried for its bound (${tries} tries, ${Date.now() - t0} ms)`)
+  tries = 0
+  const other = () => { tries++; const e = new Error('nope'); e.code = 'ENOENT'; throw e }
+  assert.throws(() => replaceFile(file, 'x', { renameSync: other }), /nope/)
+  assert.strictEqual(tries, 1, 'not retried')
+})
+
+test('MC-1548: a report the watchdog can\'t write is logged, not thrown: it still stops the Sandbox and exits 0', async () => {
+  const t = setup('wd-report-fails')
+  // watchdog.json is a folder: no report can replace it, so every write fails after its bounded retry.
+  fs.mkdirSync(path.join(t.s.dir, 'sandbox', 'run', 'watchdog.json'))
+  t.dummy.kill('SIGKILL')
+  assert.strictEqual(await t.exit, 0, 'it carried on past the failed report and stopped')
+  assert.deepStrictEqual(t.s.read().sandboxes, [])
+  assert.match(fs.readFileSync(path.join(t.s.dir, 'sandbox', 'run', 'watchdog.log'), 'utf8'), /report not written/)
+  t.wd.stdin.destroy()
+})
