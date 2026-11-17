@@ -186,50 +186,91 @@ function guest(name, script) {
     if (!lines.length) throw new Error(`no answer: ${r.stdout}${r.stderr}`)
     return lines.map(l => JSON.parse(l))
   }
-  return { run, out }
+  return { run, out, dir: sc.dir }
 }
 
 /**
- * MC-1543: ends a process the test started, only if it is still that process (its PID and creation time, within a
- * second), never by name. For an after hook: whatever a failed assertion left running.
+ * MC-1543: ends the processes a ping run's harness recorded (ids.json in its folder, written as each identity is known:
+ * the run's outer cmd, the wrapper's cmd, the ping), and any child of a recorded one started after it, each only if it is
+ * still that process (its PID and creation time, within a second), never by name. Registered before anything launches,
+ * so it runs whatever happens to the harness: a timeout, no or truncated output, a failed assertion. Returns the PIDs of
+ * those still alive afterwards.
  */
-function endIfStill(pid, created) {
-  if (!pid || !created) return
-  spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-    `$p = Get-Process -Id ${Number(pid)} -ErrorAction SilentlyContinue; if ($p -and [Math]::Abs(($p.StartTime.ToUniversalTime() - [DateTime]::Parse('${String(created).replace(/'/g, '')}').ToUniversalTime()).TotalSeconds) -lt 1) { $p.Kill() }`],
-  { encoding: 'utf8', env: ps51Env(), windowsHide: true, timeout: 30_000 })
+function endRecorded(dir) {
+  const file = path.join(dir, 'ids.json')
+  if (!fs.existsSync(file)) return []
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `
+$ids = @((Get-Content -Raw -LiteralPath '${file.replace(/'/g, "''")}' | ConvertFrom-Json).PSObject.Properties | ForEach-Object { $_.Value } | Where-Object { $_.pid -and $_.created })
+$same = { param($pid, $created) $p = Get-Process -Id $pid -ErrorAction SilentlyContinue; if ($p -and [Math]::Abs(($p.StartTime.ToUniversalTime() - [DateTime]::Parse($created).ToUniversalTime()).TotalSeconds) -lt 1) { $p } }
+$targets = @()
+foreach ($i in $ids) {
+  $p = & $same ([int]$i.pid) ([string]$i.created)
+  if ($p) { $targets += $p }
+  # A child of a recorded process, created after it: one the harness died before recording.
+  foreach ($c in @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$([int]$i.pid)")) {
+    if ($c.CreationDate.ToUniversalTime() -ge [DateTime]::Parse([string]$i.created).ToUniversalTime().AddSeconds(-1)) { $cp = Get-Process -Id $c.ProcessId -ErrorAction SilentlyContinue; if ($cp) { $targets += $cp } }
+  }
+}
+foreach ($p in $targets) { try { $p.Kill(); [void]$p.WaitForExit(5000) } catch { } }
+'LEFT:' + (@($ids | Where-Object { & $same ([int]$_.pid) ([string]$_.created) } | ForEach-Object { $_.pid }) -join ',')
+`], { encoding: 'utf8', env: ps51Env(), windowsHide: true, timeout: 60_000 })
+  const left = /LEFT:(.*)/.exec(r.stdout || '')?.[1] || ''
+  return left ? left.split(',').map(Number) : []
+}
+
+/**
+ * MC-1543: the harness for a run of a long ping through hv.ps1's real start. Error dialogs are off for everything it
+ * starts (SetErrorMode, inherited); each identity goes to ids.json as soon as it's known (the outer cmd at once, then the
+ * wrapper's cmd and the ping once the ping runs); a finally kills the run's tree if the script fails part-way. `tail` is
+ * what it does once the ping runs (the normal test kills it; the fault test dies abruptly).
+ */
+function pingRun(name, tail) {
+  return guest(name, `param($Dir, $Out, $Cwd)
+Add-Type -Namespace HvMcpTest -Name ErrorMode -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint SetErrorMode(uint mode);'
+[void][HvMcpTest.ErrorMode]::SetErrorMode(0x8003)
+$idsFile = Join-Path $Cwd 'ids.json'
+$ids = @{}
+$record = { param($k, $p) $ids[$k] = @{ pid = [int]$p.pid; created = [string]$p.created }; [IO.File]::WriteAllText($idsFile, (ConvertTo-Json -InputObject $ids -Compress)) }
+$j = @{ n = 1; command = 'ping -n 120 127.15.43.1 >nul'; shell = 'cmd'; cwd = $Cwd; dir = $Dir; out = $Out }
+$s = & $GuestRunStart $j $RunFiles.ToString()
+& $record 'run' @{ pid = $s.pid; created = $s.started }
+$killed = $false
+try {
+  ConvertTo-Json -InputObject $s -Compress
+  $ping = $null
+  $t = (Get-Date).AddSeconds(30)
+  do {
+    Start-Sleep -Milliseconds 100
+    $inner = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($s.pid)" | Where-Object { $_.Name -eq 'cmd.exe' })
+    if ($inner.Count) { $ping = @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" | Where-Object { $inner.ProcessId -contains $_.ParentProcessId })[0] }
+  } until ($ping -or (Get-Date) -gt $t)
+  if ($ping) {
+    $wrapper = @($inner | Where-Object { $_.ProcessId -eq $ping.ParentProcessId })[0]
+    & $record 'wrapper' @{ pid = $wrapper.ProcessId; created = $wrapper.CreationDate.ToUniversalTime().ToString('o') }
+    & $record 'ping' @{ pid = $ping.ProcessId; created = $ping.CreationDate.ToUniversalTime().ToString('o') }
+  }
+  ConvertTo-Json -InputObject @{ pid = $(if ($ping) { [int]$ping.ProcessId } else { $null }); created = $(if ($ping) { $ping.CreationDate.ToUniversalTime().ToString('o') } else { $null }) } -Compress
+${tail}
+} finally {
+  if (-not $killed) { try { [void](& $GuestRunKill @{ pid = $s.pid; started = $s.started }) } catch { } }
+}`)
 }
 
 test('hv.ps1\'s start, for real: a running command\'s PID and creation time (read before its object is disposed), polled, then killed by them, with everything it started', { skip: !windows || START.some(b => !b) || !KILL }, async t => {
   // MC-1543: this test once killed the run's tree while cmd was still starting PING.EXE. The ping lost its console
   // mid-initialisation, failed with 0xc0000142 and showed Windows' error dialog on the desktop, and a ping created just
-  // after taskkill's snapshot was left running. Now:
-  // - the test's PowerShell turns error dialogs off (SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX |
-  //   SEM_NOOPENFILEERRORBOX), which its children inherit, so no failure can show one;
-  // - the kill waits until the run's own PING.EXE (outer cmd, then the wrapper's cmd, then ping) is running;
-  // - the ping (a target only this test uses) is reported by its PID and creation time, must be gone after the kill,
-  //   and is ended by that identity in an after hook if an assertion left it.
-  const g = guest('runs-startps', `param($Dir, $Out, $Cwd)
-Add-Type -Namespace HvMcpTest -Name ErrorMode -MemberDefinition '[DllImport("kernel32.dll")] public static extern uint SetErrorMode(uint mode);'
-[void][HvMcpTest.ErrorMode]::SetErrorMode(0x8003)
-$j = @{ n = 1; command = 'ping -n 120 127.15.43.1 >nul'; shell = 'cmd'; cwd = $Cwd; dir = $Dir; out = $Out }
-$s = & $GuestRunStart $j $RunFiles.ToString()
-ConvertTo-Json -InputObject $s -Compress
-$ping = $null
-$t = (Get-Date).AddSeconds(30)
-do {
-  Start-Sleep -Milliseconds 100
-  $inner = @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($s.pid)" | ForEach-Object { $_.ProcessId })
-  if ($inner.Count) { $ping = @(Get-CimInstance Win32_Process -Filter "Name='PING.EXE'" | Where-Object { $inner -contains $_.ParentProcessId })[0] }
-} until ($ping -or (Get-Date) -gt $t)
-ConvertTo-Json -InputObject @{ pid = $(if ($ping) { [int]$ping.ProcessId } else { $null }); created = $(if ($ping) { $ping.CreationDate.ToUniversalTime().ToString('o') } else { $null }) } -Compress
-ConvertTo-Json -InputObject (& $GuestRunPoll @{ n = 1; cap = 1024; out = $Out }) -Compress
-ConvertTo-Json -InputObject (& $GuestRunKill @{ pid = $s.pid; started = $s.started }) -Compress
-$gone = $true
-if ($ping) { $t = (Get-Date).AddSeconds(10); do { Start-Sleep -Milliseconds 100; $gone = -not (Get-Process -Id $ping.ProcessId -ErrorAction SilentlyContinue) } until ($gone -or (Get-Date) -gt $t) }
-ConvertTo-Json -InputObject @{ pingGone = $gone } -Compress`)
+  // after taskkill's snapshot was left running. Now the harness (pingRun) turns error dialogs off, kills only once the
+  // run's own PING.EXE runs, records every identity as it learns it, and cleans up in a finally; the cleanup below is
+  // registered before anything launches.
+  const g = pingRun('runs-startps', `  ConvertTo-Json -InputObject (& $GuestRunPoll @{ n = 1; cap = 1024; out = $Out }) -Compress
+  $k = & $GuestRunKill @{ pid = $s.pid; started = $s.started }
+  $killed = [bool]$k.killed
+  ConvertTo-Json -InputObject $k -Compress
+  $gone = $true
+  if ($ping) { $t = (Get-Date).AddSeconds(10); do { Start-Sleep -Milliseconds 100; $gone = -not (Get-Process -Id $ping.ProcessId -ErrorAction SilentlyContinue) } until ($gone -or (Get-Date) -gt $t) }
+  ConvertTo-Json -InputObject @{ pingGone = $gone } -Compress`)
+  t.after(() => endRecorded(g.dir))
   const [started, ping, poll, killed, after] = g.run()
-  t.after(() => { endIfStill(ping?.pid, ping?.created); endIfStill(started?.pid, started?.started) })
   assert.ok(Number.isInteger(started.pid) && started.pid > 0, `a real PID: ${JSON.stringify(started)}`)
   assert.match(String(started.started), /^\d{4}-\d\d-\d\dT/, 'its creation time')
   assert.ok(Number.isInteger(ping.pid) && ping.pid > 0, `the run's own PING.EXE was seen running before the kill: ${JSON.stringify(ping)}`)
@@ -237,6 +278,20 @@ ConvertTo-Json -InputObject @{ pingGone = $gone } -Compress`)
   assert.deepStrictEqual(killed, { killed: true })
   assert.deepStrictEqual(after, { pingGone: true }, 'the kill took the whole tree, the ping included')
   await waitFor(() => !alive(started.pid), 10_000, 'the run gone')
+})
+
+test('MC-1543: a harness that dies after launching the run (no finally, no usable output) still leaves nothing behind: the cleanup registered first ends every recorded process', { skip: !windows || START.some(b => !b) || !KILL }, async t => {
+  const g = pingRun('runs-harness-dies', `  [Environment]::Exit(3) # dies at once: no finally runs, no more output`)
+  t.after(() => endRecorded(g.dir))
+  // It dies part-way: at most its first lines (the start and the ping), never the kill's, or no usable answer at all.
+  let lines = []
+  try { lines = g.run() } catch { lines = [] }
+  assert.ok(lines.length <= 2 && !lines.some(l => 'killed' in l), `the harness died before any kill: ${JSON.stringify(lines)}`)
+  const ids = JSON.parse(fs.readFileSync(path.join(g.dir, 'ids.json'), 'utf8'))
+  assert.ok(ids.run?.pid && ids.wrapper?.pid && ids.ping?.pid, `every identity was recorded before it died: ${JSON.stringify(ids)}`)
+  assert.ok(alive(ids.ping.pid), 'its ping really was left running by the harness')
+  assert.deepStrictEqual(endRecorded(g.dir), [], 'the cleanup ended them all, by identity')
+  for (const k of ['run', 'wrapper', 'ping']) await waitFor(() => !alive(ids[k].pid), 10_000, `${k} gone`)
 })
 
 test('hv.ps1\'s start, for real: a command that exits at once still gives its PID; the exit file gives its code and output', { skip: !windows || START.some(b => !b) }, async () => {
