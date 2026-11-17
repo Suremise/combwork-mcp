@@ -489,7 +489,29 @@ differ: how a VM is built, and how the helper talks to its guest.
 
   A guest that never answers fails the build, saying why from its diagnostics (for example "no hv_sock driver"), or
   that the cause is unknown. Either way the VM is rolled back, and nothing switches to another transport: that's the
-  user's decision.
+  user's decision. The reason also carries the last SSH attempt's error (MC-1544), and says where the connection
+  stopped (MC-1545):
+  - "connect never completed (host side)";
+  - "connected, guest saw no connection";
+  - "guest started sshd, which exited …";
+  - "guest started sshd, no SSH banner".
+
+  It knows from HvMcpVsock.exe's own lines, the build's verbose ssh attempts (their last 10 lines, cleaned), and the
+  guest's report of each connection on COM1, which is read through the whole wait.
+- **Keeping a failed build, for debugging only** (MC-1545, off by default):
+  - `pool_plan({ action: 'create' | 'resize', image, debugKeepFailedBuild: true })`, for a Linux plan, and only when the
+    user asks; the plan says so, and the user's approval covers it.
+  - A failed build then keeps its VM: put in that state and read back as running and disconnected, flagged KEPT FOR
+    DEBUG, never leased or restored. If that state can't be confirmed, it's rolled back as usual, and the reason says
+    so. Its seed, which holds its host key, stays with it.
+  - **No new access comes with it.** The guest's accounts stay locked, and SSH stays the helper's forced command
+    only. An administrator can still:
+    - watch its console in Hyper-V Manager (boot and kernel messages);
+    - open its COM1 pipe (`Get-VMComPort -VMName <vm> -Number 1` in an admin PowerShell shows its name) to see the
+      guest's diagnostics, each connection included;
+    - run `HvMcpVsock.exe <vmId> 22` in an admin PowerShell, to retry the Hyper-V socket from the host and see whether
+      it connects and whether sshd's banner comes back.
+  - A remove plan, or the next create or resize, removes it.
 - **Talking to the guest** is SSH over a **Hyper-V socket**, the channel PowerShell Direct uses, so a Linux guest has no
   network path at all.
   - The helper runs Windows' in-box `ssh.exe` with fixed arguments: no config file, the VM's own key and pinned

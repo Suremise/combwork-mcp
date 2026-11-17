@@ -108,7 +108,7 @@ test('a Linux build that never answers: diagnosed from its serial lines (conclus
     [{ linuxNeverReady: true, diagLines: [] }, /the guest never answered over SSH, and the diagnostics don't say why \(inconclusive\): unavailable=no lines\. Last SSH error \(attempt \d+\): the guest call ready gave no answer \(ssh exit 255\): ssh: connect to host hvmcp port 22: Connection refused The build stops here: the transport is the user's decision/],
     // MC-1544: the last attempt's SSH error (HvMcpVsock.exe's own message through ssh.exe's stderr), cleaned: one line,
     // anything key-like replaced, bounded.
-    [{ linuxNeverReady: true, sshStderr: "HvMcpVsock: can't connect to the guest's vsock port 22: The requested address is not valid in its context\r\nAAAAC3NzaC1lZDI1NTE5AAAAIF3oK2l918LTL3Ymh1W1hFMF9WxkL96L1TQ7LF1+Kww6\n" + 'x'.repeat(600) }, /\(inconclusive\): stage=socket-up .*\. Last SSH error \(attempt \d+\): the guest call ready gave no answer \(ssh exit 255\): HvMcpVsock: can't connect to the guest's vsock port 22: The requested address is not valid in its context \[removed\] \[removed\] The build stops here/],
+    [{ linuxNeverReady: true, sshStderr: "HvMcpVsock: can't connect to the guest's vsock port 22: The requested address is not valid in its context\r\nAAAAC3NzaC1lZDI1NTE5AAAAIF3oK2l918LTL3Ymh1W1hFMF9WxkL96L1TQ7LF1+Kww6\n" + 'x'.repeat(600) }, /the guest never answered over SSH: connect never completed \(host side\)\. Diagnostics: stage=socket-up .*\. Last SSH error \(attempt \d+\): the guest call ready gave no answer \(ssh exit 255\): HvMcpVsock: can't connect to the guest's vsock port 22: The requested address is not valid in its context \| \[removed\] \| \[removed\]/],
     [{ linuxNeverReady: true, diagLines: ['HVMCP-DIAG stage=socket-up vmbus=present hv_sock_driver=present vsock_listen=active sshd_config_ok=no sshd_error=Bad_configuration_option_Foo kernel=6.12'] }, /the guest's sshd config doesn't parse \(Bad_configuration_option_Foo\)\. Diagnostics: .*sshd_error=Bad_configuration_option_Foo.*\. Last SSH error/],
     [{ linuxNeverReady: true, comReadFails: true }, /inconclusive\): unavailable=unreadable/],
     [{ verifyOverride: { addresses: ['eth0 10.0.0.5'], listeners: ['tcp 0.0.0.0:22'] } }, /the guest's checks failed: it has addresses: eth0 10\.0\.0\.5; something listens beyond loopback: tcp 0\.0\.0\.0:22/],
@@ -322,5 +322,155 @@ test('pool checkpoints and refresh-clean on a Linux VM: published from a lease (
   const rops = sc.stub().calls.slice(c1).map(x => x.op)
   for (const op of ['guest-setup', 'guest-defender', 'guest-licence']) assert.ok(!rops.includes(op), `no ${op}`)
   assert.ok(vmOf(sc, linux.name).checkpoints.some(x => x.name.startsWith('hvmcp-pool-')), 'the pool checkpoint is kept')
+  await h.stop()
+})
+
+test('MC-1545: where an SSH connection stops, from HvMcpVsock\'s lines and the guest\'s own connection reports, read through the wait; verbose attempts', async () => {
+  const conn = (result, code, status) => [`HVMCP-DIAG stage=conn-start n=1-2-3`, ...(result ? [`HVMCP-DIAG stage=conn-end result=${result} code=${code} status=${status}`] : [])]
+  const seed = ['HVMCP-DIAG stage=socket-up vmbus=present hv_sock_driver=present hv_sock_modinfo=present vsock_listen=active sshd_config_ok=yes kernel=6.12']
+  const cases = [
+    [{ sshHang: true, sshStderr: 'HvMcpVsock: connect timed out after 20000 ms (vsock port 22)\n', diagLines: seed }, /the guest never answered over SSH: connect never completed \(host side\)\. Diagnostics: stage=socket-up .*Last SSH error \(attempt \d+\): the guest call ready timed out after 2 s: HvMcpVsock: connect timed out after 20000 ms/],
+    [{ sshHang: true, sshStderr: 'HvMcpVsock: connected to 1-2:22 after 4 ms\ndebug1: Local version string SSH-2.0-OpenSSH_for_Windows_9.5\n', diagLines: seed }, /the guest never answered over SSH: connected, guest saw no connection\..*timed out after 2 s: HvMcpVsock: connected to 1-2:22 after 4 ms \| debug1: Local version string/],
+    [{ sshHang: true, sshStderr: 'HvMcpVsock: connected to 1-2:22 after 4 ms\n', diagLines: [...seed, ...conn('exit-code', 'exited', '255')] }, /the guest never answered over SSH: guest started sshd, which ended exit-code\/exited\/255, with no SSH banner seen\. Diagnostics: .*conn_result=exit-code conn_code=exited conn_status=255 conn_starts=1 conn_ends=1/],
+    [{ sshHang: true, sshStderr: 'HvMcpVsock: connected to 1-2:22 after 4 ms\n', diagLines: [...seed, ...conn()] }, /the guest never answered over SSH: guest started sshd, no SSH banner\. Diagnostics: .*conn_starts=1 conn_ends=0/]
+  ]
+  for (const [stub, re] of cases) {
+    const sc = scratch('lx-stop', { policy: { maxVms: 4, maxMemoryMBTotal: 65536 } })
+    const { h } = await withPool(sc, 1)
+    await h.stop()
+    addDebian(sc)
+    sc.patchStub(s => Object.assign(s, stub))
+    const helper = await startHelper(sc, { HYPERV_MCP_LINUX_ATTEMPT_MS: '2000', HYPERV_MCP_LINUX_READY_MS: '5000' })
+    const admin = helper.conn(99)
+    const { line } = await change(sc, admin, { action: 'resize', image: D, vms: 1 }, { expectFail: true })
+    assert.match(line, re, JSON.stringify(stub))
+    assert.ok(sc.stub().sshVerbose >= 1, 'the build\'s attempts ask for verbose')
+    assert.strictEqual(linuxVm(sc), undefined, 'rolled back without the debug flag')
+    await helper.stop()
+  }
+})
+
+test('MC-1545: a lease\'s calls never ask for verbose; a seed\'s connection unit reports each connection to COM1, from sh only', async () => {
+  const { sc, h } = await mixedPool('lx-quiet')
+  const v0 = sc.stub().sshVerbose || 0
+  const c = h.conn(7)
+  await c.request('acquire', { minutes: 30, os: 'linux' })
+  await c.request('start', {})
+  await c.request('run', { command: 'echo x' })
+  assert.strictEqual(sc.stub().sshVerbose || 0, v0, 'no verbose for a lease')
+  await c.request('release')
+  await h.stop()
+  const seed = require('../helper/seed')
+  const sshkeys = require('../helper/sshkeys')
+  const u = JSON.parse(seed.files({ instanceId: 'i-0123456789abcdef', hostname: 'h', keys: { client: sshkeys.generate(), host: sshkeys.generate() }, dispatcher: 'x' })['user-data'].replace(/^#cloud-config\n/, ''))
+  const unit = u.write_files.find(w => w.path === '/etc/systemd/system/hvmcp-sshd@.service').content
+  assert.match(unit, /^ExecStartPre=-\/bin\/sh -c 'n=\$\$\(echo "%i" \| tr -cd "A-Za-z0-9._\+-" \| cut -c1-64\); echo "HVMCP-DIAG stage=conn-start n=\$\$n" > \/dev\/ttyS0 2>\/dev\/null; true'$/m)
+  assert.match(unit, /^ExecStopPost=-\/bin\/sh -c 'echo "HVMCP-DIAG stage=conn-end result=\$\$SERVICE_RESULT code=\$\$EXIT_CODE status=\$\$EXIT_STATUS" > \/dev\/ttyS0 2>\/dev\/null; true'$/m)
+  assert.ok(unit.indexOf('stage=conn-start') < unit.indexOf('ExecStart=-/usr/sbin/sshd -i'), 'the start is reported before sshd runs')
+})
+
+test('MC-1545: debugKeepFailedBuild keeps a failed Linux build (on, never leased, flagged across a restart, not restored); the next resize removes it', async () => {
+  const sc = scratch('lx-keep', { policy: { maxVms: 4, maxMemoryMBTotal: 65536 } })
+  const { h } = await withPool(sc, 1)
+  await h.stop()
+  addDebian(sc)
+  sc.patchStub(s => { s.linuxNeverReady = true })
+  let helper = await startHelper(sc)
+  let admin = helper.conn(99)
+  // Refusals: not true, a Windows image, a plan that builds nothing.
+  await assert.rejects(admin.request('pool_plan', { action: 'resize', image: D, vms: 1, debugKeepFailedBuild: 'yes' }), /debugKeepFailedBuild must be true/)
+  await assert.rejects(admin.request('pool_plan', { action: 'resize', image: 'ab'.repeat(32), vms: 2, debugKeepFailedBuild: true }), /only for a plan that builds Linux VMs/)
+  const { plan, line } = await change(sc, admin, { action: 'resize', image: D, vms: 1, debugKeepFailedBuild: true }, { expectFail: true })
+  assert.match(plan.text, /- DEBUG \(MC-1545\): if a Linux build fails, its VM is kept, turned on, network disconnected, never leased/)
+  assert.match(line, /FAILED: .*KEPT FOR DEBUG: hvmcp-\w+ is running and disconnected \(read back\), never leased/)
+  const kept = linuxVm(sc)
+  assert.ok(kept && kept.state === 'Running' && !kept.switchName, 'kept, running, disconnected')
+  assert.ok(kept.com, 'its COM port stays')
+  assert.ok(fs.existsSync(path.join(sc.stateDir, 'secrets', 'ssh', kept.name, 'client')), 'its keys stay until it is removed')
+  const st = await statusText(admin)
+  assert.match(st, new RegExp(`${kept.name}: .*KEPT FOR DEBUG`))
+  await assert.rejects(helper.conn(5).request('acquire', { minutes: 30, os: 'linux' }), /no free linux VM|No VM is free/)
+  await assert.rejects(helper.conn(6).request('acquire', { minutes: 30, vm: kept.name }), /kept for debugging: it is never leased/)
+  // A restart: no rollback, no restore, still flagged.
+  const r0 = vmOf(sc, kept.name).restores || 0
+  await helper.stop()
+  helper = await startHelper(sc)
+  admin = helper.conn(99)
+  assert.ok(vmOf(sc, kept.name), 'not rolled back at the start')
+  assert.strictEqual(vmOf(sc, kept.name).restores || 0, r0, 'not restored')
+  assert.match(await statusText(admin), new RegExp(`${kept.name}: .*KEPT FOR DEBUG`))
+  // The next resize of the image removes it and builds anew (the guest answering now).
+  sc.patchStub(s => { s.linuxNeverReady = false })
+  const next = await change(sc, admin, { action: 'resize', image: D, vms: 1 })
+  assert.match(next.plan.text, new RegExp(`- remove ${kept.name}`))
+  assert.strictEqual(vmOf(sc, kept.name), undefined, 'the kept VM is gone')
+  assert.ok(!fs.existsSync(path.join(sc.stateDir, 'secrets', 'ssh', kept.name)), 'and its keys')
+  assert.ok(linuxVm(sc) && linuxVm(sc).name !== kept.name, 'a new Linux VM built')
+  await helper.stop()
+})
+
+test('MC-1545 round 2: the reason classes claim only what the evidence shows (a banner, any recorded end, a trace that was read)', () => {
+  const { connectionStop } = require('../helper/guests/linux')
+  const seedSeen = { stage: 'socket-up' }
+  const connected = 'the guest call ready timed out after 60 s: HvMcpVsock: connected to x:22 after 3 ms'
+  // A banner arrived (ssh -v's "Remote protocol version"), then authentication failed: not "no banner".
+  assert.match(connectionStop({ ...seedSeen, conn_starts: '1' }, { error: `${connected} | debug1: Remote protocol version 2.0, remote software version OpenSSH_10.0 | Permission denied (publickey).` }), /^sshd answered \(its banner arrived\), then SSH failed/)
+  // A recorded end with result success (ExecStart=- hides sshd's status) is reported as it is.
+  assert.strictEqual(connectionStop({ ...seedSeen, conn_starts: '1', conn_ends: '1', conn_result: 'success', conn_code: 'exited', conn_status: '255' }, { error: connected }), 'guest started sshd, which ended success/exited/255, with no SSH banner seen')
+  // No guest trace (COM1 unreadable): a host-side connect is not "the guest saw no connection".
+  assert.strictEqual(connectionStop({ unavailable: 'unreadable' }, { error: connected }), null)
+  assert.strictEqual(connectionStop({ ...seedSeen }, { error: connected }), 'connected, guest saw no connection')
+  assert.strictEqual(connectionStop({ ...seedSeen, conn_starts: '1' }, { error: connected }), 'guest started sshd, no SSH banner')
+  assert.strictEqual(connectionStop({ ...seedSeen }, { error: 'HvMcpVsock: connect timed out after 20000 ms' }), 'connect never completed (host side)')
+})
+
+test('MC-1545 round 2: a kept build is put in its debug state and read back: started when a failure left it off (before the first start, after the shutdown); rolled back, saying why, when that fails', async () => {
+  const run = async (stub, name) => {
+    const sc = scratch(name, { policy: { maxVms: 4, maxMemoryMBTotal: 65536 } })
+    const { h } = await withPool(sc, 1)
+    await h.stop()
+    addDebian(sc)
+    sc.patchStub(s => Object.assign(s, stub))
+    const helper = await startHelper(sc)
+    const { line } = await change(sc, helper.conn(99), { action: 'resize', image: D, vms: 1, debugKeepFailedBuild: true }, { expectFail: true })
+    return { sc, helper, line }
+  }
+  // Before the first start: the COM port fails, the VM is still Off.
+  let r = await run({ fail: { 'com-attach': 1 } }, 'lx-keep-early')
+  assert.match(r.line, /com-attach: injected failure of com-attach KEPT FOR DEBUG: hvmcp-\w+ is running and disconnected \(read back\)/)
+  assert.strictEqual(linuxVm(r.sc).state, 'Running')
+  assert.strictEqual(r.sc.journal().find(x => x.t === 'debugKept').state, 'Running, disconnected')
+  await r.helper.stop()
+  // After the shutdown: the COM port's removal fails, the VM is Off.
+  r = await run({ fail: { 'com-detach': 1 } }, 'lx-keep-late')
+  assert.match(r.line, /KEPT FOR DEBUG: hvmcp-\w+ is running and disconnected \(read back\)/)
+  assert.strictEqual(linuxVm(r.sc).state, 'Running')
+  await r.helper.stop()
+  // It can't be started for the debug state: rolled back, saying so.
+  r = await run({ fail: { 'start-vm': 2 } }, 'lx-keep-fails')
+  assert.match(r.line, /FAILED: .*it couldn't be kept for debugging \(start-vm: injected failure of start-vm\), so it's rolled back/)
+  assert.doesNotMatch(r.line, /KEPT FOR DEBUG/)
+  assert.strictEqual(linuxVm(r.sc), undefined, 'rolled back')
+  assert.ok(!r.sc.journal().some(x => x.t === 'debugKept'))
+  await r.helper.stop()
+})
+
+test('MC-1545 round 2: a first pool whose only VM is a kept failed build takes a new create plan, which removes it', async () => {
+  const sc = scratch('lx-keep-create', { policy: { maxVms: 4, maxMemoryMBTotal: 65536 } })
+  let h = await startHelper(sc)
+  await h.stop()
+  addDebian(sc)
+  sc.patchStub(s => { s.linuxNeverReady = true })
+  h = await startHelper(sc)
+  const admin = h.conn(99)
+  const first = await change(sc, admin, { action: 'create', image: D, vms: 1, cores: 2, memoryGB: 4, debugKeepFailedBuild: true }, { expectFail: true })
+  assert.match(first.line, /KEPT FOR DEBUG/)
+  const kept = linuxVm(sc)
+  sc.patchStub(s => { s.linuxNeverReady = false })
+  const again = await change(sc, admin, { action: 'create', image: D, vms: 1, cores: 2, memoryGB: 4 })
+  assert.match(again.plan.text, new RegExp(`- remove ${kept.name}`))
+  assert.match(again.line, /finished/)
+  assert.strictEqual(vmOf(sc, kept.name), undefined)
+  assert.ok(linuxVm(sc) && linuxVm(sc).name !== kept.name)
   await h.stop()
 })

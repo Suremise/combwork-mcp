@@ -58,12 +58,17 @@ Accept=yes
 WantedBy=sockets.target
 `
 
+// MC-1545: each connection's start and end, with how sshd ended, go to COM1 (the build reads it through its wait), from
+// the image's sh only. "$$" is a literal "$" for systemd, so the shell expands it; "%i" is the connection's instance name,
+// reduced to the diagnostics' alphabet. A "-" prefix: a failed report never fails the connection.
 const SERVICE_UNIT = `[Unit]
 Description=hyper-v MCP: sshd for one helper connection
 
 [Service]
+ExecStartPre=-/bin/sh -c 'n=$$(echo "%i" | tr -cd "A-Za-z0-9._+-" | cut -c1-64); echo "HVMCP-DIAG stage=conn-start n=$$n" > /dev/ttyS0 2>/dev/null; true'
 ExecStartPre=/bin/mkdir -p -m 0755 /run/sshd
 ExecStart=-/usr/sbin/sshd -i -f /etc/ssh/hvmcp_sshd_config
+ExecStopPost=-/bin/sh -c 'echo "HVMCP-DIAG stage=conn-end result=$$SERVICE_RESULT code=$$EXIT_CODE status=$$EXIT_STATUS" > /dev/ttyS0 2>/dev/null; true'
 StandardInput=socket
 StandardError=journal
 `

@@ -597,17 +597,21 @@ $ConvertPathsOk = {
 # MC-1501: reads HVMCP-DIAG lines from a stream (COM1's pipe) until the seed's last stage (stage=socket-up), the
 # deadline, the stream's end, or 64 KB in all ($state.bytes, across reconnections). One read is pending at a time: a
 # quiet spell only waits on it again, never starts another. Partial lines are kept, bounded by the same 64 KB; at most
-# 64 lines are kept, and nothing but the part of a line from its HVMCP-DIAG marker.
+# 64 lines are kept, and nothing but the part of a line from its HVMCP-DIAG marker. MC-1545: with $state.through, the
+# seed's last stage doesn't end it (the guest's SSH connections are reported after it); a stop file the helper writes
+# ($state.stopFile, checked at least every second) ends it instead, as the deadline does.
 $ComReadStream = {
   param($stream, [DateTime]$deadline, $lines, $state)
   $buf = New-Object byte[] 4096
   $acc = ''
   $pending = $null
   while (-not $state.done) {
+    if ($state.stopFile -and (Test-Path -LiteralPath $state.stopFile)) { $state.stopped = $true; $state.done = $true; break }
     $left = ($deadline - [DateTime]::UtcNow).TotalMilliseconds
     if ($left -le 0) { break }
     if ($null -eq $pending) { $pending = $stream.ReadAsync($buf, 0, $buf.Length) }
-    try { if (-not $pending.Wait([int][Math]::Max(1, [Math]::Min($left, 5000)))) { continue } } catch { break }
+    $slice = if ($state.stopFile) { 1000 } else { 5000 }
+    try { if (-not $pending.Wait([int][Math]::Max(1, [Math]::Min($left, $slice)))) { continue } } catch { break }
     $n = $pending.Result
     $pending = $null
     if ($n -le 0) { break }
@@ -621,7 +625,7 @@ $ComReadStream = {
       if ($j -lt 0) { continue }
       $l = $line.Substring($j).TrimEnd("`r")
       if ($lines.Count -lt 64) { $lines.Add($l) }
-      if ($l -match '(^| )stage=socket-up( |$)') { $state.stage = $true; $state.done = $true }
+      if ($l -match '(^| )stage=socket-up( |$)') { $state.stage = $true; if (-not $state.through) { $state.done = $true } }
     }
     $acc = $acc.Substring($i + 1)
   }
@@ -997,8 +1001,15 @@ try {
       $null = & $ComPipePath ([string]$a.pipe)
       $deadline = [DateTime]::UtcNow.AddMilliseconds([int]$a.ms)
       $lines = New-Object Collections.Generic.List[string]
-      $state = @{ bytes = 0; done = $false; connected = $false; stage = $false; over = $false }
+      # MC-1545: through (read on past the seed's last stage) and its stop file, only the helper's own for this pipe.
+      $stopFile = $null
+      if ($a.stopFile) {
+        if ([string]$a.stopFile -notmatch ('\\runs\\' + [regex]::Escape([string]$a.pipe) + '\.stop$')) { throw 'bad stop file' }
+        $stopFile = [string]$a.stopFile
+      }
+      $state = @{ bytes = 0; done = $false; connected = $false; stage = $false; over = $false; through = [bool]$a.through; stopFile = $stopFile; stopped = $false }
       while (-not $state.done -and [DateTime]::UtcNow -lt $deadline) {
+        if ($stopFile -and (Test-Path -LiteralPath $stopFile)) { $state.stopped = $true; break }
         $pipe = New-Object IO.Pipes.NamedPipeClientStream('.', [string]$a.pipe, [IO.Pipes.PipeDirection]::In)
         try {
           try { $pipe.Connect(2000) } catch { Start-Sleep -Milliseconds 500; continue }
@@ -1006,7 +1017,7 @@ try {
           & $ComReadStream $pipe $deadline $lines $state
         } finally { $pipe.Dispose() }
       }
-      @{ lines = @($lines); connected = $state.connected; complete = $state.stage; overflow = $state.over }
+      @{ lines = @($lines); connected = $state.connected; complete = $state.stage; overflow = $state.over; stopped = $state.stopped }
     }
     'com-detach' {
       $vm = Get-OwnVm $a

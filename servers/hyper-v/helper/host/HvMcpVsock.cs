@@ -4,7 +4,10 @@
 // then copies its stdin to the socket and the socket to its stdout until either side closes. Nothing else: no
 // network, no other argument. Compiled by setup (the in-box .NET Framework compiler) into Program Files, where only
 // Administrators can write; the helper names it in ssh.exe's fixed arguments.
+// MC-1545: the connect is bounded (20 s, "connect timed out"), and stderr says when it completed and how the socket
+// closed, with the bytes each way, so a build that never gets an SSH answer can say which side stopped.
 using System;
+using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
@@ -14,6 +17,7 @@ static class HvMcpVsock
 {
     const AddressFamily AF_HYPERV = (AddressFamily)34;
     const ProtocolType HV_PROTOCOL_RAW = (ProtocolType)1;
+    const int CONNECT_MS = 20000;
 
     // SOCKADDR_HV: family (2 bytes), reserved (2), VM id (16), service id (16).
     sealed class HvEndPoint : EndPoint
@@ -31,6 +35,25 @@ static class HvMcpVsock
         public override EndPoint Create(SocketAddress sa) { return this; }
     }
 
+    static long bytesIn, bytesOut;
+
+    // Copies from one stream to another, counting the bytes, until the source ends or fails.
+    static void Pump(Stream from, Stream to, bool counted, bool inbound)
+    {
+        var buf = new byte[65536];
+        try
+        {
+            int n;
+            while ((n = from.Read(buf, 0, buf.Length)) > 0)
+            {
+                to.Write(buf, 0, n);
+                to.Flush();
+                if (counted) { if (inbound) Interlocked.Add(ref bytesIn, n); else Interlocked.Add(ref bytesOut, n); }
+            }
+        }
+        catch (Exception) { }
+    }
+
     static int Main(string[] args)
     {
         Guid vm;
@@ -41,28 +64,38 @@ static class HvMcpVsock
             return 2;
         }
         var service = new Guid(port.ToString("x8") + "-facb-11e6-bd58-64006a7986d3");
+        var clock = Stopwatch.StartNew();
         Socket sock;
         try
         {
             sock = new Socket(AF_HYPERV, SocketType.Stream, HV_PROTOCOL_RAW);
-            sock.Connect(new HvEndPoint(vm, service));
+            var ar = sock.BeginConnect(new HvEndPoint(vm, service), null, null);
+            if (!ar.AsyncWaitHandle.WaitOne(CONNECT_MS))
+            {
+                try { sock.Close(); } catch (Exception) { }
+                Console.Error.WriteLine("HvMcpVsock: connect timed out after " + clock.ElapsedMilliseconds + " ms (vsock port " + port + ")");
+                return 255;
+            }
+            sock.EndConnect(ar);
         }
         catch (Exception e)
         {
             Console.Error.WriteLine("HvMcpVsock: can't connect to the guest's vsock port " + port + ": " + e.Message);
             return 255;
         }
+        Console.Error.WriteLine("HvMcpVsock: connected to " + vm + ":" + port + " after " + clock.ElapsedMilliseconds + " ms");
         var net = new NetworkStream(sock, true);
         Stream stdin = Console.OpenStandardInput(), stdout = Console.OpenStandardOutput();
         var up = new Thread(() =>
         {
-            try { stdin.CopyTo(net); } catch (Exception) { }
+            Pump(stdin, net, true, false);
             try { sock.Shutdown(SocketShutdown.Send); } catch (Exception) { }
         });
         up.IsBackground = true;
         up.Start();
-        try { net.CopyTo(stdout); stdout.Flush(); } catch (Exception) { }
+        Pump(net, stdout, true, true);
         try { sock.Close(); } catch (Exception) { }
+        Console.Error.WriteLine("HvMcpVsock: closed after " + clock.ElapsedMilliseconds + " ms, " + Interlocked.Read(ref bytesIn) + " bytes in, " + Interlocked.Read(ref bytesOut) + " bytes out");
         return 0;
     }
 }

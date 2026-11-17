@@ -52,6 +52,7 @@ function scratch(name, { policy = {}, stub = {} } = {}) {
       HYPERV_MCP_SSH_STUB: SSH_STUB,
       HYPERV_MCP_LINUX_READY_MS: '3000',
       HYPERV_MCP_LINUX_CLOUD_INIT_MS: '3000',
+      HYPERV_MCP_LINUX_ATTEMPT_MS: '1500',
       HYPERV_MCP_STUB_STATE: state,
       HYPERV_MCP_POLL_MS: '10',
       HYPERV_MCP_READY_WAIT_MS: '3000',

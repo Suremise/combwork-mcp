@@ -71,24 +71,26 @@ test('vhd-convert: the helper\'s own convert-<12 hex>.vhd to <SHA-256>.vhdx reac
 })
 
 /** A prelude serving the pipe from a background runspace: each session is a list of [write text | sleep ms | 'close']. */
-function serve(pipe, sessions) {
-  // A list built item by item: PowerShell would flatten a one-session @(@(...)) into its steps.
+function serve(pipe, sessions, stopFile = '') {
+  // A list built item by item: PowerShell would flatten a one-session @(@(...)) into its steps. A step 'STOPFILE'
+  // writes the stop file (MC-1545), as the helper does when its readiness wait is over.
   const adds = sessions.map(s => `[void]$sessionList.Add(@(${s.map(x => typeof x === 'number' ? `${x}` : `'${x.replace(/'/g, "''")}'`).join(',')}))`).join('\n')
   return `$sessionList = New-Object Collections.ArrayList
 ${adds}
 $srv = [powershell]::Create()
 [void]$srv.AddScript({
-  param($name, $sessions)
+  param($name, $sessions, $stop)
   foreach ($steps in $sessions) {
     $s = New-Object IO.Pipes.NamedPipeServerStream($name, [IO.Pipes.PipeDirection]::Out)
     $s.WaitForConnection()
     foreach ($x in $steps) {
       if ($x -is [int]) { Start-Sleep -Milliseconds $x }
+      elseif ($x -eq 'STOPFILE') { [IO.File]::WriteAllText($stop, 'stop') }
       else { $b = [Text.Encoding]::ASCII.GetBytes((($x -replace '\\\\n', [string][char]10) -replace '\\\\r', [string][char]13)); $s.Write($b, 0, $b.Length); $s.Flush() }
     }
     $s.Dispose()
   }
-}).AddArgument('${pipe}').AddArgument($sessionList)
+}).AddArgument('${pipe}').AddArgument($sessionList).AddArgument('${stopFile.replace(/'/g, "''")}')
 $global:srvHandle = $srv.BeginInvoke()
 `
 }
@@ -99,7 +101,7 @@ test('com-read: lines across a quiet spell longer than its wait and a line split
   const pipe = pipeName()
   const t0 = Date.now()
   const r = hv('read-quiet', 'com-read', { pipe, ms: 30_000 }, serve(pipe, [['boot noise\\n[  1.0] x HVMCP-DIAG stage=seed-read vmbus=present\\r\\n', 6500, 'HVMCP-DIAG stage=sock', 300, 'et-up vsock_listen=active\\nafter\\n', 3000]]))
-  assert.deepStrictEqual(r.answer.result, { lines: ['HVMCP-DIAG stage=seed-read vmbus=present', 'HVMCP-DIAG stage=socket-up vsock_listen=active'], connected: true, complete: true, overflow: false })
+  assert.deepStrictEqual(r.answer.result, { lines: ['HVMCP-DIAG stage=seed-read vmbus=present', 'HVMCP-DIAG stage=socket-up vsock_listen=active'], connected: true, complete: true, overflow: false, stopped: false })
   assert.ok(Date.now() - t0 < 25_000, 'it ended at the last stage, not the deadline')
 })
 
@@ -110,11 +112,42 @@ test('com-read: the pipe closing and coming back (a guest restart) is read on; 6
   assert.strictEqual(r.answer.result.complete, true)
   const big = pipeName()
   const o = hv('read-big', 'com-read', { pipe: big, ms: 30_000 }, serve(big, [['x'.repeat(30000), 'y'.repeat(30000), 'z'.repeat(30000), 5000]]))
-  assert.deepStrictEqual(o.answer.result, { lines: [], connected: true, complete: false, overflow: true })
+  assert.deepStrictEqual(o.answer.result, { lines: [], connected: true, complete: false, overflow: true, stopped: false })
   const quiet = pipeName()
   const t0 = Date.now()
   const q = hv('read-silent', 'com-read', { pipe: quiet, ms: 7000 }, serve(quiet, [[12000]]))
-  assert.deepStrictEqual(q.answer.result, { lines: [], connected: true, complete: false, overflow: false })
+  assert.deepStrictEqual(q.answer.result, { lines: [], connected: true, complete: false, overflow: false, stopped: false })
   assert.ok(Date.now() - t0 >= 6500, 'it waited to its deadline, past one 5 s wait, without failing')
   assert.deepStrictEqual(hv('read-bad', 'com-read', { pipe: 'evil', ms: 100 }).answer, { error: 'bad pipe name' })
+})
+
+test('MC-1545 com-read through the wait: the seed\'s last stage doesn\'t end it, the guest\'s connection lines are read after it, and the helper\'s stop file ends it; another stop file is refused', { skip }, () => {
+  const pipe = pipeName()
+  const sc = scratch('lxps-through')
+  fs.mkdirSync(path.join(sc.dir, 'runs'), { recursive: true })
+  const stopFile = path.join(sc.dir, 'runs', `${pipe}.stop`)
+  const t0 = Date.now()
+  const r = hv('read-through', 'com-read', { pipe, ms: 30_000, through: true, stopFile }, serve(pipe, [['HVMCP-DIAG stage=socket-up k=v\n', 1500, 'HVMCP-DIAG stage=conn-start n=1\n', 500, 'HVMCP-DIAG stage=conn-end result=exit-code code=exited status=255\n', 500, 'STOPFILE', 20000]], stopFile))
+  assert.deepStrictEqual(r.answer.result, { lines: ['HVMCP-DIAG stage=socket-up k=v', 'HVMCP-DIAG stage=conn-start n=1', 'HVMCP-DIAG stage=conn-end result=exit-code code=exited status=255'], connected: true, complete: true, overflow: false, stopped: true })
+  assert.ok(Date.now() - t0 < 20_000, 'the stop file ended it, not the deadline')
+  for (const bad of [path.join(sc.dir, 'elsewhere', `${pipe}.stop`), path.join(sc.dir, 'runs', 'hvmcp-diag-0000000000000000.stop')]) {
+    assert.deepStrictEqual(hv('read-badstop', 'com-read', { pipe, ms: 100, through: true, stopFile: bad }).answer, { error: 'bad stop file' })
+  }
+})
+
+test('MC-1545 HvMcpVsock.exe, compiled by the in-box compiler as setup does: its usage, and an AF_HYPERV connect that fails says so at once (exit 255)', { skip }, () => {
+  const sc = scratch('lxps-vsock')
+  const exe = path.join(sc.dir, 'HvMcpVsock.exe')
+  const csc = path.join(process.env.WINDIR || 'C:\Windows', 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe')
+  const c = spawnSync(csc, ['-nologo', '-target:exe', '-optimize', `-out:${exe}`, path.join(__dirname, '..', 'helper', 'host', 'HvMcpVsock.cs')], { encoding: 'utf8' })
+  assert.strictEqual(c.status, 0, c.stdout + c.stderr)
+  const u = spawnSync(exe, [], { encoding: 'utf8' })
+  assert.strictEqual(u.status, 2)
+  assert.match(u.stderr, /usage: HvMcpVsock\.exe <vmId> <port>/)
+  const t0 = Date.now()
+  const r = spawnSync(exe, ['00000000-0000-0000-0000-000000000001', '22'], { encoding: 'utf8', input: '', timeout: 30_000 })
+  assert.strictEqual(r.status, 255, r.stderr)
+  assert.match(r.stderr, /^HvMcpVsock: (can't connect to the guest's vsock port 22: |connect timed out after \d+ ms)/)
+  assert.ok(Date.now() - t0 < 25_000, 'bounded by its own 20 s connect timeout at most')
+  // The connected and closed lines need a real guest's listener: MC-1542's trial shows them.
 })

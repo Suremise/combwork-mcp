@@ -38,6 +38,15 @@ process.stdin.on('end', () => {
   const s = load()
   s.sshCalls = [...(s.sshCalls || []), { vmId, op: req.op, command: req.command }]
   const vm = s.vms?.[vmId]
+  // MC-1545: sshHang: the attempt writes its stderr (sshStderr) and then hangs, as a connection no one answers does;
+  // the helper's own timeout ends it. The '-v' argument (a build's verbose attempts) is recorded.
+  if (process.argv.includes('-v')) s.sshVerbose = (s.sshVerbose || 0) + 1
+  if (s.sshHang && req.op === 'ready') {
+    save(s)
+    process.stderr.write(s.sshStderr ?? '')
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 600_000)
+    process.exit(255)
+  }
   if (!vm || vm.state !== 'Running' || vm.installed === false || s.linuxNeverReady) {
     save(s)
     // sshStderr (MC-1544): what this failed attempt writes instead, as ssh.exe and HvMcpVsock.exe would.
