@@ -309,8 +309,12 @@ def op_run_start(req, _):
     if not isinstance(cwd, str) or not cwd.startswith('/') or len(cwd) > 1024 or re.search(r'[\0-\x1f]', cwd):
         raise Refused('cwd must be an absolute guest folder such as /build')
     d = '%s/%d' % (RUNS, n)
-    if os.path.lexists(d):
+    # A run of this number in this boot is refused; a folder left by an earlier boot (a checkpoint taken after a run,
+    # then started from by another lease, whose run numbers start again) is that boot's, and is replaced.
+    if unit_props(n).get('LoadState') == 'loaded':
         raise Refused('run %d already exists' % n)
+    if os.path.lexists(d):
+        shutil.rmtree(d)
     os.makedirs(RUNS, mode=0o711, exist_ok=True)
     os.mkdir(d, 0o755)
     script = d + '/cmd.sh'

@@ -5,7 +5,8 @@ clean checkpoint with a build copied in, runs commands and gets their output, re
 stops it, which restores it. Several agents can each hold a VM at the same time. Optionally, a run can have its own
 reserved CPU, for timed runs. For a work session, an agent can instead keep its VM running: `vm_sync` copies only the
 files that changed into it, `vm_reset` gives a clean VM again on request, and `vm_renew` extends the lease within the
-policy. Release still restores it. Commands run in session 0 by default. For programs that need a real logged-on desktop
+policy. Release still restores it. The pool can also hold **Linux** VMs (Debian and Ubuntu, from their pinned official
+cloud images) behind the same tools: see "Linux guests". Commands run in session 0 by default. For programs that need a real logged-on desktop
 (their own desktops or windows), a start can log a guest account on, and runs can then go into that session.
 
 It's the catalogue's alternative to [`windows-sandbox`](../windows-sandbox/), for any project. Windows Sandbox runs
@@ -40,6 +41,8 @@ Hyper-V Administrators, so agents running as you can't drive Hyper-V directly.
 - A **Windows 11 x64 ISO** for the pool's VMs: Microsoft's Enterprise evaluation, or your own non-evaluation copy
   (Enterprise, Pro or Education) with its product key (see "The image").
 - Disk space: about 40 GB per VM, plus the ISO (7 GB).
+- For Linux guests only: Windows' in-box **OpenSSH Client** (Settings, System, Optional features; present by default on
+  Windows 11). Setup checks it and says if it's missing; it never adds it.
 
 ## Safety at a glance
 
@@ -53,8 +56,10 @@ Hyper-V Administrators, so agents running as you can't drive Hyper-V directly.
 | Reserve CPU for one run (`reserveCpu`, a percentage of the VM's cores), up to the policy's cap; reset at stop. | Reserve beyond the cap, or change a VM's CPU outside a run. |
 | Restore the clean checkpoint **by id** before every start, unconditionally, and at every stop and release, then check that the VM is Off, at that checkpoint, disconnected, with no reserve. Keep a VM unrestored for inspection **only when asked**, until its lease ends. | Start a VM from anything but the clean checkpoint, or let one lease's changes reach the next. A VM that can't be confirmed clean is **quarantined**: never leased until a restore confirms it. |
 | Keep a leased VM running for a **work session**: several runs in one guest, with `vm_sync` copying changed files into its `C:\build` (no restore between them), and the lease renewed up to the policy's `maxLeaseMinutes` at a time and `maxSessionMinutes` in all. | Carry anything past the lease: release, the deadline and the session's connection closing all restore and verify it as above. Write anywhere in the guest but `C:\build` and its own staging folder when syncing, or follow a link or junction there. |
+| Run commands in a leased Linux guest over SSH on a Hyper-V socket (no network), through Windows' own `ssh.exe` with fixed arguments, the guest's forced command and a per-VM key only the helper holds (see "Linux guests"). | Give an agent a key, an SSH endpoint or a shell in the guest other than the run it asked for. Run anything on the host but `powershell.exe` with its fixed script, `node` for itself, and, for Linux guests, `ssh.exe` from System32 and setup's own `HvMcpVsock.exe`, each with fixed arguments. |
 | Run commands in a leased guest over PowerShell Direct, as its admin or its standard user, with passwords only the helper holds. On request, log one of those accounts on in the guest (autologon, then a guest restart) and run commands in its desktop session through a watcher started at logon (`hvuser` as a standard user, or `hvadmin` elevated); a run there that doesn't finish cleanly restores the VM. | Run any program on the host except `powershell.exe` with its own fixed script (and `node` for itself). An agent's text never reaches a host command line or script: it's passed as JSON on stdin and arrives in the guest as data. Leave a logon behind: autologon and its password live only inside the guest, and the next restore of the clean checkpoint removes them. |
 | Download the evaluation ISO over HTTPS from a `microsoft.com` host, and check an ISO before anything runs it (see "The image"). | Use an image that fails its checks, or a local ISO that isn't a known Microsoft image, unless setup allowed that and the user approved it as "not authenticated". |
+| Download a **pinned** Debian or Ubuntu cloud image over HTTPS, check it against its pin and the distro's published checksums (Ubuntu's verified against its signing key), and convert it with its own code (see "Linux guests"). | Use any Linux image that isn't pinned, local or downloaded: there is no override. Install a converter or any other tool on the host. |
 
 **Don't put real sign-ins, tokens or real CLIs in a VM.** It's for testing a build on a clean Windows. Use fake CLIs
 and test accounts.
@@ -111,7 +116,9 @@ using the new server: the helper's protocol and features changed, and an older h
      come from (see "Build folders set by an admin"). `-ProjectsFile` names the projects that share the pool fairly (see
      "Sharing the pool between projects"). `-ProductKeyFile` names a file holding a Windows product key for VMs built
      from your own (non-evaluation) image (see "Windows licences"); a rerun without it keeps the key, and
-     `-ProductKeyFile none` removes it.
+     `-ProductKeyFile none` removes it. `-LinuxTransport` is `HvSocket`, the default and only value today (Linux guests: see
+     "Linux guests"); for it, setup also compiles `HvMcpVsock.exe` and registers vsock port 22's service id under
+     `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices` (uninstall removes it).
 
    It never enables a Windows feature or restarts the PC. If Hyper-V is off, it says how to turn it on and stops.
 3. Add the server to your client, with `HYPERV_MCP_ENABLED=1`:
@@ -324,12 +331,12 @@ non-evaluation Windows 11 ISO (see "Windows licences").
 
 | Tool | What it does |
 |---|---|
-| `vm_acquire({ minutes=60, keepOnFailure=false, wait=false, os='windows', image?, vm? })` | Leases one VM of that OS (and image, when given; or the VM named by `vm`, for trials, see "One VM by name") to this session (one VM per session) until `vm_release`, its deadline (at most the policy's `maxLeaseMinutes`), or this server exiting. Without `wait`, it refuses when none is free for this session's project, saying why (none free, the project's cap, a VM kept for another project), when the next lease ends, and where it would stand in line. With `wait: true` it waits in line about 20 s, and a repeat call within 2 minutes keeps its place (see "Sharing the pool between projects"). |
+| `vm_acquire({ minutes=60, keepOnFailure=false, wait=false, os='windows', distro?, image?, vm? })` | Leases one VM of that OS (`distro: 'debian' \| 'ubuntu'` for a Linux VM of that distro; and image, when given; or the VM named by `vm`, for trials, see "One VM by name") to this session (one VM per session) until `vm_release`, its deadline (at most the policy's `maxLeaseMinutes`), or this server exiting. Without `wait`, it refuses when none is free for this session's project, saying why (none free, the project's cap, a VM kept for another project), when the next lease ends, and where it would stand in line. With `wait: true` it waits in line about 20 s, and a repeat call within 2 minutes keeps its place (see "Sharing the pool between projects"). |
 | `vm_start({ build?, network=false, reserveCpu=0, interactive=false })` | Restores the clean checkpoint (always), applies this run's network and CPU reserve, and starts the VM. It waits for the guest, then copies `build` in to `C:\build` and leaves an empty `C:\out`. With `interactive: 'user'` (the standard user) or `'admin'`, it first logs that account on interactively: autologon, one guest restart, then it waits up to 10 minutes for the account's desktop session (often 2–4 minutes on a first logon; see "The interactive session"). Refused on a VM kept for inspection: release it, and acquire again. |
 | `vm_renew({ minutes=60 })` | Sets the lease's deadline to now + `minutes` (1 to the policy's `maxLeaseMinutes`), never past the work session's end: `maxSessionMinutes` after `vm_acquire` (`vm_status` shows both). Refused once the deadline has passed, even a moment before the helper ends the lease. |
 | `vm_sync({ build?, full=false, delete=true })` | Copies only the files that changed in `build` (default: the folder last started or synced) into the **running** guest's `C:\build`, without a restore: `C:\out`, installed software and anything else the runs left stay. The server hashes the folder (same roots checks as `vm_start`, every time; links skipped); the helper compares that with what it placed in `C:\build` and takes only the new or changed files, hashing them itself as they arrive. Files gone from the folder are removed unless `delete` is false. Only what the helper copied is tracked: if your runs changed `C:\build` themselves, use `full: true` (clears `C:\build`, copies everything) or `vm_reset`. After a sync fails, only those two are accepted. |
 | `vm_reset({ build?, network?, reserveCpu?, interactive? })` | A clean VM now: exactly `vm_start` (restore first, verified), with this session's last start's `network`, `reserveCpu` and `interactive` and its last build unless given. |
-| `vm_run({ command, shell='cmd'\|'powershell', as='admin'\|'user', timeoutSec=120, cwd='C:\build', session='service'\|'interactive' })` | Runs in the guest. stdout and stderr go to `C:\out\.run-<n>.*`, and the reply has the exit code and 16 KB of each. `as: 'user'` runs as the standard user, for whom `C:\build` is read-only. `session: 'service'` (the default) runs in session 0; on a timeout, the command is killed inside by its PID (`taskkill /T /F`), only while that PID is still the run's process (its creation time). A run is started in one short PowerShell Direct call and its exit file then polled with short calls (see "Long runs"), so it may take as long as `timeoutSec` allows. `session: 'interactive'` runs in the desktop session `vm_start`'s `interactive` logged on, as that account (`as` must name it), through a watcher started in that session at logon (`hvadmin` elevated, `hvuser` a standard user). If it times out or doesn't finish cleanly, its output so far is returned and the VM is restored, which ends everything it started; `vm_start` or `vm_reset` goes on. |
+| `vm_run({ command, shell='cmd'\|'powershell'\|'bash'\|'sh', as='admin'\|'user', timeoutSec=120, cwd='C:\build', session='service'\|'interactive' })` | Runs in the guest (on Linux: bash by default, in `/build`, as root or `hvuser`, killed with everything it started on a timeout; see "Linux guests"). stdout and stderr go to `C:\out\.run-<n>.*`, and the reply has the exit code and 16 KB of each. `as: 'user'` runs as the standard user, for whom `C:\build` is read-only. `session: 'service'` (the default) runs in session 0; on a timeout, the command is killed inside by its PID (`taskkill /T /F`), only while that PID is still the run's process (its creation time). A run is started in one short PowerShell Direct call and its exit file then polled with short calls (see "Long runs"), so it may take as long as `timeoutSec` allows. `session: 'interactive'` runs in the desktop session `vm_start`'s `interactive` logged on, as that account (`as` must name it), through a watcher started in that session at logon (`hvadmin` elevated, `hvuser` a standard user). If it times out or doesn't finish cleanly, its output so far is returned and the VM is restored, which ends everything it started; `vm_start` or `vm_reset` goes on. |
 | `vm_read_out({ paths?, glob?, maxBytes=256 KB, maxTotalBytes=1 MB, base64=false })` | Files from the guest's `C:\out`, read in the guest and capped while reading, returned as data. Paths are relative and checked before the call (no `..`, drives, UNC or device paths, streams or device names). `glob` is matched against a listing. Links are skipped. With neither, it lists. Text as text, PNG/JPEG as images. Read before `vm_stop`, which discards them. |
 | `vm_stop({ keep=false })` | Turns the VM off and restores the clean checkpoint, then **verifies** it: Off, at the checkpoint (by id), adapter disconnected, reserve 0. It says "Reverted" only then. Otherwise **CLEANUP FAILED**, and the VM is quarantined. The lease stays. `keep` (or a failed run with `keepOnFailure`) leaves it as it is until release or the deadline. |
 | `vm_checkpoint({ name })` | Takes a named checkpoint of your leased VM as it runs now: files, installed software and the registry (a production checkpoint, disk only: not running programs or a logon session). Yours only, removed when the lease ends. See "Checkpoints within a lease". |
@@ -442,6 +449,71 @@ projects start from (MC-1532) and refreshing the clean checkpoint in place (MC-1
 - **Limits:** a checkpoint never moves the lease's deadline or the VM's evaluation end, which come from the host's own
   records, not the guest's clock.
 
+## Linux guests
+
+A pool can hold **Debian** and **Ubuntu** VMs beside Windows ones (MC-1500's design, [docs/linux-guests.md](docs/linux-guests.md);
+built in MC-1501), behind the same tools. Everything that doesn't depend on the OS is the same: the helper and its
+approvals, the policy, trusted storage, leases and the line, the journal, the restore before every start, quarantine,
+warm sessions, lease and pool checkpoints. Each OS has a small **guest driver** inside the helper for the two things that
+differ: how a VM is built, and how the helper talks to its guest.
+
+- **Which distros:** Debian 13 (stable) and Ubuntu 26.04 LTS, each from the distro's own official cloud image. Debian 12
+  and Ubuntu 24.04 can follow as pins only. Others in the family aren't offered: Kali, Devuan (no systemd), Mint and the
+  desktop distros publish no comparable cloud-init images. Hyper-V can't run macOS.
+- **The images:** `pool_plan({ action: 'create' | 'resize', image: { distro: 'debian' | 'ubuntu' } })`.
+  - **Pinned, or refused.** The helper's table pins each image: distro, release, build serial, file, size and hash, from
+    a dated build folder on the distro's own host. Any other image is refused, local or downloaded, and no setting
+    changes that. `{ file: "<path>" }` takes a local copy of a pinned image.
+  - **The distro's checksums must agree.** Ubuntu's `SHA256SUMS` is first verified against its detached signature with
+    Ubuntu's pinned image-signing key, by the helper's own small OpenPGP check (no gpg). Debian publishes no signature for
+    its cloud images, so a Debian image is trusted by its pinned SHA-512 and HTTPS, as the user decided; the plan says so.
+    A checksum file must come from the distro's host itself; the image may be redirected to a mirror, since its hash
+    authenticates it.
+  - **Converted with nothing installed.** Both distros ship qcow2. The helper's own bounded reader writes a VHD, which
+    refuses backing files, encryption, snapshots, unknown features and anything out of bounds. Hyper-V's own
+    `Convert-VHD` then makes the base VHDX. Its hash is recorded and checked again before each VM is copied from it.
+- **The build** (offline, about a minute or two per VM; the plan lists it):
+  1. The VM is a copy of the base VHDX, grown to the plan's size, with Secure Boot (Microsoft's UEFI CA, which signs the
+     distros' shim).
+  2. It gets a cloud-init NoCloud seed:
+     - users `hvadmin` and `hvuser` with locked passwords;
+     - an SSH host key and a client key, both made by the helper, so the host key is pinned before the first boot;
+     - `hvadmin`'s only key is the helper's, restricted to a forced command, `sudo` of the guest's fixed dispatcher
+       (`helper/guest.py`) and nothing else. `hvuser` has no key and no sudo;
+     - sshd only on the Hyper-V socket, the distro's own sshd masked.
+  3. Its first boot writes allowlisted diagnostics to COM1, a pipe for the build only.
+  4. The build waits for the authenticated round trip to the dispatcher, then for cloud-init to finish.
+  5. It checks the guest: its distro and release, the keys, the sudoers rule, the units, no address and nothing listening
+     beyond loopback.
+  6. It turns cloud-init off for good, removes the seed and the COM port (verified), and takes the clean checkpoint Off.
+
+  A guest that never answers fails the build, saying why from its diagnostics (for example "no hv_sock driver"), or
+  that the cause is unknown. Either way the VM is rolled back, and nothing switches to another transport: that's the
+  user's decision.
+- **Talking to the guest** is SSH over a **Hyper-V socket**, the channel PowerShell Direct uses, so a Linux guest has no
+  network path at all.
+  - The helper runs Windows' in-box `ssh.exe` with fixed arguments: no config file, the VM's own key and pinned
+    `known_hosts`, batch mode. Its ProxyCommand is setup's `HvMcpVsock.exe`, which connects to the VM's vsock port 22.
+  - Each request goes on stdin, as JSON, and the remote command is always the forced one.
+  - The keys stay in the helper's secrets folder: never in a reply, plan, journal or log.
+- **The tools on Linux:**
+  - `vm_acquire({ os: 'linux' })` or `({ distro })`;
+  - the build goes to `/build` (root's, read-only to `hvuser`; a file is executable if it starts with `#!` or is an ELF
+    binary), and runs write to `/out`;
+  - `vm_run` takes `bash` (the default) or `sh`, as root or `hvuser`. Each run is its own systemd unit: a timeout kills its
+    whole cgroup;
+  - `vm_sync` streams only the changed files to the dispatcher, which checks each file's size and hash, never follows a
+    symlink (an `openat` walk with `O_NOFOLLOW`), and keeps `vm_sync`'s rules;
+  - `vm_read_out`, `vm_reset`, `vm_stop` and `vm_release` behave as for Windows;
+  - `interactive` and `session: 'interactive'` are refused: there's no desktop.
+- **Checkpoints:**
+  - A lease checkpoint of a Linux VM is taken with the guest shut down (no VSS in the images), then the VM starts again.
+    It's the same promise as Windows': files and installed software, no running programs.
+  - Pool checkpoints work as for Windows; there's no logon to undo.
+  - A refresh-clean checks the guest again. A change to its seeded files needs a rebuild.
+- **One VM per session**, as before: a project that needs Windows and Linux together uses two sessions.
+- Needs a helper with the `linux` feature: the server asks no Linux VM of an older helper, and says to run setup again.
+
 ## Multiple projects (MCP roots)
 
 One install serves every project, and every agent shares one pool through the helper's leases. A build folder must
@@ -526,9 +598,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\combwork-mcp\ser
 
 ### A pool from more than one image
 
-A pool can hold VMs built from several verified images, and so of several kinds: today Windows; Linux joins as an image
-kind through MC-1500's guest driver, with no change to the pool.
-- **Each VM records its image and OS** at its create. A VM made before that is given the image of the approved plan that
+A pool can hold VMs built from several verified images, and so of several kinds: Windows, and Linux (MC-1501, see
+"Linux guests").
+- **Each VM records its image and OS** at its create (Linux: see "Linux guests"). A VM made before that is given the image of the approved plan that
   made it, which the helper still has; if that can't be proved, its image is **unknown** (`vm_status` says so). An
   unknown-image VM is Windows: it serves a plain Windows `vm_acquire`, but never a request for an exact image, and no
   image's group counts it. It's never guessed.
@@ -791,7 +863,7 @@ work as usual.
   call goes on after the call ends. **Copies are still single calls:** `vm_start`'s build copy and `vm_sync` each copy in
   one call, so one that takes more than about 10 minutes (a big build on a slow host) ends with that same error, and
   `C:\build` is then untrusted until a full sync or a reset. `maxBuildMB` limits bytes, not time.
-- Windows guests only. An evaluation VM lasts about 90 days from its activation at build (see "Windows licences").
+- Windows guests, and Debian and Ubuntu Linux guests from their pinned images only (see "Linux guests"). An evaluation VM lasts about 90 days from its activation at build (see "Windows licences").
   Building from a ready-made VHDX isn't supported: an own copy comes from an ISO.
 - A sync tracks only what the helper copied into `C:\build`. A run that changes `C:\build` itself isn't seen; a
   file renamed only in case on the host keeps its old spelling in the guest. `full: true` or `vm_reset` puts either
@@ -804,7 +876,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\restorewait.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\restorewait.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js test\linux-image.test.js test\linux-guest-files.test.js test\linux.test.js
 ```
 
 - `units.test.js`:
@@ -1012,6 +1084,29 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   - a `vm_sync` of 18000 files (a 4.6 MB manifest) through the real pipe: batched, the warm session and its lease
     intact.
 
+- `linux-image.test.js` (MC-1501):
+  - the qcow2 reader and its VHD, read back exactly (data, compressed, zero and unallocated clusters, version 2, odd
+    sizes), and every refusal;
+  - the OpenPGP check against the pinned release's real `SHA256SUMS` and `SHA256SUMS.gpg`, and crafted refusals
+    (another key, changed bytes, armor checksum, future, expired, text mode, unknown critical, SHA-1);
+  - `linux-images.prepare` with a fake download: pins, the distros' checksum lines, the signature, redirects, local
+    copies;
+  - the pinned table's dated folders.
+- `linux-guest-files.test.js`:
+  - the helper's ed25519 keys read by Windows' own ssh-keygen;
+  - the seed for each transport;
+  - the dispatcher run for real (`guest_py_check.py`, real symlinks) under a Linux Python, which needs WSL with python3
+    or `HYPERV_TEST_LINUX_PYTHON`. It's skipped, and says so, where there's none: the trial runs it inside a Linux VM.
+- `linux.test.js`, through the stub guest (`stub-guest.js`, in place of `ssh.exe`):
+  - the build, step by step: no private key anywhere but the secrets folder, allowlisted diagnostics, no seed or COM
+    port left;
+  - builds that fail: conclusive, inconclusive and failed checks, each rolled back with no other transport tried;
+  - a Windows and a Linux lease at once;
+  - a Linux lease through `server.js`: build, runs, refusals, read-out, sync, reset and release;
+  - a timeout killed by its unit; a lease checkpoint taken Off;
+  - the helper killed mid-run and recovered;
+  - pool checkpoints and refresh-clean on Linux, and the feature gate.
+
 **The trial** on a real host (not automated): setup, then `pool_plan` → approval → `pool_create` from the pinned 25H2
 ISO, then:
 - two VMs running at once, each restoring cleanly;
@@ -1020,7 +1115,13 @@ ISO, then:
 - an interactive start, then a program that makes its own desktop and starts a child on it: it passes with
   `session: 'interactive'` and still fails in session 0;
 - `C:\build` read-only for the user, and the host's build unchanged after the guest admin writes there;
-- uninstall `-KeepPool`, then setup again, which recognises the pool.
+- uninstall `-KeepPool`, then setup again, which recognises the pool;
+- Linux (MC-1501, with the Assistant's go):
+  - a Debian and an Ubuntu VM built beside the Windows ones, each build's diagnostics showing hv_sock;
+  - a build and its tests run in a Linux VM and a Windows VM at once;
+  - `vm_sync`, `vm_checkpoint`, `vm_restore`, `vm_reset` and a pool checkpoint;
+  - `guest_py_check.py` run inside the Linux VM, as `hvuser`;
+  - the confinement checks: no address, no listener, the forced command refusing a shell, no key an agent can read.
 
 Test scratch goes to `HYPERV_TEST_SCRATCH` (default `%LOCALAPPDATA%\combwork-mcp-tests\hyperv-mcp-tests`), never the
 repo, and `npm test` clears earlier runs' folders first.
@@ -1032,6 +1133,9 @@ repo, and `npm test` clears earlier runs' folders first.
 - `helper\`: the helper, installed by setup into `%ProgramFiles%\hyperv-mcp`:
   - `helper.js` (its entry under the host), `core.js` (the rules), `journal.js`, `policy.js`, `images.js`, `iso.js`,
     `unattend.js`, `paths.js`;
+  - Linux guests (MC-1501): `guests\linux.js` (the guest driver), `linux-images.js` (pins, checksums), `openpgp.js`
+    (Ubuntu's signature), `qcow2.js` (the converter), `seed.js` (the cloud-init seed), `sshkeys.js`, `ssh.js` (the
+    transport), `guest.py` (the guest's dispatcher), and `host\HvMcpVsock.cs` (the Hyper-V socket bridge, compiled by setup);
   - `hv.js` and `hv.ps1` (the only way it acts on Hyper-V), `guest-sync.ps1` (the guest side of `vm_sync`) and
     `guest-agent.ps1` (the interactive session's watcher), each run in the guest by `hv.ps1`;
   - `approve.ps1`;

@@ -31,13 +31,25 @@
  * defenderOverride: fields it reports instead.
  * Logon diagnostics (MC-1520): guest-logon-diag answers state.diag, or a sample that also carries fields the helper must
  * drop (an event message, a command line, a password), to show only the allowlisted ones are kept.
+ * Linux VMs (MC-1501): create-vm with os 'linux' needs its base VHDX and its seed ISO (make-iso with label cidata keeps
+ * only the seed's public parts: the host key's public half, hvadmin's authorized_keys line, the sudoers rule; never a
+ * private key); com-attach/com-detach set and unset COM1, com-read answers state.diagLines (default: every stage, hv_sock
+ * present; comReadFails); vhd-convert copies the VHD. The guest itself is test/stub-guest.js (the SSH transport's stub).
  */
 const fs = require('fs')
 const crypto = require('crypto')
 const { join } = require('path')
 
 const FILE = process.env.HYPERV_MCP_STUB_STATE
-const load = () => { try { return JSON.parse(fs.readFileSync(FILE, 'utf8')) } catch { return {} } }
+// A read that catches another stub process mid-write (a torn file) is retried, never taken as an empty state.
+const load = () => {
+  for (let i = 0; i < 50; i++) {
+    let text
+    try { text = fs.readFileSync(FILE, 'utf8') } catch { return {} }
+    try { return JSON.parse(text) } catch { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10) }
+  }
+  throw new Error('the stub state stays unreadable')
+}
 const save = s => fs.writeFileSync(FILE, JSON.stringify(s, null, 1))
 const answer = o => { process.stdout.write('HVJSON:' + JSON.stringify(o) + '\n') }
 const norm = p => String(p).replace(/[\\/]+$/, '').toLowerCase()
@@ -53,15 +65,18 @@ process.stdin.on('end', () => {
   s.switches ??= {}
   s.calls ??= []
   s.fail ??= {}
+  // MC-1501: com-read runs alongside a Linux build's other calls, so it only reads: it never saves (a save racing
+  // another call's read could hand that call a half-written file).
+  const keep = op !== 'com-read'
   s.calls.push({ op, argv: process.argv.slice(2), vmId: a.vmId, command: a.command })
-  save(s) // logged before it runs, so a test can see a call in progress
+  if (keep) save(s) // logged before it runs, so a test can see a call in progress
   try {
-    if (s.fail[op] > 0) { s.fail[op]--; throw new Error(`injected failure of ${op}`) }
+    if (s.fail[op] > 0) { s.fail[op]--; if (keep) save(s); throw new Error(`injected failure of ${op}`) }
     const r = run(s, op, a)
-    save(s)
+    if (keep) save(s)
     answer({ result: r })
   } catch (e) {
-    save(s)
+    if (keep) save(s)
     answer({ error: e.message })
   }
 })
@@ -144,12 +159,20 @@ function run(s, op, a) {
     }
     case 'create-vm': {
       const id = crypto.randomUUID()
+      if (a.os === 'linux') {
+        if (!fs.existsSync(a.baseVhdx)) throw new Error('its base VHDX is missing')
+        if (!s.seeds?.[a.seedIso] || !fs.existsSync(a.seedIso)) throw new Error('its seed ISO is missing')
+        fs.copyFileSync(a.baseVhdx, join(a.folder, 'disk.vhdx'))
+        s.vms[id] = { id, name: a.name, os: 'linux', location: join(a.folder, a.name), state: 'Off', checkpoints: [], parent: null, switchName: null, reserve: 0, disk: {}, cores: a.cores, memoryMB: a.memoryMB, installed: true, seed: s.seeds[a.seedIso], dvd: a.seedIso, com: null }
+        if (s.failAfterCreate) { s.failAfterCreate = false; throw new Error('injected failure after New-VM') }
+        return { vmId: id }
+      }
       fs.writeFileSync(join(a.folder, 'disk.vhdx'), 'vhd')
       s.vms[id] = { id, name: a.name, location: join(a.folder, a.name), state: 'Off', checkpoints: [], parent: null, switchName: null, reserve: 0, disk: {}, cores: a.cores, memoryMB: a.memoryMB, installed: false }
       if (s.failAfterCreate) { s.failAfterCreate = false; throw new Error('injected failure after New-VM') }
       return { vmId: id }
     }
-    case 'start-vm': { const vm = own(s, a); vm.state = 'Running'; vm.installed = !s.installNeverReady; return { started: true } }
+    case 'start-vm': { const vm = own(s, a); vm.state = 'Running'; if (vm.os === 'linux') vm.boot = (vm.boot || 0) + 1; if (vm.os !== 'linux') vm.installed = !s.installNeverReady; else if (s.linuxNeverReady) vm.installed = false; return { started: true } }
     case 'guest-ready': {
       const vm = own(s, a)
       // readyGate: PowerShell Direct hangs (records its PID in readyPidFile, then waits for the gate file); notReady: the
@@ -167,6 +190,7 @@ function run(s, op, a) {
     case 'make-clean': {
       const vm = own(s, a)
       vm.state = 'Off'
+      vm.dvd = null
       vm.switchName = null
       vm.reserve = 0
       const id = crypto.randomUUID()
@@ -308,7 +332,7 @@ function run(s, op, a) {
       if (s.poolTakeEntered) fs.writeFileSync(s.poolTakeEntered, 'entered')
       if (s.poolTakeGate) while (!fs.existsSync(s.poolTakeGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25)
       if (vm.state !== 'Off') throw new Error(`the VM is ${vm.state}, not Off`)
-      if (!/^hvmcp-(pool|clean)-[0-9a-f]{12}$/.test(a.snapName)) throw new Error('bad checkpoint name')
+      if (!/^hvmcp-(pool|clean|lease)-[0-9a-f]{12}$/.test(a.snapName)) throw new Error('bad checkpoint name') // lease: a Linux lease checkpoint, taken Off (MC-1501)
       if (s.poolTakeFail) return { failed: true, error: 'injected: Hyper-V could not take it' }
       const id = crypto.randomUUID()
       // poolTakeDelayed: the call fails and Hyper-V finishes the take later (a running job until it appears, at the
@@ -568,12 +592,28 @@ function run(s, op, a) {
       return { gone: true, foreign: !!s.switches[a.name] }
     }
     case 'make-iso': {
+      if (a.label === 'cidata') {
+        // A Linux seed: only its public parts are kept (never the host key's private half).
+        const u = JSON.parse(fs.readFileSync(join(a.source, 'user-data'), 'utf8').replace(/^#cloud-config\n/, ''))
+        const file = path => u.write_files.find(w => w.path === path)?.content ?? null
+        s.seeds = { ...(s.seeds || {}), [a.out]: { hostKey: u.ssh_keys.ed25519_public.split(' ').slice(0, 2).join(' '), authorized: u.users[0].ssh_authorized_keys, sudoers: file('/etc/sudoers.d/hvmcp'), socket: file('/etc/systemd/system/hvmcp-sshd.socket'), network: fs.readFileSync(join(a.source, 'network-config'), 'utf8') } }
+        fs.writeFileSync(a.out, 'iso')
+        return { out: a.out }
+      }
       // The answer file it carries, kept (in the stub's state only) so tests can check the image index and key.
       const answer = join(a.source, 'autounattend.xml')
       if (fs.existsSync(answer)) s.answers = [...(s.answers || []), fs.readFileSync(answer, 'utf8').replace(/<Password>[\s\S]*?<\/Password>/g, '<Password>(not kept)</Password>')]
       fs.writeFileSync(a.out, 'iso')
       return { out: a.out }
     }
+    case 'com-attach': { const vm = own(s, a); if (!/^hvmcp-diag-[0-9a-f]{16}$/.test(a.pipe)) throw new Error('bad pipe name'); vm.com = `\\\\.\\pipe\\${a.pipe}`; return { path: vm.com } }
+    case 'com-read': {
+      if (s.comReadFails) throw new Error('injected: the COM pipe could not be read')
+      const lines = s.diagLines ?? ['HVMCP-DIAG stage=seed-read vmbus=present hv_sock_driver=present hv_sock_modinfo=present vsock_listen=inactive sshd_config_ok=yes kernel=6.12.117+deb13-cloud-amd64', 'HVMCP-DIAG stage=socket-up vmbus=present hv_sock_driver=present hv_sock_modinfo=present vsock_listen=active sshd_config_ok=yes kernel=6.12.117+deb13-cloud-amd64 secret=dropped']
+      return { lines, connected: true, complete: true }
+    }
+    case 'com-detach': { const vm = own(s, a); if (!s.comStays) vm.com = null; return { path: vm.com || '' } }
+    case 'vhd-convert': { fs.copyFileSync(a.vhd, a.vhdx); return { vhdx: a.vhdx } }
     case 'signatures': return { files: a.files.map(f => ({ file: f, ok: !s.signatureBad, why: s.signatureBad ? 'signature NotSigned' : null })) }
     case 'approval-acl': return { ok: !s.aclBad, why: s.aclBad || null }
     default: throw new Error(`unknown operation '${op}'`)

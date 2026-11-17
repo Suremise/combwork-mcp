@@ -529,12 +529,15 @@ test('setup: -BuildRoot is refused as the policy would, before anything changes'
   }
 })
 
-test('setup copies every helper file the service runs (guest-sync.ps1 included), and the zip carries them', async () => {
+test('setup copies every helper file the service runs (guest-sync.ps1, guests/ and guest.py included), and the zip carries them', async () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'setup', 'install.ps1'), 'utf8')
   const list = /^foreach \(\$f in ((?:'[^']+',? ?)+)\) \{\r?\n  Copy-Item -LiteralPath \(Join-Path \$src "helper\\\$f"\)/m.exec(src)
   assert.ok(list, 'the helper file list in install.ps1')
-  const copied = list[1].split(',').map(s => s.trim().replace(/'/g, '')).sort()
-  const shipped = fs.readdirSync(path.join(__dirname, '..', 'helper')).filter(f => /\.(js|ps1)$/.test(f)).sort()
+  const copied = list[1].split(',').map(s => s.trim().replace(/'/g, '').replace(/\\/g, '/')).sort()
+  // Every file the service runs, in the helper folder and its subfolders (the service host's source is compiled, not
+  // copied); MC-1501 added guests/ and the Linux dispatcher (guest.py, copied into each Linux guest's seed).
+  const helperDir = path.join(__dirname, '..', 'helper')
+  const shipped = fs.readdirSync(helperDir, { recursive: true }).map(f => f.replace(/\\/g, '/')).filter(f => /\.(js|ps1|py)$/.test(f) && !f.startsWith('host/')).sort()
   assert.deepStrictEqual(copied, shipped)
   const { SERVERS } = await import(require('url').pathToFileURL(path.join(__dirname, '..', '..', '..', 'scripts', 'pack.mjs')).href)
   assert.ok(SERVERS['hyper-v'].some(([from]) => from === 'helper'), 'the zip holds the whole helper folder')

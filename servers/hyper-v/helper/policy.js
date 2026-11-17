@@ -65,6 +65,8 @@ function problems(p) {
   // MC-1532: pool checkpoints per VM, optional (default 4), counting retiring ones and ones being taken.
   if (p.maxCheckpointsPerVm !== undefined && !int(p.maxCheckpointsPerVm, 0, 8)) out.push('maxCheckpointsPerVm must be 0-8')
   if (typeof p.allowUnpinnedIso !== 'boolean') out.push('allowUnpinnedIso must be true or false')
+  // MC-1501: how the helper reaches Linux guests, optional (setup's -LinuxTransport): only the Hyper-V socket today.
+  if (p.linuxTransport !== undefined && p.linuxTransport !== 'hvsocket') out.push('linuxTransport must be hvsocket')
   // Build folders an admin named at setup (install.ps1 -BuildRoot): optional, so a policy from before it stays usable.
   if (p.buildRoots !== undefined) {
     if (!Array.isArray(p.buildRoots) || p.buildRoots.length > MAX_BUILD_ROOTS) out.push(`buildRoots must be a list of at most ${MAX_BUILD_ROOTS} folders`)

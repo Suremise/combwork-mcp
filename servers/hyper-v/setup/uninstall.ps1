@@ -93,6 +93,9 @@ $ops = @{
     foreach ($m in @($svcAccount) + $(if ($Mode -eq 'Direct') { @($User) } else { @() })) {
       if (Get-LocalGroupMember -SID $HVADMINS -ErrorAction Stop | Where-Object { $_.Name -eq $m }) { Remove-LocalGroupMember -SID $HVADMINS -Member $m; Step "$m removed from Hyper-V Administrators." }
     }
+    # MC-1501: setup's registration of the Linux guests' vsock port 22, only if it is still setup's (its ElementName).
+    $gcs = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices\00000016-facb-11e6-bd58-64006a7986d3'
+    if ((Get-ItemProperty -Path $gcs -ErrorAction SilentlyContinue).ElementName -eq 'hyper-v MCP: SSH to Linux guests (vsock port 22)') { Remove-Item -Path $gcs -Force; Step 'The Linux guests'' vsock port registration removed.' }
   }
   RemoveGroup = { if (Get-LocalGroup -Name $groupName -ErrorAction SilentlyContinue) { Remove-LocalGroup -Name $groupName; Step "Group '$groupName' removed." } }
   HelperStatus = {

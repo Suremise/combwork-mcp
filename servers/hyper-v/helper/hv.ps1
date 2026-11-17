@@ -613,6 +613,24 @@ try {
     'create-vm' {
       $folder = [string]$a.folder
       $vhd = Join-Path $folder 'disk.vhdx'
+      if ($a.os -eq 'linux') {
+        # MC-1501: a Linux VM is a copy of its image's verified base VHDX (the helper rechecked its hash), grown to the
+        # plan's size (cloud-init grows the root file system at first boot), booted from disk with the Microsoft UEFI CA
+        # template (Debian's and Ubuntu's shim are signed by it), and its cloud-init seed as a DVD. No TPM: nothing uses
+        # one. The network adapter stays disconnected.
+        Copy-Item -LiteralPath ([string]$a.baseVhdx) -Destination $vhd
+        if ((Get-VHD -Path $vhd).Size -lt ([long]$a.diskGB * 1GB)) { Resize-VHD -Path $vhd -SizeBytes ([long]$a.diskGB * 1GB) }
+        $vm = New-VM -Name ([string]$a.name) -Generation 2 -Path $folder -VHDPath $vhd -MemoryStartupBytes ([long]$a.memoryMB * 1MB)
+        Set-VMMemory -VM $vm -DynamicMemoryEnabled $false
+        Set-VMProcessor -VM $vm -Count ([int]$a.cores) -Reserve 0
+        Set-VM -VM $vm -AutomaticCheckpointsEnabled $false -CheckpointType Standard -AutomaticStartAction Nothing -AutomaticStopAction TurnOff
+        Set-VMFirmware -VM $vm -EnableSecureBoot On -SecureBootTemplate MicrosoftUEFICertificateAuthority
+        Get-VMNetworkAdapter -VM $vm | Disconnect-VMNetworkAdapter
+        Add-VMDvdDrive -VM $vm -Path ([string]$a.seedIso) | Out-Null
+        Set-VMFirmware -VM $vm -FirstBootDevice (Get-VMHardDiskDrive -VM $vm | Select-Object -First 1)
+        @{ vmId = $vm.Id.ToString() }
+        break
+      }
       New-VHD -Path $vhd -SizeBytes ([long]$a.diskGB * 1GB) -Dynamic | Out-Null
       $vm = New-VM -Name ([string]$a.name) -Generation 2 -Path $folder -VHDPath $vhd -MemoryStartupBytes ([long]$a.memoryMB * 1MB)
       Set-VMMemory -VM $vm -DynamicMemoryEnabled $false
@@ -630,6 +648,7 @@ try {
     'start-vm' {
       $vm = Get-OwnVm $a
       Start-VM -VM $vm
+      if ($a.noKeys) { @{ started = $true }; break } # MC-1501: a Linux VM boots from its disk: no keys to press
       # Gen 2 DVD boot waits for "Press any key to boot from CD or DVD": press Enter a few times.
       $cs = Get-CimInstance -Namespace root\virtualization\v2 -ClassName Msvm_ComputerSystem -Filter "Name='$($vm.Id)'"
       $kb = Get-CimAssociatedInstance -InputObject $cs -ResultClassName Msvm_Keyboard
@@ -721,7 +740,8 @@ try {
     'pool-take' {
       $vm = Get-OwnVm $a
       if ($vm.State -ne 'Off') { throw "the VM is $($vm.State), not Off" }
-      if ([string]$a.snapName -notmatch '^hvmcp-(pool|clean)-[0-9a-f]{12}$') { throw 'bad checkpoint name' }
+      # MC-1501: a Linux lease checkpoint (hvmcp-lease-) is taken of the Off VM too (no VSS in the guest).
+      if ([string]$a.snapName -notmatch '^hvmcp-(pool|clean|lease)-[0-9a-f]{12}$') { throw 'bad checkpoint name' }
       $cp = $null; $err = $null
       try { $cp = Checkpoint-VM -VM $vm -SnapshotName ([string]$a.snapName) -Passthru -ErrorAction Stop } catch { $err = $_.Exception.Message }
       if ($err) { @{ failed = $true; error = $err } } else { @{ checkpointId = $cp.Id.ToString() } }
@@ -917,6 +937,53 @@ try {
         $named = @(Get-VMSwitch -Name ([string]$a.name) -ErrorAction SilentlyContinue | Where-Object { $_.Name -ceq [string]$a.name })
         @{ gone = $true; foreign = ($named.Count -gt 0) }
       }
+    }
+    # MC-1501: a Linux VM's build diagnostics (design §4.2). COM1 goes to a named pipe of a random name for the build
+    # only; com-read reads it as a client (Hyper-V serves the pipe while the VM runs), keeping only HVMCP-DIAG lines,
+    # bounded in bytes and time, until the seed's last stage or its deadline; com-detach unsets the port, read back.
+    'com-attach' {
+      $vm = Get-OwnVm $a
+      if ([string]$a.pipe -notmatch '^hvmcp-diag-[0-9a-f]{16}$') { throw 'bad pipe name' }
+      Set-VMComPort -VM $vm -Number 1 -Path ('\.\pipe' + [string]$a.pipe)
+      @{ path = [string](Get-VMComPort -VM $vm -Number 1).Path }
+    }
+    'com-read' {
+      if ([string]$a.pipe -notmatch '^hvmcp-diag-[0-9a-f]{16}$') { throw 'bad pipe name' }
+      $deadline = [DateTime]::UtcNow.AddMilliseconds([int]$a.ms)
+      $lines = New-Object Collections.Generic.List[string]
+      $bytes = 0; $done = $false; $connected = $false
+      while (-not $done -and [DateTime]::UtcNow -lt $deadline) {
+        $pipe = New-Object IO.Pipes.NamedPipeClientStream('.', [string]$a.pipe, [IO.Pipes.PipeDirection]::In)
+        try {
+          try { $pipe.Connect(2000) } catch { Start-Sleep -Milliseconds 500; continue }
+          $connected = $true
+          $reader = New-Object IO.StreamReader($pipe, [Text.Encoding]::ASCII)
+          while (-not $done -and [DateTime]::UtcNow -lt $deadline) {
+            $t = $reader.ReadLineAsync()
+            $left = [int][Math]::Max(1, ($deadline - [DateTime]::UtcNow).TotalMilliseconds)
+            if (-not $t.Wait([Math]::Min($left, 5000))) { continue }
+            $line = $t.Result
+            if ($null -eq $line) { break }
+            $bytes += $line.Length
+            if ($bytes -gt 65536) { $done = $true; break }
+            $i = $line.IndexOf('HVMCP-DIAG ')
+            if ($i -ge 0) { $l = $line.Substring($i); if ($lines.Count -lt 64) { $lines.Add($l) }; if ($l -match '(^| )stage=socket-up( |$)') { $done = $true } }
+          }
+        } finally { $pipe.Dispose() }
+      }
+      @{ lines = @($lines); connected = $connected; complete = $done }
+    }
+    'com-detach' {
+      $vm = Get-OwnVm $a
+      Set-VMComPort -VM $vm -Number 1 -Path ''
+      @{ path = [string](Get-VMComPort -VM $vm -Number 1).Path }
+    }
+    'vhd-convert' {
+      # MC-1501: the helper's own VHD (from a verified qcow2 image) to the base VHDX, with Hyper-V's own cmdlet.
+      if ([string]$a.vhd -notmatch '\convert-[0-9a-f]{12}\.vhd$' -or [string]$a.vhdx -notmatch '\[0-9a-f]{64}\.vhdx$') { throw 'bad conversion paths' }
+      if (Test-Path -LiteralPath ([string]$a.vhdx)) { throw 'the base VHDX already exists' }
+      Convert-VHD -Path ([string]$a.vhd) -DestinationPath ([string]$a.vhdx) -VHDType Dynamic
+      @{ vhdx = [string]$a.vhdx }
     }
     'make-iso' {
       $fsi = New-Object -ComObject IMAPI2FS.MsftFileSystemImage
