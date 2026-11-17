@@ -74,30 +74,48 @@ test('a stop that is never confirmed is retried in bounded rounds and reported, 
 // MC-1548: a state or report file replaced while another process has it open. Windows refuses that rename (EPERM):
 // the watchdog reading state.json as it starts, a smoke run polling watchdog.json. replaceFile retries, bounded.
 const { replaceFile } = require('../wsb')
-const { spawnSync } = require('child_process')
 const windows = process.platform === 'win32'
 
-// A process that opens file (as Node opens it for a read) and holds it for ms, then exits. Resolves once it holds it.
-function holdOpen(file, ms) {
-  const p = spawn(process.execPath, ['-e', `const fs=require('fs');const fd=fs.openSync(process.argv[1],'r');process.stdout.write('held');setTimeout(()=>{fs.closeSync(fd);process.exit(0)},${ms})`, file], { stdio: ['ignore', 'pipe', 'ignore'] })
-  test.after(() => p.kill())
-  return new Promise((res, rej) => { p.stdout.once('data', () => res(p)); p.once('exit', c => rej(new Error(`holder exited ${c}`))) })
+// A process that opens file (as Node opens it for a read) and holds it until the parent releases it: the release file
+// appearing (created synchronously by the test, so a synchronous replaceFile can release it mid-retry). Round 2: no
+// wall-clock hold. Resolves once it holds the file; exits() waits for its exit. A 60 s safety exit bounds a lost test.
+function holdOpen(file) {
+  const release = `${file}.release`
+  const script = "const fs=require('fs');const [f,r]=process.argv.slice(1);const fd=fs.openSync(f,'r');process.stdout.write('held');" +
+    "const t=setInterval(()=>{if(fs.existsSync(r)){clearInterval(t);fs.closeSync(fd);process.exit(0)}},5);setTimeout(()=>process.exit(3),60000)"
+  const p = spawn(process.execPath, ['-e', script, file, release], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true })
+  const exited = new Promise(res => p.once('exit', code => res(code)))
+  const h = { release: () => fs.writeFileSync(release, ''), exited: () => exited }
+  test.after(async () => { h.release(); await Promise.race([exited, new Promise(r => setTimeout(r, 5000))]); if (p.exitCode === null) p.kill() })
+  return new Promise((res, rej) => { p.stdout.once('data', () => res(h)); exited.then(c => rej(new Error(`holder exited ${c} before holding the file`))) })
 }
 
 test('MC-1548: replaceFile replaces a file another process holds open, once it lets go (a plain rename fails there)', { skip: !windows && 'a Windows sharing rule' }, async () => {
   const s = scratch('wd-replace')
   const file = path.join(s.dir, 'state.json')
   fs.writeFileSync(file, '{"v":1}')
-  const holder = await holdOpen(file, 700)
+  const holder = await holdOpen(file)
+  // The premise, while it's certainly held (only the test releases it): Windows refuses a plain rename over it.
   fs.writeFileSync(`${file}.plain`, '{"v":0}')
-  // The premise: while it's held, Windows refuses a plain rename over it.
   assert.throws(() => fs.renameSync(`${file}.plain`, file), e => ['EPERM', 'EACCES', 'EBUSY'].includes(e.code))
-  const t0 = Date.now()
-  replaceFile(file, '{"v":2}')
-  assert.ok(Date.now() - t0 >= 100, 'it waited for the holder')
+  // replaceFile's rename, observed: the first attempt meets the holder (a sharing error), and only then is the holder
+  // told to let go; the retries that follow succeed once it has.
+  const seen = []
+  replaceFile(file, '{"v":2}', {
+    renameSync: (a, b) => {
+      try { fs.renameSync(a, b); seen.push('ok') } catch (e) {
+        seen.push(e.code)
+        if (seen.length === 1) holder.release()
+        throw e
+      }
+    }
+  })
+  assert.ok(['EPERM', 'EACCES', 'EBUSY'].includes(seen[0]), `the first attempt met the holder: ${seen}`)
+  assert.strictEqual(seen.at(-1), 'ok', `then a retry succeeded: ${seen}`)
+  assert.ok(seen.length >= 2, 'it retried')
   assert.strictEqual(fs.readFileSync(file, 'utf8'), '{"v":2}')
   assert.ok(!fs.existsSync(`${file}.tmp`), 'no temp file left')
-  await new Promise(r => holder.once('exit', r).exitCode !== null && r())
+  assert.strictEqual(await holder.exited(), 0, 'the holder let go when told, and exited')
 })
 
 test('MC-1548: replaceFile is bounded, and throws at once on an error that isn\'t a sharing one', () => {
