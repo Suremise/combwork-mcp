@@ -252,17 +252,17 @@ $GuestRunStart = {
   $wrapper = & ([scriptblock]::Create($files)) $j ([string]$j.dir)
   $jobName = $null
   $p = $null
-  if ($jobSource) {
-    try {
-      if (-not ('HvMcpRunJob' -as [type])) { Add-Type -TypeDefinition $jobSource }
-      $name = 'hvmcp-run-{0}-{1}' -f [int]$j.n, ([guid]::NewGuid().ToString('N').Substring(0, 16))
-      $runPid = [HvMcpRunJob]::Start("cmd.exe /d /c `"$wrapper`"", $name)
-      $jobName = $name
-      try { $p = [Diagnostics.Process]::GetProcessById($runPid) } catch { $p = $null; $id = $runPid }
-    } catch { $jobName = $null; $p = $null }
-  }
-  if (-not $jobName) { $p = Start-Process -FilePath 'cmd.exe' -ArgumentList "/d /c `"$wrapper`"" -PassThru -WindowStyle Hidden }
-  if ($p) { $id = $p.Id }
+  # MC-1547 (round 2): fail closed. A run that can't be put in its job isn't started (HvMcpRunJob.Start ends any process
+  # it made before failing): the error says why, and nothing uncontained runs.
+  if (-not $jobSource) { throw 'no job type was given: a run is only started in its own job' }
+  try {
+    if (-not ('HvMcpRunJob' -as [type])) { Add-Type -TypeDefinition $jobSource }
+    $name = 'hvmcp-run-{0}-{1}' -f [int]$j.n, ([guid]::NewGuid().ToString('N').Substring(0, 16))
+    $runPid = [HvMcpRunJob]::Start("cmd.exe /d /c `"$wrapper`"", $name)
+  } catch { throw "the run couldn't be put in its own job, so it wasn't started: $($_.Exception.Message)" }
+  $jobName = $name
+  $id = $runPid
+  try { $p = [Diagnostics.Process]::GetProcessById($runPid) } catch { $p = $null }
   $started = $null
   if ($p) {
     try {
@@ -302,17 +302,23 @@ $GuestRunPoll = {
 # file decides.
 $GuestRunKill = {
   param($j, $jobSource)
-  # MC-1547: the run's job, when it has one: everything in it ends, whenever it was started. No job by that name means
-  # every process of the run has ended. A job that can't be opened or terminated falls back to the PID path below.
-  if ($j.job -and $jobSource -and ([string]$j.job -match '^hvmcp-run-\d{1,9}-[0-9a-f]{16}$')) {
+  # MC-1547: a run with a job is killed through its job only: everything in it ends, whenever it was started. No job by
+  # that name means every process of the run has ended. A job kill that can't be confirmed is reported as such (jobFailed),
+  # never retried as a PID-tree taskkill, which could miss a child created as it ran: the helper restores the VM instead.
+  # The PID path below is only for a run started without a job (an older helper's).
+  if ($j.job) {
+    if ([string]$j.job -notmatch '^hvmcp-run-\d{1,9}-[0-9a-f]{16}$') { return @{ killed = $false; jobFailed = $true; why = 'its job name is malformed' } }
     $r = -1
+    $err = $null
     try {
+      if (-not $jobSource) { throw 'no job type was given' }
       if (-not ('HvMcpRunJob' -as [type])) { Add-Type -TypeDefinition $jobSource }
       $r = [HvMcpRunJob]::Kill([string]$j.job, 10000)
-    } catch { $r = -1 }
+    } catch { $r = -1; $err = $_.Exception.Message }
     if ($r -eq 1) { return @{ killed = $true; via = 'job' } }
     if ($r -eq 0) { return @{ killed = $false; gone = $true } }
-    if ($r -eq 2) { return @{ killed = $false; why = 'processes were still in its job 10 s after it was terminated' } }
+    if ($r -eq 2) { return @{ killed = $false; jobFailed = $true; why = 'processes were still in its job 10 s after it was terminated' } }
+    return @{ killed = $false; jobFailed = $true; why = "its job couldn't be opened or terminated$(if ($err) { " ($err)" })" }
   }
   $p = $null
   try { $p = [Diagnostics.Process]::GetProcessById([int]$j.pid) } catch { return @{ killed = $false; gone = $true } }

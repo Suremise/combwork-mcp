@@ -359,12 +359,57 @@ $t = (Get-Date).AddSeconds(30); do { Start-Sleep -Milliseconds 200 } until ((& $
 ConvertTo-Json -InputObject @{ before = (& $pings).Count } -Compress
 $k = & $GuestRunKill @{ pid = $s.pid; started = $s.started; job = $s.job } $RunJob
 ConvertTo-Json -InputObject $k -Compress
-Start-Sleep -Milliseconds 1500
-ConvertTo-Json -InputObject @{ after = (& $pings).Count; runAlive = [bool](Get-Process -Id $s.pid -ErrorAction SilentlyContinue) } -Compress`, { job: true })
+# Round 2: a bounded wait on the condition itself (no fixed delay): the run's pings and its cmd gone, within 15 s.
+$t = (Get-Date).AddSeconds(15)
+do {
+  $after = (& $pings).Count
+  $runAlive = [bool](Get-Process -Id $s.pid -ErrorAction SilentlyContinue)
+  if ($after -eq 0 -and -not $runAlive) { break }
+  Start-Sleep -Milliseconds 100
+} until ((Get-Date) -gt $t)
+ConvertTo-Json -InputObject @{ after = $after; runAlive = $runAlive } -Compress`, { job: true })
   t.after(() => assert.deepStrictEqual(survivors(g.dir), [], 'nothing the harness launched survives it'))
   const [started, before, killed, after] = g.run()
   assert.match(String(started.job), /^hvmcp-run-3-[0-9a-f]{16}$/, 'the run has its job')
   assert.ok(before.before >= 4, `children were being started: ${JSON.stringify(before)}`)
   assert.deepStrictEqual(killed, { killed: true, via: 'job' }, 'the job was terminated and confirmed empty')
   assert.deepStrictEqual(after, { after: 0, runAlive: false }, 'no ping of the run is left, the latest ones included, and the run itself is gone')
+})
+
+test('MC-1547 round 2: a run is never started outside its job (fail closed), and a job kill that can\'t be confirmed is reported as such, never retried as a PID-tree kill', { skip: !windows || START.some(b => !b) || !KILL }, async () => {
+  const g = guest('runs-jobfail', `param($Dir, $Out, $Cwd)
+$out = @{}
+$j = @{ n = 4; command = 'echo should-not-run> started.txt'; shell = 'cmd'; cwd = $Cwd; dir = $Dir; out = $Out }
+try { [void](& $GuestRunStart $j $RunFiles.ToString() 'this is not C#'); $out.badSource = 'started' } catch { $out.badSource = $_.Exception.Message }
+try { [void](& $GuestRunStart $j $RunFiles.ToString() $null); $out.noSource = 'started' } catch { $out.noSource = $_.Exception.Message }
+$out.marker = Test-Path (Join-Path $Cwd 'started.txt')
+# Before anything has loaded the real job type in this process:
+$out.killNoSource = & $GuestRunKill @{ pid = 1; started = '2001-01-01T00:00:00Z'; job = 'hvmcp-run-4-0000000000000001' } 'this is not C#'
+$out.unknownJob = & $GuestRunKill @{ pid = 1; started = '2001-01-01T00:00:00Z'; job = 'hvmcp-run-4-0000000000000000' } $RunJob
+$out.badName = & $GuestRunKill @{ pid = 1; started = '2001-01-01T00:00:00Z'; job = 'not-a-run-job' } $RunJob
+ConvertTo-Json -InputObject $out -Compress -Depth 4`, { job: true })
+  const [o] = g.run()
+  assert.match(o.badSource, /the run couldn't be put in its own job, so it wasn't started/, 'a job type that won\'t compile: refused')
+  assert.match(o.noSource, /a run is only started in its own job/, 'no job type: refused')
+  assert.strictEqual(o.marker, false, 'the command never ran')
+  assert.deepStrictEqual(o.unknownJob, { killed: false, gone: true }, 'no job by that name: the run has ended')
+  assert.deepStrictEqual(o.badName, { killed: false, jobFailed: true, why: 'its job name is malformed' })
+  assert.strictEqual(o.killNoSource.jobFailed, true, 'a kill that can\'t even load the job type is a failure, never a PID-tree kill')
+  assert.match(o.killNoSource.why, /its job couldn't be opened or terminated/)
+})
+
+test('MC-1547 round 2: through the helper, a run in a job is killed through it; a job kill that can\'t be confirmed restores the VM (never a PID-tree kill)', async () => {
+  const { sc, h, a } = await running('runs-job-core')
+  sc.patchStub(st => { st.runJobs = true })
+  const ok = await a.request('run', { command: 'sleep', timeoutSec: 1 })
+  assert.match(ok.text, /^Timed out after 1 s: killed inside the guest with everything it started \(its job object, MC-1547\)\./)
+  assert.match(sc.stub().kills.at(-1).job, /^hvmcp-run-\d+-0123456789abcdef$/, 'the kill was given the run\'s job')
+  const r0 = Object.values(sc.stub().vms)[0].restores || 0
+  sc.patchStub(st => { st.jobKillFails = true })
+  const bad = await a.request('run', { command: 'sleep', timeoutSec: 1 })
+  assert.match(bad.text, /^Timed out after 1 s, and its job's kill couldn't be confirmed \(processes were still in its job 10 s after it was terminated\)\. The VM was restored to its clean checkpoint, which ends everything the run started/)
+  assert.strictEqual(bad.data.restored, true)
+  assert.strictEqual(bad.isError, true)
+  assert.strictEqual((Object.values(sc.stub().vms)[0].restores || 0), r0 + 1, 'restored once')
+  await h.stop()
 })

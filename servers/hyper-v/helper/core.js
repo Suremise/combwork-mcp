@@ -1647,11 +1647,17 @@ class Helper {
       if (r.timedOut || exit !== 0) lease.failed = true
       const out = s => (typeof s === 'string' ? s : '').slice(0, OUTPUT_CAP)
       // An interactive run that didn't finish cleanly isn't chased: the VM is restored, which ends whatever it started.
-      const restored = interactive && r.clean !== true ? await this.restoreAfterRun(lease, vm) : null
+      // MC-1547: a Windows run in its own job whose timeout kill couldn't be confirmed through that job is never chased
+      // process by process (a PID-tree kill could miss a child created as it ran): the VM is restored, as for an
+      // interactive run that didn't finish cleanly, which ends everything the run started.
+      const jobUnconfirmed = !interactive && !linux && !!r.timedOut && !r.killed && !!started?.job
+      const restored = (interactive && r.clean !== true) || jobUnconfirmed ? await this.restoreAfterRun(lease, vm) : null
       const lines = [
         interactive
           ? (restored ? `The interactive run didn't finish cleanly (${r.why || 'no exit code'}). ${restored}` : `Exit code ${exit} (in the interactive session).`)
-          : r.timedOut
+          : jobUnconfirmed
+            ? `Timed out after ${timeoutSec} s, and its job's kill couldn't be confirmed${r.killWhy ? ` (${r.killWhy})` : ''}. ${restored}`
+            : r.timedOut
             ? `Timed out after ${timeoutSec} s: ${r.killed ? (linux ? 'killed inside the guest with everything it started (its systemd unit' + "'" + 's cgroup).' : r.killVia === 'job' ? 'killed inside the guest with everything it started (its job object, MC-1547).' : 'killed inside the guest by its PID (taskkill /T /F).') : `not confirmed killed${r.killWhy ? ` (${r.killWhy})` : ''}; vm_stop is the fallback.`}`
             : `Exit code ${exit === null ? 'unknown' : exit}.`,
         `--- stdout${r.stdoutCut ? ` (first ${OUTPUT_CAP} bytes)` : ''} ---`, out(r.stdout),
