@@ -124,9 +124,11 @@ test('the host: a vm_sync whose manifest is over 4 MB goes in batches; the warm 
   await a.call('vm_acquire')
   await a.call('vm_start')
   await a.call('vm_run', { command: 'write state.txt warm' })
-  const r1 = await a.call('vm_sync', { build })
+  // MC-1553: a sync this big may outlast the reply bound: then vm_wait gives its result, as an agent would get it.
+  const settled = async r => { while (/still in progress/.test(r.text)) r = await a.call('vm_wait'); return r }
+  const r1 = await settled(await a.call('vm_sync', { build }))
   assert.match(r1.text, /18000 file\(s\) copied/, r1.text)
-  const r2 = await a.call('vm_sync')
+  const r2 = await settled(await a.call('vm_sync'))
   assert.match(r2.text, /0 file\(s\) copied .*0 removed, 18000 unchanged/, r2.text)
   assert.doesNotMatch(host.log(), /over 4 MB/)
   assert.match((await a.call('vm_status')).text, /leased, running.*\(yours\)/, 'the same lease, still running')

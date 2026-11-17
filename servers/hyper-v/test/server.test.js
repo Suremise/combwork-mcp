@@ -28,7 +28,7 @@ test('tools, instructions and the kill switch', async t => {
   assert.strictEqual(init.result.serverInfo.name, 'hyper-v')
   assert.match(init.result.instructions, /turned off/)
   const list = await off.request('tools/list')
-  assert.deepStrictEqual(list.result.tools.map(x => x.name), ['vm_acquire', 'vm_start', 'vm_renew', 'vm_sync', 'vm_reset', 'vm_run', 'vm_read_out', 'vm_stop', 'vm_checkpoint', 'vm_restore', 'vm_release', 'vm_status', 'pool_plan', 'pool_refresh', 'pool_checkpoint', 'pool_create', 'pool_resize', 'pool_remove', 'pool_status'])
+  assert.deepStrictEqual(list.result.tools.map(x => x.name), ['vm_acquire', 'vm_start', 'vm_renew', 'vm_sync', 'vm_reset', 'vm_run', 'vm_read_out', 'vm_stop', 'vm_checkpoint', 'vm_restore', 'vm_release', 'vm_status', 'vm_wait', 'pool_plan', 'pool_refresh', 'pool_checkpoint', 'pool_create', 'pool_resize', 'pool_remove', 'pool_status'])
   assert.match((await off.call('vm_acquire')).text, /turned off: set HYPERV_MCP_ENABLED=1/)
   assert.match((await off.call('vm_status')).text, /Mode: direct.*TURNED OFF/)
   assert.ok(fs.existsSync(sc.stateDir))
@@ -172,4 +172,83 @@ test('a helper from before admin-set build folders: none are used, and status sa
   // Nor the warm-session operations: the tools say to update it, and status names the protocol gap.
   assert.match((await s.call('vm_status')).text, /The helper speaks hyperv-mcp\/1, this server hyperv-mcp\/3: run setup again/)
   assert.match((await s.call('vm_renew', { minutes: 10 })).text, /predates warm sessions .*run setup again/)
+})
+
+// MC-1553: a slow tool replies within HYPERV_MCP_REPLY_MS (1 s here) instead of outlasting the client's patience: it
+// says it's still in progress and that vm_wait is the next call, and vm_wait gives the result once it settles.
+test('MC-1553: a slow vm_start says "still in progress" and vm_wait gives its result; only vm_wait and status run beside it', async t => {
+  const { sc, env } = await pooled('slow-start')
+  const a = server({ ...env, HYPERV_MCP_REPLY_MS: '1000' }, { roots: [sc.builds] })
+  t.after(() => a.close())
+  assert.match((await a.call('vm_wait')).text, /Nothing is in progress in this session/)
+  assert.match((await a.call('vm_acquire')).text, /Leased hvmcp-/)
+  // A sign-in that takes its time: the guest's readiness check is held until the test opens the gate.
+  const gate = path.join(sc.dir, 'ready-gate')
+  sc.patchStub(s => { s.readyGate = gate })
+  const t0 = Date.now()
+  const start = await a.call('vm_start')
+  assert.ok(Date.now() - t0 < 5000, `it replied within its bound, not when the start ended (${Date.now() - t0} ms)`)
+  assert.match(start.text, /vm_start is still in progress after \d+ s: it goes on in this session\. Call vm_wait now/)
+  assert.match(start.text, /Don't end your turn while it's in progress: nothing will wake you/)
+  assert.ok(!start.isError, 'not an error: the start goes on')
+  assert.match((await a.call('vm_run', { command: 'echo hi' })).text, /vm_start is still in progress in this session: call vm_wait for its result before vm_run/)
+  assert.match((await a.call('vm_status')).text, /Mode: direct/, 'status runs beside it')
+  assert.match((await a.call('vm_wait')).text, /vm_start is still in progress/, 'vm_wait says so again while it is held')
+  fs.writeFileSync(gate, 'open')
+  let done
+  for (let i = 0; i < 30 && !/finished/.test((done = await a.call('vm_wait')).text); i++) { /* each call waits up to 1 s */ }
+  assert.match(done.text, /^vm_start finished \(\d+ s after it was called\):\nStarted hvmcp-/)
+  assert.match((await a.call('vm_wait')).text, /Nothing is in progress/, 'collected once')
+  assert.match((await a.call('vm_run', { command: 'echo hi' })).text, /Exit code 0/, 'tools run again once it is collected')
+})
+
+test('MC-1553: a long vm_run replies "still in progress"; its result, if nobody waited, comes with the next call', async t => {
+  const { sc, env } = await pooled('slow-run')
+  const a = server({ ...env, HYPERV_MCP_REPLY_MS: '1000' }, { roots: [sc.builds] })
+  t.after(() => a.close())
+  await a.call('vm_acquire')
+  await a.call('vm_start')
+  // "sleep" never ends: its 3 s timeout ends it, after the 1 s reply bound.
+  const run = await a.call('vm_run', { command: 'sleep', timeoutSec: 3 })
+  assert.match(run.text, /vm_run is still in progress after \d+ s/)
+  let done
+  for (let i = 0; i < 30 && !/finished/.test((done = await a.call('vm_wait')).text); i++) { /* waiting */ }
+  assert.match(done.text, /^vm_run finished \(\d+ s after it was called\):\nTimed out after 3 s/)
+  assert.ok(done.isError, 'a timed-out run is still reported as one')
+  // Again, but nobody calls vm_wait: the result comes with the first call after it settled (round 2: observed by
+  // polling, no fixed sleep), its failure named, and exactly once.
+  const earlierOf = r => r.content.find(c => /^Your earlier vm_run finished/.test(c.text))?.text
+  const until = async call => { for (let i = 0; i < 120; i++) { const r = await call(); if (earlierOf(r)) return r; await new Promise(res => setTimeout(res, 250)) } throw new Error('the earlier result never came') }
+  assert.match((await a.call('vm_run', { command: 'sleep', timeoutSec: 2 })).text, /still in progress/)
+  const next = await until(() => a.call('vm_status'))
+  assert.match(earlierOf(next), /^Your earlier vm_run finished, and FAILED:\nTimed out after 2 s/)
+  assert.match(next.content.at(-1).text, /Mode: direct/, 'and the call\'s own reply')
+  assert.ok(!earlierOf(await a.call('vm_status')), 'given once')
+  assert.match((await a.call('vm_wait')).text, /Nothing is in progress/)
+  // The next call fails (round 2: its error path used to drop the result): the result still comes with it, once.
+  assert.match((await a.call('vm_run', { command: 'sleep', timeoutSec: 2 })).text, /still in progress/)
+  const failing = await until(() => a.call('pool_resize', { planId: 'p-0000000000000000' }))
+  assert.ok(failing.isError, 'the call itself failed')
+  assert.match(earlierOf(failing), /^Your earlier vm_run finished, and FAILED:\nTimed out after 2 s/)
+  assert.match(failing.content.at(-1).text, /p-0000000000000000/, 'with its own error')
+  assert.match((await a.call('vm_wait')).text, /Nothing is in progress/, 'delivered: not left for vm_wait')
+  assert.ok(!earlierOf(await a.call('vm_status')), 'nor given again')
+})
+
+test('MC-1553: vm_renew and vm_release run beside a slow vm_start; the release ends it, and its outcome comes with the next call', async t => {
+  const { sc, env } = await pooled('slow-release')
+  const a = server({ ...env, HYPERV_MCP_REPLY_MS: '1000' }, { roots: [sc.builds] })
+  t.after(() => a.close())
+  await a.call('vm_acquire')
+  const gate = path.join(sc.dir, 'ready-gate')
+  sc.patchStub(s => { s.readyGate = gate })
+  assert.match((await a.call('vm_start')).text, /vm_start is still in progress/)
+  assert.match((await a.call('vm_renew', { minutes: 30 })).text, /Renewed|deadline/i, 'renew runs beside it')
+  const rel = await a.call('vm_release')
+  assert.match(rel.text, /^Released/)
+  fs.writeFileSync(gate, 'open')
+  let w
+  for (let i = 0; i < 30 && /still in progress/.test((w = await a.call('vm_wait')).text); i++) { /* settling */ }
+  assert.match(w.text, /^vm_start finished/, 'its outcome is still given')
+  assert.doesNotMatch(w.text, /^vm_start finished[^\n]*\nStarted /, 'not a start: the lease ended under it')
 })

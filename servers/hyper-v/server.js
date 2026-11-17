@@ -281,7 +281,54 @@ const text = r => (typeof r === 'string' ? r : r?.text ?? '')
 // This session's last start (its options and build folder as given) and last synced build folder: vm_reset's and
 // vm_sync's defaults. A folder is checked again (buildFolder) every time it is used, never remembered as allowed.
 const session = { start: null, build: null }
-const skippedNote = list => list?.length ? `\nLinks skipped (never followed): ${list.slice(0, 20).join(', ')}${list.length > 20 ? ', …' : ''}` : ''
+
+/**
+ * MC-1553: a slow tool never outlasts the client's patience. An MCP client caps how long it waits for a tool call
+ * (some at 60 s by default), while vm_start's interactive sign-in can take up to 10 minutes and vm_run up to its
+ * timeoutSec (an hour). When the client gave up first, the operation went on here unseen, and the agent ended its turn
+ * "waiting for the VM", with nothing to wake it. Now each of these tools replies within REPLY_MS: with its result, or,
+ * if it is still going, by saying so and that vm_wait (which waits up to REPLY_MS again) is the next call to make. The
+ * operation itself, the lease and its deadline are unchanged; this server exiting still ends the lease.
+ */
+const REPLY_MS = Math.max(1000, Number(process.env.HYPERV_MCP_REPLY_MS) || 45_000)
+const BOUNDED = new Set(['vm_start', 'vm_reset', 'vm_restore', 'vm_checkpoint', 'vm_run', 'vm_sync'])
+// While one is in progress, only these run beside it: waiting, reading status, renewing the lease (a long run may
+// need it), and releasing it, which ends the operation as it always has (the helper restores the VM).
+const BESIDE = new Set(['vm_wait', 'vm_status', 'pool_status', 'vm_renew', 'vm_release'])
+let pending = null // { tool, started, result (once settled), promise }
+
+function begin(tool, run) {
+  const p = { tool, started: Date.now(), result: null }
+  p.promise = Promise.resolve().then(run).then(r => (typeof r === 'string' ? { text: r } : r), e => ({ text: e.message, isError: true }))
+  p.promise.then(r => { p.result = r })
+  pending = p
+  return waitOn(p)
+}
+
+/** Its result if it settles within REPLY_MS (and it's then no longer pending); otherwise a "still going" reply. */
+async function waitOn(p) {
+  const r = await Promise.race([p.promise, new Promise(res => setTimeout(() => res(null), REPLY_MS).unref?.())])
+  const secs = Math.round((Date.now() - p.started) / 1000)
+  if (r) {
+    if (pending === p) pending = null
+    return r
+  }
+  return {
+    text: `${p.tool} is still in progress after ${secs} s: it goes on in this session. Call vm_wait now, and again until it gives the result (each call waits up to ${Math.round(REPLY_MS / 1000)} s). Don't end your turn while it's in progress: nothing will wake you when it finishes, and its result comes only from vm_wait.`,
+    data: { pending: p.tool, seconds: secs }
+  }
+}
+
+async function vmWait() {
+  if (!pending) return { text: 'Nothing is in progress in this session: no vm_start, vm_reset, vm_restore, vm_checkpoint, vm_run or vm_sync is waiting for its result.' }
+  const p = pending
+  const r = await waitOn(p)
+  if (pending === p) return r // still going
+  const secs = Math.round((Date.now() - p.started) / 1000)
+  return { ...r, text: `${p.tool} finished (${secs} s after it was called):\n${r.text}` }
+}
+
+const skippedNote =list => list?.length ? `\nLinks skipped (never followed): ${list.slice(0, 20).join(', ')}${list.length > 20 ? ', …' : ''}` : ''
 
 async function vmStart({ build, network = false, reserveCpu = 0, interactive = false, checkpoint } = {}) {
   if (interactive) await needInteractive()
@@ -524,6 +571,12 @@ const tools = [
     open: true
   },
   {
+    name: 'vm_wait',
+    description: 'Wait for this session\'s vm_start, vm_reset, vm_restore, vm_checkpoint, vm_run or vm_sync that replied "still in progress", and get its result (MC-1553). Each call waits up to 45 s (HYPERV_MCP_REPLY_MS); call it again while it says still in progress. Ending your turn instead means nothing wakes you when the operation finishes.',
+    inputSchema: { type: 'object', properties: {} },
+    run: vmWait
+  },
+  {
     name: 'pool_plan',
     description: 'Plan a pool change from the host\'s CPUs, memory and disks and the policy: create, resize or remove. Only when the user asks for a pool change. Changes nothing: it returns the exact plan and the one line the USER runs in an admin PowerShell to approve it; never run that line yourself. The first create also needs an image (the Windows 11 Enterprise evaluation ISO, or a non-evaluation Windows 11 ISO the user supplies), checked before anything runs it. An evaluation image is activated online once as each VM is built (the plan says so), and lasts about 90 days from then.',
     inputSchema: {
@@ -583,6 +636,7 @@ const INSTRUCTIONS = [
   'Hyper-V tools give you a disposable Windows VM from a shared pool, or a Linux one (vm_acquire with os: "linux", or distro: "debian" | "ubuntu"): vm_acquire, vm_start (with your build folder), vm_run, vm_read_out, vm_stop, then always vm_release. On Linux the folders are /build and /out and commands are bash; everything else is the same.',
   'Every start restores the VM\'s clean checkpoint. For a work session, keep the VM running instead: vm_sync copies only changed files into C:\\build, vm_reset gives a clean VM again, vm_renew extends the lease (within the policy). Runs are in session 0 (no desktop) unless the VM was started with interactive (a guest account logged on): then vm_run with session: "interactive" runs in that desktop session, for programs that make their own desktops or windows. Several agents can each hold a VM at once; if none is free, wait and retry.',
   'Network is off unless you ask, and then only to an internal switch (no internet). Don\'t put real sign-ins, tokens or real CLIs in a VM.',
+  'A slow vm_start, vm_reset, vm_restore, vm_checkpoint, vm_run or vm_sync replies within about 45 s: if it says "still in progress", call vm_wait (again and again) until it gives the result. Never end your turn while one is in progress: nothing wakes you when it finishes.',
   'Write anything you want back to C:\\out inside, and read it with vm_read_out before vm_stop.',
   'pool_plan, pool_create, pool_resize and pool_remove change the pool: use them only when the user asks. The user approves each plan in an admin PowerShell; never run the approve line yourself.'
 ].join('\n')
@@ -610,16 +664,28 @@ async function handle(msg) {
     case 'tools/call': {
       const tool = tools.find(t => t.name === params?.name)
       if (!tool) return replyError(id, -32602, `Unknown tool: ${params?.name}`)
+      // MC-1553: one slow operation at a time in a session. A result that settled while nobody waited is taken here
+      // and given with this call's reply, whichever way the call ends (round 2: a failing call used to drop it), with
+      // its outcome named, so it's delivered exactly once. While it's still going, only BESIDE's tools run.
+      let earlier = null
+      let lost = null
+      const deliver = content => {
+        if (earlier) content.unshift({ type: 'text', text: `Your earlier ${earlier.tool} finished${earlier.result.isError ? ', and FAILED' : ''}:\n${earlier.result.text}` })
+        if (lost) content.unshift({ type: 'text', text: `Note: ${lost}` })
+        return content
+      }
       try {
         if (!tool.open && !ENABLED) throw new Error('The Hyper-V server is turned off: set HYPERV_MCP_ENABLED=1 in its config entry to use it.')
-        const lost = helper.takeLost?.()
-        const result = await tool.run(params?.arguments ?? {})
+        lost = helper.takeLost?.()
+        if (pending && tool.name !== 'vm_wait') {
+          if (pending.result) { earlier = pending; pending = null } else if (!BESIDE.has(tool.name)) throw new Error(`${pending.tool} is still in progress in this session: call vm_wait for its result before ${tool.name}.`)
+        }
+        const result = BOUNDED.has(tool.name) ? await begin(tool.name, () => tool.run(params?.arguments ?? {})) : await tool.run(params?.arguments ?? {})
         const r = typeof result === 'string' ? { text: result } : result
-        const content = r.content ?? [{ type: 'text', text: r.text }]
-        if (lost) content.unshift({ type: 'text', text: `Note: ${lost}` })
+        const content = deliver(r.content ?? [{ type: 'text', text: r.text }])
         return reply(id, { content, ...(r.isError ? { isError: true } : {}) })
       } catch (e) {
-        return reply(id, { content: [{ type: 'text', text: e.message }], isError: true })
+        return reply(id, { content: deliver([{ type: 'text', text: e.message }]), isError: true })
       }
     }
     default:

@@ -96,6 +96,8 @@ using the new server: the helper's protocol and features changed, and an older h
   missing, and adds nothing.
 - Then plan Linux VMs: `pool_plan` with `action: "resize"`, the new `vms` count and `image: { distro: "debian" }` or
   `{ distro: "ubuntu" }`. Approve it, then call `pool_resize`.
+- New in the server, with no rerun needed: slow tools reply within about 45 s, saying "still in progress … call
+  vm_wait now", and the new `vm_wait` gives their result (see "Slow operations", MC-1553).
 
 1. Turn on Hyper-V (see Requirements), and check `Get-Service vmms` says Running.
 2. In an **admin PowerShell**, run setup once (one line). Name a folder for the VMs' disks on a drive with room:
@@ -354,12 +356,28 @@ non-evaluation Windows 11 ISO (see "Windows licences").
 | `pool_checkpoint({ planId })` | Carries out an approved pool-checkpoint plan: publishes (or replaces, or removes) a named checkpoint of each VM a lease prepared. See "Pool checkpoints". |
 | `vm_release()` | Restores the VM (as `vm_stop`) and ends the lease. |
 | `vm_status()` | The pool, every lease, your VM, any pool job, the policy, and where builds may come from. Works with the server turned off. |
+| `vm_wait()` | Waits for this session's slow operation and gives its result (MC-1553, see "Slow operations"). Each call waits up to 45 s, `HYPERV_MCP_REPLY_MS`. |
 | `pool_plan({ action='create'\|'resize'\|'remove', vms?, cores?, memoryGB?, diskGB?, location?, network?, image?, activate? })` | Plans a pool change and changes nothing (see "Building the pool"). `image` is a new ISO to check (`{ iso \| download, edition? }`), or a verified image's SHA-256: build from it, or resize only its group (see "A pool from more than one image"). An evaluation image's plan always activates Windows online once per new VM; `activate: true` asks the same for your own copy (see "Windows licences"). |
 | `pool_create` / `pool_resize` / `pool_remove({ planId })` | Carries out an approved plan in the background. |
 | `pool_status()` | The pool, the image, and any job or image check in progress. |
 
 The server's MCP instructions tell agents to use the pool tools only when the user asks, and never to run the approve
 line themselves.
+
+### Slow operations
+
+Clients don't wait for ever for a tool call: some give up after 60 s by default. A start with an interactive sign-in
+can take up to 10 minutes, and a run lasts up to its `timeoutSec`. When the client gave up first, the operation went on
+unseen and the agent was left idle with nothing to wake it (MC-1553). So:
+- `vm_start`, `vm_reset`, `vm_restore`, `vm_checkpoint`, `vm_run` and `vm_sync` each reply within about 45 s
+  (`HYPERV_MCP_REPLY_MS`), with their result or "still in progress … call vm_wait now". Don't end your turn while one
+  is in progress.
+- `vm_wait` waits up to the same time again, and gives the result once the operation settles: "<tool> finished (N s
+  after it was called):" and its usual reply, an error included.
+- While one is in progress, only `vm_wait`, `vm_status`, `pool_status`, `vm_renew` and `vm_release` run in that
+  session. `vm_release` ends the operation, as it always has. Other tools say to call `vm_wait` first.
+- A result nobody waited for comes with the session's next call.
+- The operation, the lease and its deadline are unchanged, and the server exiting still ends the lease.
 
 ### Refreshing a VM's clean checkpoint in place
 
@@ -668,6 +686,7 @@ A pool can hold VMs built from several verified images, and so of several kinds:
 | `HYPERV_MCP_ALLOWED_ROOTS`, `HYPERV_MCP_ROOTS_FROM_CWD` | Where builds may come from, for clients that send no roots (see "Multiple projects"). |
 | `HYPERV_MCP_MAX_BUILD_MB` | Optional. A cap this server applies before streaming a build (default 2048). The policy's `maxBuildMB` is the helper's own cap. |
 | `HYPERV_MCP_PIPE` | Optional. The pipe's name (default `hyperv-mcp`). |
+| `HYPERV_MCP_REPLY_MS` | Optional. How long a slow tool, or `vm_wait`, waits before replying "still in progress" (default 45000, at least 1000; see "Slow operations"). Keep it under your MCP client's tool-call timeout. |
 
 Test-only:
 - `HYPERV_MCP_PS_STUB`, `HYPERV_MCP_STUB_STATE`: a fake `hv.ps1`;
