@@ -10,9 +10,9 @@
  * The outcome goes to <runDir>\watchdog.json ({ stopped, at, reason, attempts, error }) and watchdog.log; it exits 0
  * after a confirmed stop and 1 if it gave up (the Sandbox may still be running: the next server start retries).
  */
-const { readFileSync, writeFileSync, appendFileSync, renameSync } = require('fs')
+const { readFileSync, appendFileSync } = require('fs')
 const { join } = require('path')
-const { stopConfirmed } = require('./wsb')
+const { stopConfirmed, replaceFile } = require('./wsb')
 
 // MC-1538: tags the wsb calls this process makes (inherited by each one it spawns): the tests' wsb stub can then fail
 // only the watchdog's stops. wsb.exe ignores it.
@@ -27,10 +27,11 @@ let serverGone = false
 let stopping = false
 
 const log = (...a) => { try { appendFileSync(join(runDir, 'watchdog.log'), `[${new Date().toISOString()}] ${a.map(x => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ')}\n`) } catch { /* nothing to do */ } }
+// MC-1548: replaced whole, the rename retried while a reader has it open (a test or smoke run polling it). A report
+// that still can't be written is logged, never thrown: thrown inside stop()'s rounds it ended the watchdog before its
+// later rounds (an unhandled rejection), so it never stopped the Sandbox or rewrote its report.
 const report = r => {
-  const tmp = join(runDir, 'watchdog.json.tmp')
-  writeFileSync(tmp, JSON.stringify({ id: state.id, at: new Date().toISOString(), ...r }, null, 2))
-  renameSync(tmp, join(runDir, 'watchdog.json'))
+  try { replaceFile(join(runDir, 'watchdog.json'), JSON.stringify({ id: state.id, at: new Date().toISOString(), ...r }, null, 2)) } catch (e) { log('report not written:', e.code || e.message) }
 }
 const alive = pid => {
   try { process.kill(pid, 0); return true } catch (e) { return e.code === 'EPERM' }

@@ -11,7 +11,7 @@ const { spawn } = require('child_process')
 const fs = require('fs')
 const os = require('os')
 const { join } = require('path')
-const { LAUNCH_DIR, ID_RE, wsb, list, stopConfirmed, configXml, hostProblem, hint, connect, windowOp, SAC_QUERY, SAC_OFF, sacState } = require('./wsb')
+const { LAUNCH_DIR, ID_RE, wsb, list, stopConfirmed, configXml, hostProblem, hint, connect, windowOp, SAC_QUERY, SAC_OFF, sacState, replaceFile } = require('./wsb')
 const { segments, outRoot, readLive, pinRoot, readFile, listOut, globMatcher, parsePid, inside } = require('./confine')
 const { realDir, profileRefusal, rootsClient, allowedRoots } = require('./roots')
 
@@ -130,10 +130,9 @@ function saveState() {
   const s = { id: run.id, serverPid: process.pid, watchdogPid: run.watchdog?.pid, startedAt: run.startedAt, deadline: run.deadline, outDir: run.outDir, stopped: false, unconfirmed: !!run.unconfirmed }
   writeState(run.runDir, s)
 }
+// MC-1548: replaced whole, the rename retried while a reader (the watchdog starting, a test) has it open.
 function writeState(runDir, s) {
-  const tmp = join(runDir, 'state.json.tmp')
-  fs.writeFileSync(tmp, JSON.stringify(s, null, 2))
-  fs.renameSync(tmp, join(runDir, 'state.json'))
+  replaceFile(join(runDir, 'state.json'), JSON.stringify(s, null, 2))
 }
 const readJson = p => { try { return JSON.parse(fs.readFileSync(p, 'utf8')) } catch { return null } }
 
