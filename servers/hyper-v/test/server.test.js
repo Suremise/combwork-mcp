@@ -215,12 +215,24 @@ test('MC-1553: a long vm_run replies "still in progress"; its result, if nobody 
   for (let i = 0; i < 30 && !/finished/.test((done = await a.call('vm_wait')).text); i++) { /* waiting */ }
   assert.match(done.text, /^vm_run finished \(\d+ s after it was called\):\nTimed out after 3 s/)
   assert.ok(done.isError, 'a timed-out run is still reported as one')
-  // Again, but this time nobody calls vm_wait: the result is given with the next call.
+  // Again, but nobody calls vm_wait: the result comes with the first call after it settled (round 2: observed by
+  // polling, no fixed sleep), its failure named, and exactly once.
+  const earlierOf = r => r.content.find(c => /^Your earlier vm_run finished/.test(c.text))?.text
+  const until = async call => { for (let i = 0; i < 120; i++) { const r = await call(); if (earlierOf(r)) return r; await new Promise(res => setTimeout(res, 250)) } throw new Error('the earlier result never came') }
   assert.match((await a.call('vm_run', { command: 'sleep', timeoutSec: 2 })).text, /still in progress/)
-  await new Promise(r => setTimeout(r, 6000))
-  const next = await a.call('vm_status')
-  assert.match(next.content[0].text, /^Your earlier vm_run finished:\nTimed out after 2 s/)
+  const next = await until(() => a.call('vm_status'))
+  assert.match(earlierOf(next), /^Your earlier vm_run finished, and FAILED:\nTimed out after 2 s/)
+  assert.match(next.content.at(-1).text, /Mode: direct/, 'and the call\'s own reply')
+  assert.ok(!earlierOf(await a.call('vm_status')), 'given once')
   assert.match((await a.call('vm_wait')).text, /Nothing is in progress/)
+  // The next call fails (round 2: its error path used to drop the result): the result still comes with it, once.
+  assert.match((await a.call('vm_run', { command: 'sleep', timeoutSec: 2 })).text, /still in progress/)
+  const failing = await until(() => a.call('pool_resize', { planId: 'p-0000000000000000' }))
+  assert.ok(failing.isError, 'the call itself failed')
+  assert.match(earlierOf(failing), /^Your earlier vm_run finished, and FAILED:\nTimed out after 2 s/)
+  assert.match(failing.content.at(-1).text, /p-0000000000000000/, 'with its own error')
+  assert.match((await a.call('vm_wait')).text, /Nothing is in progress/, 'delivered: not left for vm_wait')
+  assert.ok(!earlierOf(await a.call('vm_status')), 'nor given again')
 })
 
 test('MC-1553: vm_renew and vm_release run beside a slow vm_start; the release ends it, and its outcome comes with the next call', async t => {

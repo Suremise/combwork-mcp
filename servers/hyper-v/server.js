@@ -664,23 +664,28 @@ async function handle(msg) {
     case 'tools/call': {
       const tool = tools.find(t => t.name === params?.name)
       if (!tool) return replyError(id, -32602, `Unknown tool: ${params?.name}`)
+      // MC-1553: one slow operation at a time in a session. A result that settled while nobody waited is taken here
+      // and given with this call's reply, whichever way the call ends (round 2: a failing call used to drop it), with
+      // its outcome named, so it's delivered exactly once. While it's still going, only BESIDE's tools run.
+      let earlier = null
+      let lost = null
+      const deliver = content => {
+        if (earlier) content.unshift({ type: 'text', text: `Your earlier ${earlier.tool} finished${earlier.result.isError ? ', and FAILED' : ''}:\n${earlier.result.text}` })
+        if (lost) content.unshift({ type: 'text', text: `Note: ${lost}` })
+        return content
+      }
       try {
         if (!tool.open && !ENABLED) throw new Error('The Hyper-V server is turned off: set HYPERV_MCP_ENABLED=1 in its config entry to use it.')
-        const lost = helper.takeLost?.()
-        // MC-1553: one slow operation at a time in a session. Its result, if it settled while nobody waited, is
-        // given with the next call; while it's still going, only vm_wait and the status tools run.
-        let earlier = null
+        lost = helper.takeLost?.()
         if (pending && tool.name !== 'vm_wait') {
-          if (pending.result) { earlier = `Your earlier ${pending.tool} finished:\n${pending.result.text}`; pending = null } else if (!BESIDE.has(tool.name)) throw new Error(`${pending.tool} is still in progress in this session: call vm_wait for its result before ${tool.name}.`)
+          if (pending.result) { earlier = pending; pending = null } else if (!BESIDE.has(tool.name)) throw new Error(`${pending.tool} is still in progress in this session: call vm_wait for its result before ${tool.name}.`)
         }
         const result = BOUNDED.has(tool.name) ? await begin(tool.name, () => tool.run(params?.arguments ?? {})) : await tool.run(params?.arguments ?? {})
         const r = typeof result === 'string' ? { text: result } : result
-        const content = r.content ?? [{ type: 'text', text: r.text }]
-        if (earlier) content.unshift({ type: 'text', text: earlier })
-        if (lost) content.unshift({ type: 'text', text: `Note: ${lost}` })
+        const content = deliver(r.content ?? [{ type: 'text', text: r.text }])
         return reply(id, { content, ...(r.isError ? { isError: true } : {}) })
       } catch (e) {
-        return reply(id, { content: [{ type: 'text', text: e.message }], isError: true })
+        return reply(id, { content: deliver([{ type: 'text', text: e.message }]), isError: true })
       }
     }
     default:
