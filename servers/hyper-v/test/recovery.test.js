@@ -6,7 +6,7 @@ const test = require('node:test')
 const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
-const { scratch, startHelper, approve, seedImage, waitFor, withPool } = require('./helpers')
+const { T, scratch, startHelper, approve, seedImage, waitFor, withPool } = require('./helpers')
 
 async function prepared(name) {
   const sc = scratch(name)
@@ -140,7 +140,7 @@ test('a host-mode create makes no switch; a foreign hvmcp-internal survives it, 
   const p = (await admin.request('pool_plan', { action: 'create', vms: 1, cores: 2, memoryGB: 4, network: 'host' })).data.planId
   approve(sc, p)
   await admin.request('pool_create', { planId: p })
-  await waitFor(async () => /Last pool job: create finished/.test((await admin.request('status')).text), 60_000, 'the create')
+  await waitFor(async () => /Last pool job: create finished/.test((await admin.request('status')).text), T.waitForMs, 'the create')
   assert.deepStrictEqual(sc.stub().switches, before, 'the create made no switch')
   const st = (await admin.request('status')).text
   assert.match(st, /network host \(approved in a plan/)

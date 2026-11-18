@@ -8,7 +8,7 @@ const test = require('node:test')
 const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
-const { scratch, withPool, waitFor } = require('./helpers')
+const { T, scratch, withPool, waitFor } = require('./helpers')
 const { server } = require('../client')
 
 async function lease(t, name, { policy, stub } = {}) {
@@ -151,7 +151,7 @@ async function releaseDuring(s, sc, call, knobs) {
   const entered = path.join(sc.dir, `entered-${Date.now()}`)
   sc.patchStub(st => Object.assign(st, knobs(entered)))
   const p = call()
-  await waitFor(async () => fs.existsSync(entered), 10_000, 'the call has entered Hyper-V')
+  await waitFor(async () => fs.existsSync(entered), T.waitForMs, 'the call has entered Hyper-V')
   const rel = await s.call('vm_release')
   return { r: await p, rel }
 }
@@ -316,7 +316,7 @@ test('job states (MC-1529), for real: idle only when every job is in a documente
   const file = path.join(sc.dir, 'jobs.ps1')
   const cases = [[], [7, 8, 10, 32768], [7, 2], [7, 3], [4], [5], [6], [9], [11], [12345]]
   fs.writeFileSync(file, `${JOBS_BLOCK}\n${cases.map(c => `'OUT:' + (ConvertTo-Json -InputObject (& $JobsIdle @(${c.join(',')})) -Compress)`).join('\n')}\n`)
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: ps51Env(), timeout: 60_000 })
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: ps51Env(), timeout: T.spawnMs })
   const out = r.stdout.split(/\r?\n/).filter(l => l.startsWith('OUT:')).map(l => JSON.parse(l.slice(4)).idle)
   assert.deepStrictEqual(out, [true, true, false, false, false, false, false, false, false, false], r.stdout + r.stderr)
 })

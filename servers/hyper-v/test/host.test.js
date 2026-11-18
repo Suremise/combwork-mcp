@@ -8,7 +8,7 @@ const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
 const { spawn, execFileSync } = require('child_process')
-const { scratch, withPool, waitFor } = require('./helpers')
+const { T, scratch, withPool, waitFor } = require('./helpers')
 const { server } = require('../client')
 
 const CSC = path.join(process.env.WINDIR || 'C:\\Windows', 'Microsoft.NET', 'Framework64', 'v4.0.30319', 'csc.exe')
@@ -31,14 +31,16 @@ async function startHost(sc, pipe) {
   fs.writeFileSync(path.join(dir, 'host.config'), [
     `node=${process.execPath}`, `helper=${path.join(__dirname, '..', 'helper', 'helper.js')}`, `stateDir=${sc.stateDir}`, `pipe=${pipe}`, `usersSid=S-1-5-32-545;${sid}`
   ].join('\r\n'))
-  // A freshly compiled exe can be held briefly by a virus scan: one retry, and the spawn error named if it persists.
+  // A freshly compiled exe can be held briefly by a virus scan: retried until it starts (MC-1558: a condition, not a
+  // fixed pause), within timing.json's hostSpawnRetryMs, then the spawn error named.
   let child
-  for (let attempt = 1; ; attempt++) {
+  const until = Date.now() + T.hostSpawnRetryMs
+  for (;;) {
     child = spawn(path.join(dir, 'HvMcpHost.exe'), ['--console'], { env: sc.env, stdio: 'ignore', windowsHide: true })
     const err = await new Promise(r => { child.once('spawn', () => r(null)); child.once('error', r) })
     if (!err) break
-    if (attempt === 2) throw new Error(`can't start the host: ${err.message}`)
-    await new Promise(r => setTimeout(r, 2000))
+    if (Date.now() > until) throw new Error(`can't start the host: ${err.message}`)
+    await new Promise(r => setTimeout(r, T.pollMs))
   }
   const exited = new Promise(r => child.on('exit', code => r(code)))
   const log = () => { try { return fs.readFileSync(path.join(sc.stateDir, 'host.log'), 'utf8') } catch { return '' } }
@@ -55,7 +57,7 @@ test('the host: a pipe client runs a VM; the helper killed mid-run takes its run
   const pipe = `hyperv-mcp-test-${process.pid}-a`
   const host = await startHost(sc, pipe)
   t.after(async () => { host.child.kill(); await host.exited })
-  await waitFor(() => pipeExists(pipe), 20_000, 'the pipe')
+  await waitFor(() => pipeExists(pipe), T.waitForMs, 'the pipe')
   const env = { ...sc.env, HYPERV_MCP_ENABLED: '1', HYPERV_MCP_PIPE: pipe }
   const a = server(env)
   t.after(() => a.close())
@@ -65,16 +67,16 @@ test('the host: a pipe client runs a VM; the helper killed mid-run takes its run
   const pidFile = path.join(sc.dir, 'hang.pid')
   // The run's child (in place of its PowerShell) records its PID, then blocks for 30 s before it would write the marker.
   const run = a.call('vm_run', { command: `hang ${marker} 30000 ${pidFile}`, timeoutSec: 120 })
-  const childPid = await waitFor(() => fs.existsSync(pidFile) && Number(fs.readFileSync(pidFile, 'utf8')), 10_000, 'the run\'s child to record its PID')
+  const childPid = await waitFor(() => fs.existsSync(pidFile) && Number(fs.readFileSync(pidFile, 'utf8')), T.waitForMs, 'the run\'s child to record its PID')
   assert.ok(alive(childPid), 'the run\'s child is running')
   const [first] = host.helperPids()
   process.kill(first)
   const r = await run
   assert.strictEqual(r.isError, true, r.text)
   assert.match(r.text, /connection to the helper service closed/)
-  await waitFor(() => !alive(childPid), 10_000, 'the killed run\'s child to die with the job (else it would run 30 s more)')
+  await waitFor(() => !alive(childPid), T.waitForMs, 'the killed run\'s child to die with the job (else it would run 30 s more)')
   assert.ok(!fs.existsSync(marker), 'it never finished')
-  await waitFor(() => (host.log().match(/helper ready/g) || []).length === 2, 20_000, 'the respawned helper to recover and reopen the pipe')
+  await waitFor(() => (host.log().match(/helper ready/g) || []).length === 2, T.waitForMs, 'the respawned helper to recover and reopen the pipe')
   assert.match(host.log(), /ending the helper: the helper exited or closed its output/)
   const vm = Object.values(sc.stub().vms)[0]
   assert.strictEqual(vm.state, 'Off', 'restored by the new helper\'s recovery')
@@ -91,7 +93,7 @@ test('the host: killing it ends its helper (the job closes); a pipe name already
   await h.stop()
   const pipe = `hyperv-mcp-test-${process.pid}-b`
   const host = await startHost(sc, pipe)
-  await waitFor(() => pipeExists(pipe), 20_000, 'the pipe')
+  await waitFor(() => pipeExists(pipe), T.waitForMs, 'the pipe')
   const second = await startHost(sc, pipe)
   assert.strictEqual(await second.exited, 3, 'a second host on the same pipe name refuses to start')
   assert.match(host.log(), /refusing to start: a pipe named .* already exists/)
@@ -99,7 +101,7 @@ test('the host: killing it ends its helper (the job closes); a pipe name already
   assert.ok(alive(helperPid))
   host.child.kill()
   await host.exited
-  await waitFor(() => !alive(helperPid), 10_000, 'the helper to die with the host\'s job')
+  await waitFor(() => !alive(helperPid), T.waitForMs, 'the helper to die with the host\'s job')
   assert.ok(!pipeExists(pipe))
 })
 
@@ -110,7 +112,7 @@ test('the host: a vm_sync whose manifest is over 4 MB goes in batches; the warm 
   const pipe = `hyperv-mcp-test-${process.pid}-d`
   const host = await startHost(sc, pipe)
   t.after(async () => { host.child.kill(); await host.exited })
-  await waitFor(() => pipeExists(pipe), 20_000, 'the pipe')
+  await waitFor(() => pipeExists(pipe), T.waitForMs, 'the pipe')
   // 18000 empty files with 157-character paths: about 4.6 MB of manifest JSON, under every build cap.
   const build = path.join(sc.builds, 'big')
   const dirs = Array.from({ length: 18 }, (_, i) => path.join(build, `dir-${String(i).padStart(2, '0')}-${'d'.repeat(80)}`))
@@ -142,7 +144,7 @@ test('the host: a client line can\'t forge framing, and an over-long line closes
   const pipe = `hyperv-mcp-test-${process.pid}-c`
   const host = await startHost(sc, pipe)
   t.after(async () => { host.child.kill(); await host.exited })
-  await waitFor(() => pipeExists(pipe), 20_000, 'the pipe')
+  await waitFor(() => pipeExists(pipe), T.waitForMs, 'the pipe')
   const env = { ...sc.env, HYPERV_MCP_ENABLED: '1', HYPERV_MCP_PIPE: pipe }
   const a = server(env)
   t.after(() => a.close())

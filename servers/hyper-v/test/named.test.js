@@ -7,7 +7,7 @@ const test = require('node:test')
 const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
-const { scratch, startHelper, withPool, approve, waitFor } = require('./helpers')
+const { T, scratch, startHelper, withPool, approve, waitFor } = require('./helpers')
 const { server } = require('../client')
 process.env.HYPERV_MCP_WAIT_MS = '200' // the in-process (bare) helper's bounded wait; started helpers get their own env
 const { Helper } = require('../helper/core')
@@ -73,9 +73,9 @@ test('named, wait: true: stands in line for that VM only; the release grants it;
   await acquire(a, { vm: v1 })
   await acquire(b, { vm: v2 })
   const pw = acquire(w, { wait: true }) // unnamed, first in line
-  await waitFor(async () => /Waiting in line: 1\. other/.test(await status(admin)), 5000, 'w in line')
+  await waitFor(async () => /Waiting in line: 1\. other/.test(await status(admin)), T.waitForMs, 'w in line')
   const pn = acquire(n, { vm: v1, wait: true })
-  await waitFor(async () => new RegExp(`Waiting in line: 1\\. other, .*; 2\\. other \\(for ${v1}\\)`).test(await status(admin)), 5000, 'n in line')
+  await waitFor(async () => new RegExp(`Waiting in line: 1\\. other, .*; 2\\. other \\(for ${v1}\\)`).test(await status(admin)), T.waitForMs, 'n in line')
   await a.request('release') // v1 is free: w was first, so w gets it
   assert.match((await pw).text, new RegExp(`^Leased ${v1} `))
   await w.request('release') // v1 free again: now the named waiter's
@@ -90,9 +90,9 @@ test('named, wait: true: blocked on its VM, it keeps its place while a later unn
   await acquire(a, { vm: v1 })
   await acquire(b, { vm: v2 })
   const pn = acquire(n, { vm: v1, wait: true })
-  await waitFor(async () => new RegExp(`1\\. other \\(for ${v1}\\)`).test(await status(admin)), 5000, 'n in line')
+  await waitFor(async () => new RegExp(`1\\. other \\(for ${v1}\\)`).test(await status(admin)), T.waitForMs, 'n in line')
   const pu = acquire(u, { wait: true })
-  await waitFor(async () => /2\. other, /.test(await status(admin)), 5000, 'u in line')
+  await waitFor(async () => /2\. other, /.test(await status(admin)), T.waitForMs, 'u in line')
   await b.request('release') // v2 free: not n's; u is served past it
   assert.match((await pu).text, new RegExp(`^Leased ${v2} `))
   const rn = await pn

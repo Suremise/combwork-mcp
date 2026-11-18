@@ -11,6 +11,17 @@ const crypto = require('crypto')
 const { spawn } = require('child_process')
 const { createInterface } = require('readline')
 const BASE = require('../../../test/clean-scratch').TARGETS['hyper-v'].base
+// MC-1558: every test timing, from test/timing.json (generous defaults; 'narrow' values asked for by name). T.waitForMs,
+// T.spawnMs, ... are its waits; T.bounds its deliberate narrow results.
+const TIMING = JSON.parse(fs.readFileSync(path.join(__dirname, 'timing.json'), 'utf8'))
+const T = { ...TIMING.waits, bounds: TIMING.bounds, env: TIMING.env, narrow: TIMING.narrow }
+/** The helper's test-only timing env: the defaults, with 'narrow' (all) or the named narrow values over them. */
+function timingEnv(timing) {
+  const env = { ...TIMING.env }
+  const names = timing === 'narrow' ? Object.keys(TIMING.narrow) : Array.isArray(timing) ? timing : []
+  for (const n of names) { if (!(n in TIMING.narrow)) throw new Error(`timing.json has no narrow ${n}`); env[n] = TIMING.narrow[n] }
+  return Object.fromEntries(Object.entries(env).map(([k, v]) => [k, String(v)]))
+}
 
 const STUB = path.join(__dirname, 'stub-hv.js')
 const SSH_STUB = path.join(__dirname, 'stub-guest.js') // MC-1501: a Linux guest, in place of ssh.exe
@@ -42,7 +53,7 @@ let seq = 0
 const HOST_SWITCH_ID = '5e7a1c2b-0d3e-4f5a-8b6c-7d8e9f0a1b2c'
 const HOST_NETWORK = { switchId: HOST_SWITCH_ID, switchName: 'hvmcp-host', subnet: '10.137.42.0/24', hostAddress: '10.137.42.1' }
 /** A fresh folder: state (policy.json), disks, a fake profile and builds, and the stub's state. */
-function scratch(name, { policy = {}, stub = {} } = {}) {
+function scratch(name, { policy = {}, stub = {}, timing = null } = {}) {
   const dir = path.join(BASE, `${process.pid}-${++seq}-${name}`)
   fs.rmSync(dir, { recursive: true, force: true })
   for (const d of ['state/approvals', 'disks', 'home/.ssh', 'builds/app/sub', 'outside']) fs.mkdirSync(path.join(dir, d), { recursive: true })
@@ -68,24 +79,8 @@ function scratch(name, { policy = {}, stub = {} } = {}) {
       HYPERV_MCP_STATE_DIR: path.join(dir, 'state'),
       HYPERV_MCP_PS_STUB: STUB,
       HYPERV_MCP_SSH_STUB: SSH_STUB,
-      HYPERV_MCP_LINUX_READY_MS: '3000',
-      HYPERV_MCP_LINUX_CLOUD_INIT_MS: '3000',
-      HYPERV_MCP_LINUX_ATTEMPT_MS: '1500',
       HYPERV_MCP_STUB_STATE: state,
-      HYPERV_MCP_POLL_MS: '10',
-      HYPERV_MCP_READY_WAIT_MS: '3000',
-      HYPERV_MCP_LOGON_WAIT_MS: '3000',
-      HYPERV_MCP_PROVISION_POLL_MS: '10',
-      HYPERV_MCP_PROVISION_QUIET_MS: '40',
-      HYPERV_MCP_PROVISION_WAIT_MS: '15000',
-      HYPERV_MCP_BUILD_LOGON_WAIT_MS: '3000',
-      HYPERV_MCP_LOGON_SNAPSHOT_MS: '2000',
-      HYPERV_MCP_FIRST_LOGON_SIGN_MS: '1000',
-      HYPERV_MCP_INSTALL_WAIT_MS: '3000',
-      HYPERV_MCP_LOGON_STABLE_MS: '30',
-      HYPERV_MCP_RETRY_MS: '600000',
-      HYPERV_MCP_NET_STABLE_MS: '30',
-      HYPERV_MCP_NET_WAIT_MS: '3000',
+      ...timingEnv(timing),
       HYPERV_MCP_CRASH_AT: ''
     },
     stub: () => JSON.parse(readState(state)),
@@ -176,13 +171,13 @@ function seedImage(sc) {
 }
 
 /** Polls fn until truthy. */
-async function waitFor(fn, ms = 15_000, what = 'condition') {
+async function waitFor(fn, ms = T.waitForMs, what = 'condition') {
   const t0 = Date.now()
   for (;;) {
     const v = await fn()
     if (v) return v
     if (Date.now() - t0 > ms) throw new Error(`timed out waiting for ${what}`)
-    await new Promise(r => setTimeout(r, 25))
+    await new Promise(r => setTimeout(r, T.pollMs))
   }
 }
 
@@ -199,8 +194,8 @@ async function withPool(sc, n = 2, planArgs = {}) {
   const plan = await admin.request('pool_plan', { action: 'create', vms: n, cores: 2, memoryGB: 4, ...planArgs })
   approve(sc, plan.data.planId)
   await admin.request('pool_create', { planId: plan.data.planId })
-  await waitFor(async () => /Last pool job: create finished/.test((await admin.request('status')).text), 60_000, 'the pool job')
+  await waitFor(async () => /Last pool job: create finished/.test((await admin.request('status')).text), T.poolJobMs, 'the pool job')
   return { h, admin }
 }
 
-module.exports = { HOST_NETWORK, scratch, startHelper, approve, seedImage, waitFor, withPool, STUB, SSH_STUB, HELPER, SERVER, BASE }
+module.exports = { T, timingEnv, HOST_NETWORK, scratch, startHelper, approve, seedImage, waitFor, withPool, STUB, SSH_STUB, HELPER, SERVER, BASE }

@@ -9,7 +9,7 @@ const path = require('path')
 const { execFileSync } = require('child_process')
 const net = require('net')
 const readline = require('readline')
-const { scratch, withPool, startHelper, seedImage } = require('./helpers')
+const { T, scratch, withPool, startHelper, seedImage } = require('./helpers')
 const { server } = require('../client')
 
 async function pooled(name, n = 1) {
@@ -193,7 +193,7 @@ test('MC-1553: a slow vm_start says "still in progress" and vm_wait gives its re
   sc.patchStub(s => { s.readyGate = gate })
   const t0 = Date.now()
   const start = await a.call('vm_start')
-  assert.ok(Date.now() - t0 < 5000, `it replied within its bound, not when the start ended (${Date.now() - t0} ms)`)
+  assert.ok(Date.now() - t0 < T.bounds.replyBoundMs, `it replied within its bound, not when the start ended (${Date.now() - t0} ms)`)
   assert.match(start.text, /vm_start is still in progress after \d+ s: it goes on in this session\. Call vm_wait now/)
   assert.match(start.text, /Don't end your turn while it's in progress: nothing will wake you/)
   assert.ok(!start.isError, 'not an error: the start goes on')

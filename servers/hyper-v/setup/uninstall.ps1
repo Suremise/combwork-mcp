@@ -102,7 +102,7 @@ $ops = @{
   ServiceState = { if ($Mode -eq 'Direct') { 'missing' } else { Get-ServiceState } }
   StopService = {
     Stop-Service $svc -Force
-    (Get-Service $svc).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(60))
+    (Get-Service $svc).WaitForStatus('Stopped', [TimeSpan]::FromMinutes(5)) # MC-1558: the helper may be mid-operation
     Step "Service $svc stopped."
   }
   DeleteService = {

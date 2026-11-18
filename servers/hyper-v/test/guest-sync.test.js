@@ -7,7 +7,7 @@ const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
 const { spawnSync } = require('child_process')
-const { scratch } = require('./helpers')
+const { T, scratch } = require('./helpers')
 const { ps51Env } = require('../helper/hv')
 
 const windows = process.platform === 'win32'
@@ -17,7 +17,7 @@ const RUNNER = '$j = [Console]::In.ReadToEnd() | ConvertFrom-Json; try { $r = & 
 /** Runs guest-sync.ps1 with input j; resolves { ok, result } or { ok: false, error }. */
 function gs(j) {
   const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', RUNNER], {
-    input: JSON.stringify(j), encoding: 'utf8', env: { ...ps51Env(), GS_SCRIPT: SCRIPT }, windowsHide: true, timeout: 60_000
+    input: JSON.stringify(j), encoding: 'utf8', env: { ...ps51Env(), GS_SCRIPT: SCRIPT }, windowsHide: true, timeout: T.spawnMs
   })
   const line = String(r.stdout).split(/\r?\n/).find(l => l.startsWith('OK:') || l.startsWith('ERR:'))
   if (!line) throw new Error(`no answer from guest-sync.ps1 (exit ${r.status}): ${r.stdout}\n${r.stderr}`)

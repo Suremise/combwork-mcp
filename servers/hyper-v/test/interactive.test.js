@@ -8,13 +8,13 @@ const test = require('node:test')
 const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
-const { scratch, withPool, waitFor } = require('./helpers')
+const { T, scratch, withPool, waitFor } = require('./helpers')
 const { server } = require('../client')
 
 const vmOf = (sc, name) => Object.values(sc.stub().vms).find(v => v.name === name)
 
-async function session(t, name) {
-  const sc = scratch(name)
+async function session(t, name, timing = null) {
+  const sc = scratch(name, { timing })
   const { h } = await withPool(sc, 1)
   await h.stop()
   const env = { ...sc.env, HYPERV_MCP_ENABLED: '1', HYPERV_MCP_MODE: 'direct', USERPROFILE: path.join(sc.dir, 'home') }
@@ -168,7 +168,7 @@ test('a run queued behind an interactive run whose restore fails never reaches t
   const gate = path.join(sc.dir, 'run.gate')
   sc.patchStub(st => { st.interactiveGate = gate; st.interactiveReached = reached })
   const first = helper.request('a', 'run', { command: 'sleep', as: 'user', session: 'interactive', timeoutSec: 1 })
-  await waitFor(() => fs.existsSync(reached), 15_000, 'the interactive run to hold the lock')
+  await waitFor(() => fs.existsSync(reached), T.waitForMs, 'the interactive run to hold the lock')
   // Queued behind it: it passes the check before the lock, as the VM is still running now.
   const second = helper.request('a', 'run', { command: 'echo queued' }).then(r => ({ r }), e => ({ e }))
   sc.patchStub(st => { st.fail = { restore: 1 }; delete st.interactiveGate })
@@ -278,7 +278,7 @@ test('Userinit (MC-1518), for real: Windows\' own list, any case, with or withou
   const file = path.join(sc.dir, 'userinit.ps1')
   const lines = cases.map(([v]) => `try { $r = & $UserinitValue ${v === null ? '$null' : `'${v.replace(/'/g, "''")}'`}; 'OUT:' + $r } catch { 'OUT:REFUSED ' + $_.Exception.Message }`)
   fs.writeFileSync(file, `${USERINIT_BLOCK}\n${lines.join('\n')}\n`)
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: ps51Env(), timeout: 60_000 })
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: ps51Env(), timeout: T.spawnMs })
   const out = r.stdout.split(/\r?\n/).filter(l => l.startsWith('OUT:')).map(l => l.slice(4))
   assert.strictEqual(out.length, cases.length, r.stdout + r.stderr)
   cases.forEach(([v, want], i) => {
@@ -296,8 +296,9 @@ test('Userinit (MC-1518), for real: Windows\' own list, any case, with or withou
 })
 
 /** A session with a 1-VM pool, its stub set for this logon case before the start. */
+// The logon cases check what happens when a logon's waits run out: timing.json's narrow values (MC-1558).
 async function logonCase(t, name, stub) {
-  const { sc, s } = await session(t, name)
+  const { sc, s } = await session(t, name, 'narrow')
   sc.patchStub(st => Object.assign(st, stub))
   return { sc, s, r: await s.call('vm_start', { interactive: 'admin' }) }
 }
@@ -364,7 +365,7 @@ $events = @(1..15 | ForEach-Object { [pscustomobject]@{ Id = 4600 + $_; TimeCrea
 'OUT:' + (ConvertTo-Json -InputObject @(& $DiagEvents $events $boot 12) -Compress)
 'OUT:' + (ConvertTo-Json -InputObject @(& $DiagEvents @() $boot 12) -Compress)
 `)
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: ps51Env(), timeout: 60_000 })
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: ps51Env(), timeout: T.spawnMs })
   const out = r.stdout.split(/\r?\n/).filter(l => l.startsWith('OUT:')).map(l => JSON.parse(l.slice(4)))
   assert.strictEqual(out.length, 2, r.stdout + r.stderr)
   assert.strictEqual(out[0].length, 12)
@@ -417,7 +418,7 @@ foreach ($c in @($full, $pending, $later, $other, $left, $sameSecond, $twice)) {
 'OUT:' + (ConvertTo-Json -InputObject (& $AppReadinessState @() $me) -Compress)
 'OUT:' + (ConvertTo-Json -InputObject (& $AppReadinessState $null $me) -Compress)
 `)
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: ps51Env(), timeout: 60_000 })
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: ps51Env(), timeout: T.spawnMs })
   const out = r.stdout.split(/\r?\n/).filter(l => l.startsWith('OUT:')).map(l => JSON.parse(l.slice(4)))
   assert.strictEqual(out.length, 9, r.stdout + r.stderr)
   const [full, pending, later, other, left, same, twice, empty, unread] = out
@@ -459,7 +460,7 @@ $events = @(
 'OUT:' + (ConvertTo-Json -InputObject (& $LogonCounts @() $boot 'hvadmin') -Compress)
 'OUT:' + (ConvertTo-Json -InputObject (& $LogonCounts $null $boot 'hvadmin') -Compress)
 `)
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: ps51Env(), timeout: 60_000 })
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: ps51Env(), timeout: T.spawnMs })
   const out = r.stdout.split(/\r?\n/).filter(l => l.startsWith('OUT:')).map(l => JSON.parse(l.slice(4)))
   assert.strictEqual(out.length, 5, r.stdout + r.stderr)
   const pick = o => ({ logons: o.logons, logoffs: o.logoffs })
@@ -485,7 +486,7 @@ test('AppContainer counts (MC-1520), for real: absent is 0, unloaded or failed i
   const sc = scratch('profile-counts')
   const file = path.join(sc.dir, 'counts.ps1')
   fs.writeFileSync(file, `${COUNTS_BLOCK}\n${cases.map(([r]) => `'OUT:' + (ConvertTo-Json -InputObject (& $ProfileCounts ${r}) -Compress)`).join('\n')}\n`)
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: ps51Env(), timeout: 60_000 })
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: ps51Env(), timeout: T.spawnMs })
   const out = r.stdout.split(/\r?\n/).filter(l => l.startsWith('OUT:')).map(l => JSON.parse(l.slice(4)))
   assert.strictEqual(out.length, cases.length, r.stdout + r.stderr)
   cases.forEach(([, want], i) => assert.deepStrictEqual({ mappings: out[i].mappings, packagesDirs: out[i].packagesDirs }, want, `case ${i + 1}`))

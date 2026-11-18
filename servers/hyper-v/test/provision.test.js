@@ -4,14 +4,15 @@
 // so every logon sees Windows' own Userinit and the intended UAC state, and the clean checkpoint keeps none of it.
 const test = require('node:test')
 const assert = require('assert')
-const { scratch, startHelper, approve, seedImage, waitFor } = require('./helpers')
+const { T, scratch, startHelper, approve, seedImage, waitFor } = require('./helpers')
 
 const vms = sc => Object.values(sc.stub().vms)
 const status = async c => (await c.request('status')).text
 
 /** A one-VM create with the stub set as given; resolves the plan and the job's line. */
+// Builds whose provisioning waits run out on purpose: timing.json's narrow values (MC-1558).
 async function build(t, name, stub = {}) {
-  const sc = scratch(name, { stub })
+  const sc = scratch(name, { stub, timing: 'narrow' })
   let h = await startHelper(sc)
   await h.stop()
   seedImage(sc)
@@ -21,7 +22,7 @@ async function build(t, name, stub = {}) {
   const plan = await admin.request('pool_plan', { action: 'create', vms: 1, cores: 2, memoryGB: 4 })
   approve(sc, plan.data.planId)
   await admin.request('pool_create', { planId: plan.data.planId })
-  await waitFor(async () => /Last pool job: create (finished|FAILED)/.test(await status(admin)), 60_000, 'the pool job')
+  await waitFor(async () => /Last pool job: create (finished|FAILED)/.test(await status(admin)), T.waitForMs, 'the pool job')
   const line = (await status(admin)).split('\n').find(l => l.startsWith('Last pool job'))
   return { sc, plan, line }
 }

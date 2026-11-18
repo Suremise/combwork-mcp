@@ -11,7 +11,7 @@ const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
 const inventory = require('../helper/inventory')
-const { scratch, withPool, approve, waitFor } = require('./helpers')
+const { T, scratch, withPool, approve, waitFor } = require('./helpers')
 const windows = process.platform === 'win32'
 
 const FACTS = {
@@ -54,13 +54,13 @@ test('the helper keeps inventory.txt current: at start, after a pool change, wit
   const plan = await admin.request('pool_plan', { action: 'resize', vms: 2, cores: 2, memoryGB: 4 })
   approve(sc, plan.data.planId)
   await admin.request('pool_resize', { planId: plan.data.planId })
-  await waitFor(async () => /Last pool job: resize finished/.test((await admin.request('status')).text), 60_000, 'the resize')
+  await waitFor(async () => /Last pool job: resize finished/.test((await admin.request('status')).text), T.waitForMs, 'the resize')
   text = fs.readFileSync(file, 'utf8')
   assert.match(text, /VMs \(2\):/)
   const rm = await admin.request('pool_plan', { action: 'remove' })
   approve(sc, rm.data.planId)
   await admin.request('pool_remove', { planId: rm.data.planId })
-  await waitFor(async () => /Last pool job: remove finished/.test((await admin.request('status')).text), 60_000, 'the remove')
+  await waitFor(async () => /Last pool job: remove finished/.test((await admin.request('status')).text), T.waitForMs, 'the remove')
   assert.match(fs.readFileSync(file, 'utf8'), /VMs \(0\):\r\n- none/)
 })
 
@@ -79,11 +79,11 @@ test('setup installs the uninstaller (the retiring set) and writes the Installed
   assert.deepStrictEqual(sourced, ['acl.ps1', 'appsentry.ps1', 'teardown.ps1'])
 })
 
-test('the Installed apps entry, run for real (5.1, non-elevated, scratch Program Files and HKCU): each interrupted state finished, refusals intact', { skip: !windows, timeout: 600_000 }, () => {
+test('the Installed apps entry, run for real (5.1, non-elevated, scratch Program Files and HKCU): each interrupted state finished, refusals intact', { skip: !windows, timeout: T.longTestMs }, () => {
   const { spawnSync } = require('child_process')
   const { ps51Env } = require('../helper/hv')
   const sc = scratch('appsentry')
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, 'appsentry-check.ps1'), '-Dir', sc.dir], { encoding: 'utf8', env: ps51Env(), timeout: 590_000, cwd: sc.dir })
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, 'appsentry-check.ps1'), '-Dir', sc.dir], { encoding: 'utf8', env: ps51Env(), timeout: T.longScriptMs, cwd: sc.dir })
   const line = (r.stdout || '').trim().split(/\r?\n/).pop()
   let a
   try { a = JSON.parse(line) } catch { assert.fail(`appsentry-check.ps1 failed: ${r.stdout}\n${r.stderr}`) }

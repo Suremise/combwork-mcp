@@ -9,7 +9,7 @@ const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
 const { spawnSync } = require('child_process')
-const { scratch, startHelper, withPool, approve, waitFor } = require('./helpers')
+const { T, scratch, startHelper, withPool, approve, waitFor } = require('./helpers')
 const { server } = require('../client')
 const { ps51Env } = require('../helper/hv')
 
@@ -61,9 +61,9 @@ test('the queue: first come first served; a VM freed by a release goes to the fi
   const [a, b, c] = [h.conn(1), h.conn(2), h.conn(3)]
   await acquire(a, {})
   const pb = acquire(b, { wait: true })
-  await waitFor(async () => /Waiting in line: 1\. other/.test(await status(a)), 5000, 'b in line')
+  await waitFor(async () => /Waiting in line: 1\. other/.test(await status(a)), T.waitForMs, 'b in line')
   const pc = acquire(c, { wait: true })
-  await waitFor(async () => /Waiting in line: 1\. other.*; 2\. other/.test(await status(a)), 5000, 'c in line')
+  await waitFor(async () => /Waiting in line: 1\. other.*; 2\. other/.test(await status(a)), T.waitForMs, 'c in line')
   await a.request('release')
   assert.match((await pb).text, /^Leased /)
   const rc = await pc // c waits out its bound: still in line
@@ -79,9 +79,9 @@ test('a waiter its project\'s cap blocks keeps its place; a later waiter of anot
   await acquire(c1, { roots: [cli] })
   await acquire(o1, {})
   const p2 = acquire(c2, { roots: [cli], wait: true })
-  await waitFor(async () => /Waiting in line: 1\. cli/.test(await status(c1)), 5000, 'c2 in line')
+  await waitFor(async () => /Waiting in line: 1\. cli/.test(await status(c1)), T.waitForMs, 'c2 in line')
   const po = acquire(o2, { wait: true })
-  await waitFor(async () => /2\. other/.test(await status(c1)), 5000, 'o2 in line')
+  await waitFor(async () => /2\. other/.test(await status(c1)), T.waitForMs, 'o2 in line')
   await o1.request('release')
   assert.match((await po).text, /^Leased /, 'other was served past the capped cli waiter')
   const r2 = await p2
@@ -95,10 +95,10 @@ test('an abandoned wait is never given a VM: it goes to a caller who is there, a
   await acquire(a, {})
   assert.match((await acquire(b, { wait: true })).text, /^Still waiting/) // b's client stops calling
   await a.request('release')
-  await waitFor(async () => /disk; free/.test(await status(a)), 10_000, 'the VM free again')
+  await waitFor(async () => /disk; free/.test(await status(a)), T.waitForMs, 'the VM free again')
   assert.match(await status(a), /Waiting in line: 1\. other, \d+ s \(between calls\)/, 'b kept its place but got nothing')
   assert.match((await acquire(c, {})).text, /^Leased /, 'the VM goes to a caller who is there')
-  await waitFor(async () => !/Waiting in line/.test(await status(a)), 10_000, 'b\'s place to expire')
+  await waitFor(async () => !/Waiting in line/.test(await status(a)), T.waitForMs, 'b\'s place to expire')
   await h.stop()
 })
 
@@ -113,7 +113,7 @@ test('a repeat call within the keep time keeps its place ahead of later waiters'
   // Both call again: b is still first. Release only once both are waiting right then (not between calls).
   const pb = acquire(b, { wait: true })
   const pc = acquire(c, { wait: true })
-  await waitFor(async () => { const st = await status(a); return /Waiting in line: 1\. other, \d+ s[^;]*; 2\. other, \d+ s/.test(st) && !/between calls/.test(st) }, 5000, 'b and c both waiting')
+  await waitFor(async () => { const st = await status(a); return /Waiting in line: 1\. other, \d+ s[^;]*; 2\. other, \d+ s/.test(st) && !/between calls/.test(st) }, T.waitForMs, 'b and c both waiting')
   await a.request('release')
   assert.match((await pb).text, /^Leased /)
   assert.match((await pc).text, /^Still waiting/)
@@ -125,11 +125,11 @@ test('a disconnect leaves the line, and a pool resize finishing serves the next 
   const [admin, a, b, c] = [h.conn(9), h.conn(1), h.conn(2), h.conn(3)]
   await acquire(a, {})
   void acquire(b, { wait: true })
-  await waitFor(async () => /Waiting in line: 1\. other/.test(await status(admin)), 5000, 'b in line')
+  await waitFor(async () => /Waiting in line: 1\. other/.test(await status(admin)), T.waitForMs, 'b in line')
   const pc = acquire(c, { wait: true })
-  await waitFor(async () => /2\. other/.test(await status(admin)), 5000, 'c in line')
+  await waitFor(async () => /2\. other/.test(await status(admin)), T.waitForMs, 'c in line')
   b.close()
-  await waitFor(async () => !/2\. other/.test(await status(admin)), 5000, 'b gone from the line')
+  await waitFor(async () => !/2\. other/.test(await status(admin)), T.waitForMs, 'b gone from the line')
   // A second VM, by an approved resize: when its job ends, c (now first) gets it.
   const plan = await admin.request('pool_plan', { action: 'resize', vms: 2 })
   approve(sc, plan.data.planId)
@@ -183,7 +183,7 @@ test('one connection\'s overlapping vm_acquire calls (direct mode): the newer su
   helper.connect('b', 2)
   await helper.request('a', 'acquire', { minutes: 30 })
   const first = helper.request('b', 'acquire', { minutes: 30, wait: true }).then(r => ({ r }), e => ({ e }))
-  await waitFor(() => helper.queue.length === 1 && helper.queue[0].pending, 5000, 'b waiting')
+  await waitFor(() => helper.queue.length === 1 && helper.queue[0].pending, T.waitForMs, 'b waiting')
   const second = helper.request('b', 'acquire', { minutes: 30, wait: true })
   const f = await first
   assert.match(f.e?.message || '', /Superseded by a newer vm_acquire from this connection/)
@@ -247,7 +247,7 @@ test('the projects feature: this helper still reports hyperv-mcp/3 (so hyper-v 1
   const helper = await startHelper(sc)
   const v = await helper.conn(1).request('version')
   assert.strictEqual(v.data.protocol, 'hyperv-mcp/3')
-  assert.deepStrictEqual(v.data.features, ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean', 'linux', 'debug-keep'])
+  assert.deepStrictEqual(v.data.features, ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean', 'linux', 'debug-keep', 'timing'])
   await helper.stop()
   const shim = path.join(sc.dir, 'older-core.js')
   fs.writeFileSync(shim, `const m = require(${JSON.stringify(path.join(__dirname, '..', 'helper', 'core.js'))})

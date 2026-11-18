@@ -8,7 +8,7 @@ const test = require('node:test')
 const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
-const { scratch, startHelper, approve, seedImage, waitFor, withPool } = require('./helpers')
+const { T, scratch, startHelper, approve, seedImage, waitFor, withPool } = require('./helpers')
 
 const KEY = 'ABCDE-FGHIJ-KLMNO-PQRST-UVWXY'
 const vms = sc => Object.values(sc.stub().vms)
@@ -41,7 +41,7 @@ async function create(sc, admin, args) {
   const plan = await admin.request('pool_plan', { action: 'create', vms: 1, cores: 2, memoryGB: 4, ...args })
   approve(sc, plan.data.planId)
   await admin.request('pool_create', { planId: plan.data.planId })
-  await waitFor(async () => /Last pool job: create (finished|FAILED)/.test(await status(admin)), 60_000, 'the pool job')
+  await waitFor(async () => /Last pool job: create (finished|FAILED)/.test(await status(admin)), T.waitForMs, 'the pool job')
   return { plan, line: (await status(admin)).split('\n').find(l => l.startsWith('Last pool job')) }
 }
 
@@ -116,7 +116,7 @@ test('a build left online is also retried every few minutes, without a restart',
   const { h, admin } = await bare(sc, { extraEnv: { HYPERV_MCP_RETRY_MS: '300' } })
   t.after(() => h.stop())
   await create(sc, admin, {})
-  await waitFor(async () => !vms(sc).length && !/may still be online/.test(await status(admin)), 8000, 'the retry')
+  await waitFor(async () => !vms(sc).length && !/may still be online/.test(await status(admin)), T.waitForMs, 'the retry')
   assert.strictEqual(calls(sc, 'net-off').length, 2, 'net-off tried again')
 })
 

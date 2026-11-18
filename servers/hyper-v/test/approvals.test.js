@@ -6,7 +6,7 @@ const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
-const { scratch, startHelper, approve, seedImage, waitFor, withPool } = require('./helpers')
+const { T, scratch, startHelper, approve, seedImage, waitFor, withPool } = require('./helpers')
 
 async function fresh(name, opts) {
   const sc = scratch(name, opts)
@@ -117,7 +117,7 @@ test('one pool job at a time; a second is refused and changes nothing', async t 
   approve(sc, p2)
   await admin.request('pool_create', { planId: p1 })
   await assert.rejects(admin.request('pool_create', { planId: p2 }), /A pool job is already running/)
-  await waitFor(async () => /Last pool job: create FAILED/.test((await admin.request('status')).text), 10_000)
+  await waitFor(async () => /Last pool job: create FAILED/.test((await admin.request('status')).text), T.waitForMs)
   assert.match((await admin.request('status')).text, /didn't finish within/)
   assert.deepStrictEqual(Object.keys(sc.stub().vms), [], 'the failed VM was rolled back')
   assert.ok(sc.journal().some(r => r.t === 'rolledBack'))

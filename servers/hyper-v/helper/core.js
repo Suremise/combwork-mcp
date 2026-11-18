@@ -26,28 +26,28 @@ const images = require('./images')
 const linuxImages = require('./linux-images')
 const net = require('./net')
 const inventory = require('./inventory')
+const timing = require('./timing')
+const { AsyncLocalStorage } = require('async_hooks')
 const { LinuxDriver, PATHS: LINUX_PATHS } = require('./guests/linux')
 
 const PLAN_ID_RE = /^p-[0-9a-f]{16}$/
 const PLAN_TTL_MS = 30 * 60_000
 const OUTPUT_CAP = 16 * 1024
 const MAX_COMMAND = 8000
-const READY_WAIT_MS = Number(process.env.HYPERV_MCP_READY_WAIT_MS || 5 * 60_000)
+// MC-1558: the user-adjustable timings (guest ready, logon, install, provisioning, restore, checkpoints, the queue place,
+// copy) are timing.js's, per connection, lease or job: this.tm(lease).
 // MC-1556: a connected start's guest network: read back until it has held for NET_STABLE_MS (a network manager undoing
 // a static address shows within it), within NET_WAIT_MS (a DHCP lease and DNS take a few seconds).
 const NET_WAIT_MS = Number(process.env.HYPERV_MCP_NET_WAIT_MS || 90_000)
 const NET_STABLE_MS = Number(process.env.HYPERV_MCP_NET_STABLE_MS || 5000)
 // The interactive logon's own wait (MC-1518): a guest restart, the logon and the watcher starting in its session; a
 // first logon from the clean checkpoint runs Windows' per-user first-logon work and can take several minutes.
-const LOGON_WAIT_MS = Number(process.env.HYPERV_MCP_LOGON_WAIT_MS || 10 * 60_000)
-const INSTALL_WAIT_MS = Number(process.env.HYPERV_MCP_INSTALL_WAIT_MS || 90 * 60_000)
 const POLL_MS = Number(process.env.HYPERV_MCP_POLL_MS || 3000)
 const LOGON_STABLE_MS = Number(process.env.HYPERV_MCP_LOGON_STABLE_MS || 10_000) // test-only override
 // The build's profile provisioning (MC-1516): an account's first-logon work is taken as done after PROVISION_QUIET_MS
 // of consecutive good, idle samples (PROVISION_POLL_MS apart), within PROVISION_WAIT_MS. Test-only overrides.
 const PROVISION_QUIET_MS = Number(process.env.HYPERV_MCP_PROVISION_QUIET_MS || 4 * 60_000) // MC-1520: 4 min, a trial value
 const PROVISION_POLL_MS = Number(process.env.HYPERV_MCP_PROVISION_POLL_MS || 15_000)
-const PROVISION_WAIT_MS = Number(process.env.HYPERV_MCP_PROVISION_WAIT_MS || 30 * 60_000) // MC-1520: 30 min per account (the user's scope decision)
 // MC-1520: a build-time logon attempt waits up to BUILD_LOGON_WAIT_MS (within the account's deadline), leaving room for
 // one retry; one that is still waiting at LOGON_SNAPSHOT_MS (the runtime limit) gets a read-only diagnostic snapshot.
 const BUILD_LOGON_WAIT_MS = Number(process.env.HYPERV_MCP_BUILD_LOGON_WAIT_MS || 15 * 60_000)
@@ -65,7 +65,20 @@ const DEFENDER_EXCLUSIONS = ['C:\\build', 'C:\\out', 'C:\\trial-session', 'C:\\h
 const RETRY_MS = Number(process.env.HYPERV_MCP_RETRY_MS || 5 * 60_000)
 // The build's one online step (MC-1513): its call's bound, and net-off's after a failure.
 const ACTIVATE_MS = Number(process.env.HYPERV_MCP_ACTIVATE_MS || 8 * 60_000)
-const NET_OFF_MS = 60_000
+const NET_OFF_MS = 180_000 // MC-1558: a turn-off and a disconnect, each its own PowerShell start
+const REMOVE_VM_MS = 10 * 60_000 // MC-1558: remove-vm deletes the VM's disks
+// MC-1558: guest-setup (seconds of work) is one PowerShell Direct call bounded under the transport's ~10-min limit, with
+// one retry after a timeout or a transport error (its script is idempotent); any other error fails at once.
+const GUEST_SETUP_MS = Number(process.env.HYPERV_MCP_GUEST_SETUP_MS || 8 * 60_000)
+const TRANSIENT_RE = /timed out after|PowerShell Direct|The (?:pipe|socket|connection)\b|connection (?:was|has been) (?:lost|closed|reset)|transport|virtual machine .*(?:is not running|could not be contacted|isn't reachable)/i
+// MC-1558: a Windows copy-in or vm_sync moves its files in calls of at most COPY_CALL_BYTES and COPY_CALL_FILES, a file
+// over COPY_PART_BYTES in parts; each call is bounded by copyIdleMinutes (no part or file finished: a stall).
+const COPY_PART_BYTES = Number(process.env.HYPERV_MCP_COPY_PART_BYTES || 32 * 1024 * 1024)
+const COPY_CALL_BYTES = 2 * COPY_PART_BYTES
+const COPY_CALL_FILES = 500
+// MC-1558: a Linux copy-in or sync is one SSH call, bounded by its size (no progress is read): at least 30 min, plus a
+// minute per 100 MB.
+const linuxCopyMs = bytes => 30 * 60_000 + Math.ceil(bytes / (100 * 1024 * 1024)) * 60_000
 const EVAL_MIN_DAYS = 85 // a fresh evaluation build must have at least this long left (90 nominal)
 const EVAL_LAST_MS = 60 * 60_000 // an evaluation VM with less than this left is no longer leased
 const CHUNK_MAX = 1024 * 1024
@@ -77,16 +90,30 @@ const WAIT_MS = Number(process.env.HYPERV_MCP_WAIT_MS || 20_000)
 // One PowerShell Direct call's bound for a run's start, poll or kill (MC-1510: never near the transport's 10 minutes).
 const CALL_MS = 60_000
 // A poll's least bound however little of the run is left, and the bound of a timeout's cleanup (the kill, a last read).
-const MIN_POLL_MS = Number(process.env.HYPERV_MCP_MIN_POLL_MS || 5_000)
-const CLEANUP_MS = 15_000
-const KEEP_MS = Number(process.env.HYPERV_MCP_KEEP_MS || 120_000)
+// MC-1558: a poll is a new PowerShell process plus a PowerShell Direct connect; the kill waits up to 10 s in the guest.
+const MIN_POLL_MS = Number(process.env.HYPERV_MCP_MIN_POLL_MS || 30_000)
+const CLEANUP_MS = 60_000
 
 const hex = n => crypto.randomBytes(n).toString('hex')
 const sleep = ms => new Promise(r => setTimeout(r, ms))
-// MC-1537: how long a restore's new parent is waited for, read fresh (each facts-vm its own process), probe time included.
-const RESTORE_VERIFY_MS = Number(process.env.HYPERV_MCP_RESTORE_VERIFY_MS || 45_000)
 const sha256 = buf => crypto.createHash('sha256').update(buf).digest('hex')
 const mins = ms => `${Math.max(0, Math.round(ms / 60000))} min`
+
+/** MC-1558: copies length bytes of a file from offset into a new file (a part of a Windows copy). */
+function copyRange(from, to, offset, length) {
+  const src = fs.openSync(from, 'r')
+  const dst = fs.openSync(to, 'wx')
+  try {
+    const buf = Buffer.alloc(Math.min(length, 1024 * 1024) || 1)
+    let done = 0
+    while (done < length) {
+      const n = fs.readSync(src, buf, 0, Math.min(buf.length, length - done), offset + done)
+      if (n <= 0) throw new Error(`${from}: shorter than its size`)
+      fs.writeSync(dst, buf, 0, n)
+      done += n
+    }
+  } finally { fs.closeSync(src); fs.closeSync(dst) }
+}
 
 /** Canonical JSON: keys sorted, no spaces, so a plan's bytes (and digest) are one exact text. */
 function canonical(v) {
@@ -159,12 +186,14 @@ class Helper {
     this.timers = new Set()
     this.ready = false
     this.linux = new LinuxDriver(this) // MC-1501: a Linux VM's guest ops (SSH to its dispatcher)
+    this.ctx = new AsyncLocalStorage() // MC-1558: a request's or job's timings, through its async work
   }
 
   // ---------- start-up ----------
 
   async init() {
     this.policy = policyMod.load(this.dir)
+    this.defaultTiming = timing.resolve({}, this.policy.timingCaps) // MC-1558: for work with no client behind it
     this.journal = new Journal(this.dir).open()
     this.journal.onAppend = () => this.writeInventory() // MC-1557: kept current with every journalled change
     for (const d of ['plans', 'runs', 'secrets']) fs.mkdirSync(join(this.dir, d), { recursive: true })
@@ -179,9 +208,50 @@ class Helper {
     return this
   }
 
-  close() { for (const t of this.timers) clearInterval(t), clearTimeout(t); this.timers.clear() }
+  close() { this.closed = true; for (const t of this.timers) clearInterval(t), clearTimeout(t); this.timers.clear() }
+
+  /**
+   * MC-1558: the guest's setup (folders, their permissions, the registry policy, the edition), bounded and retryable: one
+   * call of at most GUEST_SETUP_MS (under PowerShell Direct's ~10-min call limit); after a timeout or a transport error,
+   * once the call has ended, one more (its script is idempotent), unless the helper is closing. Any other error fails at
+   * once. The folders and C:\build's protection are read back before the result is used; both attempts' errors are named.
+   */
+  async guestSetup(vm, creds) {
+    const errs = []
+    for (let attempt = 1; ; attempt++) {
+      try {
+        const g = await this.hv('guest-setup', { ...this.ident(vm), cred: creds.admin, userName: creds.user.user }, { timeoutMs: GUEST_SETUP_MS })
+        if (g?.folders !== true) throw new Error('the guest setup read back without its folders (C:\\build, C:\\out, C:\\hvmcp)')
+        if (g?.buildProtected !== true) throw new Error('the guest setup read back C:\\build still inheriting permissions')
+        return g
+      } catch (e) {
+        errs.push(e.message)
+        if (attempt >= 2 || !TRANSIENT_RE.test(e.message) || this.closed) throw new Error(errs.length > 1 ? `the guest setup failed twice: ${errs.join('; then: ')}` : e.message)
+      }
+    }
+  }
 
   get state() { return this.journal.state() }
+
+  /**
+   * MC-1558: the timings in effect: a lease's (taken from its connection at acquire), else the request's or job's context
+   * (a connection's values, or a pool job's snapshot), else the defaults (start-up recovery, the quarantine retry).
+   * { values, ms, notes, d }: d holds the derived call bounds.
+   */
+  tm(lease = null) {
+    const r = lease?.timing || this.ctx?.getStore() || this.defaultTiming || timing.resolve({}, null)
+    return r.d ? r : Object.assign(r, { d: timing.derived(r.ms) })
+  }
+  connTiming(connId) { return this.conns?.get(connId)?.timing || this.defaultTiming || timing.resolve({}, null) }
+
+  /** set-timing: a connection's values (from its MCP server's env), clamped; they apply to its later leases and jobs. */
+  setTiming(connId, args) {
+    const c = this.conns.get(connId)
+    if (!c) throw new Error('unknown connection')
+    const r = timing.resolve(args.timing && typeof args.timing === 'object' ? args.timing : {}, this.policy.timingCaps)
+    c.timing = r
+    return { text: `Timings for this connection: ${timing.describe(r)}.${r.notes.length ? ` ${r.notes.join('; ')}.` : ''}`, data: { values: r.values, notes: r.notes, derived: timing.derived(r.ms) } }
+  }
 
   /**
    * MC-1557: the recorded inventory (inventory.js), rewritten only when what it lists changed: written to a temporary
@@ -296,14 +366,14 @@ class Helper {
         this.journal.append({ t: 'offline', intentId: intent.intentId })
       } catch (e) { this.log(`net-off of ${intent.vmName} failed (${e.message}): removing it anyway`) }
     }
-    if (found?.vmId) await this.hv('remove-vm', { vmId: found.vmId, name: intent.vmName, folder: intent.folder })
+    if (found?.vmId) await this.hv('remove-vm', { vmId: found.vmId, name: intent.vmName, folder: intent.folder }, { timeoutMs: REMOVE_VM_MS })
     this.removeFolder(intent.folder)
     this.linux.dropKeys(intent.vmName) // MC-1501: a Linux VM's SSH keys (none for Windows)
     this.journal.append({ t: 'rolledBack', intentId: intent.intentId })
   }
 
   async removeVm(vm) {
-    await this.hv('remove-vm', this.ident(vm))
+    await this.hv('remove-vm', this.ident(vm), { timeoutMs: REMOVE_VM_MS })
     this.removeFolder(vm.folder)
     this.linux.dropKeys(vm.vmName) // MC-1501: a Linux VM's SSH keys (none for Windows)
     this.journal.append({ t: 'removed', vmId: vm.vmId })
@@ -571,7 +641,9 @@ class Helper {
       // What the helper knows of the guest's C:\build (vm_sync): the files it placed, by canonical key; gen moves on at
       // every start, sync and the lease's end (a plan from an earlier gen is stale); trusted is false while an apply
       // is unfinished or after one failed, when only a full sync or a reset may follow.
-      sync: { record: new Map(), gen: 0, trusted: false, plan: null }
+      sync: { record: new Map(), gen: 0, trusted: false, plan: null },
+      // MC-1558: its connection's timings at acquire, for everything done for it, its cleanup included.
+      timing: c.timing || this.defaultTiming
     }
     // MC-1532: a lease acquired by a pool checkpoint starts from that exact checkpoint by default (pinned).
     if (want.checkpoint) { const p = this.poolCheckpointOn(vm.vmId, want.checkpoint); lease.startFrom = { name: p.name, checkpointId: p.checkpointId }; lease.refs.add(p.checkpointId) }
@@ -719,7 +791,7 @@ class Helper {
           this.timers.delete(timer)
           if (e.pending?.token !== token) return
           e.pending = null
-          e.expires = this.now() + KEEP_MS
+          e.expires = this.now() + this.connTiming(e.connId).ms.queueKeepMinutes
           resolve({ waiting: true })
         }, WAIT_MS)
         timer.unref?.()
@@ -738,7 +810,7 @@ class Helper {
       const why = this.blocked(step.e.project, step.e.want) || 'none is free'
       const i = this.queue.indexOf(step.e)
       return {
-        text: `Still waiting for a VM (${why}): number ${i + 1} of ${this.queue.length} in line. Call vm_acquire with wait: true again within ${Math.round(KEEP_MS / 1000)} s to keep your place.`,
+        text: `Still waiting for a VM (${why}): number ${i + 1} of ${this.queue.length} in line. Call vm_acquire with wait: true again within ${Math.round(this.connTiming(connId).ms.queueKeepMinutes / 1000)} s to keep your place.`,
         data: { waiting: true, position: i + 1, of: this.queue.length, project: step.e.project }
       }
     })
@@ -798,7 +870,8 @@ class Helper {
     // Its in-flight operations (a long vm_run, a copy) are killed now: the lease is over, and its VM's restore must not
     // wait for them. The guest side dies with the restore.
     for (const ch of lease.children) { try { ch.kill() } catch { /* gone */ } }
-    lease.ending = (async () => {
+    // MC-1558: the cleanup runs in the lease's own timings, whatever started it (a release, a disconnect, its deadline).
+    lease.ending = this.ctx.run(lease.timing || this.defaultTiming, async () => {
       const vm = this.state.vms.get(lease.vmId)
       let r = { ok: true, text: `${lease.vmName} restored to clean.` }
       if (vm) r = await this.vmLock(vm.vmId)(() => this.restore(vm))
@@ -808,7 +881,7 @@ class Helper {
       this.log(`lease ${lease.leaseId} on ${lease.vmName} ended (${why}): ${r.text}`)
       this.kick()
       return r
-    })()
+    })
     return lease.ending
   }
 
@@ -822,10 +895,13 @@ class Helper {
    * { ok, phase: 'verified' | 'parent', timedOut, last, waitedMs }, for the callers' existing checks. With a lease,
    * every call is the lease's (ending it kills them) and it is checked still held after each await.
    */
-  async restoreVia(vm, op, args, { lease = null, verifyMs = RESTORE_VERIFY_MS } = {}) {
+  async restoreVia(vm, op, args, { lease = null, verifyMs: verifyOverride = null } = {}) {
     const opts = ms => lease ? this.forLease(lease, ms) : { timeoutMs: ms }
     const held = () => { if (lease) this.stillHeld(lease) }
-    const r = await this.hv(op, args, opts(120_000))
+    // MC-1558: the call holds the off-wait and the restore after it; the verify is its own phase after the call.
+    const T = this.tm(lease)
+    const verifyMs = verifyOverride ?? T.ms.restoreVerifySeconds // an override: the unit tests' seam
+    const r = await this.hv(op, { ...args, offWaitMs: T.ms.offWaitSeconds }, opts(T.d.restoreCallMs))
     held()
     const rep0 = r?.restore
     if (rep0 && typeof rep0 === 'object' && (rep0.timedOut === true || rep0.ok === false)) return r
@@ -967,7 +1043,7 @@ class Helper {
         // A retiring pool checkpoint: removed, or already gone (its id was confirmed, so absence is definitive).
         if (snap) {
           let gone = false
-          try { gone = (await this.hv('snapshot-remove', { ...this.ident(vm), checkpointId: snap.id, snapName: x.snapName })).removed === true } catch (e) { return `pool checkpoint cleanup pending: removing "${x.name}" failed (${e.message})` }
+          try { gone = (await this.hv('snapshot-remove', { ...this.ident(vm), checkpointId: snap.id, snapName: x.snapName }, { timeoutMs: this.tm().ms.checkpointMinutes })).removed === true } catch (e) { return `pool checkpoint cleanup pending: removing "${x.name}" failed (${e.message})` }
           if (!gone) return `pool checkpoint cleanup pending: "${x.name}" is still there`
         }
         this.journal.append({ t: 'pcp-retired', checkpointId: x.checkpointId })
@@ -976,7 +1052,7 @@ class Helper {
       if (snap) {
         if (!x.dropping) this.journal.append({ t: 'lcp-drop', opId: x.opId })
         let gone = false
-        try { gone = (await this.hv('snapshot-remove', { ...this.ident(vm), checkpointId: snap.id, snapName: x.snapName })).removed === true } catch (e) { return `lease checkpoint cleanup pending: removing ${x.name} failed (${e.message})` }
+        try { gone = (await this.hv('snapshot-remove', { ...this.ident(vm), checkpointId: snap.id, snapName: x.snapName }, { timeoutMs: this.tm().ms.checkpointMinutes })).removed === true } catch (e) { return `lease checkpoint cleanup pending: removing ${x.name} failed (${e.message})` }
         if (!gone) return `lease checkpoint cleanup pending: ${x.name} is still there`
       }
       // The VM's checkpoint type, as it was before this take (an interrupted take may have left ProductionOnly).
@@ -1039,7 +1115,7 @@ class Helper {
     const bytes = Buffer.from(canonical(plan), 'utf8')
     fs.writeFileSync(join(this.dir, 'plans', `${plan.id}.json`), bytes, { flag: 'wx' })
     const digest = sha256(bytes)
-    return { text: describePlan(plan, digest, this.approveLine(plan.id)), data: { planId: plan.id, digest } }
+    return { text: describePlan(plan, digest, this.approveLine(plan.id), this.tm()), data: { planId: plan.id, digest } }
   }
 
   /**
@@ -1078,7 +1154,7 @@ class Helper {
           const bad0 = baselineProblem(f0, { ...vm, cleanCheckpointId: e.cleanCheckpointId })
           if (bad0) throw new Error(`its clean checkpoint doesn't verify: ${bad0}`)
           await this.configureStart(vm, null, 'none', 0)
-          if (await this.waitGuest(vm, creds.admin, READY_WAIT_MS) === null) throw new Error('its guest didn\'t answer')
+          if (await this.waitGuest(vm, creds.admin, this.tm().ms.guestReadyMinutes) === null) throw new Error('its guest didn\'t answer')
           let licNote
           if (this.isLinux(vm)) {
             // MC-1501: a Linux VM's guest steps: its seed's files, sshd and keys checked again (they aren't rewritten in
@@ -1088,7 +1164,7 @@ class Helper {
             licNote = 'Linux, no licence'
           } else {
             step('rerunning the guest setup')
-            const g = await this.hv('guest-setup', { ...this.ident(vm), cred: creds.admin, userName: creds.user.user }, { timeoutMs: 15 * 60_000 })
+            const g = await this.guestSetup(vm, creds)
             const img = this.state.images.get(this.imageOf(vm))
             const why = img ? images.guestReportProblem(g, img) : (g?.disableForceUnload === 1 ? null : 'DisableForceUnload is not 1')
             if (why) throw new Error(`the guest's sanity check failed: ${why}`)
@@ -1106,9 +1182,9 @@ class Helper {
           }
           await freeOk()
           step('shutting down and taking the new clean checkpoint')
-          const f1 = await this.hv('guest-shutdown', this.ident(vm), { timeoutMs: 6 * 60_000 })
+          const f1 = await this.hv('guest-shutdown', { ...this.ident(vm), shutdownMs: this.tm().ms.shutdownMinutes }, { timeoutMs: this.tm().d.shutdownCallMs })
           if (f1.state !== 'Off') throw new Error(`the guest didn't shut down (the VM is ${f1.state})`)
-          const r = await this.hv('pool-take', { ...this.ident(vm), snapName }, { timeoutMs: 10 * 60_000 }).catch(err => ({ unknown: err.message }))
+          const r = await this.hv('pool-take', { ...this.ident(vm), snapName }, { timeoutMs: this.tm().ms.checkpointMinutes }).catch(err => ({ unknown: err.message }))
           if (r.unknown) {
             const list = await this.hv('snapshots', this.ident(vm)).then(x => x.snapshots || [], () => null)
             const found = list ? list.filter(x => x.name === snapName) : []
@@ -1176,7 +1252,7 @@ class Helper {
         snap = ys[0] || null
       }
       if (snap) {
-        const gone = (await this.hv('snapshot-remove', { ...this.ident(vm), checkpointId: snap.id, snapName: rec.snapName })).removed === true
+        const gone = (await this.hv('snapshot-remove', { ...this.ident(vm), checkpointId: snap.id, snapName: rec.snapName }, { timeoutMs: this.tm().ms.checkpointMinutes })).removed === true
         if (!gone) return `refresh cleanup pending: its unpublished new snapshot is still there`
       }
       this.journal.append({ t: 'rcl-abandoned', opId: rec.opId })
@@ -1205,7 +1281,7 @@ class Helper {
       const missing = [...this.state.poolSnaps.values()].filter(x => x.vmId === vm.vmId && !fresh.has(x.checkpointId))
       if (missing.length) return `old clean removal pending: pool checkpoint(s) ${missing.map(x => `"${x.name}"`).join(', ')} are missing (the old clean is kept)`
       if (old) {
-        const gone = (await this.hv('snapshot-remove', { ...this.ident(vm), checkpointId: rec.oldClean, snapName: rec.oldName })).removed === true
+        const gone = (await this.hv('snapshot-remove', { ...this.ident(vm), checkpointId: rec.oldClean, snapName: rec.oldName }, { timeoutMs: this.tm().ms.checkpointMinutes })).removed === true
         if (!gone) return 'old clean removal pending: it is still there'
       }
       const after = new Set(((await this.hv('snapshots', this.ident(vm))).snapshots || []).map(x => x.id))
@@ -1427,11 +1503,16 @@ class Helper {
       const t0 = this.now()
       try {
         const creds = this.creds()
-        const r = await this.guestCall(vm, 'sync-in', {
-          ...this.ident(vm), cred: creds.admin, source: plan.need.size ? st.dir : null, guestStage: `C:\\hvmcp\\sync-${gen}`,
-          files: [...plan.need.values()].map(f => f.path), remove: plan.remove, full: plan.full, delete: plan.delete,
-          ...(this.isLinux(vm) ? { entries: [...plan.need.values()], gen } : {})
-        }, this.forLease(lease, 30 * 60_000))
+        const needBytes = [...plan.need.values()].reduce((n, f) => n + f.size, 0)
+        const r = this.isLinux(vm)
+          ? await this.guestCall(vm, 'sync-in', {
+            ...this.ident(vm), cred: creds.admin, source: plan.need.size ? st.dir : null, guestStage: `C:\\hvmcp\\sync-${gen}`,
+            files: [...plan.need.values()].map(f => f.path), remove: plan.remove, full: plan.full, delete: plan.delete, entries: [...plan.need.values()], gen
+          }, this.forLease(lease, linuxCopyMs(needBytes)))
+          : await this.winTransfer(vm, lease, {
+            kind: 'sync', source: st?.dir, entries: [...plan.need.values()], guestStage: `C:\\hvmcp\\sync-${gen}`, cred: creds.admin,
+            apply: { files: [...plan.need.values()].map(f => f.path), remove: plan.remove, full: plan.full, delete: plan.delete }
+          })
         this.stillHeld(lease)
         if (plan.full) s.record = new Map(plan.manifest)
         else {
@@ -1453,6 +1534,68 @@ class Helper {
         if (c.stage && c.stage.plan === plan) this.dropStage(c)
       }
     })
+  }
+
+  /**
+   * MC-1558: a Windows copy-in or vm_sync. The guest's staging folder is made fresh (guest-sync.ps1's prepare, which also
+   * drops stale ones); the files go in calls of at most COPY_CALL_BYTES and COPY_CALL_FILES, a file over COPY_PART_BYTES
+   * as byte-range parts (written to the helper's own run folder, deleted after each call); in the guest each part is
+   * appended to its file in the stage at once, only at the file's current length (one already appended is skipped). Each
+   * call is bounded by copyIdleMinutes: a call killed there with nothing finished is a stall (the copy fails); one that
+   * finished some resumes from the guest's lengths. Then guest-sync's apply puts the stage into C:\build, with every one
+   * of its checks. The whole copy is bounded by the lease alone (ending it kills the call in flight).
+   * entries: [{ path, size }] under source; apply: { files, remove, full, delete }. Returns { copied, removed, bytes }.
+   */
+  async winTransfer(vm, lease, { kind, source, entries, guestStage, cred, apply }) {
+    const idle = this.tm(lease).ms.copyIdleMinutes
+    const call = (op, args) => this.hv(op, { ...this.ident(vm), cred, guestStage, ...args }, this.forLease(lease, idle))
+    await call('copy-prepare', {})
+    this.stillHeld(lease)
+    const units = []
+    for (const e of entries) {
+      const file = join(source, ...segments(e.path))
+      if (e.size <= COPY_PART_BYTES) units.push({ rel: e.path, file, offset: 0, length: e.size, whole: true })
+      else for (let o = 0; o < e.size; o += COPY_PART_BYTES) units.push({ rel: e.path, file, offset: o, length: Math.min(COPY_PART_BYTES, e.size - o), whole: false })
+    }
+    const tmp = join(this.dir, 'runs', `xfer-${hex(6)}`)
+    fs.mkdirSync(tmp, { recursive: true })
+    let moved = 0
+    try {
+      let i = 0
+      while (i < units.length) {
+        const batch = []
+        let bytes = 0
+        while (i < units.length && batch.length < COPY_CALL_FILES && (!batch.length || bytes + units[i].length <= COPY_CALL_BYTES)) { batch.push(units[i]); bytes += units[i].length; i++ }
+        const items = batch.map((u, n) => {
+          if (u.whole) return { src: u.file, rel: u.rel, offset: 0, length: u.length }
+          const part = join(tmp, String(n))
+          copyRange(u.file, part, u.offset, u.length)
+          return { src: part, rel: u.rel, offset: u.offset, length: u.length }
+        })
+        try {
+          await call('copy-part', { items })
+          moved += bytes
+        } catch (e) {
+          this.stillHeld(lease)
+          if (!/timed out/.test(e.message)) throw e
+          // Killed at the idle bound: what the guest has now says whether anything moved.
+          const L = await call('copy-lengths', { rels: [...new Set(items.map(x => x.rel))] })
+          this.stillHeld(lease)
+          const done = items.filter(x => Number(L?.lengths?.[x.rel] ?? -1) >= x.offset + x.length)
+          if (!done.length) throw new Error(`the copy stalled: no ${COPY_PART_BYTES % 1048576 ? `${COPY_PART_BYTES}-byte` : `${COPY_PART_BYTES / 1048576} MB`} part or file finished within ${Math.round(idle / 1000)} s (copyIdleMinutes)`)
+          i -= batch.length // the same call again: what the guest already has is skipped, the rest goes on
+          continue
+        } finally {
+          for (const f of fs.readdirSync(tmp)) fs.rmSync(join(tmp, f), { force: true })
+        }
+        this.stillHeld(lease)
+      }
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true })
+    }
+    const r = await call('copy-apply', { kind, ...apply })
+    this.stillHeld(lease)
+    return { copied: Number(r?.copied) || 0, removed: Number(r?.removed) || 0, bytes: moved }
   }
 
   // ---------- a run's network (MC-1556) ----------
@@ -1615,8 +1758,9 @@ class Helper {
       await this.configureStartOrClean(vm, lease, mode, reserveCpu)
       lease.running = true
       const creds = this.creds()
-      const waited = await this.waitGuest(vm, creds.admin, READY_WAIT_MS, lease)
-      if (waited === null) { failed(`its guest didn't answer within ${Math.round(READY_WAIT_MS / 1000)} s`); throw new Error(`${vm.vmName} started but its guest didn't answer within ${Math.round(READY_WAIT_MS / 1000)} s. vm_reset to try again, or vm_release and vm_acquire for another VM (one whose start failed is leased last).`) }
+      const readyMs = this.tm(lease).ms.guestReadyMinutes
+      const waited = await this.waitGuest(vm, creds.admin, readyMs, lease)
+      if (waited === null) { failed(`its guest didn't answer within ${Math.round(readyMs / 1000)} s`); throw new Error(`${vm.vmName} started but its guest didn't answer within ${Math.round(readyMs / 1000)} s. vm_reset to try again, or vm_release and vm_acquire for another VM (one whose start failed is leased last).`) }
       this.stillHeld(lease)
       const netText = await this.guestNetOrClean(vm, lease, creds)
       let logon = ''
@@ -1624,7 +1768,7 @@ class Helper {
         const who = creds[interactive].user
         const o = await this.logon(vm, lease, interactive, creds)
         const again = 'vm_reset to try again, or vm_release and vm_acquire for another VM (one whose start failed is leased last).'
-        const wait = Math.round(LOGON_WAIT_MS / 1000)
+        const wait = Math.round(this.tm(lease).ms.logonMinutes / 1000)
         if (o.silent) { failed(`no logon of ${who} began within ${Math.round(FIRST_LOGON_SIGN_MS / 1000)} s of its new boot being seen`); throw new Error(`${vm.vmName} restarted to log ${who} on, but no logon of it began within ${Math.round(FIRST_LOGON_SIGN_MS / 1000)} s of the new boot being seen (no logon event for it on this boot). ${again}`) }
         if (o.loggedOff && o.unseen) { failed(`Windows logged ${who}'s logon off before it was seen`); throw new Error(`${vm.vmName} logged ${who} on, but Windows logged the session off again before the first check saw it (its logon and logoff events on this boot), and turned autologon off. ${again}`) }
         if (o.loggedOff) { failed(`${who} logged on, then Windows logged the session off`); throw new Error(`${vm.vmName} logged ${who} on (after ${(o.after / 1000).toFixed(1)} s), but Windows logged the session off again before its watcher started, and turned autologon off. ${again}`) }
@@ -1638,7 +1782,11 @@ class Helper {
       if (interactive || !this.startFailed.get(vm.vmId)?.interactive) this.startFailed.delete(vm.vmId)
       let build = 'no build'
       if (c.stage?.done) {
-        const res = await this.guestCall(vm, 'copy-in', { ...this.ident(vm), cred: creds.admin, userName: creds.user.user, source: c.stage.dir, ...(this.isLinux(vm) ? { entries: c.stage.hashes, gen: s.gen } : {}) }, this.forLease(lease, 30 * 60_000))
+        const t1 = this.now()
+        const res = this.isLinux(vm)
+          ? await this.guestCall(vm, 'copy-in', { ...this.ident(vm), cred: creds.admin, userName: creds.user.user, source: c.stage.dir, entries: c.stage.hashes, gen: s.gen }, this.forLease(lease, linuxCopyMs(c.stage.bytes)))
+          : await this.winTransfer(vm, lease, { kind: 'copy', source: c.stage.dir, entries: [...c.stage.hashes.values()], guestStage: `C:\\hvmcp\\sync-${s.gen}`, cred: creds.admin, apply: { files: [...c.stage.hashes.values()].map(f => f.path), remove: [], full: true, delete: true } })
+        if (!res.ms) res.ms = this.now() - t1
         this.stillHeld(lease)
         build = `build copied in to ${this.paths(vm).build} (${c.stage.files} files, ${c.stage.bytes} bytes${res.ms ? `, ${(res.ms / 1000).toFixed(1)} s` : ''})`
         s.record = new Map(c.stage.hashes)
@@ -1700,7 +1848,7 @@ class Helper {
     let snapped = false
     // A start waits LOGON_WAIT_MS; a build's attempt (MC-1520) up to BUILD_LOGON_WAIT_MS within its deadline, with one
     // diagnostic snapshot (onSlow) once LOGON_SNAPSHOT_MS has passed.
-    const limit = deadline === null ? LOGON_WAIT_MS : BUILD_LOGON_WAIT_MS
+    const limit = deadline === null ? this.tm(lease).ms.logonMinutes : BUILD_LOGON_WAIT_MS
     while (this.now() - t0 < limit) {
       if (late()) return { late: true }
       if (deadline !== null && onSlow && !snapped && this.now() - t0 >= LOGON_SNAPSHOT_MS) {
@@ -1961,7 +2109,7 @@ class Helper {
       this.journal.append({ t: 'lcp-take', opId, vmId: vm.vmId, leaseId: lease.leaseId, name, snapName, origType, at: new Date(this.now()).toISOString() })
       let r = null
       try {
-        r = await this.hv('lease-checkpoint', { ...this.ident(vm), snapName }, this.forLease(lease, 10 * 60_000))
+        r = await this.hv('lease-checkpoint', { ...this.ident(vm), snapName }, this.forLease(lease, this.tm(lease).ms.checkpointMinutes))
       } catch (e) {
         // It may have been made despite the failure (a timeout, or completing after the call died). Found by its unique
         // name, it's confirmed as this lease's; not found, it stays journalled and unconfirmed (an absence now proves
@@ -2013,7 +2161,7 @@ class Helper {
       }
       await this.configureStartOrClean(vm, lease, lease.network, lease.reserve || 0)
       this.stillHeld(lease)
-      const waited = await this.waitGuest(vm, null, READY_WAIT_MS, lease)
+      const waited = await this.waitGuest(vm, null, this.tm(lease).ms.guestReadyMinutes, lease)
       this.stillHeld(lease)
       if (waited === null) throw new Error(`${vm.vmName}'s guest didn't answer after the checkpoint: vm_reset to go on from clean`)
       lease.running = true
@@ -2021,11 +2169,11 @@ class Helper {
     }
     let r = null
     try {
-      const off = await this.hv('guest-shutdown', this.ident(vm), this.forLease(lease, 6 * 60_000))
+      const off = await this.hv('guest-shutdown', { ...this.ident(vm), shutdownMs: this.tm(lease).ms.shutdownMinutes }, this.forLease(lease, this.tm(lease).d.shutdownCallMs))
       this.stillHeld(lease)
       if (off.state !== 'Off') { this.journal.append({ t: 'lcp-dropped', opId }); throw new Error(`the guest didn't shut down (the VM is ${off.state})`) }
       lease.running = false
-      r = await this.hv('pool-take', { ...this.ident(vm), snapName }, this.forLease(lease, 10 * 60_000))
+      r = await this.hv('pool-take', { ...this.ident(vm), snapName }, this.forLease(lease, this.tm(lease).ms.checkpointMinutes))
     } catch (e) {
       if (lease.running === false && !this.leases.get(vm.vmId)?.ending) {
         const list = await this.hv('snapshots', this.ident(vm)).then(x => x.snapshots || [], () => null)
@@ -2082,9 +2230,9 @@ class Helper {
       const spec = await this.configureStartOrClean(vm, lease, lease.network, lease.reserve || 0)
       this.stillHeld(lease)
       const creds = this.creds()
-      const waited = await this.waitGuest(vm, creds.admin, READY_WAIT_MS, lease)
+      const waited = await this.waitGuest(vm, creds.admin, this.tm(lease).ms.guestReadyMinutes, lease)
       this.stillHeld(lease)
-      if (waited === null) throw new Error(`${vm.vmName} was restored to "${name}" but its guest didn't answer within ${Math.round(READY_WAIT_MS / 1000)} s: vm_reset to go on from clean.`)
+      if (waited === null) throw new Error(`${vm.vmName} was restored to "${name}" but its guest didn't answer within ${Math.round(this.tm(lease).ms.guestReadyMinutes / 1000)} s: vm_reset to go on from clean.`)
       const facts = await this.hv('facts-vm', this.ident(vm), this.forLease(lease))
       this.stillHeld(lease)
       if (facts.state !== 'Running' || facts.parentCheckpointId !== cp.checkpointId || (facts.switchId ?? null) !== (spec.switchId ?? null) || facts.reserve !== (lease.reserve || 0)) {
@@ -2167,6 +2315,8 @@ class Helper {
       `Product key for non-evaluation images (install.ps1 -ProductKeyFile): ${this.productKey() ? 'set' : 'none'}.`,
       `Policy: up to ${this.policy.maxVms} VMs, ${this.policy.maxCoresPerVm} cores each, ${this.policy.maxMemoryMBTotal} MB in all, ${this.policy.maxDiskGBPerVm} GB disks, in ${this.policy.diskFolders.join('; ')}; network up to ${this.policy.maxNetwork}${this.policy.hostNetwork ? ` (host mode: ${this.policy.hostNetwork.switchName}, this PC ${this.policy.hostNetwork.hostAddress} on ${this.policy.hostNetwork.subnet})` : ''}; CPU reserve up to ${this.policy.maxReservePercent}%; leases up to ${this.policy.maxLeaseMinutes} min at a time, renewable to ${policyMod.sessionMinutes(this.policy)} min per work session${this.policy.maxSessionMinutes === undefined ? ' (the default)' : ''}.`,
       `Build folders set by an admin (install.ps1 -BuildRoot): ${this.policy.buildRoots.length ? this.policy.buildRoots.join('; ') : 'none'}.`,
+      // MC-1558: this connection's timings (its MCP server's HYPERV_MCP_* keys), and setup's caps when it set any.
+      `Timings for this connection: ${timing.describe(this.tm(connId && this.leases.get(this.conns.get(connId)?.vmId || '')?.connId === connId ? this.leases.get(this.conns.get(connId).vmId) : { timing: this.connTiming(connId) }))}${this.policy.timingCaps && Object.keys(this.policy.timingCaps).length ? `; setup's caps: ${Object.entries(this.policy.timingCaps).map(([k, v]) => `${k} ${v}`).join(', ')}` : ''}.`,
       'vm_acquire\'s vm names one VM: for trials and censuses on a specific VM, not for normal use (it waits in line like any other request, for that VM only).'
     ]
     return { text: lines.filter(Boolean).join('\n'), data: { vms: s.vms.size, job: this.job ? this.job.op : null, epoch: this.journal.epoch, connections: this.conns.size, lastJob: this.lastJob } }
@@ -2260,7 +2410,7 @@ class Helper {
     const file = join(this.dir, 'plans', `${plan.id}.json`)
     fs.writeFileSync(file, bytes, { flag: 'wx' })
     const digest = sha256(bytes)
-    return { text: describePlan(plan, digest, this.approveLine(plan.id)), data: { planId: plan.id, digest } }
+    return { text: describePlan(plan, digest, this.approveLine(plan.id), this.tm()), data: { planId: plan.id, digest } }
   }
 
   /**
@@ -2312,7 +2462,7 @@ class Helper {
     const bytes = Buffer.from(canonical(plan), 'utf8')
     fs.writeFileSync(join(this.dir, 'plans', `${plan.id}.json`), bytes, { flag: 'wx' })
     const digest = sha256(bytes)
-    return { text: describePlan(plan, digest, this.approveLine(plan.id)), data: { planId: plan.id, digest } }
+    return { text: describePlan(plan, digest, this.approveLine(plan.id), this.tm()), data: { planId: plan.id, digest } }
   }
 
   approveLine(planId) {
@@ -2501,7 +2651,7 @@ class Helper {
           if (f1.acls?.length) throw new Error('its network adapter still has port ACLs')
           // 3. A clean guest shutdown, verified Off.
           stage = 'shutdown'
-          const f2 = await this.hv('guest-shutdown', this.ident(vm), this.forLease(lease, 6 * 60_000))
+          const f2 = await this.hv('guest-shutdown', { ...this.ident(vm), shutdownMs: this.tm(lease).ms.shutdownMinutes }, this.forLease(lease, this.tm(lease).d.shutdownCallMs))
           lease = bound()
           if (f2.state !== 'Off') throw new Error(`the guest didn't shut down (the VM is ${f2.state})`)
           lease.running = false
@@ -2511,7 +2661,7 @@ class Helper {
           const snapName = `hvmcp-pool-${opId}`
           this.journal.append({ t: 'lcp-take', opId, vmId: vm.vmId, leaseId: lease.leaseId, name: `pool:${plan.checkpoint}`, snapName, at: new Date(this.now()).toISOString() })
           let r
-          try { r = await this.hv('pool-take', { ...this.ident(vm), snapName }, this.forLease(lease, 10 * 60_000)) } catch (err) {
+          try { r = await this.hv('pool-take', { ...this.ident(vm), snapName }, this.forLease(lease, this.tm(lease).ms.checkpointMinutes)) } catch (err) {
             const list = await this.hv('snapshots', this.ident(vm)).then(x => x.snapshots || [], () => null)
             const found = list ? list.filter(x => x.name === snapName) : []
             if (found.length === 1) this.journal.append({ t: 'lcp-taken', opId, checkpointId: found[0].id })
@@ -2546,7 +2696,7 @@ class Helper {
             let again = null
             try {
               await this.configureStart(vm, lease, 'none', lease.reserve || 0)
-              const waited = await this.waitGuest(vm, creds.admin, READY_WAIT_MS, lease)
+              const waited = await this.waitGuest(vm, creds.admin, this.tm(lease).ms.guestReadyMinutes, lease)
               if (waited === null) throw new Error('its guest didn\'t answer')
             } catch (e2) { again = e2 }
             if (again) {
@@ -2718,10 +2868,11 @@ class Helper {
     const vm = this.state.vms.get(c.vmId)
     step('installing Windows unattended (network off)')
     await this.hv('start-vm', this.ident(vm))
-    const waited = await this.waitGuest(vm, creds.admin, INSTALL_WAIT_MS)
-    if (waited === null) throw new Error(`Windows setup didn't finish within ${Math.round(INSTALL_WAIT_MS / 60000)} minutes`)
+    const installMs = this.tm().ms.installMinutes
+    const waited = await this.waitGuest(vm, creds.admin, installMs)
+    if (waited === null) throw new Error(`Windows setup didn't finish within ${Math.round(installMs / 60000)} minutes`)
     step('setting up the guest and checking its install media')
-    const g = await this.hv('guest-setup', { ...this.ident(vm), cred: creds.admin, userName: creds.user.user }, { timeoutMs: 15 * 60_000 })
+    const g = await this.guestSetup(vm, creds)
     const why = images.guestReportProblem(g, img)
     if (why) throw new Error(`the guest's sanity check failed: ${why}`)
     step(plan.activation === 'online-once' ? 'activating Windows online (network on for this step only)' : 'reading its Windows licence (offline)')
@@ -2731,7 +2882,7 @@ class Helper {
     step('excluding the test folders from Defender\'s scanning (offline)')
     const defender = await this.defenderStep(vm, creds)
     step('shutting down and taking the clean checkpoint')
-    const cp = await this.hv('make-clean', { ...this.ident(vm) }, { timeoutMs: 15 * 60_000 })
+    const cp = await this.hv('make-clean', { ...this.ident(vm), shutdownMs: this.tm().ms.shutdownMinutes }, { timeoutMs: this.tm().d.makeCleanCallMs })
     fs.rmSync(media, { recursive: true, force: true })
     fs.rmSync(unattendIso, { force: true })
     const facts = await this.restoreVia(vm, 'restore', { ...this.ident(vm), checkpointId: cp.checkpointId })
@@ -2749,7 +2900,7 @@ class Helper {
   async createLinuxVm(job, plan, a, img, step) {
     const { vm, record } = await this.linux.build(job, plan, a, img, step)
     step('taking the clean checkpoint')
-    const cp = await this.hv('make-clean', { ...this.ident(vm) }, { timeoutMs: 15 * 60_000 })
+    const cp = await this.hv('make-clean', { ...this.ident(vm), shutdownMs: this.tm().ms.shutdownMinutes }, { timeoutMs: this.tm().d.makeCleanCallMs })
     const facts = await this.restoreVia(vm, 'restore', { ...this.ident(vm), checkpointId: cp.checkpointId })
     const bad = baselineProblem(facts, { ...vm, cleanCheckpointId: cp.checkpointId })
     if (bad) throw new Error(`its clean baseline doesn't verify: ${bad}`)
@@ -2786,11 +2937,12 @@ class Helper {
     const out = {}
     for (const which of ['admin', 'user']) {
       const name = creds[which].user
-      const deadline = this.now() + PROVISION_WAIT_MS // the account's one provisioning budget, retry included
+      const provisionMs = this.tm().ms.provisionMinutes
+      const deadline = this.now() + provisionMs // the account's one provisioning budget, retry included
       const attempts = [] // MC-1520: each attempt's outcome, a slow one's snapshot and a failed one's diagnosis
       for (let attempt = 1; ; attempt++) {
-        if (this.now() >= deadline) throw provisionLate(name)
-        step(`logging ${name} on${attempt > 1 ? ' (again)' : ''} (${name}'s budget: ${Math.max(0, Math.round((deadline - this.now()) / 60_000))} of ${Math.round(PROVISION_WAIT_MS / 60_000)} min left)`)
+        if (this.now() >= deadline) throw provisionLate(name, provisionMs)
+        step(`logging ${name} on${attempt > 1 ? ' (again)' : ''} (${name}'s budget: ${Math.max(0, Math.round((deadline - this.now()) / 60_000))} of ${Math.round(provisionMs / 60_000)} min left)`)
         // MC-1520: a read-only snapshot of the guest when the attempt is slow, and before the undo when it failed.
         const diag = async () => {
           const left = deadline - this.now()
@@ -2804,7 +2956,7 @@ class Helper {
           step(`${name}'s logon is still waiting at ${Math.round(LOGON_SNAPSHOT_MS / 1000)} s: ${diagLine(slow)}`)
           this.log(`${vm.vmName}: ${name}'s build logon still waiting at ${Math.round(LOGON_SNAPSHOT_MS / 1000)} s: ${diagLine(slow)}`)
         })
-        if (o.late) throw new Error(`${provisionLate(name).message}${slow ? ` (at ${Math.round(LOGON_SNAPSHOT_MS / 1000)} s: ${diagLine(slow)})` : ''}`)
+        if (o.late) throw new Error(`${provisionLate(name, provisionMs).message}${slow ? ` (at ${Math.round(LOGON_SNAPSHOT_MS / 1000)} s: ${diagLine(slow)})` : ''}`)
         let why = null
         const waited = Math.round(BUILD_LOGON_WAIT_MS / 1000)
         if (o.silent) why = `no logon of ${name} began within ${Math.round(FIRST_LOGON_SIGN_MS / 1000)} s of its new boot being seen`
@@ -2863,7 +3015,7 @@ class Helper {
       if (!busy && this.now() - quietSince >= PROVISION_QUIET_MS) return { ms: this.now() - t0, count: r.count, inventory: r.inventory, mappings: r.mappings, packagesDirs: r.packagesDirs, appReadiness: readinessRecord(r.appReadiness) }
       await sleep(Math.min(PROVISION_POLL_MS, Math.max(0, deadline - this.now())))
     }
-    const e = provisionLate(account)
+    const e = provisionLate(account, this.tm().ms.provisionMinutes)
     e.message += ` (${readinessLine(readiness)})`
     throw e
   }
@@ -2945,7 +3097,14 @@ class Helper {
 
   async request(connId, op, args = {}) {
     if (!this.ready) throw new Error('the helper is still starting')
+    const c = this.conns.get(connId)
+    const lease = c?.vmId && this.leases.get(c.vmId)
+    return this.ctx.run((lease && lease.connId === connId && lease.timing) || c?.timing || this.defaultTiming, () => this.dispatch(connId, op, args))
+  }
+
+  async dispatch(connId, op, args) {
     switch (op) {
+      case 'set-timing': return this.setTiming(connId, args)
       case 'status': return this.status(connId)
       case 'acquire': return this.acquire(connId, args)
       case 'renew': return this.renew(connId, args)
@@ -2986,7 +3145,8 @@ const PROTOCOL = 'hyperv-mcp/3' // 2: renew, sync_plan, sync (MC-1497); 3: start
 // 'checkpoints' = vm_checkpoint and vm_restore, a lease's own checkpoints (MC-1529).
 // 'pool-checkpoints' = pool_plan's checkpoint actions, pool_checkpoint, acquire's and start's checkpoint (MC-1532).
 // 'refresh-clean' = pool_plan's refresh-clean and pool_refresh (MC-1531).
-const FEATURES = ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean', 'linux', 'debug-keep']
+// 'timing' = set-timing, a connection's timings (MC-1558).
+const FEATURES = ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean', 'linux', 'debug-keep', 'timing']
 const LEASE_CHECKPOINT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$/
 // MC-1532: a pool checkpoint's name.
 const POOL_CHECKPOINT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._+-]{0,39}$/
@@ -3062,8 +3222,8 @@ function readinessLine(a) {
 }
 
 /** MC-1516: an account's provisioning budget, retry included, ran out. */
-function provisionLate(account) {
-  return new Error(`${account}'s first-logon provisioning didn't settle within ${Math.round(PROVISION_WAIT_MS / 1000)} s`)
+function provisionLate(account, ms) {
+  return new Error(`${account}'s first-logon provisioning didn't settle within ${Math.round(ms / 1000)} s`)
 }
 
 /** An evaluation VM's recorded end (ms), or null: an own copy, or a VM built before licences were recorded. */
@@ -3161,7 +3321,7 @@ const pick = img => img.os === 'linux'
   : { sha256: img.sha256, size: img.size, edition: img.edition, build: img.build, imageIndex: img.imageIndex ?? 1, evaluation: isEval(img), pinned: img.pinned, source: img.source, os: img.os || 'windows' }
 const OSES = ['windows', 'linux']
 
-function describePlan(plan, digest, approve) {
+function describePlan(plan, digest, approve, T) {
   const lines = [`Plan ${plan.id} (${plan.op}), valid for 30 minutes. Digest ${digest}; its first 6 characters are ${digest.slice(0, 6)}.`]
   for (const a of plan.add || []) lines.push(`- create ${a.name}: ${a.cores} cores, ${a.memoryMB} MB static memory, ${a.diskGB} GB dynamic disk, in ${a.folder}; network adapter disconnected`)
   for (const r of plan.remove || []) lines.push(`- remove ${r.name} and its folder ${r.folder}`)
@@ -3182,7 +3342,7 @@ function describePlan(plan, digest, approve) {
   if (plan.image && !linux) lines.push(`- image: ${plan.image.edition}${plan.image.imageIndex > 1 ? ` (index ${plan.image.imageIndex})` : ''} build ${plan.image.build}, SHA-256 ${plan.image.sha256} (${plan.image.pinned ? 'pinned: a known Microsoft download' : plan.image.source === 'download' ? 'downloaded by the helper over HTTPS from Microsoft' : 'NOT AUTHENTICATED: a local file you chose to trust'})`)
   if (plan.add?.length && !linux) lines.push('- registry: a user\'s registry isn\'t forcibly unloaded at logoff (the DisableForceUnload policy): the suspected cause of runs losing their HKCU after the short PowerShell Direct session that started them ends (MC-1522; its real-build trial is MC-1521)')
   if (plan.add?.length && !linux) lines.push(`- Defender: the test work folders ${DEFENDER_EXCLUSIONS.join(', ')} are excluded from Defender's scanning (real-time and scheduled scans) in the guest image; Defender stays on otherwise`)
-  if (plan.add?.length && !linux) lines.push(`- provisioning: each new VM logs hvadmin and hvuser on interactively once (offline), waits for Windows' first-logon setup to finish, then turns autologon off and resets UAC and the watcher's start before its clean checkpoint; each account within ${Math.round(PROVISION_WAIT_MS / 60_000)} min (a logon attempt up to ${Math.round(BUILD_LOGON_WAIT_MS / 60_000)} min once it has begun, one with no sign of a logon ${Math.round(FIRST_LOGON_SIGN_MS / 60_000)} min after its new boot is seen retried at once, then accepted once Windows' App Readiness reports the account's first-logon app setup finished and ${Math.round(PROVISION_QUIET_MS / 60_000)} min of observed quiet follow, one retry if needed)`)
+  if (plan.add?.length && !linux) lines.push(`- provisioning: each new VM logs hvadmin and hvuser on interactively once (offline), waits for Windows' first-logon setup to finish, then turns autologon off and resets UAC and the watcher's start before its clean checkpoint; each account within ${Math.round(T.ms.provisionMinutes / 60_000)} min (a logon attempt up to ${Math.round(BUILD_LOGON_WAIT_MS / 60_000)} min once it has begun, one with no sign of a logon ${Math.round(FIRST_LOGON_SIGN_MS / 60_000)} min after its new boot is seen retried at once, then accepted once Windows' App Readiness reports the account's first-logon app setup finished and ${Math.round(PROVISION_QUIET_MS / 60_000)} min of observed quiet follow, one retry if needed)`)
   if (plan.activation === 'online-once') lines.push('- activation: each new VM goes online once, through Windows\' Default Switch, to activate Windows; it is disconnected (verified) before its clean checkpoint, and no start ever uses that switch')
   else if (plan.add?.length && !linux) lines.push('- activation: none (each new VM stays offline; its licence is read and shown)')
   if (plan.add?.length && plan.image && !plan.image.evaluation && !linux) lines.push(`- product key: ${plan.productKey ? 'the pool\'s (set by install.ps1 -ProductKeyFile), written only into the answer file' : 'none'}`)

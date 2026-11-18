@@ -37,9 +37,15 @@ const MAX_LINE = 4 * 1024 * 1024 - 1024
 const PROTOCOL = 'hyperv-mcp/3'
 const splitList = v => String(v || '').split(';').map(s => s.trim()).filter(Boolean)
 
-const roots = rootsClient(m => process.stdout.write(JSON.stringify(m) + '\n'))
+// MC-1558: a client busy on its main thread can take more than the shared default's 5 s to answer roots/list.
+const roots = rootsClient(m => process.stdout.write(JSON.stringify(m) + '\n'), { timeoutMs: 30_000 })
 
 // ---------- the helper ----------
+
+// MC-1558: the user's timings, HYPERV_MCP_* keys in this server's env (Combwork's .combwork/mcp/hyper-v.json), sent to the
+// helper first on every connection (set-timing); the helper keeps each within setup's caps. None set: nothing is sent.
+const TIMING = require('./helper/timing').fromEnv(process.env)
+const SET_TIMING = Object.keys(TIMING).length ? { op: 'set-timing', args: { timing: TIMING } } : null
 
 /** A connection to the helper: over the pipe (service mode) or in-process (direct). request(op, args) → result. */
 function helperLink() {
@@ -52,6 +58,7 @@ function helperLink() {
       helper = new Helper({ stateDir, hv, checkApprovalAcl: process.env.HYPERV_MCP_TEST_NO_ACL !== '1' })
       await helper.init()
       helper.connect('direct', process.pid)
+      if (SET_TIMING) await helper.request('direct', SET_TIMING.op, SET_TIMING.args)
     })()
     return {
       request: async (op, args) => { await ready; return JSON.parse(JSON.stringify(require('./helper/helper').serialise(await helper.request('direct', op, args)))) },
@@ -78,6 +85,9 @@ function helperLink() {
         if (m.ok) w.resolve(m.result)
         else w.reject(new Error(m.error))
       })
+      // MC-1558: the timings go first on this connection (the helper answers a connection's requests in order); an older
+      // helper's "unknown operation" is ignored, as is any reply to it.
+      if (SET_TIMING) s.write(JSON.stringify({ id: `t${++seq}`, ...SET_TIMING }) + '\n')
       s.on('close', () => {
         sock = null
         lost = 'The connection to the helper service closed (it restarted, or was stopped): any VM you had is restored and its lease has ended. Call vm_acquire again.'
