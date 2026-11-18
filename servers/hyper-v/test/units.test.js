@@ -499,6 +499,19 @@ test('uninstall teardown (non-elevated, fakes): verified targets only; resumable
   assert.match(a.resumeTampered, /isn't as setup and the helper leave it/); assert.strictEqual(a.resumeTamperedQuiet, true)
   // Hyper-V's grantee pattern is for disk folders only.
   assert.match(a.capabilityInState, /isn't as setup and the helper leave it/); assert.strictEqual(a.capabilityInStateQuiet, true)
+  // MC-1557: -WhatIf changes nothing (only reads asked of the outside, no record, files and key as they were).
+  for (const m of ['remove', 'keep']) {
+    const w = a.whatIf[m]
+    assert.strictEqual(w.result, 'ok', `${m}: ${w.result}`)
+    assert.strictEqual(w.unchanged, true, `${m}: files and key unchanged: ${w.diff}`)
+    assert.strictEqual(w.record, true, `${m}: no record`)
+    assert.strictEqual(w.calls, '', `${m}: no outside action asked (the helper's status, a read, is the only one, and every other op throws)`)
+    assert.match(w.said, m === 'remove' ? /Verified\. Would remove the pool \(2 VM\(s\).*then these folders: / : /Verified\. Would keep the pool and these folders: /)
+  }
+  // MC-1557: the install folder's uninstall\ stays (the entry's route) until the retire phase; the rest goes.
+  assert.strictEqual(a.keepsUninstall, 'ok')
+  assert.strictEqual(a.keepsUninstallLeft, 'uninstall')
+  assert.strictEqual(a.keepsUninstallFile, true)
 })
 
 // install.ps1's -BuildRoot checks, run as setup runs them (the block itself, cut from the script, not elevated): they

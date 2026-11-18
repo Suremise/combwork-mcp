@@ -256,4 +256,36 @@ Set-Acl -LiteralPath $j -AclObject $acl
 $r.capabilityInState = Try-Run $f
 $r.capabilityInStateQuiet = $null -eq (Phase $f) -and (Test-Path $f.state)
 
+# 13. MC-1557: -WhatIf verifies and says what would happen, and changes nothing: only reads are asked of the outside
+# (every other op is strict), no record, the key's values and every file as they were. Both modes.
+function Get-Snapshot($f) {
+  $k = $HKCU.OpenSubKey($f.keyPath); $vals = @($k.GetValueNames() | Sort-Object | ForEach-Object { "$_=$($k.GetValue($_))" }) -join ';'; $k.Dispose()
+  # Names, and each file's size and content hash (a folder's timestamp can still settle from the fixture's own writes).
+  $files = @(Get-ChildItem -LiteralPath $f.base -Recurse -Force | ForEach-Object { if ($_.PSIsContainer) { "$($_.FullName)\" } else { "$($_.FullName)|$($_.Length)|$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)" } }) -join ';'
+  return "$vals#$files"
+}
+$whatIf = [ordered]@{}
+foreach ($m in @('remove', 'keep')) {
+  $f = New-Fixture
+  $before = Get-Snapshot $f
+  $ops = New-Ops $f
+  $said = New-Object Collections.ArrayList
+  $ops.Say = { param($x) [void]$said.Add($x) }.GetNewClosure()
+  foreach ($w in @('StopService', 'DeleteService', 'RemoveRights', 'RemoveGroup', 'Quiesce', 'RemovePool', 'ConfirmInventory')) { $nm = $w; $ops[$w] = { throw "WHATIF CALLED $nm" }.GetNewClosure() }
+  $res = try { Invoke-Teardown -Mode $m -State $f.state -Install $f.install -Root $HKCU -KeyPath $f.keyPath -Trusted $trusted -RootOwners $who -Who $who -KeyOwner $me -Ops $ops -WhatIf; 'ok' } catch { $_.Exception.Message }
+  $after = Get-Snapshot $f
+  $diff = @(Compare-Object ($before -split ';') ($after -split ';') | ForEach-Object { "$($_.SideIndicator)$($_.InputObject)" }) -join ' '
+  $whatIf[$m] = [ordered]@{ result = $res; unchanged = ($after -eq $before); diff = $diff; record = $null -eq (Phase $f); calls = (($f.sys.calls | Sort-Object -Unique) -join ','); said = ($said -join ' | ') }
+}
+$r.whatIf = $whatIf
+
+# 14. MC-1557: the install folder's uninstall\ (the Installed apps entry's route) stays through the teardown; the rest
+# of the install folder goes. An install without one goes whole, as before (every case above).
+$f = New-Fixture
+New-Item -ItemType Directory -Force (Join-Path $f.install 'uninstall') | Out-Null; Set-Content (Join-Path $f.install 'uninstall\uninstall.ps1') '# x'
+New-Item -ItemType Directory -Force (Join-Path $f.install 'guests') | Out-Null; Set-Content (Join-Path $f.install 'guests\linux.js') 'js'
+$r.keepsUninstall = Try-Run $f
+$r.keepsUninstallLeft = @(Get-ChildItem -LiteralPath $f.install -Force | ForEach-Object { $_.Name }) -join ','
+$r.keepsUninstallFile = Test-Path (Join-Path $f.install 'uninstall\uninstall.ps1')
+
 [Console]::Out.WriteLine('RESULT:' + (ConvertTo-Json $r -Compress -Depth 6))

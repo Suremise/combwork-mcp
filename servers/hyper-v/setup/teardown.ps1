@@ -102,7 +102,8 @@ function Invoke-Teardown {
     [string[]]$Who,         # may own or hold grants inside a target: SYSTEM, Administrators, the helper's account
     [string]$KeyOwner,      # owner of a key created for a legacy teardown (Administrators)
     [hashtable]$Ops,        # ServiceState, StopService, DeleteService, RemoveRights, RemoveGroup, HelperStatus, Quiesce, RemovePool, ConfirmInventory, Say
-    [scriptblock]$Crash     # test hook: run at every boundary with its name
+    [scriptblock]$Crash,    # test hook: run at every boundary with its name
+    [switch]$WhatIf         # MC-1557: verify only and say what would happen; nothing written, stopped or removed
   )
   $boundary = { param($n) if ($Crash) { & $Crash $n } }
   $say = { param($m) if ($Ops.Say) { & $Ops.Say $m } }
@@ -126,6 +127,7 @@ function Invoke-Teardown {
       }
       # Its InstallId is deleted only in the last phase (after components-removed): then a missing one is this teardown's own doing.
       if ($rec.installId -ne $installId -and -not ($null -eq $installId -and $rec.phase -eq 'components-removed')) { throw 'The unfinished uninstall belongs to another installation (its InstallId differs): nothing was changed.' }
+      if ($WhatIf) { & $say "An unfinished uninstall ($Mode) would be resumed at its '$($rec.phase)' phase; it would then remove: $(@($rec.targets | Where-Object { $_.identity -and $Mode -eq 'remove' } | ForEach-Object { $_.path }) -join ', ')"; return }
       & $say "Resuming the uninstall at its '$($rec.phase)' phase."
     } else {
       # The tail of a finished uninstall (killed after its record was deleted): no record, no InstallId, no receipts. Only
@@ -133,6 +135,7 @@ function Invoke-Teardown {
       if ($key -and -not $installId) {
         $rk = $key.OpenSubKey('Storage'); $n = if ($rk) { $rk.ValueCount } else { 0 }; if ($rk) { $rk.Dispose() }
         if (-not $n -and $key.ValueCount -eq 0 -and -not $legacy) {
+          if ($WhatIf) { & $say "The empty registry key $KeyPath left by a finished uninstall would be removed."; return }
           $key.Dispose(); $key = $null
           $Root.DeleteSubKeyTree($KeyPath, $false)
           & $say 'Removed the empty registry key left by a finished uninstall.'
@@ -198,6 +201,10 @@ function Invoke-Teardown {
       } elseif ($helper -and $helper.job) { throw "A pool job is running ($($helper.job)): wait for it, then run this again. Nothing was changed." }
       # A legacy transaction (deleting, or keeping, an older setup's storage) is the admin's explicit decision on the
       # printed inventory; only then may a record and an InstallId be written for it.
+      if ($WhatIf) {
+        & $say "Verified. $(if ($Mode -eq 'remove') { "Would remove the pool$(if ($helper) { " ($($helper.vms) VM(s), through the helper's approved remove plan)" }), then these folders: $(@($targets | Where-Object { $_.identity } | ForEach-Object { $_.path }) -join ', ')" } else { "Would keep the pool and these folders: $(@($targets | Where-Object { $_.identity } | ForEach-Object { $_.path }) -join ', ')" }); then the service, its rights, the group and the install folder."
+        return
+      }
       if ($legacy) {
         $inv = if ($Mode -eq 'remove') { @($targets | Where-Object { $_.identity } | ForEach-Object { "DELETE $(Get-Inventory $_.path)" }) }
           else { @(@($State, $LegacyDiskFolder) | Where-Object { Test-Path -LiteralPath $_ } | ForEach-Object { "KEEP $(Get-Inventory $_)" }) }
@@ -306,7 +313,11 @@ function Invoke-Teardown {
         Open-TrustedAncestors $Install $Trusted $pins
         $h = [HvMcpStorage]::Open($Install)
         try { if ([HvMcpStorage]::Attributes($h) -band [HvMcpStorage]::FILE_ATTRIBUTE_REPARSE_POINT) { throw "$Install is a link: it won't be deleted." } } finally { $h.Dispose() }
-        Remove-TreeNoFollow $Install
+        # MC-1557: its uninstall\ (and an uninstall.retiring\) stays, the Installed apps entry's route, until the retire
+        # phase (appsentry.ps1). An install without one (an older setup's) goes whole, as before.
+        $keep = @('uninstall', 'uninstall.retiring')
+        foreach ($x in @(Get-ChildItem -LiteralPath $Install -Force | Where-Object { $keep -notcontains $_.Name })) { Remove-TreeNoFollow $x.FullName }
+        if (-not @(Get-ChildItem -LiteralPath $Install -Force).Count) { Remove-TreeNoFollow $Install }
         & $boundary 'after:install'
       }
       & $advance 'components-removed'

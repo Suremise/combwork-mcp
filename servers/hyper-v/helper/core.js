@@ -25,6 +25,7 @@ const { segments, globMatcher } = require('./paths')
 const images = require('./images')
 const linuxImages = require('./linux-images')
 const net = require('./net')
+const inventory = require('./inventory')
 const { LinuxDriver, PATHS: LINUX_PATHS } = require('./guests/linux')
 
 const PLAN_ID_RE = /^p-[0-9a-f]{16}$/
@@ -165,10 +166,12 @@ class Helper {
   async init() {
     this.policy = policyMod.load(this.dir)
     this.journal = new Journal(this.dir).open()
+    this.journal.onAppend = () => this.writeInventory() // MC-1557: kept current with every journalled change
     for (const d of ['plans', 'runs', 'secrets']) fs.mkdirSync(join(this.dir, d), { recursive: true })
     fs.rmSync(join(this.dir, 'runs'), { recursive: true, force: true }) // per-run staging: swept at every start
     fs.mkdirSync(join(this.dir, 'runs'), { recursive: true })
     this.recovery = await this.recover()
+    this.writeInventory()
     this.ready = true
     const t = setInterval(() => void this.retryQuarantined(), RETRY_MS)
     t.unref?.()
@@ -179,6 +182,39 @@ class Helper {
   close() { for (const t of this.timers) clearInterval(t), clearTimeout(t); this.timers.clear() }
 
   get state() { return this.journal.state() }
+
+  /**
+   * MC-1557: the recorded inventory (inventory.js), rewritten only when what it lists changed: written to a temporary
+   * file, then renamed over the old one, so a reader never sees it torn. Never fails the change that prompted it.
+   */
+  writeInventory() {
+    try {
+      const s = this.state
+      const vms = [...s.vms.values()].map(v => {
+        const img = this.imageOf(v)
+        const cps = [v.cleanCheckpointId ? 'clean' : null,
+          ...[...s.poolSnaps.values()].filter(x => x.vmId === v.vmId).map(x => `${x.name} (pool)`),
+          ...[...s.leaseSnaps.values()].filter(x => x.vmId === v.vmId).map(x => `${x.name} (a lease's)`)].filter(Boolean)
+        return { vmName: v.vmName, vmId: v.vmId, folder: v.folder, os: this.osOf(v), image: img === 'legacy' ? null : img.slice(0, 12), checkpoints: cps }
+      })
+      let version = null
+      try { version = JSON.parse(fs.readFileSync(join(__dirname, 'meta.json'), 'utf8')).version } catch { try { version = JSON.parse(fs.readFileSync(join(__dirname, '..', 'meta.json'), 'utf8')).version } catch { /* unknown */ } }
+      const facts = {
+        version, stateDir: this.dir, installDir: __dirname, diskFolders: [...this.policy.diskFolders], vms,
+        images: [...s.images.values()].map(i => i.file).filter(Boolean),
+        hostSwitch: this.policy.hostNetwork ? { name: this.policy.hostNetwork.switchName } : null,
+        legacySwitch: s.switch ? { name: s.switch.name, switchId: s.switch.switchId } : null
+      }
+      const key = inventory.render({ ...facts, at: '' })
+      if (key === this.inventoryKey) return
+      const file = join(this.dir, inventory.FILE)
+      fs.writeFileSync(file + '.tmp', inventory.render({ ...facts, at: new Date(this.now()).toISOString() }))
+      fs.renameSync(file + '.tmp', file)
+      this.inventoryKey = key
+    } catch (e) {
+      process.stderr.write(`inventory not written: ${e.message}\n`)
+    }
+  }
 
   /** The VM operations' identity: what hv.ps1 re-checks before touching a VM. */
   ident(vm) { return { vmId: vm.vmId, name: vm.vmName, folder: vm.folder } }

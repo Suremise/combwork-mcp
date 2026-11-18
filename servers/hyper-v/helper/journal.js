@@ -114,6 +114,7 @@ class Journal {
       fs.closeSync(fd)
     }
     this.records.push(r)
+    if (this.onAppend) this.onAppend(r) // MC-1557: the helper's inventory (it never throws)
     return r
   }
 
