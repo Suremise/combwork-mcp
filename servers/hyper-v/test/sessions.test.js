@@ -10,7 +10,7 @@ const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
-const { scratch, startHelper, withPool, waitFor } = require('./helpers')
+const { T, scratch, startHelper, withPool, waitFor } = require('./helpers')
 const { server } = require('../client')
 const policy = require('../helper/policy')
 
@@ -370,7 +370,7 @@ async function inProcess(t, name, policyOver = {}) {
   const { h } = await withPool(sc, 1)
   await h.stop()
   const saved = { ...process.env }
-  Object.assign(process.env, { HYPERV_MCP_PS_STUB: sc.env.HYPERV_MCP_PS_STUB, HYPERV_MCP_STUB_STATE: sc.env.HYPERV_MCP_STUB_STATE, HYPERV_MCP_POLL_MS: '10' })
+  Object.assign(process.env, { HYPERV_MCP_PS_STUB: sc.env.HYPERV_MCP_PS_STUB, HYPERV_MCP_STUB_STATE: sc.env.HYPERV_MCP_STUB_STATE, ...T.profile('inProcess') })
   const clock = { now: Date.parse('2026-11-13T12:00:00Z') }
   const helper = new Helper({ stateDir: sc.stateDir, hv, checkApprovalAcl: false, now: () => clock.now })
   await helper.init()

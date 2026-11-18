@@ -113,7 +113,7 @@ test('activation failing and its cleanup failing: the build stays journalled onl
 
 test('a build left online is also retried every few minutes, without a restart', async t => {
   const sc = scratch('lic-retry', { stub: { activateDies: true, fail: { 'net-off': 1, 'remove-vm': 1 } } })
-  const { h, admin } = await bare(sc, { extraEnv: { HYPERV_MCP_RETRY_MS: '300' } })
+  const { h, admin } = await bare(sc, { extraEnv: T.profile('retryLicence') })
   t.after(() => h.stop())
   await create(sc, admin, {})
   await waitFor(async () => !vms(sc).length && !/may still be online/.test(await status(admin)), T.waitForMs, 'the retry')

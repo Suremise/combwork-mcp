@@ -30,8 +30,10 @@ test('no literal waits in the test files: waitFor bounds, spawn timeouts, sleeps
         [/waitFor\(.*, \d[\d_]{2,}(?:, ['`"]|\))/, 'a waitFor bound'],
         [/\btimeout: \d/, 'a timeout'],
         [/setTimeout\(r, \d[\d_]{2,}\)/, 'a sleep'],
-        [/Date\.now\(\) - t0 < \d/, 'an elapsed-time bound']
-      ]) if (re.test(l)) bad.push(`${f}:${i + 1}: ${what}: ${l.trim().slice(0, 100)}`)
+        [/Date\.now\(\) - t0 < \d/, 'an elapsed-time bound'],
+        // Round 1: the helper's and server's timing env, as a number or a string of digits (pure timing.js inputs aside).
+        [/HYPERV_MCP_[A-Z_]*_(?:MS|SEC|SECS|MINUTES|SECONDS)\b['"]?\s*[:=]\s*['"]?\d/, 'a timing env value']
+      ]) if (re.test(l) && !/timing\.(?:resolve|fromEnv)\(/.test(l)) bad.push(`${f}:${i + 1}: ${what}: ${l.trim().slice(0, 100)}`)
     })
   }
   assert.deepStrictEqual(bad, [])
@@ -39,6 +41,7 @@ test('no literal waits in the test files: waitFor bounds, spawn timeouts, sleeps
   const all = fs.readdirSync(__dirname).filter(n => n.endsWith('.js')).map(f => fs.readFileSync(path.join(__dirname, f), 'utf8')).join('\n')
   for (const m of all.matchAll(/\bT\.bounds\.(\w+)/g)) assert.ok(m[1] in T.bounds, `timing.json bounds has ${m[1]}`)
   for (const m of all.matchAll(/\bT\.(\w+Ms)\b/g)) assert.ok(m[1] in T, `timing.json waits has ${m[1]}`)
+  for (const m of all.matchAll(/\bT\.profile\('(\w+)'\)/g)) assert.doesNotThrow(() => T.profile(m[1]), `timing.json profiles has ${m[1]}`)
 })
 
 // ---------- timing.js ----------
@@ -205,6 +208,18 @@ test('a Windows copy: a call killed after finishing an item resumes from the gue
   await startWith(a, { 'r.bin': 'ABCDEFGHIJKL' })
   assert.deepStrictEqual(buildOf(sc, vm), { 'r.bin': 'ABCDEFGHIJKL' }, 'every byte once, in order')
   assert.strictEqual(sc.stub().calls.filter(c => c.op === 'copy-lengths').length, 1)
+  // Round 1: the retry carries only what the guest hadn't committed: the finished first part isn't sent again.
+  const calls = sc.stub().copyPartCalls
+  assert.deepStrictEqual(calls[0], ['r.bin@0', 'r.bin@4'])
+  assert.deepStrictEqual(calls[1], ['r.bin@4', 'r.bin@8'], 'the cut-off part again, then the next: never r.bin@0')
+})
+
+test('a Windows copy: progress once, then a permanent stall: the retry sends only the stalled item, and fails when it finishes nothing', async t => {
+  const { sc, h, a } = await copySession('copy-stall-after')
+  t.after(() => h.stop())
+  sc.patchStub(s => { s.copyStallRel = 'b.bin' })
+  await assert.rejects(startWith(a, { 'a.txt': 'AA', 'b.bin': 'BB' }), /the copy stalled: no 4-byte part or file finished within/)
+  assert.deepStrictEqual(sc.stub().copyPartCalls, [['a.txt@0', 'b.bin@0'], ['b.bin@0']], 'a.txt committed once and never resent; b.bin alone, then the stall')
 })
 
 test('a Windows copy: the lease ending mid-copy kills it; its part files go', async t => {
@@ -281,7 +296,7 @@ test('server.js sends its env\'s timing keys to the helper on connecting (direct
   const sc = scratch('timing-server')
   const { h } = await withPool(sc, 1)
   await h.stop()
-  const s = server({ ...sc.env, HYPERV_MCP_ENABLED: '1', HYPERV_MCP_MODE: 'direct', HYPERV_MCP_OFF_WAIT_SECONDS: '250', HYPERV_MCP_QUEUE_KEEP_MINUTES: '99' })
+  const s = server({ ...sc.env, HYPERV_MCP_ENABLED: '1', HYPERV_MCP_MODE: 'direct', ...T.profile('serverSettings') })
   t.after(() => s.close())
   const st = (await s.call('vm_status')).text
   assert.match(st, /Timings for this connection: .*offWaitSeconds 250 s.*queueKeepMinutes 60 min.*; restore call 850 s/, 'the env\'s keys, clamped (99 min to 60)')

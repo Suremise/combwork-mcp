@@ -150,7 +150,7 @@ test('the deadline counts from the start\'s reply: a slow start or publish, and 
 })
 
 test('a poll that hangs is cut off by what is left of the run\'s budget, and the timeout\'s cleanup follows at once', async () => {
-  const { sc, h, a } = await running('runs-stuck-poll', { HYPERV_MCP_MIN_POLL_MS: '1000' })
+  const { sc, h, a } = await running('runs-stuck-poll', T.profile('minPollShort'))
   const pidFile = path.join(sc.dir, 'poll.pid')
   sc.patchStub(st => { st.pollDelayOnceMs = 60_000; st.pollPidFile = pidFile })
   const t0 = Date.now()

@@ -205,7 +205,7 @@ test('the caller refuses a timed-out Off even though the facts read afterwards m
 })
 
 test('a lease restore that never lands is refused in phase parent, and never started; the checkpoint is unchanged', async t => {
-  const { sc, s, stubVm } = await lease(t, 'rw-never', { HYPERV_MCP_RESTORE_VERIFY_MS: '1500' })
+  const { sc, s, stubVm } = await lease(t, 'rw-never', T.profile('restoreVerifyShort'))
   const when = path.join(sc.dir, 'never-now')
   sc.patchStub(st => { st.restoreNeverLands = when })
   await s.call('vm_start', {})

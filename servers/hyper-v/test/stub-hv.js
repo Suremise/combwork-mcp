@@ -422,7 +422,7 @@ function run(s, op, a) {
     // MC-1558: a Windows copy-in or vm_sync in bounded calls, as hv.ps1 and guest-sync.ps1 do it, on the guest's disk map:
     // the stage is vm.stages[guestStage] (canonical path -> base64 content). Knobs: copySlowMs (each item of copy-part
     // takes this long), copyStallAt: k (the k-th item ever blocks until the call is killed, once), copyStallAll (every
-    // item blocks), syncGate and
+    // item blocks), copyStallRel (every item of that file blocks), syncGate and
     // syncPidFile (the apply waits for the gate file, to be killed mid-apply).
     case 'copy-prepare': case 'copy-part': case 'copy-lengths': case 'copy-apply': {
       const vm = own(s, a)
@@ -440,9 +440,11 @@ function run(s, op, a) {
       }
       if (op === 'copy-part') {
         let appended = 0, skipped = 0, n = 0
+        s.copyPartCalls = [...(s.copyPartCalls || []), a.items.map(it => `${it.rel}@${it.offset}`)]
+        save(s)
         for (const it of a.items) {
           s.copyItems = (s.copyItems || 0) + 1
-          if (s.copyStallAll || s.copyStallAt === s.copyItems) { if (!s.copyStallAll) delete s.copyStallAt; save(s); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3_600_000) }
+          if (s.copyStallAll || s.copyStallRel === it.rel || s.copyStallAt === s.copyItems) { if (!s.copyStallAll) delete s.copyStallAt; save(s); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3_600_000) }
           if (s.copySlowMs) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, s.copySlowMs)
           const bytes = fs.readFileSync(it.src)
           if (bytes.length !== it.length) throw new Error(`part of '${it.rel}' is ${bytes.length} bytes, not ${it.length}`)

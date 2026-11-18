@@ -184,7 +184,7 @@ async function settled(a, r) {
 // says it's still in progress and that vm_wait is the next call, and vm_wait gives the result once it settles.
 test('MC-1553: a slow vm_start says "still in progress" and vm_wait gives its result; only vm_wait and status run beside it', async t => {
   const { sc, env } = await pooled('slow-start')
-  const a = server({ ...env, HYPERV_MCP_REPLY_MS: '1000' }, { roots: [sc.builds] })
+  const a = server({ ...env, ...T.profile('replyShort') }, { roots: [sc.builds] })
   t.after(() => a.close())
   assert.match((await a.call('vm_wait')).text, /Nothing is in progress in this session/)
   assert.match((await a.call('vm_acquire')).text, /Leased hvmcp-/)
@@ -210,7 +210,7 @@ test('MC-1553: a slow vm_start says "still in progress" and vm_wait gives its re
 
 test('MC-1553: a long vm_run replies "still in progress"; its result, if nobody waited, comes with the next call', async t => {
   const { sc, env } = await pooled('slow-run')
-  const a = server({ ...env, HYPERV_MCP_REPLY_MS: '1000' }, { roots: [sc.builds] })
+  const a = server({ ...env, ...T.profile('replyShort') }, { roots: [sc.builds] })
   t.after(() => a.close())
   await a.call('vm_acquire')
   await settled(a, await a.call('vm_start'))
@@ -243,7 +243,7 @@ test('MC-1553: a long vm_run replies "still in progress"; its result, if nobody 
 
 test('MC-1553: vm_renew and vm_release run beside a slow vm_start; the release ends it, and its outcome comes with the next call', async t => {
   const { sc, env } = await pooled('slow-release')
-  const a = server({ ...env, HYPERV_MCP_REPLY_MS: '1000' }, { roots: [sc.builds] })
+  const a = server({ ...env, ...T.profile('replyShort') }, { roots: [sc.builds] })
   t.after(() => a.close())
   await a.call('vm_acquire')
   const gate = path.join(sc.dir, 'ready-gate')

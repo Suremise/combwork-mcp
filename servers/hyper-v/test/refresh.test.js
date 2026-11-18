@@ -15,7 +15,7 @@ async function pool(name, n = 2) {
   const { h } = await withPool(sc, n)
   await h.stop()
   sc.patchStub(st => { st.licence = { status: 1, graceMinutes: 80 * 1440 } })
-  const helper = await startHelper(sc, { HYPERV_MCP_WAIT_MS: '400', HYPERV_MCP_KEEP_MS: '60000' })
+  const helper = await startHelper(sc, T.profile('queue'))
   return { sc, h: helper, admin: helper.conn(99) }
 }
 /** Every snapshot's parent is another existing snapshot, or none (a root). */

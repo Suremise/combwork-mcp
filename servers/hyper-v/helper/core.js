@@ -1561,11 +1561,14 @@ class Helper {
     fs.mkdirSync(tmp, { recursive: true })
     let moved = 0
     try {
-      let i = 0
-      while (i < units.length) {
+      // Round 1: pending holds only what the guest hasn't committed. A call cut off at the idle bound is judged by what it
+      // committed itself (the guest's committed lengths, which never count a part still going in): nothing new is a stall;
+      // otherwise its finished items leave pending and only the rest go again, never resent.
+      let pending = units
+      while (pending.length) {
         const batch = []
         let bytes = 0
-        while (i < units.length && batch.length < COPY_CALL_FILES && (!batch.length || bytes + units[i].length <= COPY_CALL_BYTES)) { batch.push(units[i]); bytes += units[i].length; i++ }
+        while (batch.length < pending.length && batch.length < COPY_CALL_FILES && (!batch.length || bytes + pending[batch.length].length <= COPY_CALL_BYTES)) { bytes += pending[batch.length].length; batch.push(pending[batch.length]) }
         const items = batch.map((u, n) => {
           if (u.whole) return { src: u.file, rel: u.rel, offset: 0, length: u.length }
           const part = join(tmp, String(n))
@@ -1575,16 +1578,17 @@ class Helper {
         try {
           await call('copy-part', { items })
           moved += bytes
+          pending = pending.slice(batch.length)
         } catch (e) {
           this.stillHeld(lease)
           if (!/timed out/.test(e.message)) throw e
-          // Killed at the idle bound: what the guest has now says whether anything moved.
           const L = await call('copy-lengths', { rels: [...new Set(items.map(x => x.rel))] })
           this.stillHeld(lease)
-          const done = items.filter(x => Number(L?.lengths?.[x.rel] ?? -1) >= x.offset + x.length)
+          const committed = u => Number(L?.lengths?.[u.rel] ?? -1) >= u.offset + u.length
+          const done = batch.filter(committed)
           if (!done.length) throw new Error(`the copy stalled: no ${COPY_PART_BYTES % 1048576 ? `${COPY_PART_BYTES}-byte` : `${COPY_PART_BYTES / 1048576} MB`} part or file finished within ${Math.round(idle / 1000)} s (copyIdleMinutes)`)
-          i -= batch.length // the same call again: what the guest already has is skipped, the rest goes on
-          continue
+          moved += done.reduce((n, u) => n + u.length, 0)
+          pending = [...batch.filter(u => !committed(u)), ...pending.slice(batch.length)]
         } finally {
           for (const f of fs.readdirSync(tmp)) fs.rmSync(join(tmp, f), { force: true })
         }

@@ -21,7 +21,7 @@ async function pool(name, n = 2, policy = {}) {
   fs.writeFileSync(pf, JSON.stringify(p))
   const { h } = await withPool(sc, n)
   await h.stop()
-  const helper = await startHelper(sc, { HYPERV_MCP_WAIT_MS: '400', HYPERV_MCP_KEEP_MS: '60000' })
+  const helper = await startHelper(sc, T.profile('queue'))
   return { sc, h: helper, cli, mcp, admin: helper.conn(99) }
 }
 const req = (c, op, args) => c.request(op, args).then(r => r, e => ({ error: e.message, text: e.message }))
@@ -307,7 +307,7 @@ test('a name on Windows and Linux VMs: acquire without os is refused; with os it
   fs.mkdirSync(dir, { recursive: true })
   fs.writeFileSync(path.join(dir, `${L}.iso`), 'iso')
   fs.appendFileSync(path.join(sc.stateDir, 'journal.jsonl'), JSON.stringify({ t: 'image', sha256: L, size: 3, file: path.join(dir, `${L}.iso`), source: 'local', edition: 'EnterpriseEval', build: '26200.6584', pinned: true, os: 'linux', seq: 2001, at: new Date().toISOString() }) + '\n')
-  const h2 = await startHelper(sc, { HYPERV_MCP_WAIT_MS: '400', HYPERV_MCP_KEEP_MS: '60000' })
+  const h2 = await startHelper(sc, T.profile('queue'))
   const ad = h2.conn(99)
   const plan = await ad.request('pool_plan', { action: 'resize', image: L, vms: 1 })
   approve(sc, plan.data.planId)

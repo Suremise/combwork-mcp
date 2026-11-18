@@ -155,7 +155,7 @@ test('a run queued behind an interactive run whose restore fails never reaches t
   const { h } = await withPool(sc, 1)
   await h.stop()
   const saved = { ...process.env }
-  Object.assign(process.env, { HYPERV_MCP_PS_STUB: sc.env.HYPERV_MCP_PS_STUB, HYPERV_MCP_STUB_STATE: sc.env.HYPERV_MCP_STUB_STATE, HYPERV_MCP_POLL_MS: '10', HYPERV_MCP_READY_WAIT_MS: '3000', HYPERV_MCP_LOGON_STABLE_MS: '30' })
+  Object.assign(process.env, { HYPERV_MCP_PS_STUB: sc.env.HYPERV_MCP_PS_STUB, HYPERV_MCP_STUB_STATE: sc.env.HYPERV_MCP_STUB_STATE, ...T.profile('inProcessReady') })
   const { Helper } = require('../helper/core')
   const { hv } = require('../helper/hv')
   const helper = new Helper({ stateDir: sc.stateDir, hv, checkApprovalAcl: false })

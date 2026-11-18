@@ -186,3 +186,49 @@ test('guest-sync: a staged file that is missing or a junction is refused', { ski
   assert.match(r.error, /link or junction/)
   assert.deepStrictEqual(list(t.target), ['precious.txt=KEEP'])
 })
+
+// MC-1558 (round 1): a Windows copy's append and lengths, for real: parts appended at the committed length; an append
+// interrupted inside a part (its mark left, the file part-way) rolled back to the mark by lengths or by the retried
+// append, never resumed from a partial length; a file already past a part skipped; an unmarked odd length refused.
+test('append and lengths: committed lengths only; an interrupted append rolls back to its mark and the retry gives the exact content', { skip: !windows }, () => {
+  const sc = scratch('gs-append')
+  const stage = path.join(sc.dir, 'gs', 'sync-1'); const parts = `${stage}-parts`
+  assert.ok(gs({ action: 'prepare', stage, parts }).ok)
+  const part = (n, text) => { const p = path.join(parts, String(n)); fs.writeFileSync(p, text); return p }
+  const append = items => gs({ action: 'append', stage, parts, items })
+  const lengths = rels => gs({ action: 'lengths', stage, parts, rels }).result.lengths
+  let r = append([{ rel: 'd/f.bin', part: part(0, 'ABCD'), offset: 0, length: 4 }])
+  assert.deepStrictEqual(r.result, { appended: 1, skipped: 0 })
+  assert.deepStrictEqual(lengths(['d/f.bin', 'none.bin']), { 'd/f.bin': 4, 'none.bin': -1 })
+  // An append of EFGH at 4 interrupted inside the part: its mark (4) left, and the file part-way at ABCDEF.
+  const markDir = path.join(parts, 'marks')
+  r = append([{ rel: 'd/f.bin', part: part(1, 'EFGH'), offset: 4, length: 4 }])
+  assert.ok(r.ok); assert.deepStrictEqual(fs.readdirSync(markDir), [], 'a finished append leaves no mark')
+  fs.writeFileSync(path.join(stage, 'd', 'f.bin'), 'ABCD')
+  const marks = () => fs.readdirSync(markDir)
+  // Recreate the interrupted state: the mark an append writes before its first byte, then a partial write.
+  const crypto = require('crypto')
+  const mark = path.join(markDir, crypto.createHash('sha256').update('D\\F.BIN').digest('hex'))
+  fs.writeFileSync(mark, '4'); fs.appendFileSync(path.join(stage, 'd', 'f.bin'), 'EF')
+  assert.deepStrictEqual(lengths(['d/f.bin']), { 'd/f.bin': 4 }, 'lengths reports the committed length, rolling the partial part back')
+  assert.strictEqual(fs.readFileSync(path.join(stage, 'd', 'f.bin'), 'utf8'), 'ABCD')
+  assert.deepStrictEqual(marks(), [])
+  // The same again, settled by the retried append itself this time.
+  fs.writeFileSync(mark, '4'); fs.appendFileSync(path.join(stage, 'd', 'f.bin'), 'EFG')
+  r = append([{ rel: 'd/f.bin', part: part(2, 'EFGH'), offset: 4, length: 4 }])
+  assert.deepStrictEqual(r.result, { appended: 1, skipped: 0 })
+  assert.strictEqual(fs.readFileSync(path.join(stage, 'd', 'f.bin'), 'utf8'), 'ABCDEFGH', 'exactly once, in order')
+  // MR1's probe: a file part-way (AB) with the mark of an append from 0, then the part ABCD at 0: ABCD, not ABAB... .
+  fs.writeFileSync(path.join(stage, 'g.bin'), 'AB')
+  fs.mkdirSync(markDir, { recursive: true }); fs.writeFileSync(path.join(markDir, crypto.createHash('sha256').update('G.BIN').digest('hex')), '0')
+  r = append([{ rel: 'g.bin', part: part(3, 'ABCD'), offset: 0, length: 4 }])
+  assert.deepStrictEqual(r.result, { appended: 1, skipped: 0 })
+  assert.strictEqual(fs.readFileSync(path.join(stage, 'g.bin'), 'utf8'), 'ABCD')
+  // Already there: skipped. An odd length with no mark (not the copy's own doing): refused, nothing changed.
+  r = append([{ rel: 'g.bin', part: part(4, 'ABCD'), offset: 0, length: 4 }])
+  assert.deepStrictEqual(r.result, { appended: 0, skipped: 1 })
+  fs.writeFileSync(path.join(stage, 'h.bin'), 'XY')
+  r = append([{ rel: 'h.bin', part: part(5, 'WXYZ'), offset: 0, length: 4 }])
+  assert.match(r.error, /the staged file 'h.bin' is 2 bytes, not the 0 this part follows/)
+  assert.strictEqual(fs.readFileSync(path.join(stage, 'h.bin'), 'utf8'), 'XY')
+})

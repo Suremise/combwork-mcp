@@ -46,7 +46,7 @@ async function mixed(name, policy = {}) {
   const { h } = await withPool(sc, 2)
   await h.stop()
   addImages(sc, [[B, 'windows', 2000], [L, 'linux', 2001]])
-  const helper = await startHelper(sc, { HYPERV_MCP_WAIT_MS: '400', HYPERV_MCP_KEEP_MS: '60000' })
+  const helper = await startHelper(sc, T.profile('queue'))
   return { sc, h: helper, admin: helper.conn(99) }
 }
 const status = async c => (await c.request('status')).text

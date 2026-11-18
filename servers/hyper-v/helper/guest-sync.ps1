@@ -6,10 +6,14 @@
 #   prepare: makes $j.stage a fresh, empty folder (its parent must be a real folder, not a link or junction), and
 #            $j.parts too when given; other sync-<n> stages beside it (left by a failed or cancelled copy) are removed.
 #   append:  MC-1558: each item { rel, part, offset, length } of $j.items: the part file (in $j.parts) is appended to the
-#            file rel in the stage, only at that file's current length: a file already that long is skipped (a killed
-#            call's item it had finished), any other length refused. Folders are made one level at a time, never through
-#            a link. Returns { appended, skipped }.
-#   lengths: MC-1558: { lengths: { rel: bytes, or -1 if absent } } for $j.rels in the stage.
+#            file rel in the stage, only at that file's committed length. Each append is recorded first: a mark (in
+#            $j.parts\marks, named by the path's hash) holds the length it starts from, and goes once the append is done.
+#            A mark left by an interrupted append rolls the file back to that length before anything else, so a part is
+#            never half-there: a file already past the part's end is skipped (a killed call's item it had finished), a
+#            file at the part's offset gets it, any other length is refused. Folders are made one level at a time, never
+#            through a link. Returns { appended, skipped }.
+#   lengths: MC-1558: { lengths: { rel: committed bytes, or -1 if absent } } for $j.rels in the stage: an unfinished
+#            append's mark gives the length it started from, not the partial one.
 #   apply:   brings $j.root (C:\build) up to date from $j.stage:
 #     1. checks first, changing nothing: the root and the stage are real folders (no reparse point); every path is a
 #        plain relative path (no "..", ":", drive or root) whose canonical identity (segments joined by "\", upper-cased
@@ -71,6 +75,29 @@ function Parts([string]$p) {
   return , $parts
 }
 function KeyOf($parts) { return ($parts -join '\').ToUpperInvariant() }
+
+# MC-1558: an append's mark: the path of the file holding the committed length of the staged file $parts.
+function MarkOf([string]$pd, $parts) {
+  $sha = [Security.Cryptography.SHA256]::Create()
+  try { $h = -join ($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes((KeyOf $parts))) | ForEach-Object { $_.ToString('x2') }) } finally { $sha.Dispose() }
+  return "$pd\marks\$h"
+}
+# Rolls a staged file back to its mark's committed length, if an append was interrupted; returns the committed length
+# (-1 when the file is absent).
+function Settle([string]$dst, [string]$mark) {
+  if (Test-Path -LiteralPath $mark -PathType Leaf) {
+    $want = [long]([IO.File]::ReadAllText($mark).Trim())
+    $at = Attr $dst
+    if ($null -ne $at -and -not ($at -band $REPARSE) -and -not ($at -band $DIR)) {
+      $fs = New-Object IO.FileStream($dst, [IO.FileMode]::Open, [IO.FileAccess]::Write)
+      try { if ($fs.Length -gt $want) { $fs.SetLength($want) } } finally { $fs.Dispose() }
+    }
+    [IO.File]::Delete($mark)
+  }
+  $at = Attr $dst
+  if ($null -eq $at -or ($at -band $REPARSE) -or ($at -band $DIR)) { return -1 }
+  return (New-Object IO.FileInfo $dst).Length
+}
 
 # Joins segments under a base, and checks the result really is strictly inside it.
 function Under([string]$base, $parts) {
@@ -141,15 +168,19 @@ if ($action -eq 'append') {
     }
     $at = Attr $dst
     if ($null -ne $at -and (($at -band $REPARSE) -or ($at -band $DIR))) { throw "the staged file '$($it.rel)' is a link or a folder: refused" }
-    $cur = if ($null -eq $at) { 0 } else { (New-Object IO.FileInfo $dst).Length }
+    $mark = MarkOf $pd $parts
+    $cur = Settle $dst $mark
     $off = [long]$it.offset; $len = [long]$it.length
-    if ($null -ne $at -and $cur -ge $off + $len) { $skipped++; RemoveSafe $part; continue }
-    if ($cur -ne $off) { throw "the staged file '$($it.rel)' is $cur bytes, not the $off this part follows" }
+    if ($cur -ge 0 -and $cur -ge $off + $len) { $skipped++; RemoveSafe $part; continue }
+    if ([Math]::Max($cur, 0) -ne $off) { throw "the staged file '$($it.rel)' is $([Math]::Max($cur, 0)) bytes, not the $off this part follows" }
     $in = [IO.File]::OpenRead($part)
     try {
       if ($in.Length -ne $len) { throw "part of '$($it.rel)' is $($in.Length) bytes, not $len" }
+      [void][IO.Directory]::CreateDirectory("$pd\marks")
+      [IO.File]::WriteAllText($mark, [string]$off) # recorded before the first byte goes in
       $out = New-Object IO.FileStream($dst, [IO.FileMode]::Append, [IO.FileAccess]::Write)
-      try { $in.CopyTo($out) } finally { $out.Dispose() }
+      try { $in.CopyTo($out); $out.Flush($true) } finally { $out.Dispose() }
+      [IO.File]::Delete($mark) # committed
     } finally { $in.Dispose() }
     RemoveSafe $part
     $appended++
@@ -159,11 +190,12 @@ if ($action -eq 'append') {
 if ($action -eq 'lengths') {
   $stage = [IO.Path]::GetFullPath([string]$j.stage).TrimEnd('\')
   RealFolder $stage 'the staging folder'
+  $pd = [IO.Path]::GetFullPath([string]$j.parts).TrimEnd('\')
+  RealFolder $pd 'the parts folder'
   $out = @{}
   foreach ($r in @($j.rels)) {
-    $f = Under $stage (Parts ([string]$r))
-    $at = Attr $f
-    $out[[string]$r] = if ($null -eq $at -or ($at -band $REPARSE) -or ($at -band $DIR)) { -1 } else { (New-Object IO.FileInfo $f).Length }
+    $parts = Parts ([string]$r)
+    $out[[string]$r] = Settle (Under $stage $parts) (MarkOf $pd $parts)
   }
   return @{ lengths = $out }
 }

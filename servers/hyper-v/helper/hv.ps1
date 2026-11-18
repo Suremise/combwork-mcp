@@ -1133,7 +1133,7 @@ try {
             }
             @{ appended = $appended; skipped = $skipped }
           }
-          'copy-lengths' { Invoke-Command -Session $s -ScriptBlock $sync -ArgumentList @{ action = 'lengths'; stage = $stage; rels = @(@($a.rels) | ForEach-Object { [string]$_ }) } }
+          'copy-lengths' { Invoke-Command -Session $s -ScriptBlock $sync -ArgumentList @{ action = 'lengths'; stage = $stage; parts = $parts; rels = @(@($a.rels) | ForEach-Object { [string]$_ }) } }
           'copy-apply' {
             $j = @{ action = 'apply'; root = 'C:\build'; stage = $stage; parts = $parts; files = @(@($a.files) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ }); remove = @(@($a.remove) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ }); full = [bool]$a.full; delete = [bool]$a.delete }
             $r = Invoke-Command -Session $s -ScriptBlock $sync -ArgumentList $j

@@ -14,7 +14,15 @@ const BASE = require('../../../test/clean-scratch').TARGETS['hyper-v'].base
 // MC-1558: every test timing, from test/timing.json (generous defaults; 'narrow' values asked for by name). T.waitForMs,
 // T.spawnMs, ... are its waits; T.bounds its deliberate narrow results.
 const TIMING = JSON.parse(fs.readFileSync(path.join(__dirname, 'timing.json'), 'utf8'))
-const T = { ...TIMING.waits, bounds: TIMING.bounds, env: TIMING.env, narrow: TIMING.narrow }
+const T = {
+  ...TIMING.waits, bounds: TIMING.bounds, env: TIMING.env, narrow: TIMING.narrow,
+  /** A named set of the helper's test-only timing env (timing.json's profiles), as env strings. */
+  profile(name) {
+    const p = TIMING.profiles[name]
+    if (!p || name.startsWith('_')) throw new Error(`timing.json has no profile ${name}`)
+    return Object.fromEntries(Object.entries(p).map(([k, v]) => [k, String(v)]))
+  }
+}
 /** The helper's test-only timing env: the defaults, with 'narrow' (all) or the named narrow values over them. */
 function timingEnv(timing) {
   const env = { ...TIMING.env }

@@ -43,7 +43,7 @@ test('a connection closing (its server killed) ends its lease: the VM is restore
 
 test('the deadline ends a lease and restores the VM', async t => {
   const sc = scratch('deadline')
-  sc.env.HYPERV_MCP_MINUTE_MS = '300'
+  Object.assign(sc.env, T.profile('leaseMinute'))
   const { h, admin } = await withPool(sc, 1)
   t.after(() => h.stop())
   const a = h.conn(10)
@@ -108,7 +108,7 @@ test('keepOnFailure keeps the VM after a failed run; release restores it', async
 
 test('a kept VM is restored at the deadline', async t => {
   const sc = scratch('keep-deadline')
-  sc.env.HYPERV_MCP_MINUTE_MS = '300'
+  Object.assign(sc.env, T.profile('leaseMinute'))
   const { h, admin } = await withPool(sc, 1)
   t.after(() => h.stop())
   const a = h.conn(10)
@@ -126,7 +126,7 @@ test('a kept VM is restored at the deadline', async t => {
 test('a restore that leaves the adapter connected or a reserve set is caught: CLEANUP FAILED, quarantined, retried', async t => {
   for (const leaves of [{ switchName: 'hvmcp-host' }, { reserve: 20 }, { state: 'Running' }]) {
     const sc = scratch('bad-restore')
-    sc.env.HYPERV_MCP_RETRY_MS = '200'
+    Object.assign(sc.env, T.profile('retryQuick'))
     const { h, admin } = await withPool(sc, 1)
     const a = h.conn(10)
     const vm = await leased(a)
@@ -292,7 +292,7 @@ test('the protocol: malformed lines and unknown connections are refused without 
 
 test('a lease that is ending refuses its connection at once, and its VM goes to the next client only once restored', async t => {
   const sc = scratch('ending-refuses')
-  sc.env.HYPERV_MCP_MINUTE_MS = '400'
+  Object.assign(sc.env, T.profile('leaseMinuteSlow'))
   const { h, admin } = await withPool(sc, 1)
   t.after(() => h.stop())
   const gate = require('path').join(sc.dir, 'restore-gate')
@@ -320,7 +320,7 @@ test('an operation queued for the VM while its lease ended is refused inside the
     const { h } = await withPool(sc, 1)
     await h.stop()
     const saved = { ...process.env }
-    Object.assign(process.env, { HYPERV_MCP_PS_STUB: sc.env.HYPERV_MCP_PS_STUB, HYPERV_MCP_STUB_STATE: sc.env.HYPERV_MCP_STUB_STATE, HYPERV_MCP_POLL_MS: '10' })
+    Object.assign(process.env, { HYPERV_MCP_PS_STUB: sc.env.HYPERV_MCP_PS_STUB, HYPERV_MCP_STUB_STATE: sc.env.HYPERV_MCP_STUB_STATE, ...T.profile('inProcess') })
     const helper = new Helper({ stateDir: sc.stateDir, hv, checkApprovalAcl: false })
     try {
       await helper.init()
@@ -384,8 +384,7 @@ test('a lease ending during vm_start (disconnect or deadline, guest hung or neve
     ['deadline, guest-ready hung', sc => sc.patchStub(s => { s.readyGate = path.join(sc.dir, 'gate'); s.readyPidFile = path.join(sc.dir, 'ready.pid') }), null]
   ]) {
     const sc = scratch('start-cancel')
-    sc.env.HYPERV_MCP_MINUTE_MS = '1500'
-    sc.env.HYPERV_MCP_READY_WAIT_MS = '600000' // the start would otherwise wait 10 minutes
+    Object.assign(sc.env, T.profile('leaseMinuteDuringStart')) // the start's readiness wait outlasts the lease
     const { h, admin } = await withPool(sc, 1)
     try {
       const a = h.conn(10)
@@ -417,7 +416,7 @@ test('a disconnect whose staging cleanup fails (a staged file held open) still e
   const path = require('path')
   const fs = require('fs')
   const sc = scratch('locked-staging')
-  sc.env.HYPERV_MCP_RETRY_MS = '200'
+  Object.assign(sc.env, T.profile('retryQuick'))
   const { h, admin } = await withPool(sc, 1)
   t.after(() => h.stop())
   const a = h.conn(10)

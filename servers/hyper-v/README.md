@@ -768,7 +768,9 @@ each within its range and within setup's caps (below). vm_status shows the value
 - **Windows copies.** A build's copy-in and vm_sync go in calls of at most 64 MB and 500 files, a file over 32 MB as 32 MB
   parts, each appended in the guest at once. The copy fails only when a call finishes no part or file within
   `HYPERV_MCP_COPY_IDLE_MINUTES`: a large copy at a slow but steady rate never meets a whole-copy limit. A call cut off
-  after finishing some resumes from what the guest has. Progress is counted in whole parts or files, not bytes. The cap
+  after finishing some goes on with only what the guest hasn't committed, never resending the rest; one that finished
+  nothing new fails. Each append is marked before it starts, so one cut off inside a part is rolled back to the part's
+  start rather than resumed half-way. Progress is counted in whole parts or files, not bytes. The cap
   of 9 minutes stays under PowerShell Direct's own limit of about 10 minutes per call.
 - **Linux copies** go over SSH, which has no such limit, in one call bounded by size, not progress: 30 minutes plus one
   per 100 MB.
@@ -784,7 +786,8 @@ Test-only:
 - `HYPERV_MCP_PS_STUB`, `HYPERV_MCP_STUB_STATE`: a fake `hv.ps1`;
 - `HYPERV_MCP_CRASH_AT`: crash injection;
 - `HYPERV_MCP_STATE_DIR`;
-- timing: the `HYPERV_MCP_*_MS` variables in `test\timing.json` (each replaces a default, below its range), plus
+- timing: the `HYPERV_MCP_*_MS` variables in `test\timing.json` (its defaults, narrow values and named profiles; each
+  replaces a default, below its range), plus
   `HYPERV_MCP_MINUTE_MS`, `HYPERV_MCP_COPY_PART_BYTES` and the service host's `HYPERV_MCP_HOST_HEARTBEAT_MS`;
 - `HYPERV_MCP_MIN_ISO_BYTES`.
 

@@ -56,7 +56,7 @@ async function mixedPool(name, stub = {}) {
   const { h } = await withPool(sc, 1)
   await h.stop()
   addDebian(sc)
-  const helper = await startHelper(sc, { HYPERV_MCP_KEEP_MS: '60000' })
+  const helper = await startHelper(sc, T.profile('queueKeep'))
   const admin = helper.conn(99)
   const built = await change(sc, admin, { action: 'resize', image: D, vms: 1 })
   return { sc, h: helper, admin, built, linux: linuxVm(sc) }
@@ -348,7 +348,7 @@ test('MC-1545: where an SSH connection stops, from HvMcpVsock\'s lines and the g
     await h.stop()
     addDebian(sc)
     sc.patchStub(s => Object.assign(s, stub))
-    const helper = await startHelper(sc, { HYPERV_MCP_LINUX_ATTEMPT_MS: '2000', HYPERV_MCP_LINUX_READY_MS: '5000' })
+    const helper = await startHelper(sc, T.profile('linuxAttempts'))
     const admin = helper.conn(99)
     const { line } = await change(sc, admin, { action: 'resize', image: D, vms: 1 }, { expectFail: true })
     assert.match(line, re, JSON.stringify(stub))

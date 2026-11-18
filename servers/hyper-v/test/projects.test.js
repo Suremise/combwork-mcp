@@ -14,7 +14,7 @@ const { server } = require('../client')
 const { ps51Env } = require('../helper/hv')
 
 const windows = process.platform === 'win32'
-const Q = { HYPERV_MCP_WAIT_MS: '400', HYPERV_MCP_KEEP_MS: '60000' }
+const Q = T.profile('queue')
 
 /** A pool of n VMs with this policy's projects, then a helper with the queue's test timings. */
 async function pool(name, n, projects, env = Q) {
@@ -57,7 +57,7 @@ test('caps: cli 2 + mcp 1 on 3 VMs; cli at its cap is refused while mcp still ge
 })
 
 test('the queue: first come first served; a VM freed by a release goes to the first active waiter', async () => {
-  const { h } = await pool('pr-fifo', 1, undefined, { HYPERV_MCP_WAIT_MS: '5000', HYPERV_MCP_KEEP_MS: '60000' })
+  const { h } = await pool('pr-fifo', 1, undefined, T.profile('queueSlow'))
   const [a, b, c] = [h.conn(1), h.conn(2), h.conn(3)]
   await acquire(a, {})
   const pb = acquire(b, { wait: true })
@@ -74,7 +74,7 @@ test('the queue: first come first served; a VM freed by a release goes to the fi
 test('a waiter its project\'s cap blocks keeps its place; a later waiter of another project is served past it', async () => {
   const sc0 = scratch('pr-pass-setup')
   const cli = path.join(sc0.dir, 'cli')
-  const { h } = await pool('pr-pass', 2, [{ name: 'cli', folders: [cli], maxVms: 1 }], { HYPERV_MCP_WAIT_MS: '5000', HYPERV_MCP_KEEP_MS: '60000' })
+  const { h } = await pool('pr-pass', 2, [{ name: 'cli', folders: [cli], maxVms: 1 }], T.profile('queueSlow'))
   const [c1, c2, o1, o2] = [h.conn(1), h.conn(2), h.conn(3), h.conn(4)]
   await acquire(c1, { roots: [cli] })
   await acquire(o1, {})
@@ -90,7 +90,7 @@ test('a waiter its project\'s cap blocks keeps its place; a later waiter of anot
 })
 
 test('an abandoned wait is never given a VM: it goes to a caller who is there, and the place expires', async () => {
-  const { h } = await pool('pr-abandon', 1, undefined, { HYPERV_MCP_WAIT_MS: '300', HYPERV_MCP_KEEP_MS: '1500' })
+  const { h } = await pool('pr-abandon', 1, undefined, T.profile('queueAbandon'))
   const [a, b, c] = [h.conn(1), h.conn(2), h.conn(3)]
   await acquire(a, {})
   assert.match((await acquire(b, { wait: true })).text, /^Still waiting/) // b's client stops calling
@@ -105,7 +105,7 @@ test('an abandoned wait is never given a VM: it goes to a caller who is there, a
 test('a repeat call within the keep time keeps its place ahead of later waiters', async () => {
   // Each wait lasts 5 s: long enough that the release's restore (slow under a loaded test run) finishes while b and c
   // are both still waiting. A 300 ms wait could expire first and hand b "Still waiting" (MC-1528's review).
-  const { h } = await pool('pr-keep', 1, undefined, { HYPERV_MCP_WAIT_MS: '5000', HYPERV_MCP_KEEP_MS: '60000' })
+  const { h } = await pool('pr-keep', 1, undefined, T.profile('queueSlow'))
   const [a, b, c] = [h.conn(1), h.conn(2), h.conn(3)]
   await acquire(a, {})
   assert.match((await acquire(b, { wait: true })).text, /number 1 of 1/)
@@ -121,7 +121,7 @@ test('a repeat call within the keep time keeps its place ahead of later waiters'
 })
 
 test('a disconnect leaves the line, and a pool resize finishing serves the next waiter', async () => {
-  const { sc, h } = await pool('pr-resize', 1, undefined, { HYPERV_MCP_WAIT_MS: '20000', HYPERV_MCP_KEEP_MS: '60000' })
+  const { sc, h } = await pool('pr-resize', 1, undefined, T.profile('queueLong'))
   const [admin, a, b, c] = [h.conn(9), h.conn(1), h.conn(2), h.conn(3)]
   await acquire(a, {})
   void acquire(b, { wait: true })
@@ -172,7 +172,7 @@ test('one connection\'s overlapping vm_acquire calls (direct mode): the newer su
   const { h } = await withPool(sc, 1)
   await h.stop()
   const saved = { ...process.env }
-  Object.assign(process.env, { HYPERV_MCP_PS_STUB: sc.env.HYPERV_MCP_PS_STUB, HYPERV_MCP_STUB_STATE: sc.env.HYPERV_MCP_STUB_STATE, HYPERV_MCP_POLL_MS: '10', HYPERV_MCP_WAIT_MS: '5000', HYPERV_MCP_KEEP_MS: '60000' })
+  Object.assign(process.env, { HYPERV_MCP_PS_STUB: sc.env.HYPERV_MCP_PS_STUB, HYPERV_MCP_STUB_STATE: sc.env.HYPERV_MCP_STUB_STATE, ...T.profile('inProcessQueue') })
   delete require.cache[require.resolve('../helper/core')]
   const { Helper } = require('../helper/core')
   const { hv } = require('../helper/hv')

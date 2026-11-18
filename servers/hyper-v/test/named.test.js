@@ -9,12 +9,12 @@ const fs = require('fs')
 const path = require('path')
 const { T, scratch, startHelper, withPool, approve, waitFor } = require('./helpers')
 const { server } = require('../client')
-process.env.HYPERV_MCP_WAIT_MS = '200' // the in-process (bare) helper's bounded wait; started helpers get their own env
+Object.assign(process.env, require('./helpers').T.profile('queueBare')) // the in-process (bare) helper's bounded wait; started helpers get their own env
 const { Helper } = require('../helper/core')
 
 const A = 'ab'.repeat(32) // seeded by withPool: Windows
 const L = 'ef'.repeat(32) // a stub "linux" image
-const SLOW = { HYPERV_MCP_WAIT_MS: '5000', HYPERV_MCP_KEEP_MS: '60000' }
+const SLOW = T.profile('queueSlow')
 
 function addImages(sc, list) {
   const dir = path.join(sc.disks, 'images')

@@ -3,13 +3,7 @@
 // retry its logon and its full quiet window; an AppContainer count change late in the window starts quiet over; counts
 // that never settle exhaust the budget. core.js's own provisionProfiles, logon and waitProvisioned run on a bare object
 // with a fake transport and a clock that moves only by its calls (guest-logon 10, a probe 5, the undo 5).
-process.env.HYPERV_MCP_PROVISION_WAIT_MS = '300'
-process.env.HYPERV_MCP_PROVISION_QUIET_MS = '40'
-process.env.HYPERV_MCP_PROVISION_POLL_MS = '1'
-process.env.HYPERV_MCP_POLL_MS = '1'
-process.env.HYPERV_MCP_LOGON_STABLE_MS = '10'
-process.env.HYPERV_MCP_BUILD_LOGON_WAIT_MS = '150'
-process.env.HYPERV_MCP_LOGON_SNAPSHOT_MS = '100'
+Object.assign(process.env, require('./helpers').T.profile('provisionBudget')) // test/timing.json (MC-1558): read before core.js loads
 const test = require('node:test')
 const assert = require('assert')
 const { Helper } = require('../helper/core')
