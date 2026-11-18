@@ -6,6 +6,7 @@
  */
 const fs = require('fs')
 const { join, win32 } = require('path')
+const net = require('./net')
 
 const FILE = 'policy.json'
 const PREFIX_RE = /^[a-z][a-z0-9]{1,11}$/
@@ -18,7 +19,7 @@ const DEFAULTS = {
   maxMemoryMBTotal: 16 * 1024,
   maxDiskGBPerVm: 128,
   diskFolders: [],
-  allowNetwork: true,
+  maxNetwork: 'none',
   maxReservePercent: 100,
   maxLeaseMinutes: 240,
   maxSessionMinutes: 480,
@@ -52,7 +53,12 @@ function problems(p) {
   if (!int(p.maxDiskGBPerVm, 64, 4096)) out.push('maxDiskGBPerVm must be 64-4096 (Windows 11 needs 64 GB)')
   if (!Array.isArray(p.diskFolders) || !p.diskFolders.length) out.push('diskFolders must name at least one folder')
   else for (const f of p.diskFolders) if (typeof f !== 'string' || !win32.isAbsolute(f) || /^\\\\/.test(f) || win32.parse(f).root === win32.normalize(f)) out.push(`disk folder "${f}" must be an absolute local folder, not a drive root`)
-  if (typeof p.allowNetwork !== 'boolean') out.push('allowNetwork must be true or false')
+  // MC-1556: the highest network mode a pool may be planned with (setup's -MaxNetwork). A policy from before it has
+  // allowNetwork instead: true reads as host, false as none.
+  if (p.maxNetwork !== undefined && !net.isMode(p.maxNetwork)) out.push(`maxNetwork must be one of ${net.MODES.join(', ')}`)
+  if (p.maxNetwork === undefined && typeof p.allowNetwork !== 'boolean') out.push('maxNetwork must be set (or, from an older setup, allowNetwork true or false)')
+  // Host mode's switch and addresses, made by setup: required for a policy that allows host or above.
+  if (p.hostNetwork !== undefined) { const why = net.hostNetworkProblem(p.hostNetwork); if (why) out.push(why) }
   if (!int(p.maxReservePercent, 0, 100)) out.push('maxReservePercent must be 0-100')
   if (!int(p.maxLeaseMinutes, 5, 24 * 60)) out.push('maxLeaseMinutes must be 5-1440')
   // A work session's cap (vm_renew), optional so a policy from before it stays usable; never below one lease.
@@ -133,14 +139,16 @@ function load(dir) {
     name: pr.name, folders: Object.freeze(pr.folders.map(tidy)), maxVms: byOs(pr.maxVms),
     buildRoots: Object.freeze((pr.buildRoots ?? []).map(tidy)), images: Object.freeze((pr.images ?? []).map(i => i.toLowerCase()))
   }))
-  return Object.freeze({ ...p, diskFolders: Object.freeze(p.diskFolders.map(tidy)), buildRoots: Object.freeze((p.buildRoots ?? []).map(tidy)), projects: Object.freeze(projects) })
+  const maxNetwork = p.maxNetwork ?? (p.allowNetwork ? 'host' : 'none')
+  const hostNetwork = p.hostNetwork ? Object.freeze({ ...p.hostNetwork }) : null
+  return Object.freeze({ ...p, maxNetwork, hostNetwork, diskFolders: Object.freeze(p.diskFolders.map(tidy)), buildRoots: Object.freeze((p.buildRoots ?? []).map(tidy)), projects: Object.freeze(projects) })
 }
 
 /**
  * Whether a pool, after a change, stays within the policy. vms: every VM the pool would hold (committed and planned),
  * each { cores, memoryMB, diskGB, folder }. Returns [] or the problems.
  */
-function checkPool(policy, vms, { network = false } = {}) {
+function checkPool(policy, vms, { network = 'none' } = {}) {
   const out = []
   if (vms.length > policy.maxVms) out.push(`${vms.length} VMs is more than the policy's ${policy.maxVms}`)
   const mem = vms.reduce((s, v) => s + v.memoryMB, 0)
@@ -151,7 +159,10 @@ function checkPool(policy, vms, { network = false } = {}) {
     if (!int(v.diskGB, 64, policy.maxDiskGBPerVm)) out.push(`a ${v.diskGB} GB disk is outside the policy's 64-${policy.maxDiskGBPerVm} GB`)
     if (!underDiskFolder(policy, v.folder)) out.push(`folder "${v.folder}" is not under one of the policy's disk folders`)
   }
-  if (network && !policy.allowNetwork) out.push('the policy does not allow networking')
+  // MC-1556: the pool's network mode, at or below the policy's; host needs setup's host network.
+  const why = net.above(network, policy.maxNetwork ?? 'none', 'the policy')
+  if (why) out.push(`${why} (rerun setup with -MaxNetwork to raise it)`)
+  else if (network === 'host' && !policy.hostNetwork) out.push("host mode needs setup's host network (rerun setup with -MaxNetwork Host or above)")
   return [...new Set(out)]
 }
 

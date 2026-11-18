@@ -139,4 +139,10 @@ Invoke-Teardown -Mode $(if ($RemovePool) { 'remove' } else { 'keep' }) -State $s
   -Root ([Microsoft.Win32.Registry]::LocalMachine) -KeyPath 'SOFTWARE\hyperv-mcp' `
   -Trusted @($SYSTEM, $ADMINS, $script:TrustedInstaller) -RootOwners @($SYSTEM, $ADMINS) -Who @($SYSTEM, $ADMINS, $runnerSid) -KeyOwner $ADMINS `
   -Ops $ops
+# MC-1556: setup's host-mode switch (its name and the Notes setup wrote, never the name alone), with this PC's address on
+# it. Idempotent: an interrupted uninstall run again removes it then.
+foreach ($x in @(Get-VMSwitch -Name 'hvmcp-host' -ErrorAction SilentlyContinue | Where-Object { $_.Name -ceq 'hvmcp-host' -and $_.SwitchType -eq 'Internal' -and [string]$_.Notes -match '^hvmcp:host:[0-9a-f]{32}$' })) {
+  Remove-VMSwitch -VMSwitch $x -Force
+  Step "Host-mode switch hvmcp-host removed (and this PC's address on it)."
+}
 Write-Host 'Done.' -ForegroundColor Green

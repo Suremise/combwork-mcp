@@ -16,6 +16,7 @@ const { join } = require('path')
 const ssh = require('../ssh')
 const sshkeys = require('../sshkeys')
 const seed = require('../seed')
+const net = require('../net')
 
 const READY_MS = Number(process.env.HYPERV_MCP_LINUX_READY_MS || 10 * 60_000)
 const CLOUD_INIT_MS = Number(process.env.HYPERV_MCP_LINUX_CLOUD_INIT_MS || 15 * 60_000)
@@ -78,7 +79,42 @@ class LinuxDriver {
         }, opts, a.source ? entries.map(f => join(a.source, ...f.path.split(/[\\/]/))) : [])
         return { ms: Date.now() - t0, copied: r.copied, removed: r.removed }
       }
+      // MC-1556: the guest's network for a mode, and its read-back, each a fixed root script of the helper's own (never an
+      // agent's), run through the dispatcher's existing run path, so no rebuild is needed. Nothing of it persists: /run
+      // is tmpfs and a restore brings the disk back, so 'none' (a pool checkpoint's reset) has nothing to undo.
+      case 'guest-net': {
+        if (a.mode === 'none') return { reset: true }
+        const r = await this.internalRun(vm, net.linuxSetScript(a.mode, { mac: a.mac, address: a.address }), opts)
+        if (r.exitCode !== 0) throw new Error(`setting its network failed (exit ${r.exitCode}${r.stderr ? `: ${String(r.stderr).trim().slice(-300)}` : ''})`)
+        return { set: true }
+      }
+      case 'guest-net-read': {
+        const r = await this.internalRun(vm, net.linuxReadScript({ lookup: !!a.lookup }), opts)
+        const read = net.parseRead(r.stdout)
+        if (!read) throw new Error(`its network couldn't be read (exit ${r.exitCode}${r.stderr ? `: ${String(r.stderr).trim().slice(-300)}` : ''})`)
+        return read
+      }
       default: throw new Error(`${op} isn't available in a Linux guest`)
+    }
+  }
+
+  /**
+   * MC-1556: one of the helper's own root scripts, as a run numbered above any agent's (900000000 up), polled to its
+   * end within 60 s. Never listed as a run of the lease. Returns the poll's answer.
+   */
+  async internalRun(vm, script, opts = {}) {
+    this.netRuns = ((this.netRuns || 0) % 99_999_999) + 1
+    const n = 900_000_000 + this.netRuns
+    await this.dispatch(vm, { op: 'run-start', n, command: script, shell: 'bash', as: 'admin', cwd: '/' }, opts)
+    const t0 = Date.now()
+    for (;;) {
+      const r = await this.dispatch(vm, { op: 'run-poll', n, cap: 64 * 1024 }, opts)
+      if (r.done) return r
+      if (Date.now() - t0 > 60_000) {
+        await this.dispatch(vm, { op: 'run-kill', n }, opts).catch(() => {})
+        throw new Error("its network script didn't finish within 60 s")
+      }
+      await sleep(Math.min(POLL_MS, 500))
     }
   }
 

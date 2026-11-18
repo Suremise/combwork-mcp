@@ -23,6 +23,8 @@
  *   removed   { vmId }
  *   switch    { jobId, name, phase: 'creating'|'created'|'removing'|'removed', token, switchId? }   token: written
  *             into the switch's Notes at creation, so it is recognised as the pool's even before its id is journalled
+ *   pool-network { jobId, mode }                          MC-1556: the pool's network mode, from the plan the user
+ *             approved (none, host, internet, internet-lan); a pool with no record is none
  *   jobEnd    { jobId, ok, note }
  *   quarantine{ vmId, why } / unquarantine { vmId }       a VM that couldn't be confirmed clean, and its release
  *   lcp-take  { opId, vmId, leaseId, name, snapName, origType }  MC-1529: before a lease checkpoint's take (its Hyper-V
@@ -124,7 +126,7 @@ class Journal {
     // checkpointId (null until its take is confirmed), at, dropping }.
     // poolSnaps (MC-1532): published pool checkpoints by checkpointId: { checkpointId, opId, name, vmId, snapName, owner,
     // image, os, at, sourceLease, retiring }.
-    const s = { vms: new Map(), intents: new Map(), jobs: new Map(), usedNonces: new Set(), images: new Map(), switch: null, quarantined: new Map(), leaseSnaps: new Map(), poolSnaps: new Map(), refreshes: new Map() }
+    const s = { vms: new Map(), intents: new Map(), jobs: new Map(), usedNonces: new Set(), images: new Map(), switch: null, network: 'none', quarantined: new Map(), leaseSnaps: new Map(), poolSnaps: new Map(), refreshes: new Map() }
     for (const r of this.records) {
       switch (r.t) {
         case 'image': s.images.set(r.sha256, r); break
@@ -167,6 +169,7 @@ class Journal {
           if (r.phase === 'removed') s.switch = null
           else s.switch = { name: r.name, switchId: r.switchId ?? s.switch?.switchId ?? null, token: r.token ?? s.switch?.token ?? null, phase: r.phase, jobId: r.jobId }
           break
+        case 'pool-network': s.network = r.mode; break
         // MC-1529: a lease checkpoint's life: intent before the take, its id once confirmed, intent before removal, gone.
         case 'lcp-take': s.leaseSnaps.set(r.opId, { opId: r.opId, vmId: r.vmId, leaseId: r.leaseId, name: r.name, snapName: r.snapName, origType: r.origType ?? null, checkpointId: null, at: r.at, dropping: false }); break
         case 'lcp-taken': { const x = s.leaseSnaps.get(r.opId); if (x) x.checkpointId = r.checkpointId; break }

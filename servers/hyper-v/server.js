@@ -330,7 +330,9 @@ async function vmWait() {
 
 const skippedNote =list => list?.length ? `\nLinks skipped (never followed): ${list.slice(0, 20).join(', ')}${list.length > 20 ? ', …' : ''}` : ''
 
-async function vmStart({ build, network = false, reserveCpu = 0, interactive = false, checkpoint } = {}) {
+// MC-1556: the network modes, as an agent describes them to the user when a pool is planned.
+const NETWORK_DESC = 'Modes: none (disconnected); host (reaches only this PC, at a fixed address, on the ports its firewall allows, e.g. a local model server; no LAN, no internet); internet (through Windows\' Default Switch, so its traffic leaves this PC; not the LAN); internet-lan (the internet and the local network).'
+async function vmStart({ build, network = 'none', reserveCpu = 0, interactive = false, checkpoint } = {}) {
   if (interactive) await needInteractive()
   if (checkpoint !== undefined) await needFeature('pool-checkpoints', 'starting from a pool checkpoint (checkpoint)')
   let staged = null
@@ -338,14 +340,14 @@ async function vmStart({ build, network = false, reserveCpu = 0, interactive = f
     if (typeof build !== 'string' || !build.trim()) throw new Error('build must be a folder path')
     staged = await stage(await buildFolder(build))
   }
-  const r = await helper.request('start', { network: !!network, reserveCpu, ...(interactive ? { interactive } : {}), ...(checkpoint !== undefined ? { checkpoint } : {}) })
-  if (!r.isError) { session.start = { network: !!network, reserveCpu, interactive: interactive || false, checkpoint }; session.build = build ?? null }
+  const r = await helper.request('start', { network, reserveCpu, ...(interactive ? { interactive } : {}), ...(checkpoint !== undefined ? { checkpoint } : {}) })
+  if (!r.isError) { session.start = { network, reserveCpu, interactive: interactive || false, checkpoint }; session.build = build ?? null }
   return { text: text(r) + skippedNote(staged?.skipped), isError: r.isError }
 }
 
 /** vm_reset: a start (restore first, always), with this session's last start's options and build unless given. */
 async function vmReset({ build, network, reserveCpu, interactive, checkpoint } = {}) {
-  const last = session.start || { network: false, reserveCpu: 0, interactive: false }
+  const last = session.start || { network: 'none', reserveCpu: 0, interactive: false }
   return vmStart({ build: build ?? session.build ?? undefined, network: network ?? last.network, reserveCpu: reserveCpu ?? last.reserveCpu, interactive: interactive ?? last.interactive, checkpoint: checkpoint ?? last.checkpoint })
 }
 
@@ -460,12 +462,12 @@ const tools = [
   },
   {
     name: 'vm_start',
-    description: 'Start the leased VM: always restores its clean checkpoint first, then optionally copies a build folder in to C:\\build (/build on Linux; a copy: the guest can never change your files), with an empty C:\\out (/out). Network is off unless asked (then only the pool\'s internal switch: host and guests, no internet).',
+    description: 'Start the leased VM: always restores its clean checkpoint first, then optionally copies a build folder in to C:\\build (/build on Linux; a copy: the guest can never change your files), with an empty C:\\out (/out). Network is none unless asked, and never above the mode the user approved for the pool (vm_status shows it).',
     inputSchema: {
       type: 'object',
       properties: {
         build: { type: 'string', description: 'A folder inside your project (your MCP roots), or inside a build folder an admin set (vm_status lists them), to copy in to C:\\build. Links are skipped.' },
-        network: { type: 'boolean', description: 'Connect to the pool\'s internal switch. Default false.' },
+        network: { enum: ['none', 'host', 'internet', 'internet-lan', false, true], description: NETWORK_DESC + ' At or below the pool\'s approved mode. Default none. (true means host, false none.)' },
         reserveCpu: { type: 'number', description: 'Reserve this percentage of the VM\'s cores for timed runs (up to the policy\'s cap). Default 0.' },
         checkpoint: { type: 'string', description: 'Start from one of this VM\'s pool checkpoints instead of clean, or "clean". Default: the lease\'s start point (the pool checkpoint it was acquired by, else clean). A name the VM doesn\'t have is refused, never replaced by clean.' },
         interactive: { enum: [false, 'user', 'admin'], description: 'Log a guest account on interactively (autologon, then one guest restart; the start waits up to 10 minutes for its session), so vm_run with session: \'interactive\' can run in its desktop session: \'user\' (the standard user, UAC on) or \'admin\' (the guest admin, elevated: UAC is off in that guest until its next restore). For programs that need a real logged-on session (their own desktops, windows). Windows guests only. Default false.' }
@@ -499,7 +501,7 @@ const tools = [
       type: 'object',
       properties: {
         build: { type: 'string', description: 'Default: the build last started or synced in this session.' },
-        network: { type: 'boolean' },
+        network: { enum: ['none', 'host', 'internet', 'internet-lan', false, true], description: 'As vm_start\'s. Default: this session\'s last start\'s.' },
         reserveCpu: { type: 'number' },
         interactive: { enum: [false, 'user', 'admin'] },
         checkpoint: { type: 'string', description: 'As vm_start\'s. Default: this session\'s last start\'s.' }
@@ -591,7 +593,7 @@ const tools = [
         memoryGB: { type: 'number' },
         diskGB: { type: 'number' },
         location: { type: 'string', description: 'One of the policy\'s disk folders.' },
-        network: { type: 'boolean', description: 'create: also create an internal switch so runs can ask for networking. Default false.' },
+        network: { enum: ['none', 'host', 'internet', 'internet-lan'], description: 'create, resize: the pool\'s network mode, the highest a run may ask for. The user chooses it in this plan, like cores, memory and disk: describe the options to them. ' + NETWORK_DESC + ' Up to setup\'s policy (vm_status shows it). Default: none for create, the current mode for resize (a resize may change only this).' },
         activate: { type: 'boolean', description: 'A non-evaluation image: also activate Windows online once as each VM is built (the plan says so). Default false (it stays offline; its licence is shown). An evaluation image is always activated.' },
         debugKeepFailedBuild: { type: 'boolean', description: 'Debugging only, for a plan that builds Linux VMs, and only when the user asks: if a build fails, its VM is kept (on, disconnected, never leased) for an administrator to inspect in Hyper-V Manager, instead of being rolled back. The plan says so. A resize plan with no image and vms equal to the number of other VMs in the pool removes only it; any other create or resize removes it too, along with the changes it asks for; a remove plan removes the whole pool. Default: left out (rolled back).' },
         image: { type: ['object', 'string'], description: 'A new image to check: { iso: "<path to the ISO>" } or { download: "<https URL on microsoft.com>" }, with edition: "Enterprise" | "Professional" | "Education" | "EnterpriseEval" when the ISO holds several (one edition per ISO). For Linux: { distro: "debian" | "ubuntu" } (the pinned official cloud image, downloaded and checked against the distro\'s published checksums), or { file: "<path>" } for a local copy of a pinned one. Or a verified image\'s SHA-256 (or its first 12+ hex digits): create from it, or resize only the VMs built from it (its group). Omit to use the newest verified image (and, for resize, the whole pool).' }
@@ -635,7 +637,7 @@ const tools = [
 const INSTRUCTIONS = [
   'Hyper-V tools give you a disposable Windows VM from a shared pool, or a Linux one (vm_acquire with os: "linux", or distro: "debian" | "ubuntu"): vm_acquire, vm_start (with your build folder), vm_run, vm_read_out, vm_stop, then always vm_release. On Linux the folders are /build and /out and commands are bash; everything else is the same.',
   'Every start restores the VM\'s clean checkpoint. For a work session, keep the VM running instead: vm_sync copies only changed files into C:\\build, vm_reset gives a clean VM again, vm_renew extends the lease (within the policy). Runs are in session 0 (no desktop) unless the VM was started with interactive (a guest account logged on): then vm_run with session: "interactive" runs in that desktop session, for programs that make their own desktops or windows. Several agents can each hold a VM at once; if none is free, wait and retry.',
-  'Network is off unless you ask, and then only to an internal switch (no internet). Don\'t put real sign-ins, tokens or real CLIs in a VM.',
+  'Network is none unless you ask, and never above the mode the user approved for the pool (vm_status): host (this PC only, on the ports its firewall allows), internet, or internet and LAN. Don\'t put real sign-ins, tokens or real CLIs in a VM.',
   'A slow vm_start, vm_reset, vm_restore, vm_checkpoint, vm_run or vm_sync replies within about 45 s: if it says "still in progress", call vm_wait (again and again) until it gives the result. Never end your turn while one is in progress: nothing wakes you when it finishes.',
   'Write anything you want back to C:\\out inside, and read it with vm_read_out before vm_stop.',
   'pool_plan, pool_create, pool_resize and pool_remove change the pool: use them only when the user asks. The user approves each plan in an admin PowerShell; never run the approve line yourself.'

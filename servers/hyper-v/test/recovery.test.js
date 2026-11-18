@@ -1,7 +1,7 @@
 // Crash recovery: the helper is killed (HYPERV_MCP_CRASH_AT ends the process) before or after each side effect of a pool
 // change, then started again. Recovery must finish or undo exactly what the journal says may have been done: an
 // unfinished create rolled back (the VM found only by its exact random name in its exact folder, never another), an
-// unfinished remove completed, an unfinished switch change finished, open jobs closed, and every VM restored.
+// unfinished remove completed, an unfinished switch change finished (older pools only), open jobs closed, and every VM restored.
 const test = require('node:test')
 const assert = require('assert')
 const fs = require('fs')
@@ -94,16 +94,6 @@ for (const at of ['before:remove-vm', 'after:remove-vm']) {
   })
 }
 
-for (const at of ['before:new-switch', 'after:new-switch']) {
-  test(`a crash at ${at} undoes the switch at the next start`, async t => {
-    const sc = await prepared(`crash-switch-${at.replace(':', '-')}`)
-    const h = await crashCreate(sc, at, { network: true })
-    t.after(() => h.stop())
-    assert.deepStrictEqual(sc.stub().switches, {})
-    assert.match((await h.conn(1).request('status')).text, /switch: none/)
-  })
-}
-
 test('a helper restart voids every lease and restores every VM before serving anyone', async t => {
   const sc = scratch('restart-restores')
   let { h } = await withPool(sc, 2)
@@ -135,55 +125,36 @@ test('a quarantined VM that can\'t be restored at start-up stays quarantined and
   assert.match((await h.conn(1).request('status')).text, /QUARANTINED \(restore: injected failure of restore\)/)
 })
 
-// A same-named switch that isn't the pool's (another id, no token of ours in its Notes) is never removed or used.
+// MC-1556: runs no longer use a pool switch: plans never make one, and host mode uses setup's hvmcp-host by its id.
+// A same-named switch that isn't ours (another id, no token of ours in its Notes) is never removed or used.
 const FOREIGN = { 'hvmcp-internal': { id: 'foreign-switch-id', type: 'Internal', notes: '' } }
 
-test('a foreign switch with the pool\'s switch name survives a create that fails on it, and the next start', async t => {
-  const sc = await prepared('foreign-switch-fail')
-  sc.patchStub(s => { s.switches = { ...FOREIGN } })
-  let h = await startHelper(sc)
+test('a host-mode create makes no switch; a foreign hvmcp-internal survives it, a crash and recovery untouched', async t => {
+  const sc = await prepared('foreign-switch')
+  sc.patchStub(s => { s.switches = { ...s.switches, ...FOREIGN } })
+  const before = sc.stub().switches
+  const h = await crashCreate(sc, 'after:create-vm', { network: 'host' })
+  t.after(() => h.stop())
+  assert.deepStrictEqual(sc.stub().switches, before, 'recovery touched no switch')
   const admin = h.conn(1)
-  const p = (await admin.request('pool_plan', { action: 'create', vms: 1, cores: 2, memoryGB: 4, network: true })).data.planId
+  const p = (await admin.request('pool_plan', { action: 'create', vms: 1, cores: 2, memoryGB: 4, network: 'host' })).data.planId
   approve(sc, p)
   await admin.request('pool_create', { planId: p })
-  await waitFor(async () => /Last pool job: create FAILED: creating the switch hvmcp-internal: .*already exists/.test((await admin.request('status')).text))
-  assert.deepStrictEqual(sc.stub().switches, FOREIGN, 'untouched by the failed create')
-  await h.stop()
-  h = await startHelper(sc)
-  t.after(() => h.stop())
-  assert.deepStrictEqual(sc.stub().switches, FOREIGN, 'untouched by recovery')
-  assert.match((await h.conn(1).request('status')).text, /switch: none/)
+  await waitFor(async () => /Last pool job: create finished/.test((await admin.request('status')).text), 60_000, 'the create')
+  assert.deepStrictEqual(sc.stub().switches, before, 'the create made no switch')
+  const st = (await admin.request('status')).text
+  assert.match(st, /network host \(approved in a plan/)
+  assert.doesNotMatch(st, /old pool switch/)
 })
 
-test('a crash before creating the switch, with a foreign one of that name present: recovery leaves it alone', async t => {
-  const sc = await prepared('foreign-switch-crash')
-  sc.patchStub(s => { s.switches = { ...FOREIGN } })
-  const h = await crashCreate(sc, 'before:new-switch', { network: true })
-  t.after(() => h.stop())
-  assert.deepStrictEqual(sc.stub().switches, FOREIGN)
-  assert.match((await h.conn(1).request('status')).text, /exists but isn't the pool's .*left untouched/)
-})
-
-test('a switch made but not journalled (a failure after New-VMSwitch) is found by its token and removed', async t => {
-  const sc = await prepared('switch-token')
-  sc.patchStub(s => { s.failAfterSwitch = true })
-  const h = await startHelper(sc)
-  t.after(() => h.stop())
-  const admin = h.conn(1)
-  const p = (await admin.request('pool_plan', { action: 'create', vms: 1, cores: 2, memoryGB: 4, network: true })).data.planId
-  approve(sc, p)
-  await admin.request('pool_create', { planId: p })
-  await waitFor(async () => /Last pool job: create FAILED/.test((await admin.request('status')).text))
-  assert.deepStrictEqual(sc.stub().switches, {}, 'its own switch, found by token, is gone')
-})
-
-test('a start with networking uses the pool\'s switch by id: a same-named replacement is refused', async t => {
+test('a host-mode start uses setup\'s switch by id: a same-named replacement is refused, nothing connected', async t => {
   const sc = scratch('switch-replaced')
-  const { h } = await withPool(sc, 1, { network: true })
+  const { h } = await withPool(sc, 1, { network: 'host' })
   t.after(() => h.stop())
-  sc.patchStub(s => { s.switches['hvmcp-internal'] = { id: 'replacement-id', type: 'Internal', notes: '' } })
+  sc.patchStub(s => { s.switches['hvmcp-host'] = { id: 'replacement-id', type: 'Internal', notes: '' } })
   const a = h.conn(10)
   await a.request('acquire')
-  await assert.rejects(a.request('start', { network: true }), /switch hvmcp-internal \(id .*\) is missing, renamed or not internal/)
+  await assert.rejects(a.request('start', { network: 'host' }), /host-mode switch hvmcp-host \(id .*\) is missing: rerun setup/)
   assert.ok(!Object.values(sc.stub().vms).some(v => v.switchName), 'no adapter was connected')
+  assert.ok(!Object.values(sc.stub().vms).some(v => v.acls?.length), 'no ACLs left')
 })

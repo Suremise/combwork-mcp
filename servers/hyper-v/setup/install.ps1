@@ -23,6 +23,14 @@
 # non-evaluation image (README, "The image"): checked here, then stored in the state's secrets folder, readable only by
 # SYSTEM, Administrators and the helper; it goes only into such a build's answer file. A file, so the key is never on
 # a command line. Left out, a rerun keeps the current key; -ProductKeyFile none removes it.
+# -MaxNetwork (MC-1556) is the highest network mode a pool may be planned with (the user then picks the pool's mode in
+# each plan they approve): None (the default for a new install), Host (a VM reaches only this PC, on the ports its
+# firewall allows), Internet (also the internet, through Windows' Default Switch; not the LAN) or InternetLan (the
+# internet and the LAN). Left out, a rerun keeps the current value (an older install's -AllowNetwork $true reads as
+# Host, $false as None; -AllowNetwork still works and means the same). Host or above makes setup's internal switch
+# hvmcp-host and gives this PC a static address on -HostSubnet (default 10.137.42.0/24; this PC is .1, VMs .10 up),
+# refused if anything on this PC already uses that range. Setup changes no firewall rule: it prints the lines that would
+# let host-mode VMs reach a service, for you to run if you want. Lowering it below Host removes that switch.
 # -MaxSessionMinutes caps a work session (vm_renew can extend a lease up to it, from vm_acquire): 5-1440 and at least
 # -MaxLeaseMinutes. Left out, the helper uses 480 (or -MaxLeaseMinutes, if that is more).
 # It is idempotent: run it again to update the helper or change the policy. It keeps an existing pool and its state.
@@ -35,7 +43,9 @@ param(
   [int]$MaxCoresPerVm = 0,
   [int]$MaxMemoryGB = 0,
   [int]$MaxDiskGBPerVm = 128,
-  [bool]$AllowNetwork = $true,
+  [bool]$AllowNetwork = $false,
+  [ValidateSet('', 'None', 'Host', 'Internet', 'InternetLan')][string]$MaxNetwork = '',
+  [string]$HostSubnet = '',
   [int]$MaxReservePercent = 100,
   [int]$MaxLeaseMinutes = 240,
   [int]$MaxSessionMinutes = 0,
@@ -155,6 +165,44 @@ if ($projects.Count) {
 }
 # The helper refuses a policy whose session cap is below one lease (helper/policy.js): refuse it here first.
 if ($MaxSessionMinutes -and ($MaxSessionMinutes -lt 5 -or $MaxSessionMinutes -gt 1440 -or $MaxSessionMinutes -lt $MaxLeaseMinutes)) { throw "-MaxSessionMinutes must be 5-1440 and at least -MaxLeaseMinutes ($MaxLeaseMinutes)." }
+# MC-1556: the network ceiling, and host mode's subnet, worked out and checked here (read-only), before anything changes.
+if ($MaxNetwork -and $PSBoundParameters.ContainsKey('AllowNetwork')) { throw 'Give -MaxNetwork, or the older -AllowNetwork, not both. Nothing was changed.' }
+$curPolicy = $null
+$curPolicyFile = Join-Path $state 'policy.json'
+if (Test-Path -LiteralPath $curPolicyFile) { try { $curPolicy = Get-Content -Raw -LiteralPath $curPolicyFile | ConvertFrom-Json } catch { $curPolicy = $null } }
+$netMode = if ($MaxNetwork) { @{ None = 'none'; Host = 'host'; Internet = 'internet'; InternetLan = 'internet-lan' }[$MaxNetwork] }
+  elseif ($PSBoundParameters.ContainsKey('AllowNetwork')) { if ($AllowNetwork) { 'host' } else { 'none' } }
+  elseif ($curPolicy -and $curPolicy.maxNetwork) { [string]$curPolicy.maxNetwork }
+  elseif ($curPolicy -and $null -ne $curPolicy.allowNetwork) { if ($curPolicy.allowNetwork) { 'host' } else { 'none' } }
+  else { 'none' }
+if ($netMode -notin 'none', 'host', 'internet', 'internet-lan') { throw "The current policy's network ceiling ($netMode) isn't one this setup knows: give -MaxNetwork." }
+$wantHost = $netMode -ne 'none' # every mode above none includes host
+$subnet = if ($HostSubnet) { $HostSubnet } elseif ($curPolicy -and $curPolicy.hostNetwork) { [string]$curPolicy.hostNetwork.subnet } else { '10.137.42.0/24' }
+$hostSwName = 'hvmcp-host'
+$hostSw = @(Get-VMSwitch -Name $hostSwName -ErrorAction SilentlyContinue | Where-Object { $_.Name -ceq $hostSwName })
+$ourHostSw = @($hostSw | Where-Object { $_.SwitchType -eq 'Internal' -and [string]$_.Notes -match '^hvmcp:host:[0-9a-f]{32}$' }) | Select-Object -First 1
+if ($hostSw.Count -and -not $ourHostSw) { throw "A switch named $hostSwName exists that setup didn't make (it isn't internal, or its Notes aren't setup's): rename or remove it, then run this again. Nothing was changed." }
+# This PC's adapter for a switch (by the switch's id), or $null.
+function Get-HostAdapter($switchId) {
+  $m = Get-VMNetworkAdapter -ManagementOS -ErrorAction SilentlyContinue | Where-Object { ([string]$_.SwitchId).ToLower() -eq ([string]$switchId).ToLower() } | Select-Object -First 1
+  if (-not $m) { return $null }
+  Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object { ($_.MacAddress -replace '-', '') -eq [string]$m.MacAddress } | Select-Object -First 1
+}
+if ($wantHost) {
+  $nodeNet = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
+  if (-not $nodeNet) { throw 'Node (18 or later) is not on PATH.' }
+  $ourIx = if ($ourHostSw) { $a0 = Get-HostAdapter $ourHostSw.Id; if ($a0) { $a0.ifIndex } else { -1 } } else { -1 }
+  $seen = @{
+    others = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceIndex -ne $ourIx } | ForEach-Object { @{ alias = [string]$_.InterfaceAlias; ip = [string]$_.IPAddress; prefix = [int]$_.PrefixLength } })
+    routes = @(Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.ifIndex -ne $ourIx } | ForEach-Object { @{ alias = [string]$_.InterfaceAlias; prefix = [string]$_.DestinationPrefix } })
+  }
+  # The helper's own rules (helper/net.js): a /24 in 10/8 or 192.168/16, overlapping nothing on another interface.
+  $why = (ConvertTo-Json -InputObject $seen -Depth 4 -Compress) | & $nodeNet -e "const n = require(process.argv[1]); let t = ''; process.stdin.on('data', d => t += d).on('end', () => { const r = JSON.parse(t); process.stdout.write(n.subnetProblem(process.argv[2]) || n.clashProblem(process.argv[2], r.others || [], r.routes || []) || '') })" (Join-Path $src 'helper
+et.js') $subnet
+  if ($LASTEXITCODE) { throw 'The host-subnet check (node) failed.' }
+  if ($why) { throw "Host mode can't use $subnet`: $why. Give another -HostSubnet (a.b.c.0/24), or -MaxNetwork None. Nothing was changed." }
+}
+$hostAddr = $subnet -replace '\.0/24$', '.1'
 $pins = New-Object Collections.ArrayList
 $receipts = $null
 try {
@@ -207,7 +255,7 @@ if ($bad.Count) { throw "$install isn't admin-only after setting its ACL: $($bad
 # Nothing earlier in it is kept: every file the service runs is copied fresh below (a stray file could be loaded instead).
 Get-ChildItem -LiteralPath $install -Force | Remove-Item -Recurse -Force
 New-Item -ItemType Directory -Path (Join-Path $install 'guests') -Force | Out-Null
-foreach ($f in 'core.js', 'helper.js', 'hv.js', 'hv.ps1', 'guest-sync.ps1', 'guest-agent.ps1', 'images.js', 'iso.js', 'journal.js', 'paths.js', 'policy.js', 'unattend.js', 'approve.ps1', 'linux-images.js', 'openpgp.js', 'qcow2.js', 'seed.js', 'ssh.js', 'sshkeys.js', 'guest.py', 'guests\linux.js') {
+foreach ($f in 'core.js', 'helper.js', 'hv.js', 'hv.ps1', 'guest-sync.ps1', 'guest-agent.ps1', 'images.js', 'iso.js', 'journal.js', 'net.js', 'paths.js', 'policy.js', 'unattend.js', 'approve.ps1', 'linux-images.js', 'openpgp.js', 'qcow2.js', 'seed.js', 'ssh.js', 'sshkeys.js', 'guest.py', 'guests\linux.js') {
   Copy-Item -LiteralPath (Join-Path $src "helper\$f") -Destination (Join-Path $install $f) -Force
 }
 Copy-Item -LiteralPath (Join-Path $src 'meta.json') -Destination (Join-Path $install 'meta.json') -Force
@@ -256,6 +304,34 @@ Step "$runner is in Hyper-V Administrators."
 # 6. The storage was created or verified in step 1b, and is never re-permissioned here.
 if ((New-Object Security.Principal.NTAccount $runner).Translate([Security.Principal.SecurityIdentifier]).Value -ne $runnerSid) { throw "$runner's SID isn't the one checked in step 1b." }
 
+# 6b. MC-1556: host mode's switch and this PC's address on it, when the ceiling is Host or above (the service is stopped,
+# so no run is using it). The switch is recognised by its name and the Notes setup wrote, never by its name alone; this
+# PC's adapter on it gets exactly the subnet's .1, nothing else. Below Host, setup's switch is removed.
+$hostNetwork = $null
+if ($wantHost) {
+  if (-not $ourHostSw) {
+    $tok = -join ((1..16) | ForEach-Object { '{0:x2}' -f (Get-Random -Maximum 256) })
+    $ourHostSw = New-VMSwitch -Name $hostSwName -SwitchType Internal -Notes "hvmcp:host:$tok"
+  }
+  $hif = $null
+  $t = (Get-Date).AddSeconds(30)
+  while (-not ($hif = Get-HostAdapter $ourHostSw.Id) -and (Get-Date) -lt $t) { Start-Sleep 1 }
+  if (-not $hif) { throw "This PC's adapter on $hostSwName didn't appear: run setup again." }
+  $have = @(Get-NetIPAddress -InterfaceIndex $hif.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+  if (-not ($have.Count -eq 1 -and $have[0].IPAddress -eq $hostAddr -and $have[0].PrefixLength -eq 24)) {
+    Set-NetIPInterface -InterfaceIndex $hif.ifIndex -AddressFamily IPv4 -Dhcp Disabled
+    $have | Remove-NetIPAddress -Confirm:$false
+    New-NetIPAddress -InterfaceIndex $hif.ifIndex -IPAddress $hostAddr -PrefixLength 24 | Out-Null
+  }
+  $have = @(Get-NetIPAddress -InterfaceIndex $hif.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+  if (-not ($have.Count -eq 1 -and $have[0].IPAddress -eq $hostAddr -and $have[0].PrefixLength -eq 24)) { throw "This PC's address on $hostSwName isn't exactly $hostAddr/24 after setting it: run setup again." }
+  $hostNetwork = [ordered]@{ switchId = $ourHostSw.Id.ToString(); switchName = $hostSwName; subnet = $subnet; hostAddress = $hostAddr }
+  Step "Host mode: internal switch $hostSwName; this PC is $hostAddr on $subnet (VMs get .10 upwards when they start in host mode)."
+} elseif ($ourHostSw) {
+  Remove-VMSwitch -VMSwitch $ourHostSw -Force
+  Step "Host mode: off. Setup's switch $hostSwName (and this PC's address on it) removed."
+}
+
 # 7. The policy: hard limits for every pool change, writable only by Administrators and SYSTEM. Written with its final
 # ACL from the moment it exists (a new file, then renamed over the old one).
 $cs = Get-CimInstance Win32_ComputerSystem
@@ -266,7 +342,7 @@ $policy = [ordered]@{
   maxVms = $poolMaxVms
   maxCoresPerVm = $(if ($MaxCoresPerVm) { $MaxCoresPerVm } else { [Math]::Max(1, [Math]::Min(8, [Math]::Floor($cpus / 4))) })
   maxMemoryMBTotal = $(if ($MaxMemoryGB) { $MaxMemoryGB * 1024 } else { [Math]::Max(4096, [Math]::Floor($ramGB / 2) * 1024) })
-  maxDiskGBPerVm = $MaxDiskGBPerVm; diskFolders = $folders; allowNetwork = $AllowNetwork
+  maxDiskGBPerVm = $MaxDiskGBPerVm; diskFolders = $folders; maxNetwork = $netMode
   maxReservePercent = $MaxReservePercent; maxLeaseMinutes = $MaxLeaseMinutes; maxBuildMB = $MaxBuildMB
   allowUnpinnedIso = [bool]$AllowUnpinnedIso
   buildRoots = @($buildRoots)
@@ -274,6 +350,7 @@ $policy = [ordered]@{
 }
 if ($projects.Count) { $policy.projects = @($projects) } # checked, against this maxVms, before anything changed
 if ($MaxSessionMinutes) { $policy.maxSessionMinutes = $MaxSessionMinutes }
+if ($hostNetwork) { $policy.hostNetwork = $hostNetwork } # MC-1556
 $policyFile = Join-Path $state 'policy.json'
 Write-SecureFile $policyFile ($policy | ConvertTo-Json -Depth 4) @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=ReadAndExecute") $ADMINS
 $keyFile = Join-Path (Join-Path $state 'secrets') 'product-key.json'
@@ -295,8 +372,8 @@ Step "State in $state; VM disks in $($folders -join ', '); ACLs checked."
 Step "Build folders set by an admin (beside each client's MCP roots): $(if ($buildRoots.Count) { $buildRoots -join '; ' } else { 'none' })."
 Step "Projects sharing the pool: $projectsLine."
 Step "Product key (-ProductKeyFile): $keyLine."
-Step $(if ($defaultSwitch) { "Default Switch: present. Each evaluation VM goes online through it once, when it is built, to activate Windows (about 90 days from then); no start uses it." } else { "Default Switch: absent. Evaluation VMs can't be activated here, so pools need a non-evaluation image (an own copy, built offline)." })
-Step ("Policy: up to {0} VMs, {1} cores each, {2} GB memory in all, {3} GB disks; network {4}; unpinned ISOs {5}; leases up to {6} min, work sessions up to {7} min." -f $policy.maxVms, $policy.maxCoresPerVm, ($policy.maxMemoryMBTotal / 1024), $policy.maxDiskGBPerVm, $(if ($AllowNetwork) { 'allowed (internal switch only)' } else { 'not allowed' }), $(if ($AllowUnpinnedIso) { 'allowed' } else { 'refused' }), $MaxLeaseMinutes, $(if ($MaxSessionMinutes) { $MaxSessionMinutes } else { [Math]::Max($MaxLeaseMinutes, 480) }))
+Step $(if ($defaultSwitch) { "Default Switch: present. Each evaluation VM goes online through it once, when it is built, to activate Windows (about 90 days from then); runs use it only in the internet modes, when a plan the user approved allows them." } else { "Default Switch: absent. Evaluation VMs can't be activated here, so pools need a non-evaluation image (an own copy, built offline), and the internet modes can't be used." })
+Step ("Policy: up to {0} VMs, {1} cores each, {2} GB memory in all, {3} GB disks; network {4}; unpinned ISOs {5}; leases up to {6} min, work sessions up to {7} min." -f $policy.maxVms, $policy.maxCoresPerVm, ($policy.maxMemoryMBTotal / 1024), $policy.maxDiskGBPerVm, "up to $netMode (each pool's mode is chosen in the plan you approve)", $(if ($AllowUnpinnedIso) { 'allowed' } else { 'refused' }), $MaxLeaseMinutes, $(if ($MaxSessionMinutes) { $MaxSessionMinutes } else { [Math]::Max($MaxLeaseMinutes, 480) }))
 
 # 8. Start.
 if ($Mode -eq 'Service') {
@@ -328,6 +405,15 @@ Step "The pool's VMs and their Windows licences: $lic"
   # Every handle setup opened (the pinned parents and storage folders), and the receipts key, on every path out.
   Close-Pins $pins
   if ($receipts) { $receipts.Dispose() }
+}
+if ($hostNetwork) {
+  # MC-1556: never run by setup. Printed so the user can choose what host-mode VMs may reach on this PC.
+  Write-Host ''
+  Write-Host "Host mode: a VM reaches only this PC, at $hostAddr, and only on ports this PC's firewall allows. Setup changed no firewall rule."
+  Write-Host 'To let host-mode VMs reach a service here, for example Ollama on port 11434, you can run this yourself in an admin PowerShell:'
+  Write-Host "  New-NetFirewallRule -DisplayName 'hyper-v MCP host mode: TCP 11434' -Direction Inbound -Protocol TCP -LocalPort 11434 -LocalAddress $hostAddr -RemoteAddress $subnet -Action Allow"
+  Write-Host "and make the service listen beyond localhost (for Ollama: set OLLAMA_HOST to $hostAddr`:11434, or 0.0.0.0:11434, then restart it)."
+  Write-Host "To undo: Remove-NetFirewallRule -DisplayName 'hyper-v MCP host mode: TCP 11434'"
 }
 Write-Host ''
 Write-Host "Done ($Mode mode). Add the server to your MCP client with HYPERV_MCP_ENABLED=1$(if ($Mode -eq 'Direct') { ' and HYPERV_MCP_MODE=direct' }) (see the README), then ask an agent to plan a pool (pool_plan)." -ForegroundColor Green

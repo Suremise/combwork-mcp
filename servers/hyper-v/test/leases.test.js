@@ -124,7 +124,7 @@ test('a kept VM is restored at the deadline', async t => {
 })
 
 test('a restore that leaves the adapter connected or a reserve set is caught: CLEANUP FAILED, quarantined, retried', async t => {
-  for (const leaves of [{ switchName: 'hvmcp-internal' }, { reserve: 20 }, { state: 'Running' }]) {
+  for (const leaves of [{ switchName: 'hvmcp-host' }, { reserve: 20 }, { state: 'Running' }]) {
     const sc = scratch('bad-restore')
     sc.env.HYPERV_MCP_RETRY_MS = '200'
     const { h, admin } = await withPool(sc, 1)
@@ -172,12 +172,13 @@ test('only its own VMs: a renamed pool VM is refused; a foreign VM with the pref
   assert.match((await admin.request('status')).text, /QUARANTINED/)
 })
 
-test('network: off by default; only the pool\'s internal switch, only when the pool has one; reserve capped', async t => {
+test('network: none by default; never above the pool\'s mode; host mode on setup\'s switch, no pool switch made; reserve capped', async t => {
   const sc = scratch('network')
   const { h } = await withPool(sc, 1)
   const a = h.conn(10)
   const vm = await leased(a)
-  await assert.rejects(a.request('start', { network: true }), /no internal switch/)
+  await assert.rejects(a.request('start', { network: 'host' }), /Network host is above the pool's none/)
+  await assert.rejects(a.request('start', { network: true }), /Network host is above the pool's none/)
   await assert.rejects(a.request('start', { reserveCpu: 51 }), /0-50 \(the policy's cap\)/)
   await assert.rejects(a.request('start', { reserveCpu: 2.5 }), /whole percentage/)
   await a.request('start', { reserveCpu: 50 })
@@ -188,25 +189,25 @@ test('network: off by default; only the pool\'s internal switch, only when the p
   await h.stop()
 
   const sc2 = scratch('network-switch')
-  const p = await withPool(sc2, 1, { network: true })
+  const p = await withPool(sc2, 1, { network: 'host' })
   t.after(() => p.h.stop())
-  assert.strictEqual(sc2.stub().switches['hvmcp-internal'].type, 'Internal')
+  assert.deepStrictEqual(Object.keys(sc2.stub().switches), ['hvmcp-host'], 'no pool switch made')
   const b = p.h.conn(10)
   const vm2 = await leased(b)
-  assert.match((await b.request('start', { network: true })).text, /network ON \(internal switch hvmcp-internal\)/)
-  assert.strictEqual(vmOf(sc2, vm2).switchName, 'hvmcp-internal')
+  assert.match((await b.request('start', { network: 'host' })).text, /network host \(10\.137\.42\.10 on hvmcp-host; this PC is 10\.137\.42\.1/)
+  assert.strictEqual(vmOf(sc2, vm2).switchName, 'hvmcp-host')
   await b.request('stop')
   assert.strictEqual(vmOf(sc2, vm2).switchName, null)
 })
 
-test('a policy without networking refuses it, in plans and in starts', async t => {
-  const sc = scratch('no-network', { policy: { allowNetwork: false } })
+test('a policy whose network cap is none refuses a higher mode in plans', async t => {
+  const sc = scratch('no-network', { policy: { maxNetwork: 'none' } })
   let h = await startHelper(sc)
   await h.stop()
   seedImage(sc)
   h = await startHelper(sc)
   t.after(() => h.stop())
-  await assert.rejects(h.conn(1).request('pool_plan', { action: 'create', vms: 1, cores: 2, memoryGB: 4, network: true }), /does not allow networking/)
+  await assert.rejects(h.conn(1).request('pool_plan', { action: 'create', vms: 1, cores: 2, memoryGB: 4, network: 'host' }), /network host is above the policy's none/)
 })
 
 test('staging: names checked, sizes held to, the policy\'s build cap', async t => {

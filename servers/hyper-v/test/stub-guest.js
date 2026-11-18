@@ -13,6 +13,7 @@
  */
 const fs = require('fs')
 const crypto = require('crypto')
+const stubNet = require('./stub-net')
 
 const FILE = process.env.HYPERV_MCP_STUB_STATE
 // A read that catches another stub process mid-write (a torn file) is retried, never taken as an empty state.
@@ -97,6 +98,14 @@ function run(s, vm, req, data) {
       r.polls++
       if (r.result) return r.result
       const blank = { stdout: '', stdoutCut: false, stderr: '', stderrCut: false, pending: false }
+      // MC-1556: the helper's own network scripts (net.js), answered from stub-net.js.
+      if (r.command.startsWith('# hvmcp-net set')) {
+        const m = /ip addr add (\S+)\/24/.exec(r.command)
+        try { stubNet.setGuestNet(s, vm, /DHCP=ipv4/.test(r.command) ? 'internet' : 'host', m ? m[1] : null) } catch (e) { r.result = { ...blank, done: true, exitCode: 5, stderr: e.message + '\n' }; return r.result }
+        r.result = { ...blank, done: true, exitCode: 0, stdout: 'ok\n' }
+        return r.result
+      }
+      if (r.command.startsWith('# hvmcp-net read')) return { ...blank, done: true, exitCode: 0, stdout: 'HVNET:' + JSON.stringify(stubNet.readGuestNet(s, vm, r.command.includes('python3 - 1'))) + '\n' }
       const [cmd, ...rest] = r.command.split(' ')
       if (r.killed || cmd === 'sleep') return { ...blank, stdout: 'partial\n', done: false }
       if (cmd === 'slow' && r.polls < Number(rest[0])) return { ...blank, done: false }

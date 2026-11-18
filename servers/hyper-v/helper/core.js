@@ -24,6 +24,7 @@ const policyMod = require('./policy')
 const { segments, globMatcher } = require('./paths')
 const images = require('./images')
 const linuxImages = require('./linux-images')
+const net = require('./net')
 const { LinuxDriver, PATHS: LINUX_PATHS } = require('./guests/linux')
 
 const PLAN_ID_RE = /^p-[0-9a-f]{16}$/
@@ -31,6 +32,10 @@ const PLAN_TTL_MS = 30 * 60_000
 const OUTPUT_CAP = 16 * 1024
 const MAX_COMMAND = 8000
 const READY_WAIT_MS = Number(process.env.HYPERV_MCP_READY_WAIT_MS || 5 * 60_000)
+// MC-1556: a connected start's guest network: read back until it has held for NET_STABLE_MS (a network manager undoing
+// a static address shows within it), within NET_WAIT_MS (a DHCP lease and DNS take a few seconds).
+const NET_WAIT_MS = Number(process.env.HYPERV_MCP_NET_WAIT_MS || 90_000)
+const NET_STABLE_MS = Number(process.env.HYPERV_MCP_NET_STABLE_MS || 5000)
 // The interactive logon's own wait (MC-1518): a guest restart, the logon and the watcher starting in its session; a
 // first logon from the clean checkpoint runs Windows' per-user first-logon work and can take several minutes.
 const LOGON_WAIT_MS = Number(process.env.HYPERV_MCP_LOGON_WAIT_MS || 10 * 60_000)
@@ -518,7 +523,7 @@ class Helper {
     const lease = {
       leaseId: `l-${hex(6)}`, vmId: vm.vmId, vmName: vm.vmName, connId, ownerConn: connId, pid: c.pid, ending: null, children: new Set(),
       acquiredAt: now, sessionEnd, deadline: Math.min(sessionEnd, now + Math.round(minutes * MINUTE_MS)), keepOnFailure: !!keepOnFailure,
-      kept: false, running: false, failed: false, runs: 0, dirty: false, network: false, reserve: 0,
+      kept: false, running: false, failed: false, runs: 0, dirty: false, network: 'none', net: null, reserve: 0,
       // project: pinned here, so a later change of the caller's roots never moves the lease or its count; os and image:
       // the VM's, for the per-OS shares.
       project, os: this.osOf(vm), image: this.imageOf(vm),
@@ -1036,7 +1041,7 @@ class Helper {
           const f0 = await this.restoreVia(vm, 'restore', { ...this.ident(vm), checkpointId: e.cleanCheckpointId })
           const bad0 = baselineProblem(f0, { ...vm, cleanCheckpointId: e.cleanCheckpointId })
           if (bad0) throw new Error(`its clean checkpoint doesn't verify: ${bad0}`)
-          await this.hv('configure-start', { ...this.ident(vm), switchName: null, switchId: null, reserve: 0 })
+          await this.configureStart(vm, null, 'none', 0)
           if (await this.waitGuest(vm, creds.admin, READY_WAIT_MS) === null) throw new Error('its guest didn\'t answer')
           let licNote
           if (this.isLinux(vm)) {
@@ -1414,17 +1419,118 @@ class Helper {
     })
   }
 
+  // ---------- a run's network (MC-1556) ----------
+
+  /** Throws unless a run may use this mode now: at or below the pool's approved mode, which is at or below the policy's. */
+  netAllowed(mode) {
+    const why = net.above(mode, this.state.network, 'the pool') || net.above(mode, this.policy.maxNetwork, 'the policy')
+    if (why) throw new Error(`${why[0].toUpperCase()}${why.slice(1)}: ask for a lower one, or ask the user to approve a pool_plan resize with a higher network mode${net.above(mode, this.policy.maxNetwork, 'x') ? ' (above the policy, setup must be rerun first)' : ''}.`)
+  }
+
+  /**
+   * What a mode needs, checked now: { mode, switchId, switchName, kind, acls, address?, hostAddress?, subnet?, gateway? }.
+   * Host mode: setup's switch by id, internal, the host's address exactly on it, no clash with any other interface or
+   * route; the guest's address the lowest free one among the live host-mode leases. Internet modes: the Default Switch's
+   * gateway and subnet, read now (Windows can change them at a restart).
+   */
+  async netSpec(lease, mode, opts) {
+    if (mode === 'none') return { mode, switchId: null, switchName: null, kind: null, acls: [] }
+    if (mode === 'host') {
+      const h = this.policy.hostNetwork
+      if (!h) throw new Error('Host mode needs setup\'s host network: ask the user to rerun setup with -MaxNetwork Host or above.')
+      const r = await this.hv('net-host', { switchId: h.switchId, switchName: h.switchName }, opts)
+      const why = net.hostProblem(r, h)
+      if (why) throw new Error(`Host mode can't be used now: ${why}. Nothing was started.`)
+      // Synchronous from here to the assignment: two starts can't take the same address.
+      const used = [...this.leases.values()].filter(l => l !== lease && l.net?.address).map(l => l.net.address)
+      const address = lease?.net?.mode === 'host' && lease.net.address && !used.includes(lease.net.address) ? lease.net.address : net.allocate(h.subnet, used)
+      if (!address) throw new Error('No host-mode address is free.')
+      const spec = { mode, switchId: h.switchId, switchName: h.switchName, kind: 'host', acls: net.aclsFor('host', { hostAddress: h.hostAddress }), address, hostAddress: h.hostAddress, subnet: h.subnet }
+      if (lease) lease.net = spec
+      return spec
+    }
+    const d = net.defaultFacts(await this.hv('net-default', {}, opts))
+    if (d.why) throw new Error(`${d.why[0].toUpperCase()}${d.why.slice(1)}. Nothing was started.`)
+    const spec = { mode, switchId: net.DEFAULT_SWITCH_ID, switchName: 'Default Switch', kind: 'default', acls: net.aclsFor(mode, { gateway: d.gateway }), gateway: d.gateway, subnet: d.subnet }
+    if (lease) lease.net = spec
+    return spec
+  }
+
+  /**
+   * Starts an Off VM in a network mode, fail-closed: first the adapter disconnected and the mode's complete port-ACL set
+   * installed while it is (net-prepare), read back exactly; only then connected, by switch id, and started
+   * (configure-start). A failure before the start leaves the VM Off and disconnected. Returns the spec.
+   */
+  async configureStart(vm, lease, mode, reserve) {
+    const opts = lease ? this.forLease(lease) : undefined
+    const spec = await this.netSpec(lease, mode, opts)
+    if (lease) this.stillHeld(lease)
+    const prep = await this.hv('net-prepare', { ...this.ident(vm), acls: spec.acls }, opts)
+    if (lease) this.stillHeld(lease)
+    if (prep.switchName) throw new Error(`${vm.vmName}'s network adapter didn't disconnect (it reads ${prep.switchName}). Nothing was started.`)
+    const bad = net.aclProblem(prep.acls, spec.acls)
+    if (bad) throw new Error(`${vm.vmName}'s network couldn't be prepared: ${bad}. It was left disconnected; nothing was started.`)
+    await this.hv('configure-start', { ...this.ident(vm), switchId: spec.switchId, switchName: spec.switchName, kind: spec.kind, reserve }, opts)
+    return spec
+  }
+
+  /**
+   * The guest's own network for the lease's mode (host: its static address; internet: DHCP), then read back until it has
+   * held for NET_STABLE_MS, within NET_WAIT_MS. Returns the text for the reply. Throws with the last reason seen.
+   */
+  async guestNet(vm, lease, creds) {
+    const spec = lease.net
+    if (lease.network === 'none' || !spec) return 'off'
+    const opts = this.forLease(lease)
+    const f = await this.hv('facts-vm', this.ident(vm), opts)
+    this.stillHeld(lease)
+    if (!f.mac) throw new Error(`${vm.vmName}'s network adapter has no MAC address yet`)
+    const cred = (creds || this.creds()).admin
+    const want = { mode: lease.network, mac: f.mac, address: spec.address, subnet: spec.subnet, gateway: spec.gateway }
+    await this.guestCall(vm, 'guest-net', { ...this.ident(vm), cred, mode: net.defaultSwitch(lease.network) ? 'internet' : 'host', mac: f.mac, address: spec.address }, opts)
+    this.stillHeld(lease)
+    const t0 = this.now()
+    let okSince = null
+    let why = 'not read yet'
+    for (;;) {
+      let read = null
+      try { read = await this.guestCall(vm, 'guest-net-read', { ...this.ident(vm), cred, lookup: net.defaultSwitch(lease.network) }, opts) } catch (e) { why = `the read failed: ${e.message}` }
+      this.stillHeld(lease)
+      if (read) why = net.guestProblem(read, want)
+      const now = this.now()
+      if (read && !why) {
+        if (okSince === null) okSince = now
+        if (now - okSince >= NET_STABLE_MS) break
+      } else okSince = null
+      if (now - t0 > NET_WAIT_MS) throw new Error(`its network (${lease.network}) wasn't ready and steady within ${Math.round(NET_WAIT_MS / 1000)} s: ${why || 'it changed while it was read'}`)
+      await this.sleep(Math.min(1000, Math.max(50, NET_STABLE_MS / 5)))
+    }
+    return lease.network === 'host'
+      ? `host (${spec.address} on ${spec.switchName}; this PC is ${spec.hostAddress}, its firewall decides which ports)`
+      : `${lease.network} (DHCP from Windows' Default Switch${lease.network === 'internet' ? '; the LAN is blocked' : ''})`
+  }
+
+  /** guestNet, and on its failure the VM restored to clean (never left running half-configured) and the start failed. */
+  async guestNetOrClean(vm, lease, creds) {
+    try { return await this.guestNet(vm, lease, creds) } catch (e) {
+      this.stillHeld(lease)
+      lease.running = false
+      const r = await this.restore(vm, null, lease)
+      throw new Error(`${vm.vmName} started, but ${e.message}. ${r.ok ? 'It was restored to clean (network disconnected).' : r.text} vm_reset to try again, or ask for network none.`)
+    }
+  }
+
   // ---------- runs ----------
 
-  async start(connId, { network = false, reserveCpu = 0, interactive = false, checkpoint } = {}) {
+  async start(connId, { network, reserveCpu = 0, interactive = false, checkpoint } = {}) {
     const lease = this.leaseOf(connId)
     const c = this.conns.get(connId)
     if (checkpoint !== undefined && (typeof checkpoint !== 'string' || !POOL_CHECKPOINT_RE.test(checkpoint))) throw new Error("checkpoint must be 'clean' or one of this VM's pool checkpoints (vm_status lists them).")
     if (![false, 'user', 'admin'].includes(interactive)) throw new Error("interactive must be false, 'user' or 'admin'")
     if (lease.kept) throw new Error(`${lease.vmName} is kept for inspection: vm_release it, then vm_acquire again (a release restores it).`)
     if (interactive && lease.os === 'linux') throw new Error('Linux guests have no desktop session: interactive is for Windows guests.')
-    if (network && !this.policy.allowNetwork) throw new Error('The policy does not allow networking.')
-    if (network && this.state.switch?.phase !== 'created') throw new Error('The pool has no internal switch: create the pool with network on to use networking.')
+    const mode = net.modeOf(network)
+    this.netAllowed(mode)
     if (!Number.isInteger(reserveCpu) || reserveCpu < 0 || reserveCpu > this.policy.maxReservePercent) throw new Error(`reserveCpu must be a whole percentage, 0-${this.policy.maxReservePercent} (the policy's cap).`)
     if (c.stage?.plan) this.dropStage(c) // a sync's partial staging is never a start's build
     if (c.stage && !c.stage.done) throw new Error('the build is still being staged')
@@ -1453,16 +1559,16 @@ class Helper {
       this.stillHeld(lease)
       // The guest not answering, or its logon not appearing, is the VM's failure (unless the lease ended meanwhile).
       const failed = why => { if (this.leases.get(lease.vmId) === lease && !lease.ending) this.startFailed.set(vm.vmId, { at: this.now(), why, interactive: !!interactive }) }
-      const sw = network ? this.state.switch : null
-      await this.hv('configure-start', { ...this.ident(vm), switchName: sw ? sw.name : null, switchId: sw ? sw.switchId : null, reserve: reserveCpu }, this.forLease(lease))
-      lease.running = true
       lease.dirty = true
-      lease.network = !!network
+      lease.network = mode
       lease.reserve = reserveCpu
+      await this.configureStart(vm, lease, mode, reserveCpu)
+      lease.running = true
       const creds = this.creds()
       const waited = await this.waitGuest(vm, creds.admin, READY_WAIT_MS, lease)
       if (waited === null) { failed(`its guest didn't answer within ${Math.round(READY_WAIT_MS / 1000)} s`); throw new Error(`${vm.vmName} started but its guest didn't answer within ${Math.round(READY_WAIT_MS / 1000)} s. vm_reset to try again, or vm_release and vm_acquire for another VM (one whose start failed is leased last).`) }
       this.stillHeld(lease)
+      const netText = await this.guestNetOrClean(vm, lease, creds)
       let logon = ''
       if (interactive) {
         const who = creds[interactive].user
@@ -1490,8 +1596,8 @@ class Helper {
       }
       s.trusted = true
       return {
-        text: `Started ${vm.vmName} from ${target ? `its pool checkpoint "${target.name}"` : 'its clean checkpoint'}: restore ${((tRestore - t0) / 1000).toFixed(1)} s, guest ready after ${(waited / 1000).toFixed(1)} s${logon}; ${build}; network ${network ? `ON (internal switch ${this.state.switch.name})` : 'off'}; CPU reserve ${reserveCpu}%. ${this.paths(vm).out} is empty. Deadline ${new Date(lease.deadline).toISOString()}.`,
-        data: { vm: vm.vmName, network: !!network, reserveCpu, interactive }
+        text: `Started ${vm.vmName} from ${target ? `its pool checkpoint "${target.name}"` : 'its clean checkpoint'}: restore ${((tRestore - t0) / 1000).toFixed(1)} s, guest ready after ${(waited / 1000).toFixed(1)} s${logon}; ${build}; network ${netText}; CPU reserve ${reserveCpu}%. ${this.paths(vm).out} is empty. Deadline ${new Date(lease.deadline).toISOString()}.`,
+        data: { vm: vm.vmName, network: mode, ...(lease.net?.address ? { address: lease.net.address, hostAddress: lease.net.hostAddress } : {}), reserveCpu, interactive }
       }
     })
   }
@@ -1847,14 +1953,21 @@ class Helper {
    */
   async checkpointOff(lease, vm, name, opId, snapName) {
     this.journal.append({ t: 'lcp-take', opId, vmId: vm.vmId, leaseId: lease.leaseId, name, snapName, origType: null, at: new Date(this.now()).toISOString() })
+    // MC-1556: the restart is a new connection, so both caps are checked again. A mode now above one (a plan lowered
+    // the pool's) restarts with no network instead, and the reply says so: the VM stays usable, never over a cap.
+    let netNote = ''
     const restart = async () => {
-      const sw = lease.network ? this.state.switch : null
-      await this.hv('configure-start', { ...this.ident(vm), switchName: sw ? sw.name : null, switchId: sw ? sw.switchId : null, reserve: lease.reserve || 0 }, this.forLease(lease))
+      try { this.netAllowed(lease.network) } catch (e) {
+        netNote = ` Its network was ${lease.network}, now above a cap (${e.message}), so it was started with network none.`
+        lease.network = 'none'; lease.net = null
+      }
+      await this.configureStart(vm, lease, lease.network, lease.reserve || 0)
       this.stillHeld(lease)
       const waited = await this.waitGuest(vm, null, READY_WAIT_MS, lease)
       this.stillHeld(lease)
       if (waited === null) throw new Error(`${vm.vmName}'s guest didn't answer after the checkpoint: vm_reset to go on from clean`)
       lease.running = true
+      await this.guestNet(vm, lease, null)
     }
     let r = null
     try {
@@ -1885,7 +1998,7 @@ class Helper {
     const f = await this.hv('facts-vm', this.ident(vm), this.forLease(lease))
     this.stillHeld(lease)
     if (f.state !== 'Running' || f.parentCheckpointId !== r.checkpointId) throw new Error(`${vm.vmName} took the checkpoint "${name}", but didn't read back as running from it (${f.state}, at ${f.parentCheckpointId}): vm_reset to go on from clean.`)
-    return { text: `Checkpoint "${name}" taken of ${vm.vmName} with the guest shut down (Linux: files, installed software and configuration; not running programs). The guest was started again from it. vm_restore({ name: "${name}" }) brings it back; it's removed when this lease ends.`, data: { name, checkpointId: r.checkpointId } }
+    return { text: `Checkpoint "${name}" taken of ${vm.vmName} with the guest shut down (Linux: files, installed software and configuration; not running programs). The guest was started again from it.${netNote} vm_restore({ name: "${name}" }) brings it back; it's removed when this lease ends.`, data: { name, checkpointId: r.checkpointId } }
   }
 
   /**
@@ -1914,8 +2027,9 @@ class Helper {
       const rp = restoreProblem(after) // MC-1536/1537: a timed-out phase is refused, whatever the facts say
       if (rp) throw new Error(`Restoring "${name}" didn't verify: ${rp}. vm_reset to go on from clean.`)
       if (after.vmId !== vm.vmId || after.parentCheckpointId !== cp.checkpointId || after.state !== 'Off') throw new Error(`Restoring "${name}" didn't verify (state ${after.state}, parent ${after.parentCheckpointId}): vm_reset to go on from clean.`)
-      const sw = lease.network ? this.state.switch : null
-      await this.hv('configure-start', { ...this.ident(vm), switchName: sw ? sw.name : null, switchId: sw ? sw.switchId : null, reserve: lease.reserve || 0 }, this.forLease(lease))
+      // MC-1556: the lease's mode, checked again against the pool's (lowered meanwhile? then refused, nothing started).
+      this.netAllowed(lease.network)
+      const spec = await this.configureStart(vm, lease, lease.network, lease.reserve || 0)
       this.stillHeld(lease)
       const creds = this.creds()
       const waited = await this.waitGuest(vm, creds.admin, READY_WAIT_MS, lease)
@@ -1923,10 +2037,10 @@ class Helper {
       if (waited === null) throw new Error(`${vm.vmName} was restored to "${name}" but its guest didn't answer within ${Math.round(READY_WAIT_MS / 1000)} s: vm_reset to go on from clean.`)
       const facts = await this.hv('facts-vm', this.ident(vm), this.forLease(lease))
       this.stillHeld(lease)
-      const wantSw = sw ? sw.name : null
-      if (facts.state !== 'Running' || facts.parentCheckpointId !== cp.checkpointId || (facts.switchName ?? null) !== wantSw || facts.reserve !== (lease.reserve || 0)) throw new Error(`${vm.vmName} restored to "${name}", but its state didn't read back as expected (${facts.state}, network ${facts.switchName ?? 'none'}, reserve ${facts.reserve}): vm_reset to go on from clean.`)
+      if (facts.state !== 'Running' || facts.parentCheckpointId !== cp.checkpointId || (facts.switchId ?? null) !== (spec.switchId ?? null) || facts.reserve !== (lease.reserve || 0)) throw new Error(`${vm.vmName} restored to "${name}", but its state didn't read back as expected (${facts.state}, network ${facts.switchName ?? 'none'}, reserve ${facts.reserve}): vm_reset to go on from clean.`)
       lease.running = true // the sync record stays cleared and untrusted: only a full sync or a reset follows
-      return { text: `Restored ${vm.vmName} to its checkpoint "${name}" and started it (${((this.now() - t0) / 1000).toFixed(1)} s; guest ready after ${(waited / 1000).toFixed(1)} s); network ${wantSw ? `ON (internal switch ${wantSw})` : 'off'}; CPU reserve ${lease.reserve || 0}%. ${this.isLinux(vm)
+      const netText = await this.guestNetOrClean(vm, lease, creds)
+      return { text: `Restored ${vm.vmName} to its checkpoint "${name}" and started it (${((this.now() - t0) / 1000).toFixed(1)} s; guest ready after ${(waited / 1000).toFixed(1)} s); network ${netText}; CPU reserve ${lease.reserve || 0}%. ${this.isLinux(vm)
         // MC-1551: a Linux guest's words (no registry, no logon session; its build folder is /build).
         ? 'Files, installed software and configuration are as at the checkpoint; running programs aren\'t (the guest booted fresh).'
         : 'Files, installed software and the registry are as at the checkpoint; running programs and any logon session aren\'t (no one is logged on interactively: vm_start or vm_reset with interactive restores clean instead).'} ${this.paths(vm).build} is as the checkpoint left it but unconfirmed: run a full vm_sync before relying on it.`, data: { name, vm: vm.vmName } }
@@ -1987,7 +2101,7 @@ class Helper {
     })
     const img = [...s.images.values()].at(-1)
     const lines = [
-      `Pool: ${vms.length ? `${vms.length} VM(s)` : 'no VMs'}; switch: ${s.switch ? `${s.switch.name} (${s.switch.phase})` : 'none'}; image: ${img ? (img.os === 'linux' ? linuxImages.describe(img) : `${img.edition} ${img.build} (${img.sha256.slice(0, 12)}…, ${img.pinned ? 'pinned' : img.source})`) : 'none'}.`,
+      `Pool: ${vms.length ? `${vms.length} VM(s)` : 'no VMs'}; network ${s.network} (approved in a plan: ${net.DESCRIBE[s.network]})${s.switch ? `; old pool switch ${s.switch.name} (${s.switch.phase}, unused by runs)` : ''}; image: ${img ? (img.os === 'linux' ? linuxImages.describe(img) : `${img.edition} ${img.build} (${img.sha256.slice(0, 12)}…, ${img.pinned ? 'pinned' : img.source})`) : 'none'}.`,
       ...vms,
       ...this.shareLines(),
       this.job ? `Pool job in progress: ${this.job.op} (${this.job.jobId}): ${this.job.progress}` : this.lastJob ? `Last pool job: ${this.lastJob.op} ${this.lastJob.ok ? 'finished' : 'FAILED'}: ${this.lastJob.note}` : null,
@@ -1996,7 +2110,7 @@ class Helper {
       this.recovery?.length ? `At start-up: ${this.recovery.join(' ')}` : null,
       ...[...s.intents.values()].filter(i => !i.done && i.online && !i.offline).map(i => `WARNING: ${i.vmName} may still be online (its build's activation step didn't finish): it is being removed, retried every few minutes.`),
       `Product key for non-evaluation images (install.ps1 -ProductKeyFile): ${this.productKey() ? 'set' : 'none'}.`,
-      `Policy: up to ${this.policy.maxVms} VMs, ${this.policy.maxCoresPerVm} cores each, ${this.policy.maxMemoryMBTotal} MB in all, ${this.policy.maxDiskGBPerVm} GB disks, in ${this.policy.diskFolders.join('; ')}; network ${this.policy.allowNetwork ? 'allowed (internal switch only)' : 'not allowed'}; CPU reserve up to ${this.policy.maxReservePercent}%; leases up to ${this.policy.maxLeaseMinutes} min at a time, renewable to ${policyMod.sessionMinutes(this.policy)} min per work session${this.policy.maxSessionMinutes === undefined ? ' (the default)' : ''}.`,
+      `Policy: up to ${this.policy.maxVms} VMs, ${this.policy.maxCoresPerVm} cores each, ${this.policy.maxMemoryMBTotal} MB in all, ${this.policy.maxDiskGBPerVm} GB disks, in ${this.policy.diskFolders.join('; ')}; network up to ${this.policy.maxNetwork}${this.policy.hostNetwork ? ` (host mode: ${this.policy.hostNetwork.switchName}, this PC ${this.policy.hostNetwork.hostAddress} on ${this.policy.hostNetwork.subnet})` : ''}; CPU reserve up to ${this.policy.maxReservePercent}%; leases up to ${this.policy.maxLeaseMinutes} min at a time, renewable to ${policyMod.sessionMinutes(this.policy)} min per work session${this.policy.maxSessionMinutes === undefined ? ' (the default)' : ''}.`,
       `Build folders set by an admin (install.ps1 -BuildRoot): ${this.policy.buildRoots.length ? this.policy.buildRoots.join('; ') : 'none'}.`,
       'vm_acquire\'s vm names one VM: for trials and censuses on a specific VM, not for normal use (it waits in line like any other request, for that VM only).'
     ]
@@ -2041,7 +2155,9 @@ class Helper {
       const folders = facts.folders || []
       const location = args.location ?? like?.folder?.replace(/\\pool\\i-[0-9a-f]{16}$/i, '') ?? folders.slice().sort((a, b) => b.freeGB - a.freeGB)[0]?.folder ?? this.policy.diskFolders[0]
       if (!this.policy.diskFolders.some(d => d.toLowerCase() === win32.normalize(location).replace(/\\+$/, '').toLowerCase())) throw new Error(`location must be one of the policy's disk folders: ${this.policy.diskFolders.join('; ')}`)
-      const network = op === 'create' ? !!args.network : !!s.switch
+      // MC-1556: the pool's network mode, the user's choice in this plan like cores, memory and disk: none unless the
+      // plan says, a resize keeping the pool's current mode unless it says otherwise.
+      const network = net.modeOf(args.network, op === 'create' ? 'none' : s.network)
       const keep = group.slice(0, Math.min(group.length, n))
       const add = Math.max(0, n - group.length)
       plan.add = Array.from({ length: add }, () => {
@@ -2049,9 +2165,12 @@ class Helper {
         return { intentId, name: `${this.policy.prefix}-${hex(4)}`, folder: `${location}\\pool\\${intentId}`, cores, memoryMB, diskGB }
       })
       plan.remove = [...kept, ...group.slice(n)].map(v => ({ vmId: v.vmId, name: v.vmName, folder: v.folder }))
-      plan.switch = op === 'create' && network ? `${this.policy.prefix}-internal` : null
+      plan.network = network
+      if (op === 'resize') plan.networkWas = s.network
+      plan.keep = [...others, ...keep].filter(v => v.ready).map(v => ({ name: v.vmName, cores: v.cores, memoryMB: v.memoryMB, diskGB: v.diskGB }))
       const bad = policyMod.checkPool(this.policy, [...others, ...keep, ...plan.add], { network })
       if (bad.length) throw new Error(`That plan is outside the policy: ${bad.join('; ')}.`)
+      if (net.defaultSwitch(network) && !facts.defaultSwitch) throw new Error(`This host has no Default Switch, so the network mode ${network} can't be used here.`)
       if (cores * 2 > facts.logicalCpus) throw new Error(`${cores} cores per VM is more than half this host's ${facts.logicalCpus} logical CPUs.`)
       const free = folders.find(f => f.folder.toLowerCase() === location.toLowerCase())?.freeGB ?? 0
       const need = plan.add.length * 40 + (plan.add.length ? 10 : 0)
@@ -2080,7 +2199,7 @@ class Helper {
         if (!plan.add.length || plan.image?.os !== 'linux') throw new Error('debugKeepFailedBuild is only for a plan that builds Linux VMs.')
         plan.debugKeepFailedBuild = true
       }
-      if (!plan.add.length && !plan.remove.length) throw new Error(`The pool already has ${pool.length} VM(s): nothing to change.`)
+      if (!plan.add.length && !plan.remove.length && network === s.network) throw new Error(`The pool already has ${pool.length} VM(s) and network ${network}: nothing to change.`)
     }
     const bytes = Buffer.from(canonical(plan), 'utf8')
     const file = join(this.dir, 'plans', `${plan.id}.json`)
@@ -2205,7 +2324,7 @@ class Helper {
       }
       if (plan.add?.length) {
         const after = [...s.vms.values()].filter(v => !(plan.remove || []).some(r => r.vmId === v.vmId))
-        const bad = policyMod.checkPool(this.policy, [...after, ...plan.add], { network: !!plan.switch || !!s.switch })
+        const bad = policyMod.checkPool(this.policy, [...after, ...plan.add], { network: s.network })
         if (bad.length) throw new Error(`Plan ${planId} is outside the policy now: ${bad.join('; ')}.`)
         // MC-1545: a create's pool must be empty after its approved removals (a kept failed build it replaces goes first);
         // any other VM, a real one or one kept after the plan was made, refuses it.
@@ -2309,10 +2428,16 @@ class Helper {
           lease = bound()
           // 2. The network disconnected, read back. Assumed off from the attempt on, whatever the call's outcome.
           stage = 'network'
-          lease.network = false
+          // MC-1556: a Windows guest's own network settings back to DHCP first (a static address would be kept in the
+          // checkpoint), then the adapter disconnected and its port ACLs removed, both read back.
+          if (!this.isLinux(vm) && lease.network !== 'none') await this.guestCall(vm, 'guest-net', { ...this.ident(vm), cred: creds.admin, mode: 'none' }, opts())
+          lease = bound()
+          lease.network = 'none'
+          lease.net = null
           const f1 = await this.hv('net-disconnect', this.ident(vm), opts())
           lease = bound()
           if (f1.switchName) throw new Error(`its network adapter is still connected to ${f1.switchName}`)
+          if (f1.acls?.length) throw new Error('its network adapter still has port ACLs')
           // 3. A clean guest shutdown, verified Off.
           stage = 'shutdown'
           const f2 = await this.hv('guest-shutdown', this.ident(vm), this.forLease(lease, 6 * 60_000))
@@ -2359,7 +2484,7 @@ class Helper {
           if (state === 'Off' && stage !== 'undo' && stage !== 'disk') {
             let again = null
             try {
-              await this.hv('configure-start', { ...this.ident(vm), switchName: null, switchId: null, reserve: lease.reserve || 0 }, this.forLease(lease))
+              await this.configureStart(vm, lease, 'none', lease.reserve || 0)
               const waited = await this.waitGuest(vm, creds.admin, READY_WAIT_MS, lease)
               if (waited === null) throw new Error('its guest didn\'t answer')
             } catch (e2) { again = e2 }
@@ -2454,6 +2579,10 @@ class Helper {
       if (vm) await this.vmLock(vm.vmId)(() => this.removeVm(vm))
       done.push(`removed ${r.name}`)
     }
+    // MC-1556: the pool's network mode, as the approved plan says (a removed pool's is none again). Runs already
+    // going keep theirs until their next start, reset or restore, which checks the new mode.
+    const mode = plan.op === 'remove' ? 'none' : plan.network
+    if (mode && mode !== this.state.network) { this.journal.append({ t: 'pool-network', jobId: job.jobId, mode }); done.push(`network ${mode}`) }
     if (plan.op === 'remove' && plan.removeSwitch) {
       job.progress = `removing the switch ${plan.removeSwitch}`
       const sw = this.state.switch
@@ -2960,6 +3089,7 @@ function baselineProblem(f, vm) {
   if (!Array.isArray(f.checkpointIds) || !f.checkpointIds.includes(vm.cleanCheckpointId)) return 'its clean checkpoint is missing'
   if (f.parentCheckpointId !== vm.cleanCheckpointId) return 'it is not at its clean checkpoint'
   if (f.switchName) return `its network adapter is connected to ${f.switchName}`
+  if (f.acls?.length) return `its network adapter still has ${f.acls.length} port ACL(s)` // MC-1556
   if (f.reserve !== 0) return `CPU reserve is ${f.reserve}%`
   return null
 }
@@ -2979,6 +3109,10 @@ function describePlan(plan, digest, approve) {
   // MC-1532: pool-checkpoint plans.
   if (plan.op === 'checkpoint') for (const v of plan.vms) lines.push(plan.mode === 'remove' ? `- remove the pool checkpoint "${plan.checkpoint}" of ${v.name} (owner ${v.owner}); a lease already using it keeps it until that lease ends` : `- ${plan.mode === 'replace' ? 'replace' : 'publish'} the pool checkpoint "${plan.checkpoint}" of ${v.name} (owner ${v.owner}, ${v.os}, image ${v.image === 'legacy' ? 'unknown' : v.image.slice(0, 12)}), from lease ${v.leaseId}'s state: its logon undone and verified, network disconnected, the guest shut down, then checkpointed Off; any project's lease may then start from it${plan.mode === 'replace' ? '; the old one stops being offered at once and is removed when no lease uses it' : ''}`)
   if (plan.switch) lines.push(`- create the internal switch ${plan.switch} (host and guests only; no internet, no LAN)`)
+  // MC-1556: every create and resize states the whole pool it leaves and its network mode, for the user to confirm.
+  for (const k of plan.keep || []) lines.push(`- keep ${k.name}: ${k.cores} cores, ${k.memoryMB} MB static memory, ${k.diskGB} GB disk (unchanged)`)
+  if (plan.network) lines.push(`- network: ${plan.network}${plan.networkWas && plan.networkWas !== plan.network ? ` (was ${plan.networkWas})` : plan.networkWas ? ' (unchanged)' : ''}: ${net.DESCRIBE[plan.network]}. Runs may ask for this mode or a lower one; each run is disconnected again when it stops`)
+  if (plan.networkWas && net.rank(plan.network) < net.rank(plan.networkWas)) lines.push(`- lowering it: a lease already running in a higher mode keeps it until its next start, reset, restore or checkpoint restart, each of which is checked against the new mode then (a start, reset or restore above it is refused; a checkpoint restart goes on with network none)`)
   if (plan.removeSwitch) lines.push(`- remove the switch ${plan.removeSwitch}`)
   const linux = plan.image?.os === 'linux' // MC-1501
   if (linux) lines.push(`- image: ${linuxImages.describe(plan.image)}; checksums: ${plan.image.checksums || 'unknown'}`)
