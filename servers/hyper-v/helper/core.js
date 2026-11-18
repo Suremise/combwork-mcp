@@ -2980,7 +2980,7 @@ class Helper {
           this.log(`${vm.vmName}: ${name}'s build logon attempt ${attempt} failed (${why}; ${diagLine(failed)})`)
         }
         await this.undoLogon(vm, creds)
-        if (!why) { out[name] = { logonMs: o.ms, quietMs: quiet.ms, appReadiness: quiet.appReadiness, packages: quiet.count, inventory: quiet.inventory, mappings: quiet.mappings, packagesDirs: quiet.packagesDirs, attempts }; break }
+        if (!why) { out[name] = { logonMs: o.ms, quietMs: quiet.ms, appReadiness: quiet.appReadiness, packages: quiet.count, inventory: quiet.inventory, mappings: quiet.mappings, packagesDirs: quiet.packagesDirs, quietResets: quiet.quietResets, attempts }; break }
         if (attempt >= 2) throw new Error(`provisioning ${name}'s profile failed twice: ${why} (${diagLine(failed)})`)
       }
     }
@@ -3000,6 +3000,8 @@ class Helper {
     let last = null
     let readiness = null // MC-1528: App Readiness's state for the account, as last answered (for the record)
     let quietSince = null
+    const resets = new Map() // MC-1562: signal -> samples it broke the quiet in, after App Readiness finished
+    let lastReset = null
     while (this.now() < deadline) {
       const left = deadline - this.now()
       const r = await this.hv('guest-provisioned', { ...this.ident(vm), cred: creds.admin, account, quietMs: PROVISION_QUIET_MS }, { timeoutMs: Math.max(1, Math.min(120_000, left)) }).catch(() => null)
@@ -3012,15 +3014,21 @@ class Helper {
       if (r?.appReadiness) readiness = r.appReadiness
       const ready = r?.appReadiness?.done === true
       // A new completion (a later 211: more work came and finished) also starts the quiet over.
-      const busy = !good || !ready || r.busy.length > 0 || (last && (r.lastEvent !== last.lastEvent || r.inventory !== last.inventory || r.mappings !== last.mappings || r.packagesDirs !== last.packagesDirs || r.appReadiness?.completedAt !== last.appReadiness?.completedAt || r.appReadiness?.completionId !== last.appReadiness?.completionId))
+      const why = busyReasons(r, good, ready, last)
+      const busy = why.length > 0
+      // MC-1562: which signal kept it from quiet, tallied once App Readiness had already finished at the previous good
+      // sample (before that, and at the change-over itself, being busy is expected), so a late failure, and the build's
+      // record, say what Windows was still doing.
+      const settledBefore = last?.appReadiness?.done === true
       if (good) last = r
+      if (busy && ready && settledBefore) { for (const w of why) resets.set(w, (resets.get(w) || 0) + 1); lastReset = { why, at: this.now() - t0 } }
       if (busy) quietSince = null
       else if (quietSince === null) quietSince = this.now()
-      if (!busy && this.now() - quietSince >= PROVISION_QUIET_MS) return { ms: this.now() - t0, count: r.count, inventory: r.inventory, mappings: r.mappings, packagesDirs: r.packagesDirs, appReadiness: readinessRecord(r.appReadiness) }
+      if (!busy && this.now() - quietSince >= PROVISION_QUIET_MS) return { ms: this.now() - t0, count: r.count, inventory: r.inventory, mappings: r.mappings, packagesDirs: r.packagesDirs, appReadiness: readinessRecord(r.appReadiness), quietResets: Object.fromEntries(resets) }
       await sleep(Math.min(PROVISION_POLL_MS, Math.max(0, deadline - this.now())))
     }
     const e = provisionLate(account, this.tm().ms.provisionMinutes)
-    e.message += ` (${readinessLine(readiness)})`
+    e.message += ` (${readinessLine(readiness)}${resets.size ? `; after it finished, the quiet was broken by ${resetsLine(resets)}, last at ${Math.round(lastReset.at / 1000)} s by ${lastReset.why.join(', ')}` : ''})`
     throw e
   }
 
@@ -3196,7 +3204,7 @@ function buildNote(profiles) {
   const notes = []
   for (const [name, p] of Object.entries(profiles || {})) {
     // The settled counts, always: what the quiet test saw when it accepted the profile.
-    if (Number.isInteger(p.mappings)) notes.push(`${name} settled with ${p.mappings} AppContainer mappings and ${p.packagesDirs} Packages folders after ${Math.round(p.quietMs / 1000)} s${p.appReadiness?.done ? ' (App Readiness finished)' : ''}`)
+    if (Number.isInteger(p.mappings)) notes.push(`${name} settled with ${p.mappings} AppContainer mappings and ${p.packagesDirs} Packages folders after ${Math.round(p.quietMs / 1000)} s${p.appReadiness?.done ? ` (App Readiness finished${p.quietResets && Object.keys(p.quietResets).length ? `, then the quiet restarted on ${resetsLine(Object.entries(p.quietResets))}` : ''})` : ''}`)
     // MC-1524: Windows' known drop of a first logon, followed by an attempt that succeeded, is expected: said so, briefly.
     // Any other failed attempt, or a drop with no later success, stays in full.
     const ok = (p.attempts || []).some(t => !t.why)
@@ -3209,6 +3217,29 @@ function buildNote(profiles) {
   }
   return notes.join('; ')
 }
+
+/**
+ * MC-1562: why one 'guest-provisioned' sample isn't quiet, as short signal names (none: quiet). r: the sample (null: no
+ * answer); good: every probe answered; ready: App Readiness finished; last: the previous good sample. A busy process
+ * is named (a known first-logon worker's name, else 'other'), so the record holds no arbitrary guest text.
+ */
+function busyReasons(r, good, ready, last) {
+  if (!r) return ['no answer']
+  if (!good) return ['probe incomplete']
+  const why = []
+  if (!ready) why.push('App Readiness not finished')
+  for (const n of new Set(r.busy)) why.push(`process ${/^[A-Za-z0-9._-]{1,40}$/.test(String(n)) ? n : 'other'}`)
+  if (last) {
+    if (r.lastEvent !== last.lastEvent) why.push('new AppX deployment event')
+    if (r.inventory !== last.inventory) why.push('package inventory changed')
+    if (r.mappings !== last.mappings) why.push('AppContainer mappings changed')
+    if (r.packagesDirs !== last.packagesDirs) why.push('Packages folders changed')
+    if (r.appReadiness?.completedAt !== last.appReadiness?.completedAt || r.appReadiness?.completionId !== last.appReadiness?.completionId) why.push('new App Readiness completion')
+  }
+  return why
+}
+/** MC-1562: the tally, most frequent first: "new AppX deployment event 31×, process msedgewebview2 12×". */
+const resetsLine = m => [...m].sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k} ${n}×`).join(', ')
 
 /** MC-1528: App Readiness's state, allowlisted for the record: done, the task count and three UTC times. */
 function readinessRecord(a) {

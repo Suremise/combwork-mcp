@@ -14,7 +14,7 @@ const DONE = { done: true, tasks: 0, completedAt: '2026-11-16T02:01:55.000Z', co
 const PENDING = { done: false, tasks: 39, completedAt: null, completionId: null, suspendedUntil: '2026-11-16T02:00:55.499Z', resumedAt: null }
 
 /** A helper on the fake clock. readiness(account, logonNo, sinceReady): App Readiness's state on that probe. */
-function fake(readiness) {
+function fake(readiness, extra = null) {
   const h = Object.create(Helper.prototype)
   let t = 0
   let logons = 0
@@ -32,7 +32,7 @@ function fake(readiness) {
       t += 5
       const ar = readiness(a.account, logons, t - ready)
       // The wave lands when App Readiness finishes: 61/26 before, 100/65 after.
-      return { boot: `b${logons}`, user: true, inventory: 'x', lastEvent: null, busy: [], count: 99, mappings: ar?.done ? 100 : 61, packagesDirs: ar?.done ? 65 : 26, appReadiness: ar }
+      return { boot: `b${logons}`, user: true, inventory: 'x', lastEvent: null, busy: [], count: 99, mappings: ar?.done ? 100 : 61, packagesDirs: ar?.done ? 65 : 26, appReadiness: ar, ...(extra ? extra(a.account, t - ready) : {}) }
     }
     if (op === 'guest-logon-diag') { t += 5; return { uptime: 1, logs: {}, processes: [], autoAdminLogon: '1', watcher: false } }
     throw new Error(`unexpected ${op}`)
@@ -113,4 +113,26 @@ test('two completions in the same second (MR1): a new completion record id start
   const out = await f.h.provisionProfiles(vm, creds, () => {})
   assert.ok(out.hvadmin.quietMs >= 20 + 20, `a full fresh quiet after the second completion (${out.hvadmin.quietMs})`)
   assert.strictEqual(out.hvadmin.appReadiness.completionId, 140)
+})
+
+test('MC-1562: a late failure after App Readiness finished names what kept breaking the quiet; busy before it isn\'t tallied', async () => {
+  // App Readiness finishes at 30; a WebView2 process keeps (re)starting and an AppX deployment event lands every sample.
+  let n = 0
+  const f = fake((acc, k, since) => since >= 30 ? DONE : PENDING, () => ({ busy: ['msedgewebview2'], lastEvent: `e${n++}` }))
+  await assert.rejects(f.h.provisionProfiles(vm, creds, () => {}), e => {
+    assert.match(e.message, /didn't settle within 0 s \(App Readiness: finished at 2026-11-16T02:01:55\.000Z; after it finished, the quiet was broken by process msedgewebview2 \d+×, new AppX deployment event \d+×, last at \d+ s by process msedgewebview2, new AppX deployment event\)/)
+    assert.doesNotMatch(e.message, /App Readiness not finished \d+×/, 'the pending samples before it finished aren\'t counted')
+    return true
+  })
+  bounded(f.calls, 'hvadmin', 200)
+})
+
+test('MC-1562: a settled account records what restarted its quiet after App Readiness, and a guest name that isn\'t plain is "other"', async () => {
+  // Finished from the start; one odd-named busy process at 10, then quiet.
+  const f = fake(() => DONE, (acc, since) => (since >= 10 && since < 15 ? { busy: ['bad name; rm -rf'] } : {}))
+  const out = await f.h.provisionProfiles(vm, creds, () => {})
+  assert.deepStrictEqual(out.hvadmin.quietResets, { 'process other': 1 })
+  assert.deepStrictEqual(out.hvuser.quietResets, { 'process other': 1 })
+  const quiet = fake(() => DONE)
+  assert.deepStrictEqual((await quiet.h.provisionProfiles(vm, creds, () => {})).hvadmin.quietResets, {})
 })

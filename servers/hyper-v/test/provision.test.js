@@ -199,7 +199,7 @@ test('quiet waits for the account\'s AppContainer counts to stop changing (MC-15
   const p = sc.journal().find(r => r.t === 'ready').profiles
   assert.deepStrictEqual([p.hvadmin.mappings, p.hvadmin.packagesDirs, p.hvuser.mappings, p.hvuser.packagesDirs], [64, 29, 64, 29])
   // The settled counts are visible to any agent, in the job's note (pool_status).
-  assert.match(line, /hvadmin settled with 64 AppContainer mappings and 29 Packages folders after \d+ s \(App Readiness finished\); hvuser settled with 64 AppContainer mappings and 29 Packages folders after \d+ s \(App Readiness finished\)/)
+  assert.match(line, /hvadmin settled with 64 AppContainer mappings and 29 Packages folders after \d+ s \(App Readiness finished, then the quiet restarted on AppContainer mappings changed 3×, Packages folders changed 3×\); hvuser settled with 64 AppContainer mappings and 29 Packages folders after \d+ s \(App Readiness finished, then the quiet restarted on AppContainer mappings changed 3×, Packages folders changed 3×\)/)
 })
 
 test('an unknown AppContainer count (MC-1520) is never quiet: it starts the window over, and the build still settles', async t => {
