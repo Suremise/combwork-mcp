@@ -1510,6 +1510,20 @@ class Helper {
       : `${lease.network} (DHCP from Windows' Default Switch${lease.network === 'internet' ? '; the LAN is blocked' : ''})`
   }
 
+  /**
+   * configureStart for a lease, and on its failure the VM restored to clean at once, while the lease still holds it:
+   * never left Off on a switch with its ACLs, or started half-configured, until a later stop or recovery. A restore
+   * that doesn't verify quarantines the VM (restore's own rule). MC-1556 round 1.
+   */
+  async configureStartOrClean(vm, lease, mode, reserve) {
+    try { return await this.configureStart(vm, lease, mode, reserve) } catch (e) {
+      this.stillHeld(lease)
+      lease.running = false
+      const r = await this.restore(vm, null, lease)
+      throw new Error(`${e.message.replace(/\.?$/, '.')} ${r.ok ? `${vm.vmName} was restored to clean (network disconnected).` : r.text}`)
+    }
+  }
+
   /** guestNet, and on its failure the VM restored to clean (never left running half-configured) and the start failed. */
   async guestNetOrClean(vm, lease, creds) {
     try { return await this.guestNet(vm, lease, creds) } catch (e) {
@@ -1562,7 +1576,7 @@ class Helper {
       lease.dirty = true
       lease.network = mode
       lease.reserve = reserveCpu
-      await this.configureStart(vm, lease, mode, reserveCpu)
+      await this.configureStartOrClean(vm, lease, mode, reserveCpu)
       lease.running = true
       const creds = this.creds()
       const waited = await this.waitGuest(vm, creds.admin, READY_WAIT_MS, lease)
@@ -1961,13 +1975,13 @@ class Helper {
         netNote = ` Its network was ${lease.network}, now above a cap (${e.message}), so it was started with network none.`
         lease.network = 'none'; lease.net = null
       }
-      await this.configureStart(vm, lease, lease.network, lease.reserve || 0)
+      await this.configureStartOrClean(vm, lease, lease.network, lease.reserve || 0)
       this.stillHeld(lease)
       const waited = await this.waitGuest(vm, null, READY_WAIT_MS, lease)
       this.stillHeld(lease)
       if (waited === null) throw new Error(`${vm.vmName}'s guest didn't answer after the checkpoint: vm_reset to go on from clean`)
       lease.running = true
-      await this.guestNet(vm, lease, null)
+      await this.guestNetOrClean(vm, lease, null)
     }
     let r = null
     try {
@@ -2029,7 +2043,7 @@ class Helper {
       if (after.vmId !== vm.vmId || after.parentCheckpointId !== cp.checkpointId || after.state !== 'Off') throw new Error(`Restoring "${name}" didn't verify (state ${after.state}, parent ${after.parentCheckpointId}): vm_reset to go on from clean.`)
       // MC-1556: the lease's mode, checked again against the pool's (lowered meanwhile? then refused, nothing started).
       this.netAllowed(lease.network)
-      const spec = await this.configureStart(vm, lease, lease.network, lease.reserve || 0)
+      const spec = await this.configureStartOrClean(vm, lease, lease.network, lease.reserve || 0)
       this.stillHeld(lease)
       const creds = this.creds()
       const waited = await this.waitGuest(vm, creds.admin, READY_WAIT_MS, lease)
@@ -2037,7 +2051,12 @@ class Helper {
       if (waited === null) throw new Error(`${vm.vmName} was restored to "${name}" but its guest didn't answer within ${Math.round(READY_WAIT_MS / 1000)} s: vm_reset to go on from clean.`)
       const facts = await this.hv('facts-vm', this.ident(vm), this.forLease(lease))
       this.stillHeld(lease)
-      if (facts.state !== 'Running' || facts.parentCheckpointId !== cp.checkpointId || (facts.switchId ?? null) !== (spec.switchId ?? null) || facts.reserve !== (lease.reserve || 0)) throw new Error(`${vm.vmName} restored to "${name}", but its state didn't read back as expected (${facts.state}, network ${facts.switchName ?? 'none'}, reserve ${facts.reserve}): vm_reset to go on from clean.`)
+      if (facts.state !== 'Running' || facts.parentCheckpointId !== cp.checkpointId || (facts.switchId ?? null) !== (spec.switchId ?? null) || facts.reserve !== (lease.reserve || 0)) {
+        // MC-1556 round 1: never left running on an unexpected network: restored to clean at once.
+        lease.running = false
+        const r = await this.restore(vm, null, lease)
+        throw new Error(`${vm.vmName} restored to "${name}", but its state didn't read back as expected (${facts.state}, network ${facts.switchName ?? 'none'}, reserve ${facts.reserve}). ${r.ok ? 'It was restored to clean (network disconnected): vm_reset to go on.' : r.text}`)
+      }
       lease.running = true // the sync record stays cleared and untrusted: only a full sync or a reset follows
       const netText = await this.guestNetOrClean(vm, lease, creds)
       return { text: `Restored ${vm.vmName} to its checkpoint "${name}" and started it (${((this.now() - t0) / 1000).toFixed(1)} s; guest ready after ${(waited / 1000).toFixed(1)} s); network ${netText}; CPU reserve ${lease.reserve || 0}%. ${this.isLinux(vm)
@@ -2322,9 +2341,15 @@ class Helper {
         if (!vm || vm.vmName !== r.name || vm.folder !== r.folder) throw new Error(`Plan ${planId} names ${r.name}, which is no longer in the pool as planned: make a new plan.`)
         if (this.leases.has(r.vmId)) throw new Error(`${r.name} is leased (or kept for inspection): its lease must end before it can be removed. Nothing was changed.`)
       }
+      // MC-1556: the mode the plan approves (an older plan's: the pool's current one), against the policy as it is now,
+      // for every create and resize: a network-only or removal-only one too. Checked alone here, so a lowered VM limit
+      // never blocks a resize that shrinks the pool.
+      const network = op === 'create' || op === 'resize' ? net.modeOf(plan.network, s.network) : 'none'
+      const netBad = policyMod.checkPool(this.policy, [], { network })
+      if (netBad.length) throw new Error(`Plan ${planId} is outside the policy now: ${netBad.join('; ')}. Nothing was changed: make a new plan.`)
       if (plan.add?.length) {
         const after = [...s.vms.values()].filter(v => !(plan.remove || []).some(r => r.vmId === v.vmId))
-        const bad = policyMod.checkPool(this.policy, [...after, ...plan.add], { network: s.network })
+        const bad = policyMod.checkPool(this.policy, [...after, ...plan.add], { network })
         if (bad.length) throw new Error(`Plan ${planId} is outside the policy now: ${bad.join('; ')}.`)
         // MC-1545: a create's pool must be empty after its approved removals (a kept failed build it replaces goes first);
         // any other VM, a real one or one kept after the plan was made, refuses it.

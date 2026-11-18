@@ -197,8 +197,7 @@ if ($wantHost) {
     routes = @(Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.ifIndex -ne $ourIx } | ForEach-Object { @{ alias = [string]$_.InterfaceAlias; prefix = [string]$_.DestinationPrefix } })
   }
   # The helper's own rules (helper/net.js): a /24 in 10/8 or 192.168/16, overlapping nothing on another interface.
-  $why = (ConvertTo-Json -InputObject $seen -Depth 4 -Compress) | & $nodeNet -e "const n = require(process.argv[1]); let t = ''; process.stdin.on('data', d => t += d).on('end', () => { const r = JSON.parse(t); process.stdout.write(n.subnetProblem(process.argv[2]) || n.clashProblem(process.argv[2], r.others || [], r.routes || []) || '') })" (Join-Path $src 'helper
-et.js') $subnet
+  $why = (ConvertTo-Json -InputObject $seen -Depth 4 -Compress) | & $nodeNet -e "const n = require(process.argv[1]); let t = ''; process.stdin.on('data', d => t += d).on('end', () => { const r = JSON.parse(t); process.stdout.write(n.subnetProblem(process.argv[2]) || n.clashProblem(process.argv[2], r.others || [], r.routes || []) || '') })" (Join-Path $src 'helper\net.js') $subnet
   if ($LASTEXITCODE) { throw 'The host-subnet check (node) failed.' }
   if ($why) { throw "Host mode can't use $subnet`: $why. Give another -HostSubnet (a.b.c.0/24), or -MaxNetwork None. Nothing was changed." }
 }

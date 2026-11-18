@@ -198,6 +198,28 @@ test('a host plan needs setup\'s host network; an internet plan needs the Defaul
   await assert.rejects(admin.request('pool_plan', { action: 'create', vms: 1, cores: 2, memoryGB: 4, network: 'internet' }), /no Default Switch, so the network mode internet can't be used here/)
 })
 
+test('an approved plan is rechecked against the policy as it is now: a network-only resize and an add, approved before setup lowered the cap, are refused, nothing changed', async t => {
+  const sc = scratch('net-apply-lowered')
+  let { h, admin } = await withPool(sc, 1)
+  const netOnly = (await admin.request('pool_plan', { action: 'resize', network: 'internet-lan' })).data.planId
+  const grow = (await admin.request('pool_plan', { action: 'resize', vms: 2, cores: 2, memoryGB: 4, network: 'host' })).data.planId
+  approve(sc, netOnly)
+  approve(sc, grow)
+  await h.stop()
+  const jobs = sc.journal().filter(r => r.t === 'job').length
+  const file = path.join(sc.stateDir, 'policy.json')
+  fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), maxNetwork: 'none' }))
+  h = await startHelper(sc)
+  t.after(() => h.stop())
+  admin = h.conn(1)
+  await assert.rejects(admin.request('pool_resize', { planId: netOnly }), /outside the policy now: network internet-lan is above the policy's none .*Nothing was changed/)
+  await assert.rejects(admin.request('pool_resize', { planId: grow }), /outside the policy now: network host is above the policy's none/)
+  assert.ok(!sc.journal().some(r => r.t === 'pool-network'), 'no mode recorded')
+  assert.strictEqual(sc.journal().filter(r => r.t === 'job').length, jobs, 'no job started')
+  assert.strictEqual(Object.keys(sc.stub().vms).length, 1)
+  assert.match((await admin.request('status')).text, /network none \(approved in a plan/)
+})
+
 // ---------- runs ----------
 
 test('runs: host mode (setup\'s switch, exact ACLs, the guest\'s static address), internet and internet-lan (Default Switch, DHCP); stop restores disconnected with no ACLs', async t => {
@@ -341,16 +363,27 @@ for (const at of ['after:net-prepare', 'after:configure-start', 'after:guest-net
   })
 }
 
-test('a crash between the connect and the start leaves the VM Off; the next helper restores it disconnected with no ACLs', async t => {
+test('a configure-start that fails after connecting: the VM is restored to clean at once (disconnected, no ACLs) while the lease holds; a crash there is recovered too', async t => {
   const sc = scratch('net-crash-connect')
   let { h } = await withPool(sc, 1, { network: 'internet' })
   const a = h.conn(10)
   await a.request('acquire')
   sc.patchStub(s => { s.crashAfterConnect = true })
-  await assert.rejects(a.request('start', { network: 'internet' }), /the call died after connecting/)
-  const mid = only(sc)
-  assert.strictEqual(mid.state, 'Off', 'connected, with its ACLs, but never started')
-  await h.kill()
+  await assert.rejects(a.request('start', { network: 'internet' }), /the call died after connecting\. hvmcp-[0-9a-f]{8} was restored to clean \(network disconnected\)\./)
+  let mid = only(sc)
+  assert.strictEqual(mid.state, 'Off')
+  assert.strictEqual(mid.switchName, null, 'disconnected now, not at the next stop or recovery')
+  assert.deepStrictEqual(mid.acls, [])
+  assert.doesNotMatch((await h.conn(1).request('status')).text, /QUARANTINED/)
+  // The helper dying in that call instead (no chance to clean up): the next one's recovery does it.
+  await h.stop()
+  h = await startHelper(sc, { HYPERV_MCP_CRASH_AT: 'after:configure-start' })
+  const b = h.conn(10)
+  await b.request('acquire')
+  b.request('start', { network: 'internet' }).catch(() => {}) // the helper dies before it replies
+  assert.strictEqual(await h.exited, 99)
+  mid = only(sc)
+  assert.strictEqual(mid.switchName, 'Default Switch', 'connected, with its ACLs, when it died')
   h = await startHelper(sc)
   t.after(() => h.stop())
   assert.strictEqual(only(sc).switchName, null)
@@ -369,4 +402,40 @@ test('a baseline with leftover ACLs is quarantined, not leased', async t => {
   const r = await a.request('stop')
   assert.match(r.text, /CLEANUP FAILED: .*port ACL\(s\)/)
   assert.match((await h.conn(1).request('status')).text, /QUARANTINED/)
+})
+
+// ---------- setup ----------
+
+// install.ps1's host-subnet check, run as setup runs it (the block itself, cut from the script, not elevated), with
+// this PC's interfaces and routes mocked: it loads the helper's own net.js from the source folder and refuses a bad
+// or clashing subnet before setup changes anything (MC-1556 round 1: the path to net.js was broken).
+test('setup: the host-subnet check loads helper/net.js and refuses a bad or clashing subnet, before anything changes', { skip: process.platform !== 'win32' }, () => {
+  const { spawnSync } = require('child_process')
+  const { ps51Env } = require('../helper/hv')
+  const src = fs.readFileSync(path.join(__dirname, '..', 'setup', 'install.ps1'), 'utf8')
+  const block = /^if \(\$wantHost\) \{\r?\n  \$nodeNet = [\s\S]*?\r?\n\}\r?\n/m.exec(src)
+  assert.ok(block, 'the host-subnet block in install.ps1')
+  assert.match(block[0], /Join-Path \$src 'helper\\net\.js'\) \$subnet\r?\n/, 'the real file, on one line')
+  const sc = scratch('setup-subnet')
+  const file = path.join(sc.dir, 'subnet.ps1')
+  fs.writeFileSync(file, [
+    'param([string]$src, [string]$subnet, [string]$clash = \'\')',
+    "$ErrorActionPreference = 'Stop'",
+    '$wantHost = $true; $ourHostSw = $null',
+    'function Get-HostAdapter($id) { $null }',
+    "function Get-NetIPAddress { @([pscustomobject]@{ InterfaceIndex = 4; InterfaceAlias = 'Ethernet'; IPAddress = '192.168.1.20'; PrefixLength = 24 }) + @(if ($clash) { [pscustomobject]@{ InterfaceIndex = 9; InterfaceAlias = 'VPN'; IPAddress = $clash; PrefixLength = 16 } }) }",
+    "function Get-NetRoute { @([pscustomobject]@{ ifIndex = 4; InterfaceAlias = 'Ethernet'; DestinationPrefix = '0.0.0.0/0' }, [pscustomobject]@{ ifIndex = 4; InterfaceAlias = 'Ethernet'; DestinationPrefix = '192.168.1.0/24' }) }",
+    block[0],
+    "'checked'"
+  ].join('\n'))
+  const run = (subnet, clash = '') => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, '-src', path.join(__dirname, '..'), '-subnet', subnet, '-clash', clash], { encoding: 'utf8', env: ps51Env(), timeout: 60_000 })
+  const good = run('10.137.42.0/24')
+  assert.strictEqual(good.status, 0, good.stdout + good.stderr)
+  assert.match(good.stdout, /checked/)
+  const clash = run('10.137.42.0/24', '10.137.9.9')
+  assert.notStrictEqual(clash.status, 0)
+  assert.match(clash.stdout + clash.stderr, /Host mode can't use 10\.137\.42\.0\/24: VPN has 10\.137\.9\.9\/16, which overlaps the host subnet/)
+  const bad = run('10.137.42.1/24')
+  assert.notStrictEqual(bad.status, 0)
+  assert.match(bad.stdout + bad.stderr, /the host subnet must be a \/24 written as a\.b\.c\.0\/24/)
 })
