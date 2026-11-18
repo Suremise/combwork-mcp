@@ -54,7 +54,7 @@ const LOG_ROOT = path.join(os.homedir(), 'hvnest-proof-logs')
 const MODES = ['none', 'host', 'internet', 'internet-lan']
 const OSES = [{ key: 'windows', acquire: { os: 'windows' }, shell: 'powershell' }, { key: 'debian', acquire: { os: 'linux', distro: 'debian' }, shell: 'bash' }]
 const GUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
-const VM_RE = /^[a-z][a-z0-9]{1,11}-[0-9a-f]{4}$/
+const VM_RE = /^[a-z][a-z0-9]{1,11}-[0-9a-f]{8}$/ // core.js: `${policy.prefix}-${hex(4)}`, hex(4) = 4 random bytes as 8 hex digits
 const SHA_RE = /^[0-9a-f]{40}$/
 const PLAN_RE = /^p-[0-9a-f]{16}$/
 
@@ -223,14 +223,16 @@ function classify(results, outer, { oses = OSES.map(o => o.key), firewall = {} }
       for (const [target, expect] of Object.entries(EXPECT[mode])) {
         const r = results[`${o}|${mode}|${target}`]
         const row = { os: o, mode, target, expect, ok: r ? !!r.ok : null, detail: r ? probeDetail(r) : 'not run' }
-        if (!r) { row.verdict = 'unclaimed'; row.why = 'not run' } else if (expect === 'pass') {
+        // 18081 with a firewall that could let it through (or doesn't block by default): unclaimed whatever the probe saw,
+        // so neither a reach (the environment's doing) nor a refusal (unproven isolation) is counted.
+        if (r && target === 'H81' && firewall.h81Unclaimed) { row.verdict = 'unclaimed'; row.why = firewall.h81Unclaimed } else if (!r) { row.verdict = 'unclaimed'; row.why = 'not run' } else if (expect === 'pass') {
           row.verdict = r.ok ? 'passed' : 'failed'
           if (!r.ok) row.why = 'expected to reach the target'
         } else if (r.ok) { row.verdict = 'failed'; row.why = 'reached a target it must not' } else {
           const outerOk = !!outer[target]?.ok
           const ctl = CONTROL_MODE[target] ? results[`${o}|${CONTROL_MODE[target]}|${target}`] : null
           const ctlOk = target === 'H81' ? true : !!ctl?.ok
-          if (target === 'H81' && firewall.h81Unclaimed) { row.verdict = 'unclaimed'; row.why = firewall.h81Unclaimed } else if (!outerOk) { row.verdict = 'unclaimed'; row.why = 'positive control failed: the outer VM itself didn\'t reach it' } else if (!ctlOk) { row.verdict = 'unclaimed'; row.why = `positive control failed: this guest didn't reach it in ${CONTROL_MODE[target]}` } else row.verdict = 'passed'
+          if (!outerOk) { row.verdict = 'unclaimed'; row.why = 'positive control failed: the outer VM itself didn\'t reach it' } else if (!ctlOk) { row.verdict = 'unclaimed'; row.why = `positive control failed: this guest didn't reach it in ${CONTROL_MODE[target]}` } else row.verdict = 'passed'
         }
         rows.push(row)
       }
@@ -391,12 +393,41 @@ if ($p.HasExited) { throw "the listener exited ($($p.ExitCode))" }
 $rec=@{ pid=$p.Id; start=$p.StartTime.ToUniversalTime().ToString('o'); node=$node }
 $rec | ConvertTo-Json -Compress | Set-Content -LiteralPath '${GUEST_LISTENER}'
 $rec | ConvertTo-Json -Compress`
-const LISTENERS_STOP_PS = `if (Test-Path -LiteralPath '${GUEST_LISTENER}') { $rec=Get-Content -LiteralPath '${GUEST_LISTENER}' -Raw | ConvertFrom-Json
-  $p=Get-Process -Id $rec.pid -ErrorAction SilentlyContinue
-  if ($p -and $p.StartTime.ToUniversalTime().ToString('o') -eq $rec.start) { Stop-Process -Id $p.Id -Force }
-  Remove-Item -LiteralPath '${GUEST_LISTENER}' }
-if (Get-NetFirewallRule -DisplayName '${FW_RULE}' -ErrorAction SilentlyContinue) { Remove-NetFirewallRule -DisplayName '${FW_RULE}' }
-@{ listener=[bool](Test-Path -LiteralPath '${GUEST_LISTENER}'); rule=[bool](Get-NetFirewallRule -DisplayName '${FW_RULE}' -ErrorAction SilentlyContinue) } | ConvertTo-Json -Compress`
+// Stops the recorded listener (only that pid with that start time), removes the named rule, then reads both back. The
+// record is kept while the listener still runs, so a later cleanup can find it.
+const LISTENERS_STOP_PS = `$out=@{ record=$null; listenerRunning=$false; rule=$false }
+$mine={ param($r) $q=Get-Process -Id $r.pid -ErrorAction SilentlyContinue; $q -and $q.StartTime.ToUniversalTime().ToString('o') -eq $r.start }
+if (Test-Path -LiteralPath '${GUEST_LISTENER}') { $rec=Get-Content -LiteralPath '${GUEST_LISTENER}' -Raw | ConvertFrom-Json; $out.record=$rec
+  if (& $mine $rec) { Stop-Process -Id $rec.pid -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1 }
+  $out.listenerRunning=[bool](& $mine $rec)
+  if (-not $out.listenerRunning) { Remove-Item -LiteralPath '${GUEST_LISTENER}' } }
+if (Get-NetFirewallRule -DisplayName '${FW_RULE}' -ErrorAction SilentlyContinue) { Remove-NetFirewallRule -DisplayName '${FW_RULE}' -ErrorAction SilentlyContinue }
+$out.rule=[bool](Get-NetFirewallRule -DisplayName '${FW_RULE}' -ErrorAction SilentlyContinue)
+$out | ConvertTo-Json -Compress -Depth 3`
+
+/** What the user removes by hand when the driver's cleanup can't run or isn't verified (in the VM, admin). */
+const manualCleanup = listener => `in the outer VM (admin): Remove-NetFirewallRule -DisplayName '${FW_RULE}'${listener?.pid ? `; and the listener: Get-Process -Id ${listener.pid} (only if its StartTime is ${listener.start}) | Stop-Process` : `; and any listener recorded in ${GUEST_LISTENER}`}`
+
+/**
+ * The listeners' and rule's cleanup, guarded and verified: identity first (no remote change on a target it can't
+ * confirm), then the stop, then its readback. Returns { verified, why, manual } and never throws: a failure is reported
+ * with what the user removes by hand, never as success.
+ */
+function guardedCleanup(remote, expected, log, listener) {
+  let result
+  try {
+    assertTarget(remote, expected, log, 'cleaning up the listeners and the 18080 rule')
+    const r = remote.run('admin', LISTENERS_STOP_PS)
+    let back = null
+    try { back = r.code === 0 ? JSON.parse(r.stdout.trim().split(/\r?\n/).pop()) : null } catch { /* below */ }
+    if (!back) result = { verified: false, why: `the cleanup's call failed (exit ${r.code}): ${(r.stderr || r.stdout).slice(0, 500)}` }
+    else if (back.listenerRunning || back.rule) result = { verified: false, why: `read back after the cleanup: ${[back.listenerRunning && 'the listener still runs', back.rule && 'the rule is still there'].filter(Boolean).join(', ')}` }
+    else result = { verified: true, why: '' }
+  } catch (e) { result = { verified: false, why: `not cleaned up: ${e.message}` } }
+  if (!result.verified) result.manual = manualCleanup(listener)
+  log({ kind: 'cleanup', listener: listener || null, ...result })
+  return result
+}
 const FW_ADD_PS = (address, subnet) => `if (-not (Get-NetFirewallRule -DisplayName '${FW_RULE}' -ErrorAction SilentlyContinue)) { New-NetFirewallRule -DisplayName '${FW_RULE}' -Direction Inbound -Protocol TCP -LocalPort ${PORT_ALLOWED} -LocalAddress ${address} -RemoteAddress ${subnet} -Action Allow | Out-Null }
 @(Get-NetFirewallRule -DisplayName '${FW_RULE}' | ForEach-Object { @{ name=[string]$_.DisplayName; enabled=[string]$_.Enabled } }) | ConvertTo-Json -Compress`
 const DEFAULT_SWITCH_PS = `$a=Get-NetIPAddress -InterfaceAlias 'vEthernet (Default Switch)' -AddressFamily IPv4 -ErrorAction Stop | Select-Object -First 1
@@ -416,11 +447,12 @@ async function matrix(remote, expected, cfg, log) {
   const outer = {}
   const aclRows = []
   let firewall = {}
-  // Nothing is cleaned up on a target never confirmed: the cleanup (our recorded pid, our named rule) runs only after
-  // the first assertTarget passed.
+  let listener = null
+  let failure = null
+  // Nothing is started on a target never confirmed; the cleanup confirms it again itself (guardedCleanup).
   assertTarget(remote, expected, log, 'starting the listeners and adding the 18080 rule')
   try {
-    const listener = jsonOut(remote.run('admin', LISTENERS_START_PS(cfg.repoDir, hostAddress)))
+    listener = jsonOut(remote.run('admin', LISTENERS_START_PS(cfg.repoDir, hostAddress)))
     log({ kind: 'listener', listener })
     log({ kind: 'firewallRule', rule: jsonOut(remote.run('admin', FW_ADD_PS(hostAddress, subnet))) })
     // The outer VM's own reach: the positive control of every target (both listeners locally, the LAN, the internet).
@@ -456,10 +488,10 @@ async function matrix(remote, expected, cfg, log) {
         await s.close()
       }
     }
-  } finally {
-    log({ kind: 'cleanup', result: remote.run('admin', LISTENERS_STOP_PS).stdout.trim() })
-  }
-  return { rows: classify(results, outer, { firewall }), acl: aclRows, outer }
+  } catch (e) { failure = e }
+  const cleanup = guardedCleanup(remote, expected, log, listener)
+  if (failure) throw new Error(`${failure.message}${cleanup.verified ? ' (the listeners and rule were cleaned up, verified)' : ` CLEANUP NOT VERIFIED: ${cleanup.why}. Remove by hand, ${cleanup.manual}`}`)
+  return { rows: classify(results, outer, { firewall }), acl: aclRows, outer, cleanup }
 }
 
 /** One run asked above a cap: passes only when refused for that cap (the helper's "network X is above the pool's/policy's Y"). */
@@ -484,6 +516,7 @@ function report(run) {
   lines.push('', '| OS | when | mode | ACLs | verdict |', '|---|---|---|---|---|')
   for (const a of run.acl || []) lines.push(`| ${a.os} | ${a.when} | ${a.mode} | ${a.actual.join('<br>') || '(none)'} | **${a.verdict}**${a.why ? ` (${a.why})` : ''} |`)
   for (const r of run.refusals || []) lines.push('', `Refusal ${r.os} ${r.mode} above the ${r.cap}: **${r.verdict}**: ${r.text.split('\n')[0]}`)
+  if (run.cleanup) lines.push('', run.cleanup.verified ? 'Cleanup: the listeners stopped and the 18080 rule removed (read back).' : `**CLEANUP NOT VERIFIED**: ${run.cleanup.why}. Remove by hand, ${run.cleanup.manual}`)
   return lines.join('\n')
 }
 
@@ -650,6 +683,7 @@ async function main(argv) {
     fs.writeFileSync(path.join(dir, 'results.md'), report(run))
     console.log(report(run))
     console.log(`\nlogs: ${dir}`)
+    if (!run.cleanup?.verified) process.exitCode = 1
     return
   }
   if (cmd === 'refusal') {
@@ -659,7 +693,12 @@ async function main(argv) {
     console.log(`${r.verdict}: ${r.text}`)
     return
   }
-  if (cmd === 'cleanup') { console.log(remote.run('admin', LISTENERS_STOP_PS).stdout); return }
+  if (cmd === 'cleanup') {
+    const c = guardedCleanup(remote, expected, log, null)
+    console.log(c.verified ? 'cleaned up: no listener running, no 18080 rule (read back)' : `CLEANUP NOT VERIFIED: ${c.why}. Remove by hand, ${c.manual}`)
+    if (!c.verified) process.exitCode = 1
+    return
+  }
   throw new Error(`unknown command ${cmd}: see the header of ${__filename}`)
 }
 
@@ -667,7 +706,7 @@ module.exports = {
   HOSTNAME, HOST_ROOT, FW_RULE, EXPECT, CONTROL_MODE, MODES, OSES,
   normGuid, parseIdentityTxt, targetProblems, expectedAcls, aclVerdict, aclReadPs, psProbe, bashProbe, probeScript,
   parseProbes, targets, classify, broadAllows, h81Unclaimed, sshArgs, assertTarget, matrix, refusal, report, bridgeSession,
-  vmFromAcquire, SCRIPTS, IDENTITY_PS, FIREWALL_PS, LISTENERS_START_PS, LISTENERS_STOP_PS, FW_ADD_PS, DEFAULT_SWITCH_PS
+  vmFromAcquire, SCRIPTS, IDENTITY_PS, FIREWALL_PS, LISTENERS_START_PS, LISTENERS_STOP_PS, FW_ADD_PS, DEFAULT_SWITCH_PS, guardedCleanup, VM_RE
 }
 
 if (require.main === module) main(process.argv.slice(2)).catch(e => { console.error(e.message); process.exitCode = 1 })

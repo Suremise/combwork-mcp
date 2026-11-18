@@ -1391,7 +1391,8 @@ Test scratch goes to `HYPERV_TEST_SCRATCH` (default `%LOCALAPPDATA%\combwork-mcp
 repo, and `npm test` clears earlier runs' folders first.
 
 - `nested-proof.test.js` (MC-1559): the nested live proof's driver, offline, with a fake outer VM:
-  - the identity guard before every remote change, a mismatch stopping the run;
+  - the identity guard before every remote change and the cleanup, a mismatch stopping the run; the cleanup read back,
+    never claimed when unverified; pool VM names in the helper's real format;
   - pinned SSH;
   - the exact ACL sets;
   - bounded, validated probes;
@@ -1483,8 +1484,11 @@ $ErrorActionPreference='Stop'; if ($env:COMPUTERNAME -ne 'HVNEST-PROOF') { throw
 
 **The matrix:**
 - **Listeners:** the driver starts node listeners (`nested-listener.js`) on the VM's host-mode address, ports 18080
-  and 18081, and records each pid and start time. It adds the one firewall rule, for 18080, in the VM. It stops both
-  listeners and removes the rule afterwards, by pid and start time and by the rule's exact name.
+  and 18081, and records each pid and start time. It adds the one firewall rule, for 18080, in the VM. Afterwards it
+  checks the VM's identity again, stops the listeners (only that pid with that start time) and removes the rule by its
+  exact name, then reads both back. If the identity can't be confirmed, or the readback still shows either, it changes
+  nothing more, says **CLEANUP NOT VERIFIED** with the lines to remove them by hand, and exits non-zero. `cleanup` on
+  its own does the same.
 - **Controls:** the VM's own reach (both listeners locally, the LAN endpoint, 1.1.1.1:443 and an HTTPS page) is every
   target's positive control.
 - **Probes:** each guest probes in each mode, with bounded probes:

@@ -1,7 +1,9 @@
 // MC-1559: the nested live proof's driver (test/live/nested-proof.js), offline. Nothing here touches Hyper-V, SSH or the
 // network: a fake remote stands in for the outer VM.
 // - the identity guard: the host's identity.txt, GUIDs compared normalised, every mismatch refused, and assertTarget run
-//   before each remote change in the matrix (a mismatch mid-run stops it, and the cleanup still runs);
+//   before each remote change in the matrix and again before its cleanup (a mismatch stops the run, with no cleanup on
+//   that target and the manual cleanup reported); the cleanup's result read back and never claimed when unverified;
+// - pool VM names in core.js's real format (prefix and 8 hex digits);
 // - pinned SSH: StrictHostKeyChecking=yes, its own known_hosts and alias, BatchMode, one key per account;
 // - the ACL sets are exactly net.aclsFor's (simple port ACLs), empty after a stop or release, any extra or missing fails;
 // - probes are bounded, validated before they're put in a command, and parsed from a run's reply;
@@ -60,7 +62,7 @@ test('ACLs: exactly the mode\'s set (simple port ACLs, both directions), empty a
   assert.match(P.aclVerdict('none', {}, { switch: '', acls: host }, { disconnected: true }).why, /unexpected/)
   assert.match(P.aclVerdict('none', {}, { switch: 'Default Switch', acls: [] }, { disconnected: true }).why, /still connected/)
   assert.throws(() => P.aclReadPs("x'; Remove-VM *"), /isn't a pool VM name/)
-  assert.match(P.aclReadPs('hvmcp-ab12'), /Get-VMNetworkAdapterAcl -VM \$vm/)
+  assert.match(P.aclReadPs('hvmcp-1234abcd'), /Get-VMNetworkAdapterAcl -VM \$vm/)
 })
 
 test('probes: validated before use, bounded, one JSON line each, a batch exits 0; parsed back from a reply', () => {
@@ -134,7 +136,7 @@ test('firewall: a rule that could allow 18081 (or anything not understood) makes
  * A fake outer VM: the admin scripts the driver sends, recognised by what they do; a session whose VM follows the
  * modes (its ACLs as hv.ps1 would set them) and answers probes as the expected outcomes say.
  */
-function fakeRemote({ identity = () => GOOD, outerLan = true } = {}) {
+function fakeRemote({ identity = () => GOOD, outerLan = true, cleanupResult = { code: 0, out: { record: null, listenerRunning: false, rule: false } } } = {}) {
   const calls = []
   const state = { mode: null, connected: false }
   const ok = o => ({ code: 0, stdout: JSON.stringify(o) + '\n', stderr: '' })
@@ -155,7 +157,7 @@ function fakeRemote({ identity = () => GOOD, outerLan = true } = {}) {
         const acls = state.connected ? require('../helper/net').aclsFor(state.mode, { hostAddress: '10.137.42.1', gateway: '172.20.80.1' }).map(a => ({ action: a.action, direction: 'Both', remote: a.remote })) : []
         return ok({ switch: state.connected ? (state.mode === 'host' ? 'hvmcp-host' : 'Default Switch') : '', connected: state.connected, acls })
       }
-      if (kind === 'cleanup') return ok({ listener: false, rule: false })
+      if (kind === 'cleanup') return cleanupResult.code === 0 ? ok(cleanupResult.out) : { code: cleanupResult.code, stdout: '', stderr: 'ssh: connection reset' }
       return { code: 1, stdout: '', stderr: 'unexpected script' }
     },
     session() {
@@ -163,7 +165,7 @@ function fakeRemote({ identity = () => GOOD, outerLan = true } = {}) {
       return {
         async call(tool, args) {
           calls.push(tool)
-          if (tool === 'vm_acquire') return { text: 'Leased hvmcp-ab12 (lease l-1) until ...', isError: false }
+          if (tool === 'vm_acquire') return { text: 'Leased hvmcp-1234abcd (lease l-1) until ...', isError: false }
           if (tool === 'vm_start') { state.mode = args.network; state.connected = args.network !== 'none'; return { text: `Started (network ${args.network})`, isError: false } }
           if (tool === 'vm_run') return { text: 'Exit code 0.\n--- stdout ---\n' + Object.entries(P.EXPECT[state.mode]).map(([t, e]) => JSON.stringify({ probe: 'tcp', target: t, ip: '1.1.1.1', port: 1, ok: e === 'pass' })).join('\n') + '\n--- stderr ---\n', isError: false }
           if (tool === 'vm_stop' || tool === 'vm_release') { state.connected = false; state.mode = null; return { text: 'Reverted', isError: false } }
@@ -185,19 +187,50 @@ test('matrix (fake outer VM): identity before each change, every row and ACL rea
   assert.strictEqual(c[0], 'identity', 'identity before the listeners')
   assert.strictEqual(c[1], 'listen')
   for (let i = 0; i < c.length; i++) if (c[i] === 'session') assert.strictEqual(c[i - 1], 'identity', 'identity right before each lease')
-  assert.strictEqual(c[c.length - 1], 'cleanup')
-  assert.match(P.report({ id: 'r', commit: 'c', target: GOOD, ...out }), /\| debian \| internet-lan \| L \| pass \| \*\*passed\*\*/)
+  assert.deepStrictEqual(c.slice(-2), ['identity', 'cleanup'], 'identity right before the cleanup, the cleanup last')
+  assert.strictEqual(out.cleanup.verified, true)
+  const md = P.report({ id: 'r', commit: 'c', target: GOOD, ...out })
+  assert.match(md, /\| debian \| internet-lan \| L \| pass \| \*\*passed\*\*/)
+  assert.match(md, /Cleanup: the listeners stopped and the 18080 rule removed \(read back\)/)
 })
 
-test('matrix: an identity mismatch before a lease stops the run; no session starts and the cleanup still runs', async () => {
+const CFG = { lan: { ip: '192.168.1.1', port: 80 }, internetTcp: { ip: '1.1.1.1', port: 443 }, https: 'https://www.microsoft.com/', repoDir: 'C:\\r' }
+
+test('matrix: an identity mismatch mid-run stops it; no session starts, no cleanup on the unconfirmed target, the manual cleanup reported', async () => {
   const remote = fakeRemote({ identity: n => (n === 1 ? GOOD : { ...GOOD, uuid: '11111111-1111-1111-1111-111111111111' }) })
-  await assert.rejects(P.matrix(remote, EXPECTED, { lan: { ip: '192.168.1.1', port: 80 }, internetTcp: { ip: '1.1.1.1', port: 443 }, https: 'https://www.microsoft.com/', repoDir: 'C:\\r' }, () => {}), /Not the outer VM \(before leasing the windows VM\)/)
+  const logs = []
+  await assert.rejects(P.matrix(remote, EXPECTED, CFG, e => logs.push(e)), e => /Not the outer VM \(before leasing the windows VM\)/.test(e.message) && /CLEANUP NOT VERIFIED/.test(e.message) && /Remove-NetFirewallRule/.test(e.message) && /Get-Process -Id 42/.test(e.message))
   assert.ok(!remote.calls.includes('session'))
-  assert.strictEqual(remote.calls[remote.calls.length - 1], 'cleanup')
+  assert.ok(!remote.calls.includes('cleanup'), 'no remote change on a target that no longer matches')
+  const cl = logs.find(e => e.kind === 'cleanup')
+  assert.strictEqual(cl.verified, false)
+  assert.deepStrictEqual(cl.listener, { pid: 42, start: 'x', node: 'C:\\Program Files\\nodejs\\node.exe' }, 'the listener record kept in the log')
   // The first check failing: nothing at all is started or cleaned.
   const r2 = fakeRemote({ identity: () => ({ ...GOOD, hostname: 'WORKSTATION-1' }) })
   await assert.rejects(P.matrix(r2, EXPECTED, { lan: { ip: '192.168.1.1', port: 80 }, internetTcp: { ip: '1.1.1.1', port: 443 }, https: 'https://www.microsoft.com/', repoDir: 'C:\\r' }, () => {}), /hostname/)
   assert.deepStrictEqual(r2.calls, ['identity'], 'nothing started, nothing cleaned up on an unconfirmed target')
+})
+
+test('cleanup: an SSH failure, or a rule or listener still there on readback, is reported as not verified, never success', async () => {
+  // The matrix itself succeeded, but its cleanup's call failed: results kept, cleanup.verified false, the report says so.
+  const failed = await P.matrix(fakeRemote({ cleanupResult: { code: 255 } }), EXPECTED, CFG, () => {})
+  assert.strictEqual(failed.cleanup.verified, false)
+  assert.match(failed.cleanup.why, /cleanup's call failed \(exit 255\)/)
+  assert.match(P.report({ id: 'r', commit: 'c', target: GOOD, ...failed }), /\*\*CLEANUP NOT VERIFIED\*\*.*Remove-NetFirewallRule/)
+  // The rule still there, or the listener still running, after the cleanup.
+  const rule = await P.matrix(fakeRemote({ cleanupResult: { code: 0, out: { record: null, listenerRunning: false, rule: true } } }), EXPECTED, CFG, () => {})
+  assert.match(rule.cleanup.why, /the rule is still there/)
+  const lis = await P.matrix(fakeRemote({ cleanupResult: { code: 0, out: { record: { pid: 42 }, listenerRunning: true, rule: false } } }), EXPECTED, CFG, () => {})
+  assert.match(lis.cleanup.why, /the listener still runs/)
+  // The explicit cleanup command's path: guarded (identity first), verified, never throwing.
+  const r = fakeRemote({ identity: () => ({ ...GOOD, token: undefined, marker: { biosGuid: GUID, token: 'other' } }) })
+  const c = P.guardedCleanup(r, EXPECTED, () => {}, null)
+  assert.strictEqual(c.verified, false)
+  assert.match(c.why, /token differs/)
+  assert.deepStrictEqual(r.calls, ['identity'], 'nothing removed on a mismatched target')
+  const ok = fakeRemote()
+  assert.strictEqual(P.guardedCleanup(ok, EXPECTED, () => {}, null).verified, true)
+  assert.deepStrictEqual(ok.calls, ['identity', 'cleanup'])
 })
 
 test('matrix: the LAN unreachable from the outer VM leaves its negative rows unclaimed', async () => {
@@ -206,7 +239,7 @@ test('matrix: the LAN unreachable from the outer VM leaves its negative rows unc
 })
 
 test('refusal: passes only when refused for the cap asked about', async () => {
-  const mk = text => ({ run: () => ({ code: 0, stdout: JSON.stringify(GOOD), stderr: '' }), session: () => ({ async call(tool) { return tool === 'vm_start' ? { text, isError: true } : { text: 'Leased hvmcp-ab12 (lease l)', isError: false } }, async close() {} }) })
+  const mk = text => ({ run: () => ({ code: 0, stdout: JSON.stringify(GOOD), stderr: '' }), session: () => ({ async call(tool) { return tool === 'vm_start' ? { text, isError: true } : { text: 'Leased hvmcp-1234abcd (lease l)', isError: false } }, async close() {} }) })
   const pool = 'Network internet-lan is above the pool\'s internet: ask for a lower one, ...'
   assert.strictEqual((await P.refusal(mk(pool), EXPECTED, 'windows', 'internet-lan', 'pool', () => {})).verdict, 'passed')
   assert.strictEqual((await P.refusal(mk(pool), EXPECTED, 'windows', 'internet-lan', 'policy', () => {})).verdict, 'failed', 'refused, but for the other cap')
@@ -214,9 +247,36 @@ test('refusal: passes only when refused for the cap asked about', async () => {
   await assert.rejects(P.refusal(mk(pool), EXPECTED, 'mac', 'internet', 'pool', () => {}), /refusal </)
 })
 
-test('vm_acquire\'s reply names the VM, or the run stops', () => {
-  assert.strictEqual(P.vmFromAcquire('Leased hvmcp-0a1b (lease l-2) until x'), 'hvmcp-0a1b')
+test('pool VM names in the helper\'s real format: vm_acquire\'s reply and the ACL readback accept them', () => {
+  // core.js names a pool VM `${policy.prefix}-${hex(4)}`, hex(n) being n random bytes in hex: checked in its source,
+  // so a change there fails here rather than at the first live lease.
+  const core = require('fs').readFileSync(require('path').join(__dirname, '..', 'helper', 'core.js'), 'utf8')
+  assert.ok(core.includes('const hex = n => crypto.randomBytes(n).toString(\'hex\')'))
+  assert.ok(core.includes('name: `${this.policy.prefix}-${hex(4)}`'))
+  const crypto = require('crypto')
+  for (const prefix of ['hvmcp', 'ab', 'z12345678901']) {
+    const name = `${prefix}-${crypto.randomBytes(4).toString('hex')}`
+    assert.strictEqual(P.vmFromAcquire(`Leased ${name} (lease l-123) until 2026-11-18T13:00:00.000Z; vm_renew can extend it`), name)
+    assert.match(P.aclReadPs(name), new RegExp(`Get-VM -Name '${name}'`))
+  }
+  assert.strictEqual(P.vmFromAcquire('Leased hvmcp-1234abcd (lease l-123) until ...'), 'hvmcp-1234abcd')
+  assert.throws(() => P.vmFromAcquire('Leased hvmcp-ab12 (lease l) until x'), /no VM/, 'a 4-digit suffix isn\'t the helper\'s')
+  assert.throws(() => P.aclReadPs('hvmcp-ab12'), /isn't a pool VM name/)
   assert.throws(() => P.vmFromAcquire('No VM is free'), /no VM/)
+})
+
+test('18081 under a firewall that could let it through, or a non-blocking profile: unclaimed whether reached or not', () => {
+  const { results, outer } = idealResults()
+  for (const why of ['an unrelated allow rule covers it: allow-node', 'the Public profile\'s default inbound action is Allow']) {
+    for (const ok of [true, false]) {
+      const rows = P.classify({ ...results, 'windows|host|H81': { target: 'H81', ok } }, outer, { firewall: { h81Unclaimed: why } })
+      const row = rows.find(r => r.os === 'windows' && r.target === 'H81')
+      assert.strictEqual(row.verdict, 'unclaimed', `${why}, reached ${ok}`)
+      assert.strictEqual(row.why, why)
+    }
+  }
+  // Without such a rule, a reached 18081 is a real failure.
+  assert.strictEqual(P.classify({ ...results, 'windows|host|H81': { target: 'H81', ok: true } }, outer).find(r => r.os === 'windows' && r.target === 'H81').verdict, 'failed')
 })
 
 test('every PowerShell script the driver sends parses (Windows PowerShell 5.1\'s parser; nothing is run)', () => {
@@ -226,7 +286,7 @@ test('every PowerShell script the driver sends parses (Windows PowerShell 5.1\'s
   const scripts = {
     identity: P.IDENTITY_PS, firewall: P.FIREWALL_PS('10.137.42.1'), listenersStart: P.LISTENERS_START_PS(REPO_DIR, '10.137.42.1'),
     listenersStop: P.LISTENERS_STOP_PS, fwAdd: P.FW_ADD_PS('10.137.42.1', '10.137.42.0/24'), defaultSwitch: P.DEFAULT_SWITCH_PS,
-    acl: P.aclReadPs('hvmcp-ab12'), probes: P.probeScript('powershell', Object.values(t)),
+    acl: P.aclReadPs('hvmcp-1234abcd'), probes: P.probeScript('powershell', Object.values(t)),
     preflight: P.SCRIPTS.preflight, deployPrepare: P.SCRIPTS.deployPrepare,
     deployUnpack: P.SCRIPTS.deployUnpack('0123456789abcdef0123456789abcdef01234567', 'a'.repeat(64), REPO_DIR),
     setup: P.SCRIPTS.setup(REPO_DIR, 'InternetLan'),
