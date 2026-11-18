@@ -48,6 +48,7 @@ const FW_RULE = 'hvnest-proof: host mode TCP 18080 (MC-1559 test)'
 const GUEST_NODE = 'C:\\Program Files\\nodejs\\node.exe' // by full path: sshd's sessions keep the PATH it started with
 const PORT_ALLOWED = 18080
 const PORT_DENIED = 18081
+const HTTPS_TRIES = 2
 const USERS = { admin: 'proofadmin', user: 'proofuser' }
 const KEY_DIR = path.join(os.homedir(), '.ssh', 'hvnest-proof')
 const LOG_ROOT = path.join(os.homedir(), 'hvnest-proof-logs')
@@ -147,7 +148,9 @@ function psProbe(p) {
     return `$c=New-Object Net.Sockets.TcpClient; $ok=$false; $e=''; try { $ok=$c.ConnectAsync('${p.ip}',${p.port}).Wait(5000) -and $c.Connected } catch { $e=[string]$_.Exception.GetBaseException().Message }; $c.Dispose(); [Console]::WriteLine((@{ probe='tcp'; target='${p.target}'; ip='${p.ip}'; port=${p.port}; ok=[bool]$ok; err=$e } | ConvertTo-Json -Compress))`
   }
   const host = new URL(p.url).hostname
-  return `$code=0; $addr=''; $e=''; try { $addr=[string](@([Net.Dns]::GetHostAddresses('${host}') | Where-Object { $_.AddressFamily -eq 'InterNetwork' })[0]) } catch { $e='dns: ' + $_.Exception.GetBaseException().Message }; if ($addr) { try { $r=Invoke-WebRequest -Uri '${p.url}' -UseBasicParsing -TimeoutSec 15 -MaximumRedirection 5; $code=[int]$r.StatusCode } catch { if ($_.Exception.Response) { $code=[int]$_.Exception.Response.StatusCode } else { $e=[string]$_.Exception.GetBaseException().Message } } }; [Console]::WriteLine((@{ probe='https'; target='${p.target}'; url='${p.url}'; address=$addr; code=$code; ok=($code -ge 200 -and $code -lt 400); err=$e } | ConvertTo-Json -Compress))`
+  // Two attempts (HTTPS_TRIES), each recorded: one fetch under nesting timed out where the same guest's other fetch
+  // passed. A reach on either is a reach; a negative row needs both to fail, so the retry never helps a block pass.
+  return `$code=0; $addr=''; $e=''; $tries=@(); foreach ($t in 1..${HTTPS_TRIES}) { $code=0; $e=''; try { $addr=[string](@([Net.Dns]::GetHostAddresses('${host}') | Where-Object { $_.AddressFamily -eq 'InterNetwork' })[0]) } catch { $e='dns: ' + $_.Exception.GetBaseException().Message }; if ($addr) { try { $r=Invoke-WebRequest -Uri '${p.url}' -UseBasicParsing -TimeoutSec 15 -MaximumRedirection 5; $code=[int]$r.StatusCode } catch { if ($_.Exception.Response) { $code=[int]$_.Exception.Response.StatusCode } else { $e=[string]$_.Exception.GetBaseException().Message } } }; $tries+=@{ code=$code; err=$e }; if ($code -ge 200 -and $code -lt 400) { break } }; [Console]::WriteLine((@{ probe='https'; target='${p.target}'; url='${p.url}'; address=$addr; code=$code; ok=($code -ge 200 -and $code -lt 400); err=$e; tries=$tries } | ConvertTo-Json -Compress -Depth 3))`
 }
 
 /** One probe as a bash statement (Linux guests): bash's /dev/tcp under timeout 5; python3 (cloud-init's) for HTTPS. */
@@ -157,15 +160,19 @@ function bashProbe(p) {
     return `if timeout 5 bash -c '</dev/tcp/${p.ip}/${p.port}' 2>/dev/null; then ok=true; else ok=false; fi; printf '{"probe":"tcp","target":"${p.target}","ip":"${p.ip}","port":${p.port},"ok":%s}\\n' "$ok"`
   }
   const py = `import json,socket,urllib.request,urllib.parse
-u='${p.url}'; r={'probe':'https','target':'${p.target}','url':u,'address':'','code':0,'ok':False,'err':''}
-try:
-  r['address']=socket.getaddrinfo(urllib.parse.urlparse(u).hostname,443,socket.AF_INET)[0][4][0]
-  r['code']=urllib.request.urlopen(u,timeout=15).status
-except urllib.error.HTTPError as e: r['code']=e.code
-except Exception as e: r['err']=str(e)
+u='${p.url}'; r={'probe':'https','target':'${p.target}','url':u,'address':'','code':0,'ok':False,'err':'','tries':[]}
+for t in range(${HTTPS_TRIES}):
+  r['code']=0; r['err']=''
+  try:
+    r['address']=socket.getaddrinfo(urllib.parse.urlparse(u).hostname,443,socket.AF_INET)[0][4][0]
+    r['code']=urllib.request.urlopen(u,timeout=15).status
+  except urllib.error.HTTPError as e: r['code']=e.code
+  except Exception as e: r['err']=str(e)
+  r['tries'].append({'code':r['code'],'err':r['err']})
+  if 200<=r['code']<400: break
 r['ok']=200<=r['code']<400
 print(json.dumps(r))`
-  return `timeout 30 python3 -c ${shQuote(py)} || printf '{"probe":"https","target":"${p.target}","ok":false,"err":"python3 failed or timed out"}\\n'`
+  return `timeout ${30 * HTTPS_TRIES} python3 -c ${shQuote(py)} || printf '{"probe":"https","target":"${p.target}","ok":false,"err":"python3 failed or timed out"}\\n'`
 }
 const shQuote = s => `'${String(s).replace(/'/g, `'\\''`)}'`
 
@@ -226,8 +233,10 @@ function classify(results, outer, { oses = OSES.map(o => o.key), firewall = {} }
         // 18081 with a firewall that could let it through (or doesn't block by default): unclaimed whatever the probe saw,
         // so neither a reach (the environment's doing) nor a refusal (unproven isolation) is counted.
         if (r && target === 'H81' && firewall.h81Unclaimed) { row.verdict = 'unclaimed'; row.why = firewall.h81Unclaimed } else if (!r) { row.verdict = 'unclaimed'; row.why = 'not run' } else if (expect === 'pass') {
-          row.verdict = r.ok ? 'passed' : 'failed'
-          if (!r.ok) row.why = 'expected to reach the target'
+          // A miss when the outer VM itself couldn't reach the target is the environment's (a dead listener, no internet),
+          // not the mode's: unclaimed, never failed. A reach is a pass whatever the control saw.
+          if (r.ok) row.verdict = 'passed'
+          else if (!outer[target]?.ok) { row.verdict = 'unclaimed'; row.why = 'positive control failed: the outer VM itself didn\'t reach it' } else { row.verdict = 'failed'; row.why = 'expected to reach the target' }
         } else if (r.ok) { row.verdict = 'failed'; row.why = 'reached a target it must not' } else {
           const outerOk = !!outer[target]?.ok
           const ctl = CONTROL_MODE[target] ? results[`${o}|${CONTROL_MODE[target]}|${target}`] : null
@@ -242,7 +251,7 @@ function classify(results, outer, { oses = OSES.map(o => o.key), firewall = {} }
   }
   return rows
 }
-const probeDetail = r => (r.probe === 'https' ? `${r.url} -> ${r.address || 'no address'} code ${r.code}${r.err ? ` (${r.err})` : ''}` : `${r.ip}:${r.port} ${r.ok ? 'connected' : 'no connection'}${r.err ? ` (${r.err})` : ''}`)
+const probeDetail = r => (r.probe === 'https' ? `${r.url} -> ${r.address || 'no address'} code ${r.code}${r.err ? ` (${r.err})` : ''}${(r.tries || []).length > 1 ? ` (${r.tries.length} tries: ${r.tries.map(t => t.code || t.err || 0).join('; ')})` : ''}` : `${r.ip}:${r.port} ${r.ok ? 'connected' : 'no connection'}${r.err ? ` (${r.err})` : ''}`)
 
 // ---------- the firewall around 18081 ----------
 
@@ -385,14 +394,28 @@ function assertTarget(remote, expected, log, why) {
 
 const jsonOut = r => { if (r.code !== 0) throw new Error(`remote step failed (exit ${r.code}): ${(r.stderr || r.stdout).slice(0, 2000)}`); return JSON.parse(r.stdout.trim().split(/\r?\n/).pop()) }
 
-/** The listeners on the outer VM's host-mode address: started as admin, pid and start time recorded, stopped by both. */
+/**
+ * The listeners on the outer VM's host-mode address: started as admin, pid and start time recorded, stopped by both.
+ * Started through WMI (Win32_Process.Create), not Start-Process: Windows' sshd puts a session's processes in a job that
+ * is killed when the session ends, which ended the first live run's listener 2 s after this step returned. A WMI-made
+ * process is the WMI service's child, outside that job. LISTENERS_CHECK_PS confirms it from a later session.
+ */
 const LISTENERS_START_PS = (repoDir, address) => `$node='${GUEST_NODE}'; if (-not (Test-Path -LiteralPath $node -PathType Leaf)) { throw 'node is not installed: run install-node' }
-$p=Start-Process -FilePath $node -ArgumentList @('"${repoDir}\\servers\\hyper-v\\test\\live\\nested-listener.js"', '${address}', '${PORT_ALLOWED}', '${PORT_DENIED}') -WindowStyle Hidden -PassThru
-Start-Sleep -Seconds 2
-if ($p.HasExited) { throw "the listener exited ($($p.ExitCode))" }
+$cmd='"' + $node + '" "${repoDir}\\servers\\hyper-v\\test\\live\\nested-listener.js" ${address} ${PORT_ALLOWED} ${PORT_DENIED}'
+$r=Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine=$cmd; CurrentDirectory='${GUEST_ROOT}' }
+if ($r.ReturnValue -ne 0) { throw "Win32_Process.Create returned $($r.ReturnValue)" }
+$p=Get-Process -Id ([int]$r.ProcessId)
 $rec=@{ pid=$p.Id; start=$p.StartTime.ToUniversalTime().ToString('o'); node=$node }
 $rec | ConvertTo-Json -Compress | Set-Content -LiteralPath '${GUEST_LISTENER}'
+Start-Sleep -Seconds 2
+$p.Refresh(); if ($p.HasExited) { throw "the listener exited ($($p.ExitCode))" }
 $rec | ConvertTo-Json -Compress`
+/** From a new SSH session: the recorded listener still runs (that pid, that start time) and listens on both ports. */
+const LISTENERS_CHECK_PS = address => `$rec=Get-Content -LiteralPath '${GUEST_LISTENER}' -Raw | ConvertFrom-Json
+$q=Get-Process -Id $rec.pid -ErrorAction SilentlyContinue
+$running=[bool]($q -and $q.StartTime.ToUniversalTime().ToString('o') -eq $rec.start)
+$ports=@(Get-NetTCPConnection -State Listen -LocalAddress '${address}' -ErrorAction SilentlyContinue | Where-Object { $_.OwningProcess -eq $rec.pid } | ForEach-Object { [int]$_.LocalPort })
+@{ running=$running; listening=@($ports | Sort-Object -Unique) } | ConvertTo-Json -Compress`
 // Stops the recorded listener (only that pid with that start time), removes the named rule, then reads both back. The
 // record is kept while the listener still runs, so a later cleanup can find it.
 const LISTENERS_STOP_PS = `$out=@{ record=$null; listenerRunning=$false; rule=$false }
@@ -455,8 +478,13 @@ async function matrix(remote, expected, cfg, log) {
     listener = jsonOut(remote.run('admin', LISTENERS_START_PS(cfg.repoDir, hostAddress)))
     log({ kind: 'listener', listener })
     log({ kind: 'firewallRule', rule: jsonOut(remote.run('admin', FW_ADD_PS(hostAddress, subnet))) })
+    const alive = jsonOut(remote.run('admin', LISTENERS_CHECK_PS(hostAddress)))
+    log({ kind: 'listenerCheck', ...alive })
+    const ports = (alive.listening || []).map(Number)
+    if (!alive.running || !ports.includes(PORT_ALLOWED) || !ports.includes(PORT_DENIED)) throw new Error(`the listener isn't running and listening on ${hostAddress}:${PORT_ALLOWED} and ${PORT_DENIED} after its session ended (${JSON.stringify(alive)}): no guest was run`)
     // The outer VM's own reach: the positive control of every target (both listeners locally, the LAN, the internet).
     for (const p of parseProbes(remote.run('admin', Object.values(T).map(psProbe).join('\n')).stdout)) outer[p.target] = p
+    if (!outer.H80?.ok || !outer.H81?.ok) throw new Error(`the outer VM can't reach its own listeners (18080: ${outer.H80 ? probeDetail(outer.H80) : 'no result'}; 18081: ${outer.H81 ? probeDetail(outer.H81) : 'no result'}): no guest was run`)
     const fw = jsonOut(remote.run('admin', FIREWALL_PS(hostAddress)))
     firewall = { h81Unclaimed: h81Unclaimed(fw, { address: hostAddress, guestAddress: '10.137.42.10', nodePath: listener.node }) }
     log({ kind: 'firewall', profile: fw.profile, category: fw.category, ownRule18081: fw.ownRule18081, h81Unclaimed: firewall.h81Unclaimed, coveringRules: broadAllows(fw.rules, { address: hostAddress, guestAddress: '10.137.42.10', nodePath: listener.node, port: PORT_DENIED, profile: fw.profile?.name }) })
@@ -706,7 +734,7 @@ module.exports = {
   HOSTNAME, HOST_ROOT, FW_RULE, EXPECT, CONTROL_MODE, MODES, OSES,
   normGuid, parseIdentityTxt, targetProblems, expectedAcls, aclVerdict, aclReadPs, psProbe, bashProbe, probeScript,
   parseProbes, targets, classify, broadAllows, h81Unclaimed, sshArgs, assertTarget, matrix, refusal, report, bridgeSession,
-  vmFromAcquire, SCRIPTS, IDENTITY_PS, FIREWALL_PS, LISTENERS_START_PS, LISTENERS_STOP_PS, FW_ADD_PS, DEFAULT_SWITCH_PS, guardedCleanup, VM_RE
+  vmFromAcquire, SCRIPTS, IDENTITY_PS, FIREWALL_PS, LISTENERS_START_PS, LISTENERS_CHECK_PS, LISTENERS_STOP_PS, FW_ADD_PS, DEFAULT_SWITCH_PS, guardedCleanup, VM_RE
 }
 
 if (require.main === module) main(process.argv.slice(2)).catch(e => { console.error(e.message); process.exitCode = 1 })

@@ -71,7 +71,9 @@ test('probes: validated before use, bounded, one JSON line each, a batch exits 0
   assert.match(P.psProbe(t), /ConnectAsync\('192\.168\.1\.1',80\)\.Wait\(5000\)/)
   assert.match(P.psProbe(h), /-TimeoutSec 15/)
   assert.match(P.bashProbe(t), /timeout 5 bash -c '<\/dev\/tcp\/192\.168\.1\.1\/80'/)
-  assert.match(P.bashProbe(h), /^timeout 30 python3 -c /)
+  assert.match(P.bashProbe(h), /^timeout 60 python3 -c /)
+  assert.match(P.bashProbe(h), /for t in range\(2\):/)
+  assert.match(P.psProbe(h), /foreach \(\$t in 1\.\.2\)/)
   assert.match(P.bashProbe(h), /timeout=15/)
   for (const bad of [{ ...t, ip: '1.2.3.4; rm -rf /' }, { ...t, port: 0 }, { ...h, url: "https://x/'; id" }, { ...h, url: 'http://plain/' }, { ...t, target: 'a b' }]) assert.throws(() => P.psProbe(bad), /bad|unknown/)
   assert.match(P.probeScript('powershell', [t]), /\nexit 0$/)
@@ -136,23 +138,24 @@ test('firewall: a rule that could allow 18081 (or anything not understood) makes
  * A fake outer VM: the admin scripts the driver sends, recognised by what they do; a session whose VM follows the
  * modes (its ACLs as hv.ps1 would set them) and answers probes as the expected outcomes say.
  */
-function fakeRemote({ identity = () => GOOD, outerLan = true, cleanupResult = { code: 0, out: { record: null, listenerRunning: false, rule: false } } } = {}) {
+function fakeRemote({ identity = () => GOOD, outerLan = true, outerH80 = true, alive = { running: true, listening: [18080, 18081] }, cleanupResult = { code: 0, out: { record: null, listenerRunning: false, rule: false } } } = {}) {
   const calls = []
   const state = { mode: null, connected: false }
   const ok = o => ({ code: 0, stdout: JSON.stringify(o) + '\n', stderr: '' })
   const remote = {
     calls,
     run(role, script) {
-      const kind = /Win32_ComputerSystemProduct/.test(script) ? 'identity' : /nested-listener\.js/.test(script) ? 'listen' : /New-NetFirewallRule/.test(script) ? 'fwAdd'
+      const kind = /Win32_ComputerSystemProduct/.test(script) ? 'identity' : /Get-NetTCPConnection/.test(script) ? 'check' : /nested-listener\.js/.test(script) ? 'listen' : /New-NetFirewallRule/.test(script) ? 'fwAdd'
         : /Get-NetFirewallPortFilter/.test(script) ? 'fwRead' : /Get-VMNetworkAdapterAcl/.test(script) ? 'acl' : /Stop-Process/.test(script) ? 'cleanup'
           : /vEthernet \(Default Switch\)/.test(script) ? 'dsw' : /TcpClient/.test(script) ? 'outer' : 'other'
       calls.push(kind)
       if (kind === 'identity') return ok(identity(calls.filter(c => c === 'identity').length))
       if (kind === 'listen') return ok({ pid: 42, start: 'x', node: 'C:\\Program Files\\nodejs\\node.exe' })
+      if (kind === 'check') return ok(alive)
       if (kind === 'fwAdd') return ok([{ name: P.FW_RULE, enabled: 'True' }])
       if (kind === 'fwRead') return ok({ category: 'Public', profile: { name: 'Public', enabled: true, defaultInboundAction: 'Block' }, rules: [] })
       if (kind === 'dsw') return ok({ gateway: '172.20.80.1', prefix: 20 })
-      if (kind === 'outer') return { code: 0, stderr: '', stdout: ['H80', 'H81', 'L', 'IT', 'HTTPS'].map(t => JSON.stringify({ probe: 'tcp', target: t, ok: t === 'L' ? outerLan : true })).join('\n') }
+      if (kind === 'outer') return { code: 0, stderr: '', stdout: ['H80', 'H81', 'L', 'IT', 'HTTPS'].map(t => JSON.stringify({ probe: 'tcp', target: t, ok: t === 'L' ? outerLan : t === 'H80' ? outerH80 : true })).join('\n') }
       if (kind === 'acl') {
         const acls = state.connected ? require('../helper/net').aclsFor(state.mode, { hostAddress: '10.137.42.1', gateway: '172.20.80.1' }).map(a => ({ action: a.action, direction: 'Both', remote: a.remote })) : []
         return ok({ switch: state.connected ? (state.mode === 'host' ? 'hvmcp-host' : 'Default Switch') : '', connected: state.connected, acls })
@@ -186,6 +189,7 @@ test('matrix (fake outer VM): identity before each change, every row and ACL rea
   const c = remote.calls
   assert.strictEqual(c[0], 'identity', 'identity before the listeners')
   assert.strictEqual(c[1], 'listen')
+  assert.deepStrictEqual(c.slice(2, 4), ['fwAdd', 'check'], 'the listener confirmed from a later session before anything relies on it')
   for (let i = 0; i < c.length; i++) if (c[i] === 'session') assert.strictEqual(c[i - 1], 'identity', 'identity right before each lease')
   assert.deepStrictEqual(c.slice(-2), ['identity', 'cleanup'], 'identity right before the cleanup, the cleanup last')
   assert.strictEqual(out.cleanup.verified, true)
@@ -284,7 +288,7 @@ test('every PowerShell script the driver sends parses (Windows PowerShell 5.1\'s
   const t = P.targets({ lan: { ip: '192.168.1.1', port: 80 }, internetTcp: { ip: '1.1.1.1', port: 443 }, https: 'https://www.microsoft.com/' }, '10.137.42.1')
   const REPO_DIR = 'C:\\hvnest-proof\\repo-0123456789ab'
   const scripts = {
-    identity: P.IDENTITY_PS, firewall: P.FIREWALL_PS('10.137.42.1'), listenersStart: P.LISTENERS_START_PS(REPO_DIR, '10.137.42.1'),
+    identity: P.IDENTITY_PS, firewall: P.FIREWALL_PS('10.137.42.1'), listenersStart: P.LISTENERS_START_PS(REPO_DIR, '10.137.42.1'), listenersCheck: P.LISTENERS_CHECK_PS('10.137.42.1'),
     listenersStop: P.LISTENERS_STOP_PS, fwAdd: P.FW_ADD_PS('10.137.42.1', '10.137.42.0/24'), defaultSwitch: P.DEFAULT_SWITCH_PS,
     acl: P.aclReadPs('hvmcp-1234abcd'), probes: P.probeScript('powershell', Object.values(t)),
     preflight: P.SCRIPTS.preflight, deployPrepare: P.SCRIPTS.deployPrepare,
@@ -302,4 +306,31 @@ test('every PowerShell script the driver sends parses (Windows PowerShell 5.1\'s
   const r = spawnSync('powershell', ['-NoProfile', '-NonInteractive', '-Command', ps], { input: JSON.stringify(scripts), encoding: 'utf8', windowsHide: true })
   assert.strictEqual(r.status, 0, r.stderr)
   assert.strictEqual(r.stdout.trim(), '')
+})
+
+test('matrix: a listener that died with its SSH session, or one the outer VM can\'t reach, stops the run before any guest', async () => {
+  // The first live run: Start-Process's listener was killed when sshd's job closed; every 18080 row was then unprovable.
+  for (const alive of [{ running: false, listening: [] }, { running: true, listening: [18080] }]) {
+    const remote = fakeRemote({ alive })
+    await assert.rejects(P.matrix(remote, EXPECTED, CFG, () => {}), e => /isn't running and listening/.test(e.message) && /no guest was run/.test(e.message) && /cleaned up, verified/.test(e.message))
+    assert.ok(!remote.calls.includes('session'), 'no lease taken')
+    assert.deepStrictEqual(remote.calls.slice(-2), ['identity', 'cleanup'], 'still cleaned up, guarded')
+  }
+  const remote = fakeRemote({ outerH80: false })
+  await assert.rejects(P.matrix(remote, EXPECTED, CFG, () => {}), /can't reach its own listeners .*no guest was run/)
+  assert.ok(!remote.calls.includes('session'))
+  // The start goes through WMI, outside the session's job, and records the pid before waiting on it.
+  const start = P.LISTENERS_START_PS('C:\hvnest-proof\repo-0123456789ab', '10.137.42.1')
+  assert.match(start, /Invoke-CimMethod -ClassName Win32_Process -MethodName Create/)
+  assert.doesNotMatch(start, /Start-Process/)
+  assert.ok(start.indexOf('Set-Content') < start.indexOf('Start-Sleep'), 'recorded before the wait, so a cleanup can find it')
+})
+
+test('classify: an expected reach that failed while the outer VM couldn\'t reach the target either is unclaimed, not failed', () => {
+  const { results, outer } = idealResults()
+  const miss = { ...results, 'debian|host|H80': { target: 'H80', ok: false } }
+  const row = rows => rows.find(r => r.os === 'debian' && r.mode === 'host' && r.target === 'H80')
+  assert.strictEqual(row(P.classify(miss, { ...outer, H80: { target: 'H80', ok: false } })).verdict, 'unclaimed')
+  assert.strictEqual(row(P.classify(miss, outer)).verdict, 'failed', 'with a working control, a miss is a real failure')
+  assert.strictEqual(row(P.classify(results, { ...outer, H80: { target: 'H80', ok: false } })).verdict, 'passed', 'a reach passes whatever the control saw')
 })

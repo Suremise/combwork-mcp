@@ -1484,7 +1484,10 @@ $ErrorActionPreference='Stop'; if ($env:COMPUTERNAME -ne 'HVNEST-PROOF') { throw
 
 **The matrix:**
 - **Listeners:** the driver starts node listeners (`nested-listener.js`) on the VM's host-mode address, ports 18080
-  and 18081, and records each pid and start time. It adds the one firewall rule, for 18080, in the VM. Afterwards it
+  and 18081, and records each pid and start time. It starts them through WMI (`Win32_Process.Create`), because
+  Windows' sshd kills a session's processes when the session ends. A later session then confirms the listener still
+  runs and listens on both ports, and the VM reaches both itself; otherwise the run stops before any guest. It adds the
+  one firewall rule, for 18080, in the VM. Afterwards it
   checks the VM's identity again, stops the listeners (only that pid with that start time) and removes the rule by its
   exact name, then reads both back. If the identity can't be confirmed, or the readback still shows either, it changes
   nothing more, says **CLEANUP NOT VERIFIED** with the lines to remove them by hand, and exits non-zero. `cleanup` on
@@ -1495,8 +1498,10 @@ $ErrorActionPreference='Stop'; if ($env:COMPUTERNAME -ne 'HVNEST-PROOF') { throw
   - Windows: `TcpClient.ConnectAsync(...).Wait(5000)` and `Invoke-WebRequest -TimeoutSec 15`;
   - Debian: `timeout 5 bash -c '</dev/tcp/...'` and python3 `urlopen(timeout=15)`.
 
-  Each records its destination address and result.
+  Each records its destination address and result. An HTTPS probe tries twice, recording both attempts: a reach on
+  either counts, and a block needs both to fail.
 - **Verdicts:**
+  - A positive row that missed while the VM itself couldn't reach that target is unclaimed, not failed.
   - A negative row passes only when its probe failed, the VM itself reached the target, and the same guest reached
     it in its control mode (host for 18080; internet-lan for the LAN, internet and HTTPS).
   - 18081's control is the VM's own connection. An allow rule that could cover 18081, or a profile that doesn't
