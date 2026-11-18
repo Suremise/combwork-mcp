@@ -4,7 +4,7 @@
 // helper acts only on its own VMs; staging, runs and reads are bounded and checked.
 const test = require('node:test')
 const assert = require('assert')
-const { scratch, startHelper, withPool, waitFor, seedImage } = require('./helpers')
+const { T, scratch, startHelper, withPool, waitFor, seedImage } = require('./helpers')
 
 const vmOf = (sc, name) => Object.values(sc.stub().vms).find(v => v.name === name)
 const leased = async (c, opts) => (await c.request('acquire', opts)).data.vm
@@ -34,7 +34,7 @@ test('a connection closing (its server killed) ends its lease: the VM is restore
   await a.request('run', { command: 'write junk.txt from-run' })
   const before = vmOf(sc, vm).restores
   a.close()
-  await waitFor(async () => new RegExp(`${vm}: .*; free`).test((await admin.request('status')).text), 5000, 'the lease to end')
+  await waitFor(async () => new RegExp(`${vm}: .*; free`).test((await admin.request('status')).text), T.waitForMs, 'the lease to end')
   assert.ok(vmOf(sc, vm).restores > before, 'restored')
   assert.strictEqual(vmOf(sc, vm).disk['C:\\out\\junk.txt'], undefined, 'the run\'s file is gone with the restore')
   const b = h.conn(11)
@@ -43,7 +43,7 @@ test('a connection closing (its server killed) ends its lease: the VM is restore
 
 test('the deadline ends a lease and restores the VM', async t => {
   const sc = scratch('deadline')
-  sc.env.HYPERV_MCP_MINUTE_MS = '300'
+  Object.assign(sc.env, T.profile('leaseMinute'))
   const { h, admin } = await withPool(sc, 1)
   t.after(() => h.stop())
   const a = h.conn(10)
@@ -51,7 +51,7 @@ test('the deadline ends a lease and restores the VM', async t => {
   // MC-1554: on a loaded machine the start can outlast those 1.5 s; the deadline then cuts it short, which is this
   // test's subject too: either way the deadline ends the lease and restores the VM. 120 s only stops a hang.
   await a.request('start').catch(e => assert.match(e.message, /lease on \S+ (ended while the request waited|is ending)/))
-  await waitFor(async () => /; free/.test((await admin.request('status')).text), 120_000, 'the deadline')
+  await waitFor(async () => /; free/.test((await admin.request('status')).text), T.waitForMs, 'the deadline')
   assert.strictEqual(vmOf(sc, vm).state, 'Off')
   await assert.rejects(a.request('run', { command: 'echo x' }), /no VM: call vm_acquire/)
 })
@@ -108,7 +108,7 @@ test('keepOnFailure keeps the VM after a failed run; release restores it', async
 
 test('a kept VM is restored at the deadline', async t => {
   const sc = scratch('keep-deadline')
-  sc.env.HYPERV_MCP_MINUTE_MS = '300'
+  Object.assign(sc.env, T.profile('leaseMinute'))
   const { h, admin } = await withPool(sc, 1)
   t.after(() => h.stop())
   const a = h.conn(10)
@@ -117,16 +117,16 @@ test('a kept VM is restored at the deadline', async t => {
   await a.request('stop', { keep: true })
   a.close() // a kept VM outlives its connection, until its deadline
   // The close is processed once the helper counts one connection (admin's) again: then the lease must still be kept.
-  const st = await waitFor(async () => { const s = await admin.request('status'); return s.data.connections === 1 && s }, 5000, 'the helper to process the close')
+  const st = await waitFor(async () => { const s = await admin.request('status'); return s.data.connections === 1 && s }, T.waitForMs, 'the helper to process the close')
   assert.match(st.text, /kept for inspection/)
-  await waitFor(async () => /; free/.test((await admin.request('status')).text), 5000, 'the deadline')
+  await waitFor(async () => /; free/.test((await admin.request('status')).text), T.waitForMs, 'the deadline')
   assert.strictEqual(vmOf(sc, vm).state, 'Off')
 })
 
 test('a restore that leaves the adapter connected or a reserve set is caught: CLEANUP FAILED, quarantined, retried', async t => {
   for (const leaves of [{ switchName: 'hvmcp-host' }, { reserve: 20 }, { state: 'Running' }]) {
     const sc = scratch('bad-restore')
-    sc.env.HYPERV_MCP_RETRY_MS = '200'
+    Object.assign(sc.env, T.profile('retryQuick'))
     const { h, admin } = await withPool(sc, 1)
     const a = h.conn(10)
     const vm = await leased(a)
@@ -139,7 +139,7 @@ test('a restore that leaves the adapter connected or a reserve set is caught: CL
     assert.match((await admin.request('status')).text, new RegExp(`${vm}: .*QUARANTINED`))
     await assert.rejects(h.conn(11).request('acquire'), /No VM is free \(1 in the pool, 1 quarantined\)/)
     sc.patchStub(s => { delete s.restoreLeaves })
-    await waitFor(async () => /; free/.test((await admin.request('status')).text), 5000, 'the retry')
+    await waitFor(async () => /; free/.test((await admin.request('status')).text), T.waitForMs, 'the retry')
     await h.stop()
   }
 })
@@ -292,7 +292,7 @@ test('the protocol: malformed lines and unknown connections are refused without 
 
 test('a lease that is ending refuses its connection at once, and its VM goes to the next client only once restored', async t => {
   const sc = scratch('ending-refuses')
-  sc.env.HYPERV_MCP_MINUTE_MS = '400'
+  Object.assign(sc.env, T.profile('leaseMinuteSlow'))
   const { h, admin } = await withPool(sc, 1)
   t.after(() => h.stop())
   const gate = require('path').join(sc.dir, 'restore-gate')
@@ -301,12 +301,12 @@ test('a lease that is ending refuses its connection at once, and its VM goes to 
   const vm = await leased(a, { minutes: 1 }) // its deadline: 400 ms here
   const before = restores()
   sc.patchStub(s => { s.restoreGate = gate })
-  await waitFor(() => restores() > before, 10_000, 'the deadline\'s restore to begin (it waits at the gate)')
+  await waitFor(() => restores() > before, T.waitForMs, 'the deadline\'s restore to begin (it waits at the gate)')
   await assert.rejects(a.request('start'), /lease on hvmcp-[0-9a-f]+ is ending: call vm_acquire again/)
   const b = h.conn(11)
   await assert.rejects(b.request('acquire'), /No VM is free/, 'not handed on while it is being restored')
   require('fs').writeFileSync(gate, 'open')
-  await waitFor(async () => /; free/.test((await admin.request('status')).text), 10_000, 'the restore to finish')
+  await waitFor(async () => /; free/.test((await admin.request('status')).text), T.waitForMs, 'the restore to finish')
   assert.strictEqual(await leased(b), vm)
   assert.deepStrictEqual(sc.stub().calls.filter(c => c.op === 'configure-start'), [], 'a\'s start never ran')
   assert.strictEqual(vmOf(sc, vm).state, 'Off')
@@ -320,7 +320,7 @@ test('an operation queued for the VM while its lease ended is refused inside the
     const { h } = await withPool(sc, 1)
     await h.stop()
     const saved = { ...process.env }
-    Object.assign(process.env, { HYPERV_MCP_PS_STUB: sc.env.HYPERV_MCP_PS_STUB, HYPERV_MCP_STUB_STATE: sc.env.HYPERV_MCP_STUB_STATE, HYPERV_MCP_POLL_MS: '10' })
+    Object.assign(process.env, { HYPERV_MCP_PS_STUB: sc.env.HYPERV_MCP_PS_STUB, HYPERV_MCP_STUB_STATE: sc.env.HYPERV_MCP_STUB_STATE, ...T.profile('inProcess') })
     const helper = new Helper({ stateDir: sc.stateDir, hv, checkApprovalAcl: false })
     try {
       await helper.init()
@@ -362,13 +362,13 @@ test('a connection closing mid-run ends its lease at once: the in-flight run is 
   const marker = path.join(sc.dir, 'run-finished.txt')
   const pidFile = path.join(sc.dir, 'run.pid')
   const run = a.request('run', { command: `hang ${marker} 60000 ${pidFile}`, timeoutSec: 600 }).catch(e => e)
-  const childPid = await waitFor(() => fs.existsSync(pidFile) && Number(fs.readFileSync(pidFile, 'utf8')), 10_000, 'the run to start')
+  const childPid = await waitFor(() => fs.existsSync(pidFile) && Number(fs.readFileSync(pidFile, 'utf8')), T.waitForMs, 'the run to start')
   const t0 = Date.now()
   a.close()
-  await waitFor(async () => /; free/.test((await admin.request('status')).text), 15_000, 'the lease to end without waiting for the 60 s run')
-  assert.ok(Date.now() - t0 < 15_000)
+  await waitFor(async () => /; free/.test((await admin.request('status')).text), T.waitForMs, 'the lease to end without waiting for the 60 s run')
+  assert.ok(Date.now() - t0 < T.bounds.leaseEndsQuickMs)
   const alive = pid => { try { process.kill(pid, 0); return true } catch (e) { return e.code === 'EPERM' } }
-  await waitFor(() => !alive(childPid), 10_000, 'the run\'s child to be killed')
+  await waitFor(() => !alive(childPid), T.waitForMs, 'the run\'s child to be killed')
   assert.ok(!fs.existsSync(marker), 'the run never finished')
   assert.strictEqual(vmOf(sc, vm).state, 'Off', 'restored')
   assert.ok((await run) instanceof Error || true)
@@ -384,8 +384,7 @@ test('a lease ending during vm_start (disconnect or deadline, guest hung or neve
     ['deadline, guest-ready hung', sc => sc.patchStub(s => { s.readyGate = path.join(sc.dir, 'gate'); s.readyPidFile = path.join(sc.dir, 'ready.pid') }), null]
   ]) {
     const sc = scratch('start-cancel')
-    sc.env.HYPERV_MCP_MINUTE_MS = '1500'
-    sc.env.HYPERV_MCP_READY_WAIT_MS = '600000' // the start would otherwise wait 10 minutes
+    Object.assign(sc.env, T.profile('leaseMinuteDuringStart')) // the start's readiness wait outlasts the lease
     const { h, admin } = await withPool(sc, 1)
     try {
       const a = h.conn(10)
@@ -394,17 +393,17 @@ test('a lease ending during vm_start (disconnect or deadline, guest hung or neve
       // A build is staged, so a copy-in would follow readiness if the start went on.
       await a.request('stage_begin'); await a.request('stage_file', { path: 'x.txt', size: 1 }); await a.request('stage_chunk', { data: Buffer.from('x').toString('base64') }); await a.request('stage_end')
       const started = a.request('start').catch(e => e)
-      await waitFor(() => sc.stub().calls.some(c => c.op === 'guest-ready'), 10_000, 'the start to reach readiness')
+      await waitFor(() => sc.stub().calls.some(c => c.op === 'guest-ready'), T.waitForMs, 'the start to reach readiness')
       const t0 = Date.now()
       if (end) end(a)
-      await waitFor(async () => /; free/.test((await admin.request('status')).text), 15_000, `${what}: the lease to end without the start's 10-minute wait`)
-      assert.ok(Date.now() - t0 < 15_000, what)
+      await waitFor(async () => /; free/.test((await admin.request('status')).text), T.waitForMs, `${what}: the lease to end without the start's 10-minute wait`)
+      assert.ok(Date.now() - t0 < T.bounds.leaseEndsQuickMs, what)
       const pidFile = path.join(sc.dir, 'ready.pid')
-      if (fs.existsSync(pidFile)) await waitFor(() => !alive(Number(fs.readFileSync(pidFile, 'utf8'))), 10_000, `${what}: the hung guest-ready to be killed`)
+      if (fs.existsSync(pidFile)) await waitFor(() => !alive(Number(fs.readFileSync(pidFile, 'utf8'))), T.waitForMs, `${what}: the hung guest-ready to be killed`)
       const r = await started
       if (!end) assert.match(String(r && r.message), /ended while the request waited/, `${what}: the start fails`)
       const later = sc.stub().calls.map(c => c.op)
-      assert.ok(!later.includes('copy-in'), `${what}: no copy-in after the lease ended (${later.slice(-6)})`)
+      assert.ok(!later.some(o => o.startsWith('copy-')), `${what}: no copy after the lease ended (${later.slice(-6)})`)
       assert.strictEqual(vmOf(sc, vm).state, 'Off', `${what}: restored`)
     } finally {
       try { fs.writeFileSync(path.join(sc.dir, 'gate'), 'open') } catch { }
@@ -417,7 +416,7 @@ test('a disconnect whose staging cleanup fails (a staged file held open) still e
   const path = require('path')
   const fs = require('fs')
   const sc = scratch('locked-staging')
-  sc.env.HYPERV_MCP_RETRY_MS = '200'
+  Object.assign(sc.env, T.profile('retryQuick'))
   const { h, admin } = await withPool(sc, 1)
   t.after(() => h.stop())
   const a = h.conn(10)
@@ -430,11 +429,11 @@ test('a disconnect whose staging cleanup fails (a staged file held open) still e
   const fd = fs.openSync(path.join(stagingDir, 'held.bin'), fs.constants.O_RDONLY | 0x10000000)
   try {
     a.close()
-    await waitFor(async () => /; free/.test((await admin.request('status')).text), 10_000, 'the lease to end despite the failed cleanup')
+    await waitFor(async () => /; free/.test((await admin.request('status')).text), T.waitForMs, 'the lease to end despite the failed cleanup')
     assert.strictEqual(vmOf(sc, vm).state, 'Off', 'restored')
     assert.ok(fs.existsSync(stagingDir), 'the held staging is still there, recorded for retry')
   } finally { fs.closeSync(fd) }
-  await waitFor(() => !fs.existsSync(stagingDir), 10_000, 'the retried cleanup to remove the staging once released')
+  await waitFor(() => !fs.existsSync(stagingDir), T.waitForMs, 'the retried cleanup to remove the staging once released')
   const b = h.conn(11)
   assert.strictEqual(await leased(b), vm, 'and the VM can be leased again')
 })

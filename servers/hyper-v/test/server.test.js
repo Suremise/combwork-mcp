@@ -9,7 +9,7 @@ const path = require('path')
 const { execFileSync } = require('child_process')
 const net = require('net')
 const readline = require('readline')
-const { scratch, withPool, startHelper, seedImage } = require('./helpers')
+const { T, scratch, withPool, startHelper, seedImage } = require('./helpers')
 const { server } = require('../client')
 
 async function pooled(name, n = 1) {
@@ -184,7 +184,7 @@ async function settled(a, r) {
 // says it's still in progress and that vm_wait is the next call, and vm_wait gives the result once it settles.
 test('MC-1553: a slow vm_start says "still in progress" and vm_wait gives its result; only vm_wait and status run beside it', async t => {
   const { sc, env } = await pooled('slow-start')
-  const a = server({ ...env, HYPERV_MCP_REPLY_MS: '1000' }, { roots: [sc.builds] })
+  const a = server({ ...env, ...T.profile('replyShort') }, { roots: [sc.builds] })
   t.after(() => a.close())
   assert.match((await a.call('vm_wait')).text, /Nothing is in progress in this session/)
   assert.match((await a.call('vm_acquire')).text, /Leased hvmcp-/)
@@ -193,7 +193,7 @@ test('MC-1553: a slow vm_start says "still in progress" and vm_wait gives its re
   sc.patchStub(s => { s.readyGate = gate })
   const t0 = Date.now()
   const start = await a.call('vm_start')
-  assert.ok(Date.now() - t0 < 5000, `it replied within its bound, not when the start ended (${Date.now() - t0} ms)`)
+  assert.ok(Date.now() - t0 < T.bounds.replyBoundMs, `it replied within its bound, not when the start ended (${Date.now() - t0} ms)`)
   assert.match(start.text, /vm_start is still in progress after \d+ s: it goes on in this session\. Call vm_wait now/)
   assert.match(start.text, /Don't end your turn while it's in progress: nothing will wake you/)
   assert.ok(!start.isError, 'not an error: the start goes on')
@@ -210,7 +210,7 @@ test('MC-1553: a slow vm_start says "still in progress" and vm_wait gives its re
 
 test('MC-1553: a long vm_run replies "still in progress"; its result, if nobody waited, comes with the next call', async t => {
   const { sc, env } = await pooled('slow-run')
-  const a = server({ ...env, HYPERV_MCP_REPLY_MS: '1000' }, { roots: [sc.builds] })
+  const a = server({ ...env, ...T.profile('replyShort') }, { roots: [sc.builds] })
   t.after(() => a.close())
   await a.call('vm_acquire')
   await settled(a, await a.call('vm_start'))
@@ -243,7 +243,7 @@ test('MC-1553: a long vm_run replies "still in progress"; its result, if nobody 
 
 test('MC-1553: vm_renew and vm_release run beside a slow vm_start; the release ends it, and its outcome comes with the next call', async t => {
   const { sc, env } = await pooled('slow-release')
-  const a = server({ ...env, HYPERV_MCP_REPLY_MS: '1000' }, { roots: [sc.builds] })
+  const a = server({ ...env, ...T.profile('replyShort') }, { roots: [sc.builds] })
   t.after(() => a.close())
   await a.call('vm_acquire')
   const gate = path.join(sc.dir, 'ready-gate')

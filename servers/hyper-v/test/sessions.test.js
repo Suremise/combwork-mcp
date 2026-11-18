@@ -10,7 +10,7 @@ const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
-const { scratch, startHelper, withPool, waitFor } = require('./helpers')
+const { T, scratch, startHelper, withPool, waitFor } = require('./helpers')
 const { server } = require('../client')
 const policy = require('../helper/policy')
 
@@ -218,7 +218,7 @@ test('plans: a replaced, used or stale plan is refused, and its staging must be 
   await a.request('stage_chunk', { data: Buffer.from('B').toString('base64') })
   await assert.rejects(a.request('stage_end'), /needs 1 file\(s\) not staged: a.txt/)
   await assert.rejects(a.request('sync', { planId: p2 }), /files aren't all staged/)
-  const calls = sc.stub().calls.filter(c => c.op === 'sync-in').length
+  const calls = sc.stub().calls.filter(c => c.op === 'copy-apply' && c.kind === 'sync').length
   assert.strictEqual(calls, 0, 'nothing reached the guest')
   // A used plan can't be applied again; a plan from before a reset is stale.
   const { plan } = await syncWith(a, files)
@@ -231,7 +231,7 @@ test('plans: a replaced, used or stale plan is refused, and its staging must be 
   const p4 = (await a.request('sync_plan', { files: manifest({ 'z.txt': 'Z' }) })).data.planId
   await a.request('stage_begin', { planId: p4 })
   await a.request('start')
-  assert.strictEqual(sc.stub().calls.filter(c => c.op === 'copy-in').length, 1, 'only the first start copied a build')
+  assert.strictEqual(sc.stub().calls.filter(c => c.op === 'copy-apply' && c.kind === 'copy').length, 1, 'only the first start copied a build')
 })
 
 test('manifests in parts: bound to the lease and generation, taken once, capped per batch and in all', async t => {
@@ -263,7 +263,7 @@ test('manifests in parts: bound to the lease and generation, taken once, capped 
   await assert.rejects(a.request('manifest_add', { files: many(1) }), /more than 100000 files/)
   // None of that touched the lease or the guest.
   assert.match((await a.request('status')).text, new RegExp(`${vm}: .*leased, running`))
-  assert.strictEqual(sc.stub().calls.filter(c => c.op === 'sync-in').length, 0)
+  assert.strictEqual(sc.stub().calls.filter(c => c.op === 'copy-apply' && c.kind === 'sync').length, 0)
 })
 
 test('server.js refuses a request line over the host\'s 4 MB limit before sending it: the lease is untouched', async t => {
@@ -295,14 +295,14 @@ test('a failed sync leaves C:\\build untrusted: incremental syncs are refused un
   const { sc, h, a, vm } = await session('sync-failed')
   t.after(() => h.stop())
   await startWith(a, { 'a.txt': 'A' })
-  sc.patchStub(s => { s.fail['sync-in'] = 1 })
+  sc.patchStub(s => { s.fail['copy-apply'] = 1 })
   await assert.rejects(syncWith(a, { 'a.txt': 'A2' }), /The sync failed \(.*injected failure.*\)\. C:\\build may be partly changed: the next vm_sync must be full: true, or vm_reset/)
   await assert.rejects(a.request('sync_plan', { files: manifest({ 'a.txt': 'A2' }) }), /didn't finish.*full: true.*vm_reset/)
   await syncWith(a, { 'a.txt': 'A2' }, { full: true })
   assert.deepStrictEqual(buildOf(sc, vm), { 'a.txt': 'A2' })
   await syncWith(a, { 'a.txt': 'A3' })
   // A failed full sync too.
-  sc.patchStub(s => { s.fail['sync-in'] = 1 })
+  sc.patchStub(s => { s.fail['copy-apply'] = 1 })
   await assert.rejects(syncWith(a, { 'a.txt': 'A4' }, { full: true }), /The sync failed/)
   await assert.rejects(a.request('sync_plan', { files: manifest({ 'a.txt': 'A4' }) }), /didn't finish/)
   // A reset makes it trusted again.
@@ -310,8 +310,8 @@ test('a failed sync leaves C:\\build untrusted: incremental syncs are refused un
   await syncWith(a, { 'a.txt': 'A6' })
   assert.deepStrictEqual(buildOf(sc, vm), { 'a.txt': 'A6' })
   // A start that fails after the restore leaves no earlier record usable.
-  sc.patchStub(s => { s.fail['copy-in'] = 1 })
-  await assert.rejects(startWith(a, { 'a.txt': 'A7' }), /injected failure of copy-in/)
+  sc.patchStub(s => { s.fail['copy-part'] = 1 })
+  await assert.rejects(startWith(a, { 'a.txt': 'A7' }), /injected failure of copy-part/)
   await assert.rejects(a.request('sync_plan', { files: manifest({ 'a.txt': 'A6' }) }), /didn't finish/)
 })
 
@@ -370,7 +370,7 @@ async function inProcess(t, name, policyOver = {}) {
   const { h } = await withPool(sc, 1)
   await h.stop()
   const saved = { ...process.env }
-  Object.assign(process.env, { HYPERV_MCP_PS_STUB: sc.env.HYPERV_MCP_PS_STUB, HYPERV_MCP_STUB_STATE: sc.env.HYPERV_MCP_STUB_STATE, HYPERV_MCP_POLL_MS: '10' })
+  Object.assign(process.env, { HYPERV_MCP_PS_STUB: sc.env.HYPERV_MCP_PS_STUB, HYPERV_MCP_STUB_STATE: sc.env.HYPERV_MCP_STUB_STATE, ...T.profile('inProcess') })
   const clock = { now: Date.parse('2026-11-13T12:00:00Z') }
   const helper = new Helper({ stateDir: sc.stateDir, hv, checkApprovalAcl: false, now: () => clock.now })
   await helper.init()

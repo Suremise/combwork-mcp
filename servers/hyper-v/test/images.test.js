@@ -7,7 +7,7 @@ const test = require('node:test')
 const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
-const { scratch, startHelper, withPool, approve, waitFor } = require('./helpers')
+const { T, scratch, startHelper, withPool, approve, waitFor } = require('./helpers')
 const { server } = require('../client')
 
 const A = 'ab'.repeat(32) // seeded by withPool: Windows
@@ -46,7 +46,7 @@ async function mixed(name, policy = {}) {
   const { h } = await withPool(sc, 2)
   await h.stop()
   addImages(sc, [[B, 'windows', 2000], [L, 'linux', 2001]])
-  const helper = await startHelper(sc, { HYPERV_MCP_WAIT_MS: '400', HYPERV_MCP_KEEP_MS: '60000' })
+  const helper = await startHelper(sc, T.profile('queue'))
   return { sc, h: helper, admin: helper.conn(99) }
 }
 const status = async c => (await c.request('status')).text
@@ -157,7 +157,7 @@ test('a waiter for one kind is not given a freed VM of another', async () => {
   await acquire(w, {})
   await acquire(l, { os: 'linux' })
   const waitLinux = acquire(x, { os: 'linux', wait: true })
-  await waitFor(async () => /Waiting in line: 1\. other \(linux\)/.test(await status(admin)), 5000, 'x in line')
+  await waitFor(async () => /Waiting in line: 1\. other \(linux\)/.test(await status(admin)), T.waitForMs, 'x in line')
   await w.request('release')
   const r = await waitLinux
   assert.match(r.text, /^Still waiting for a VM \(the pool has no free linux VM\): number 1 of 1/, 'the freed Windows VM wasn\'t given to a Linux waiter')

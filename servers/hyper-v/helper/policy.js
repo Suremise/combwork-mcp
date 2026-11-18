@@ -7,6 +7,7 @@
 const fs = require('fs')
 const { join, win32 } = require('path')
 const net = require('./net')
+const timing = require('./timing')
 
 const FILE = 'policy.json'
 const PREFIX_RE = /^[a-z][a-z0-9]{1,11}$/
@@ -59,6 +60,7 @@ function problems(p) {
   if (p.maxNetwork === undefined && typeof p.allowNetwork !== 'boolean') out.push('maxNetwork must be set (or, from an older setup, allowNetwork true or false)')
   // Host mode's switch and addresses, made by setup: required for a policy that allows host or above.
   if (p.hostNetwork !== undefined) { const why = net.hostNetworkProblem(p.hostNetwork); if (why) out.push(why) }
+  out.push(...timing.capsProblems(p.timingCaps)) // MC-1558: each a known key, a number within its floor and maximum
   if (!int(p.maxReservePercent, 0, 100)) out.push('maxReservePercent must be 0-100')
   if (!int(p.maxLeaseMinutes, 5, 24 * 60)) out.push('maxLeaseMinutes must be 5-1440')
   // A work session's cap (vm_renew), optional so a policy from before it stays usable; never below one lease.

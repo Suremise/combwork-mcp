@@ -31,12 +31,12 @@ function Cred($c) {
 
 # MC-1536: a restore, as one pure handler both restore ops use (the tests run it with mock io). Off after a turn-off
 # is polled as a condition on a monotonic clock, every sleep capped to the time left and none after the deadline,
-# within 20 s; else no restore is issued at all. Then the restore is issued, and that's all: MC-1537 found that this
+# within $offMs (MC-1558: the lease's off-wait, 120 s by default; 20 s before); else no restore is issued at all. Then the restore is issued, and that's all: MC-1537 found that this
 # process's Hyper-V objects keep the VM's parent as it was when the process started, so the new parent is never judged
 # here; core verifies it from fresh facts-vm calls (each its own process). Returns { ok, phase, timedOut, last,
 # waitedMs }; the callers refuse any timedOut, whatever the facts read afterwards say.
 $RestoreTo = {
-  param($cpId, $io)
+  param($cpId, $io, $offMs = 120000)
   $t0 = & $io.now
   $poll = {
     param($probe, $want, $limitMs)
@@ -51,7 +51,7 @@ $RestoreTo = {
   }
   $st = & $io.state
   if ($st -eq 'Saved') { & $io.removeSaved } elseif ($st -ne 'Off') { & $io.turnOff }
-  $off = & $poll $io.state 'Off' 20000
+  $off = & $poll $io.state 'Off' ([int]$offMs)
   if (-not $off.ok) { return @{ ok = $false; phase = 'off'; timedOut = $true; last = [string]$off.last; waitedMs = [int]((& $io.now) - $t0) } }
   & $io.restore
   @{ ok = $true; phase = 'restored'; timedOut = $false; last = 'Off'; waitedMs = [int]((& $io.now) - $t0) }
@@ -469,7 +469,10 @@ $GuestSetup = {
   New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Force | Out-Null
   Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name DisableForceUnload -Value 1 -Type DWord
   $dfu = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -ErrorAction SilentlyContinue).DisableForceUnload
-  @{ editionId = $cv.EditionID; build = $cv.CurrentBuild; ubr = $cv.UBR; disableForceUnload = $(if ($null -eq $dfu) { $null } else { [int]$dfu }) }
+  # MC-1558: read back what it made (it may run twice: everything above is idempotent).
+  $folders = (Test-Path -LiteralPath 'C:\out' -PathType Container) -and (Test-Path -LiteralPath 'C:\build' -PathType Container) -and (Test-Path -LiteralPath 'C:\hvmcp' -PathType Container)
+  $buildProtected = [bool](Get-Acl -LiteralPath 'C:\build').AreAccessRulesProtected
+  @{ editionId = $cv.EditionID; build = $cv.CurrentBuild; ubr = $cv.UBR; disableForceUnload = $(if ($null -eq $dfu) { $null } else { [int]$dfu }); folders = $folders; buildProtected = $buildProtected }
 }
 
 # The guest's LSA secret helper (MC-1503): Store sets the autologon password; Remove (MC-1516) deletes it again. Passed
@@ -919,7 +922,9 @@ try {
       # Gen 2 DVD boot waits for "Press any key to boot from CD or DVD": press Enter a few times.
       $cs = Get-CimInstance -Namespace root\virtualization\v2 -ClassName Msvm_ComputerSystem -Filter "Name='$($vm.Id)'"
       $kb = Get-CimAssociatedInstance -InputObject $cs -ResultClassName Msvm_Keyboard
-      for ($i = 0; $i -lt 30; $i++) { Start-Sleep -Milliseconds 500; Invoke-CimMethod -InputObject $kb -MethodName TypeKey -Arguments @{ keyCode = 13 } -ErrorAction SilentlyContinue | Out-Null }
+      # MC-1558: pressed for 60 s (was 15 s), a fixed window: the firmware's prompt can come late on a slow host, and
+      # WinPE and unattended setup take no keys after it. Nothing here detects the boot itself.
+      for ($i = 0; $i -lt 120; $i++) { Start-Sleep -Milliseconds 500; Invoke-CimMethod -InputObject $kb -MethodName TypeKey -Arguments @{ keyCode = 13 } -ErrorAction SilentlyContinue | Out-Null }
       @{ started = $true }
     }
     'guest-ready' {
@@ -933,7 +938,7 @@ try {
     }
     'make-clean' {
       $vm = Get-OwnVm $a
-      if ($vm.State -ne 'Off') { Stop-VM -VM $vm -Force; $t = (Get-Date).AddMinutes(10); while ((Get-VM -Id $vm.Id).State -ne 'Off' -and (Get-Date) -lt $t) { Start-Sleep 2 } }
+      if ($vm.State -ne 'Off') { Stop-VM -VM $vm -Force; $t = (Get-Date).AddMilliseconds($(if ([int]$a.shutdownMs -gt 0) { [int]$a.shutdownMs } else { 600000 })); while ((Get-VM -Id $vm.Id).State -ne 'Off' -and (Get-Date) -lt $t) { Start-Sleep 2 } }
       if ((Get-VM -Id $vm.Id).State -ne 'Off') { throw 'the guest did not shut down' }
       Get-VMDvdDrive -VM $vm | Remove-VMDvdDrive
       Set-VMFirmware -VM $vm -FirstBootDevice (Get-VMHardDiskDrive -VM $vm | Select-Object -First 1)
@@ -947,7 +952,7 @@ try {
       $vm = Get-OwnVm $a
       $cp = Get-VMSnapshot -VM $vm | Where-Object { $_.Id.ToString() -eq [string]$a.checkpointId }
       if (-not $cp) { throw "its $(if ($a.label) { [string]$a.label } else { 'clean' }) checkpoint (by id) is missing" }
-      $r = & $RestoreTo $cp.Id.ToString() (RestoreIo $vm $cp)
+      $r = & $RestoreTo $cp.Id.ToString() (RestoreIo $vm $cp) $(if ([int]$a.offWaitMs -gt 0) { [int]$a.offWaitMs } else { 120000 })
       # MC-1556: an Off VM's adapter disconnected, then its port ACLs removed (in that order); both read back in Facts.
       if ((Get-VM -Id $vm.Id).State -eq 'Off') { Get-VMNetworkAdapter -VM $vm | Disconnect-VMNetworkAdapter; Clear-Acls $vm }
       $f = Facts $vm
@@ -987,7 +992,7 @@ try {
       $vm = Get-OwnVm $a
       $cp = Get-VMSnapshot -VM $vm | Where-Object { $_.Id.ToString() -eq [string]$a.checkpointId -and [string]$_.Name -ceq [string]$a.snapName }
       if (-not $cp) { throw "checkpoint $($a.snapName) (by id) is missing on this VM" }
-      $r = & $RestoreTo $cp.Id.ToString() (RestoreIo $vm $cp)
+      $r = & $RestoreTo $cp.Id.ToString() (RestoreIo $vm $cp) $(if ([int]$a.offWaitMs -gt 0) { [int]$a.offWaitMs } else { 120000 })
       $f = Facts $vm
       $f.restore = $r
       $f
@@ -1048,7 +1053,7 @@ try {
     'guest-shutdown' {
       $vm = Get-OwnVm $a
       if ($vm.State -eq 'Running') { Stop-VM -VM $vm -Force -ErrorAction Stop }
-      $t = (Get-Date).AddMinutes(5)
+      $t = (Get-Date).AddMilliseconds($(if ([int]$a.shutdownMs -gt 0) { [int]$a.shutdownMs } else { 300000 })) # MC-1558: the shutdown wait
       while ((Get-VM -Id $vm.Id).State -ne 'Off' -and (Get-Date) -lt $t) { Start-Sleep 2 }
       Facts $vm
     }
@@ -1101,38 +1106,41 @@ try {
       Start-VM -VM $vm
       @{ started = $true }
     }
-    'copy-in' {
-      $vm = Get-OwnVm $a
-      $t0 = Get-Date
-      $s = New-PSSession -VMId $vm.Id -Credential (Cred $a.cred)
-      try {
-        Invoke-Command -Session $s -ScriptBlock { Get-ChildItem -LiteralPath C:\build -Force | Remove-Item -Recurse -Force }
-        $items = @(Get-ChildItem -LiteralPath ([string]$a.source) -Force)
-        if ($items.Count) { Copy-Item -ToSession $s -Path $items.FullName -Destination 'C:\build' -Recurse -Force }
-      } finally { Remove-PSSession $s }
-      @{ ms = [int]((Get-Date) - $t0).TotalMilliseconds }
-    }
-    'sync-in' {
-      # vm_sync: into the running guest's C:\build without a restore. The staged files go to a fresh guest staging
-      # folder (PowerShell Direct, no share); guest-sync.ps1, a fixed file beside this one, checks every path and moves
-      # them into place, never following a link. Only C:\build and the staging under C:\hvmcp are touched.
+    # MC-1558: a Windows copy-in or vm_sync, in calls the helper bounds by copyIdleMinutes: copy-prepare makes the guest's
+    # staging folder (and its parts folder beside it) fresh; copy-part copies each item (a whole file, or a byte-range part
+    # of one) into the parts folder and, at once, has guest-sync.ps1 append it to its file in the stage at that file's
+    # current length (an item already there is skipped), so a killed call resumes without redoing what it finished;
+    # copy-lengths reads the stage's file lengths; copy-apply is guest-sync's apply into C:\build, every check included.
+    # Only C:\build and the staging under C:\hvmcp are touched.
+    { $_ -in 'copy-prepare', 'copy-part', 'copy-lengths', 'copy-apply' } {
       $vm = Get-OwnVm $a
       if ($vm.State -ne 'Running') { throw 'the VM is not running' }
       if ([string]$a.guestStage -notmatch '^C:\\hvmcp\\sync-\d{1,9}$') { throw 'bad guest staging folder' }
+      $stage = [string]$a.guestStage
+      $parts = "$stage-parts"
       $sync = [scriptblock]::Create([IO.File]::ReadAllText((Join-Path $PSScriptRoot 'guest-sync.ps1')))
-      $t0 = Get-Date
       $s = New-PSSession -VMId $vm.Id -Credential (Cred $a.cred)
       try {
-        $files = @(@($a.files) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ })
-        if ($files.Count) {
-          [void](Invoke-Command -Session $s -ScriptBlock $sync -ArgumentList @{ action = 'prepare'; stage = [string]$a.guestStage })
-          $items = @(Get-ChildItem -LiteralPath ([string]$a.source) -Force)
-          if ($items.Count) { Copy-Item -ToSession $s -Path $items.FullName -Destination ([string]$a.guestStage) -Recurse -Force }
+        switch ([string]$in.op) {
+          'copy-prepare' { [void](Invoke-Command -Session $s -ScriptBlock $sync -ArgumentList @{ action = 'prepare'; stage = $stage; parts = $parts }); @{ prepared = $true } }
+          'copy-part' {
+            $appended = 0; $skipped = 0; $n = 0
+            foreach ($it in @($a.items)) {
+              $dst = "$parts\$n"; $n++
+              Copy-Item -ToSession $s -Path ([string]$it.src) -Destination $dst -Force
+              $r = Invoke-Command -Session $s -ScriptBlock $sync -ArgumentList @{ action = 'append'; stage = $stage; parts = $parts; items = @(@{ rel = [string]$it.rel; part = $dst; offset = [long]$it.offset; length = [long]$it.length }) }
+              $appended += [int]$r.appended; $skipped += [int]$r.skipped
+            }
+            @{ appended = $appended; skipped = $skipped }
+          }
+          'copy-lengths' { Invoke-Command -Session $s -ScriptBlock $sync -ArgumentList @{ action = 'lengths'; stage = $stage; parts = $parts; rels = @(@($a.rels) | ForEach-Object { [string]$_ }) } }
+          'copy-apply' {
+            $j = @{ action = 'apply'; root = 'C:\build'; stage = $stage; parts = $parts; files = @(@($a.files) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ }); remove = @(@($a.remove) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ }); full = [bool]$a.full; delete = [bool]$a.delete }
+            $r = Invoke-Command -Session $s -ScriptBlock $sync -ArgumentList $j
+            @{ copied = [int]$r.copied; removed = [int]$r.removed }
+          }
         }
-        $j = @{ action = 'apply'; root = 'C:\build'; stage = [string]$a.guestStage; files = $files; remove = @(@($a.remove) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_ }); full = [bool]$a.full; delete = [bool]$a.delete }
-        $r = Invoke-Command -Session $s -ScriptBlock $sync -ArgumentList $j
       } finally { Remove-PSSession $s }
-      @{ ms = [int]((Get-Date) - $t0).TotalMilliseconds; copied = [int]$r.copied; removed = [int]$r.removed }
     }
     'guest-logon' {
       $vm = Get-OwnVm $a

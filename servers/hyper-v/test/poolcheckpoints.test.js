@@ -7,7 +7,7 @@ const test = require('node:test')
 const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
-const { scratch, startHelper, withPool, approve, waitFor } = require('./helpers')
+const { T, scratch, startHelper, withPool, approve, waitFor } = require('./helpers')
 
 async function pool(name, n = 2, policy = {}) {
   const sc = scratch(name, { policy: { maxVms: 4, ...policy, projects: [{ name: 'cli', folders: [] }, { name: 'mcp', folders: [] }] } })
@@ -21,7 +21,7 @@ async function pool(name, n = 2, policy = {}) {
   fs.writeFileSync(pf, JSON.stringify(p))
   const { h } = await withPool(sc, n)
   await h.stop()
-  const helper = await startHelper(sc, { HYPERV_MCP_WAIT_MS: '400', HYPERV_MCP_KEEP_MS: '60000' })
+  const helper = await startHelper(sc, T.profile('queue'))
   return { sc, h: helper, cli, mcp, admin: helper.conn(99) }
 }
 const req = (c, op, args) => c.request(op, args).then(r => r, e => ({ error: e.message, text: e.message }))
@@ -184,7 +184,7 @@ test('acquire by checkpoint: an unknown name, a vm that lacks it, a contradictin
   // v1 is leased: a waiter for "tools" waits (not given v2), then gets v1 when it's released.
   const w = h.conn(3)
   const pw = req(w, 'acquire', { minutes: 30, checkpoint: 'tools', wait: true })
-  await waitFor(async () => /Waiting in line: 1\./.test((await admin.request('status')).text), 5000, 'waiting')
+  await waitFor(async () => /Waiting in line: 1\./.test((await admin.request('status')).text), T.waitForMs, 'waiting')
   await a.request('release')
   // A wait can end (WAIT_MS) before the release's restore has freed v1: the place is kept, and the waiter asks again, as
   // the reply says, until it holds a lease (a condition, not a longer wait).
@@ -205,7 +205,7 @@ test('a lease that ends during the take publishes nothing, and the take is remov
   const entered = path.join(sc.dir, 'pool-take-entered')
   sc.patchStub(st => { st.poolTakeEntered = entered; st.poolTakeGate = path.join(sc.dir, 'never') })
   const run = req(admin, 'pool_checkpoint', { planId: p.data.planId })
-  await waitFor(async () => fs.existsSync(entered), 10_000, 'the take has begun')
+  await waitFor(async () => fs.existsSync(entered), T.waitForMs, 'the take has begun')
   // Another VM is leased meanwhile: the pool lock isn't held across the take.
   assert.match((await req(h.conn(2), 'acquire', { minutes: 30, vm: v2 })).text, new RegExp(`^Leased ${v2} `))
   await a.request('release')
@@ -307,12 +307,12 @@ test('a name on Windows and Linux VMs: acquire without os is refused; with os it
   fs.mkdirSync(dir, { recursive: true })
   fs.writeFileSync(path.join(dir, `${L}.iso`), 'iso')
   fs.appendFileSync(path.join(sc.stateDir, 'journal.jsonl'), JSON.stringify({ t: 'image', sha256: L, size: 3, file: path.join(dir, `${L}.iso`), source: 'local', edition: 'EnterpriseEval', build: '26200.6584', pinned: true, os: 'linux', seq: 2001, at: new Date().toISOString() }) + '\n')
-  const h2 = await startHelper(sc, { HYPERV_MCP_WAIT_MS: '400', HYPERV_MCP_KEEP_MS: '60000' })
+  const h2 = await startHelper(sc, T.profile('queue'))
   const ad = h2.conn(99)
   const plan = await ad.request('pool_plan', { action: 'resize', image: L, vms: 1 })
   approve(sc, plan.data.planId)
   await ad.request('pool_resize', { planId: plan.data.planId })
-  await waitFor(async () => /Last pool job: resize finished/.test((await ad.request('status')).text), 15_000, 'the Linux VM')
+  await waitFor(async () => /Last pool job: resize finished/.test((await ad.request('status')).text), T.waitForMs, 'the Linux VM')
   const stt = (await ad.request('status')).text
   const win = /^- (hvmcp-[0-9a-f]+): windows/m.exec(stt)[1]
   const lin = /^- (hvmcp-[0-9a-f]+): linux/m.exec(stt)[1]
@@ -379,7 +379,7 @@ test('stale plans: a second approved publish of the same name fails (nothing pub
   const entered = path.join(sc.dir, 'take-entered'); const gate = path.join(sc.dir, 'take-gate')
   sc.patchStub(st => { st.poolTakeEntered = entered; st.poolTakeGate = gate })
   const run = req(admin, 'pool_checkpoint', { planId: rp.data.planId })
-  await waitFor(async () => fs.existsSync(entered), 10_000, 'the replace is at its take')
+  await waitFor(async () => fs.existsSync(entered), T.waitForMs, 'the replace is at its take')
   assert.match((await req(h.conn(5), 'pool_checkpoint', { planId: rm.data.planId })).text, /retired/)
   fs.writeFileSync(gate, 'open')
   assert.match((await run).text, /FAILED: the checkpoint to replace has changed: nothing was published/)

@@ -10,7 +10,7 @@ const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
 const { spawn, spawnSync } = require('child_process')
-const { scratch, withPool, waitFor } = require('./helpers')
+const { T, scratch, withPool, waitFor } = require('./helpers')
 const { ps51Env } = require('../helper/hv')
 
 const windows = process.platform === 'win32'
@@ -70,7 +70,7 @@ test('failed polls are retried within the run\'s one deadline, never extending i
   const t0 = Date.now()
   const r = await a.request('run', { command: 'sleep', timeoutSec: 2 })
   assert.match(r.text, /^Timed out after 2 s/)
-  assert.ok(Date.now() - t0 < 15_000, `every poll failing still ends at the deadline (${Date.now() - t0} ms)`)
+  assert.ok(Date.now() - t0 < T.bounds.pollDeadlineMs, `every poll failing still ends at the deadline (${Date.now() - t0} ms)`)
   await h.stop()
 })
 
@@ -78,12 +78,12 @@ test('a lease that ends mid-run: no guest call is sent after it, and the VM is r
   const { sc, h, a } = await running('runs-lease-end')
   const admin = h.conn(9)
   const run = a.request('run', { command: 'sleep', timeoutSec: 60 }).catch(e => e)
-  await waitFor(() => ops(sc).filter(x => x === 'guest-run-poll').length >= 2, 10_000, 'the run being polled')
+  await waitFor(() => ops(sc).filter(x => x === 'guest-run-poll').length >= 2, T.waitForMs, 'the run being polled')
   a.close()
   // The run's request settles once its poll loop has stopped (refused by the ended lease), and the VM is free once
   // restored: after both, nothing can still be sent for it, so the log is final.
   assert.ok((await run) instanceof Error)
-  await waitFor(async () => /; free/.test((await admin.request('status')).text), 15_000, 'the lease to end')
+  await waitFor(async () => /; free/.test((await admin.request('status')).text), T.waitForMs, 'the lease to end')
   const o = ops(sc)
   const after = o.slice(o.lastIndexOf('restore') + 1)
   assert.ok(!after.some(x => x.startsWith('guest-run')), `guest calls after the lease ended: ${after.join(', ')}`)
@@ -97,7 +97,7 @@ const KILL = /^\$GuestRunKill = \{\r?\n[\s\S]*?\r?\n\}\r?\n/m.exec(HV)?.[0]
 function kill(pid, started) {
   const file = path.join(scratch('runs-killps').dir, 'kill.ps1')
   fs.writeFileSync(file, `param([int]$TargetPid, [string]$Started)\n${KILL}\n$r = & $GuestRunKill @{ pid = $TargetPid; started = $(if ($Started) { $Started } else { $null }) }\nConvertTo-Json -InputObject $r -Compress\n`)
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, '-TargetPid', String(pid), '-Started', started || ''], { encoding: 'utf8', env: ps51Env(), timeout: 60_000 })
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, '-TargetPid', String(pid), '-Started', started || ''], { encoding: 'utf8', env: ps51Env(), timeout: T.spawnMs })
   const line = r.stdout.trim().split(/\r?\n/).at(-1)
   try { return JSON.parse(line) } catch { throw new Error(`no answer from the kill: ${r.stdout}${r.stderr}`) }
 }
@@ -114,7 +114,7 @@ test('hv.ps1\'s kill, for real: the run\'s own process (by its creation time) an
   assert.match(s.started, /^\d{4}-\d\d-\d\dT/)
   const r = kill(s.pid, s.started)
   assert.deepStrictEqual(r, { killed: true })
-  await waitFor(() => !alive(s.pid), 10_000, 'the process gone')
+  await waitFor(() => !alive(s.pid), T.waitForMs, 'the process gone')
 })
 
 test('hv.ps1\'s kill, for real: another creation time (a reused PID), or no recorded identity, kills nothing', { skip: !windows || !KILL }, async t => {
@@ -132,7 +132,7 @@ test('hv.ps1\'s kill, for real: another creation time (a reused PID), or no reco
 test('hv.ps1\'s kill, for real: a process already gone is reported gone (the exit file decides), never an error', { skip: !windows || !KILL }, async () => {
   const s = sleeper()
   s.child.kill()
-  await waitFor(() => !alive(s.pid), 10_000, 'the process gone')
+  await waitFor(() => !alive(s.pid), T.waitForMs, 'the process gone')
   assert.deepStrictEqual(kill(s.pid, s.started), { killed: false, gone: true })
 })
 
@@ -150,7 +150,7 @@ test('the deadline counts from the start\'s reply: a slow start or publish, and 
 })
 
 test('a poll that hangs is cut off by what is left of the run\'s budget, and the timeout\'s cleanup follows at once', async () => {
-  const { sc, h, a } = await running('runs-stuck-poll', { HYPERV_MCP_MIN_POLL_MS: '1000' })
+  const { sc, h, a } = await running('runs-stuck-poll', T.profile('minPollShort'))
   const pidFile = path.join(sc.dir, 'poll.pid')
   sc.patchStub(st => { st.pollDelayOnceMs = 60_000; st.pollPidFile = pidFile })
   const t0 = Date.now()
@@ -159,7 +159,7 @@ test('a poll that hangs is cut off by what is left of the run\'s budget, and the
   assert.match(r.text, /^Timed out after 1 s: killed inside the guest by its PID/)
   assert.ok(took < 15_000, `the hung poll (60 s) was cut off: the run took ${took} ms`)
   const pollPid = Number(fs.readFileSync(pidFile, 'utf8'))
-  await waitFor(() => !alive(pollPid), 10_000, 'the hung poll\'s process ended')
+  await waitFor(() => !alive(pollPid), T.waitForMs, 'the hung poll\'s process ended')
   await h.stop()
 })
 
@@ -187,8 +187,8 @@ function guest(name, script, { job = false } = {}) {
     // MC-1543: with job, the harness runs inside jobrun.exe's kill-on-close Job object: whatever it starts ends when the
     // launcher does, however it ends (a timeout here kills the launcher, which closes the job).
     const r = job
-      ? spawnSync(jobrun(), ['powershell.exe', ...argv.map(a => (/\s/.test(a) ? `"${a}"` : a))], { encoding: 'utf8', env: ps51Env(), timeout: 120_000, windowsHide: true, windowsVerbatimArguments: true })
-      : spawnSync('powershell.exe', argv, { encoding: 'utf8', env: ps51Env(), timeout: 120_000 })
+      ? spawnSync(jobrun(), ['powershell.exe', ...argv.map(a => (/\s/.test(a) ? `"${a}"` : a))], { encoding: 'utf8', env: ps51Env(), timeout: T.spawnMs, windowsHide: true, windowsVerbatimArguments: true })
+      : spawnSync('powershell.exe', argv, { encoding: 'utf8', env: ps51Env(), timeout: T.spawnMs })
     const lines = r.stdout.trim().split(/\r?\n/).filter(l => l.startsWith('{'))
     if (!lines.length) throw new Error(`no answer: ${r.stdout}${r.stderr}`)
     return lines.map(l => JSON.parse(l))
@@ -228,7 +228,7 @@ foreach ($i in $ids) {
   if ([Math]::Abs(($start - [DateTime]::Parse([string]$i.created).ToUniversalTime()).TotalSeconds) -lt 1) { $left += [int]$i.pid }
 }
 'SURVIVORS-DONE:' + ($left -join ',')
-`], { encoding: 'utf8', env: ps51Env(), windowsHide: true, timeout: 60_000 })
+`], { encoding: 'utf8', env: ps51Env(), windowsHide: true, timeout: T.spawnMs })
   const m = /SURVIVORS-DONE:(.*)/.exec(r.stdout || '')
   if (r.status !== 0 || !m) throw new Error(`the survivors check failed (exit ${r.status}): ${r.stdout}${r.stderr}`)
   return m[1].trim() ? m[1].trim().split(',').map(Number) : []
@@ -292,7 +292,7 @@ test('hv.ps1\'s start, for real: a running command\'s PID and creation time (rea
   assert.strictEqual(poll.done, false)
   assert.deepStrictEqual(killed, { killed: true, via: 'job' }, 'hv.ps1\'s own kill took the run, through its job (MC-1547)')
   assert.deepStrictEqual(after, { pingGone: true }, 'the kill took the whole tree, the ping included')
-  await waitFor(() => !alive(started.pid), 10_000, 'the run gone')
+  await waitFor(() => !alive(started.pid), T.waitForMs, 'the run gone')
 })
 
 test('MC-1543: a harness that dies after launching the run (no finally, no usable output) leaves nothing behind: the job it ran in ends everything it started', { skip: !windows || START.some(b => !b) || !KILL }, async t => {
@@ -305,7 +305,7 @@ test('MC-1543: a harness that dies after launching the run (no finally, no usabl
   const ids = JSON.parse(fs.readFileSync(path.join(g.dir, 'ids.json'), 'utf8'))
   assert.ok(ids.run?.pid && ids.wrapper?.pid && ids.ping?.pid, `every identity was recorded before it died: ${JSON.stringify(ids)}`)
   // Nothing killed them but the job's closing: the run's cmd, the wrapper's cmd and the ping all end with it.
-  for (const k of ['run', 'wrapper', 'ping']) await waitFor(() => !alive(ids[k].pid), 10_000, `${k} gone with the job`)
+  for (const k of ['run', 'wrapper', 'ping']) await waitFor(() => !alive(ids[k].pid), T.waitForMs, `${k} gone with the job`)
   assert.deepStrictEqual(survivors(g.dir), [])
 })
 

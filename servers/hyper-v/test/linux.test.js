@@ -13,7 +13,7 @@ const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
-const { scratch, startHelper, withPool, approve, waitFor } = require('./helpers')
+const { T, scratch, startHelper, withPool, approve, waitFor } = require('./helpers')
 const { server } = require('../client')
 
 const D = 'de'.repeat(32) // a Debian image, recorded as linux-images.prepare records one
@@ -56,7 +56,7 @@ async function mixedPool(name, stub = {}) {
   const { h } = await withPool(sc, 1)
   await h.stop()
   addDebian(sc)
-  const helper = await startHelper(sc, { HYPERV_MCP_KEEP_MS: '60000' })
+  const helper = await startHelper(sc, T.profile('queueKeep'))
   const admin = helper.conn(99)
   const built = await change(sc, admin, { action: 'resize', image: D, vms: 1 })
   return { sc, h: helper, admin, built, linux: linuxVm(sc) }
@@ -122,7 +122,7 @@ test('a Linux build that never answers: diagnosed from its serial lines (conclus
     [{ seedCacheLeft: ['/var/lib/cloud/instances'] }, /cloud-init's cached seed is still there: \/var\/lib\/cloud\/instances/]
   ]
   for (const [stub, re] of cases) {
-    const sc = scratch('lx-notready', { policy: { maxVms: 4, maxMemoryMBTotal: 65536 } })
+    const sc = scratch('lx-notready', { policy: { maxVms: 4, maxMemoryMBTotal: 65536 }, timing: 'narrow' })
     const { h } = await withPool(sc, 1)
     await h.stop()
     addDebian(sc)
@@ -258,7 +258,7 @@ test('the helper killed mid-run: the next one\'s recovery restores the Linux VM 
   await c.request('run', { command: 'write /build/sentinel.txt x' })
   // Left pending: a killed helper answers nothing more.
   c.request('run', { command: 'sleep', timeoutSec: 60 }).catch(() => null)
-  await waitFor(() => (sc.stub().sshCalls || []).some(x => x.op === 'run-poll' && x.vmId === linux.id), 10_000, 'the run polling')
+  await waitFor(() => (sc.stub().sshCalls || []).some(x => x.op === 'run-poll' && x.vmId === linux.id), T.waitForMs, 'the run polling')
   const r0 = vmOf(sc, linux.name).restores
   await h.kill()
   const h2 = await startHelper(sc)
@@ -324,7 +324,7 @@ test('pool checkpoints and refresh-clean on a Linux VM: published from a lease (
   approve(sc, rp.data.planId)
   const c1 = sc.stub().calls.length
   await admin.request('pool_refresh', { planId: rp.data.planId })
-  await waitFor(async () => /Last pool job: refresh (finished|FAILED)/.test(await statusText(admin)), 30_000, 'the refresh job')
+  await waitFor(async () => /Last pool job: refresh (finished|FAILED)/.test(await statusText(admin)), T.waitForMs, 'the refresh job')
   assert.match(await statusText(admin), /Last pool job: refresh finished: hvmcp-\w+: refreshed \(Linux, no licence; profiles kept as built; its pool checkpoints kept\)/)
   assert.strictEqual(verifies(), v0 + 1)
   const rops = sc.stub().calls.slice(c1).map(x => x.op)
@@ -348,7 +348,7 @@ test('MC-1545: where an SSH connection stops, from HvMcpVsock\'s lines and the g
     await h.stop()
     addDebian(sc)
     sc.patchStub(s => Object.assign(s, stub))
-    const helper = await startHelper(sc, { HYPERV_MCP_LINUX_ATTEMPT_MS: '2000', HYPERV_MCP_LINUX_READY_MS: '5000' })
+    const helper = await startHelper(sc, T.profile('linuxAttempts'))
     const admin = helper.conn(99)
     const { line } = await change(sc, admin, { action: 'resize', image: D, vms: 1 }, { expectFail: true })
     assert.match(line, re, JSON.stringify(stub))
@@ -378,7 +378,7 @@ test('MC-1545: a lease\'s calls never ask for verbose; a seed\'s connection unit
 })
 
 test('MC-1545: debugKeepFailedBuild keeps a failed Linux build (on, never leased, flagged across a restart, not restored); the next resize removes it', async () => {
-  const sc = scratch('lx-keep', { policy: { maxVms: 4, maxMemoryMBTotal: 65536 } })
+  const sc = scratch('lx-keep', { policy: { maxVms: 4, maxMemoryMBTotal: 65536 }, timing: 'narrow' })
   const { h } = await withPool(sc, 1)
   await h.stop()
   addDebian(sc)
@@ -418,7 +418,7 @@ test('MC-1545: debugKeepFailedBuild keeps a failed Linux build (on, never leased
 })
 
 test('MC-1549: a no-image resize to the other VMs\' count removes only the kept VM (its accept text promises no build); a smaller one removes others too; the texts say so and that a remove plan removes the whole pool', async () => {
-  const sc = scratch('lx-keep-drop', { policy: { maxVms: 4, maxMemoryMBTotal: 65536 } })
+  const sc = scratch('lx-keep-drop', { policy: { maxVms: 4, maxMemoryMBTotal: 65536 }, timing: 'narrow' })
   const { h } = await withPool(sc, 2)
   await h.stop()
   addDebian(sc)
@@ -509,7 +509,7 @@ test('MC-1545 round 2: a kept build is put in its debug state and read back: sta
 })
 
 test('MC-1545 round 2: a first pool whose only VM is a kept failed build takes a new create plan, which removes it', async () => {
-  const sc = scratch('lx-keep-create', { policy: { maxVms: 4, maxMemoryMBTotal: 65536 } })
+  const sc = scratch('lx-keep-create', { policy: { maxVms: 4, maxMemoryMBTotal: 65536 }, timing: 'narrow' })
   let h = await startHelper(sc)
   await h.stop()
   addDebian(sc)

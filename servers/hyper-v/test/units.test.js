@@ -6,7 +6,7 @@ const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
-const { scratch } = require('./helpers')
+const { T, scratch } = require('./helpers')
 const iso = require('../helper/iso')
 const images = require('../helper/images')
 const policy = require('../helper/policy')
@@ -438,10 +438,10 @@ test('setup, uninstall and approve.ps1 load 5.1\'s own modules when started from
   assert.match(fixed.stdout, /\S/)
 })
 
-test('uninstall teardown (non-elevated, fakes): verified targets only; resumable after a crash at every boundary', { skip: !windows, timeout: 600_000 }, () => {
+test('uninstall teardown (non-elevated, fakes): verified targets only; resumable after a crash at every boundary', { skip: !windows, timeout: T.longTestMs }, () => {
   const { spawnSync } = require('child_process')
   const sc = scratch('teardown')
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, 'teardown-check.ps1'), '-Dir', sc.dir], { encoding: 'utf8', env: ps51Env(), timeout: 590_000 })
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, 'teardown-check.ps1'), '-Dir', sc.dir], { encoding: 'utf8', env: ps51Env(), timeout: T.longScriptMs })
   const line = (r.stdout || '').split(/\r?\n/).find(l => l.startsWith('RESULT:'))
   assert.ok(line, `teardown-check.ps1 failed: ${r.stdout}\n${r.stderr}`)
   const a = JSON.parse(line.slice(7))

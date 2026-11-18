@@ -258,14 +258,14 @@ Step "Group '$groupName' holds $User; $User may also open the pipe directly (no 
 # 4. The code, installed where only Administrators can write. The service is stopped first (a running helper's VMs are
 # restored by the next one's recovery), and the folder's ACL is made exclusive, and checked, before any code goes in.
 $existing = Get-Service $svc -ErrorAction SilentlyContinue
-if ($existing -and $existing.Status -ne 'Stopped') { Stop-Service $svc -Force; (Get-Service $svc).WaitForStatus('Stopped', [TimeSpan]::FromSeconds(60)); Step "Service $svc stopped for the update." }
+if ($existing -and $existing.Status -ne 'Stopped') { Stop-Service $svc -Force; (Get-Service $svc).WaitForStatus('Stopped', [TimeSpan]::FromMinutes(5)); Step "Service $svc stopped for the update." } # MC-1558: up to 5 min, the helper may be mid-operation
 Set-ExclusiveAcl $install @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$USERS=ReadAndExecute") -SetOwner
 $bad = @(Test-ExclusiveAcl $install -Allowed $SYSTEM, $ADMINS, $USERS -Writers $SYSTEM, $ADMINS -Owners $SYSTEM, $ADMINS)
 if ($bad.Count) { throw "$install isn't admin-only after setting its ACL: $($bad -join '; ')" }
 # Nothing earlier in it is kept: every file the service runs is copied fresh below (a stray file could be loaded instead).
 Get-ChildItem -LiteralPath $install -Force | Remove-Item -Recurse -Force
 New-Item -ItemType Directory -Path (Join-Path $install 'guests') -Force | Out-Null
-foreach ($f in 'core.js', 'helper.js', 'hv.js', 'hv.ps1', 'guest-sync.ps1', 'guest-agent.ps1', 'images.js', 'iso.js', 'journal.js', 'net.js', 'paths.js', 'policy.js', 'inventory.js', 'unattend.js', 'approve.ps1', 'linux-images.js', 'openpgp.js', 'qcow2.js', 'seed.js', 'ssh.js', 'sshkeys.js', 'guest.py', 'guests\linux.js') {
+foreach ($f in 'core.js', 'helper.js', 'hv.js', 'hv.ps1', 'guest-sync.ps1', 'guest-agent.ps1', 'images.js', 'iso.js', 'journal.js', 'net.js', 'paths.js', 'policy.js', 'inventory.js', 'timing.js', 'unattend.js', 'approve.ps1', 'linux-images.js', 'openpgp.js', 'qcow2.js', 'seed.js', 'ssh.js', 'sshkeys.js', 'guest.py', 'guests\linux.js') {
   Copy-Item -LiteralPath (Join-Path $src "helper\$f") -Destination (Join-Path $install $f) -Force
 }
 Copy-Item -LiteralPath (Join-Path $src 'meta.json') -Destination (Join-Path $install 'meta.json') -Force
@@ -396,12 +396,14 @@ Step ("Policy: up to {0} VMs, {1} cores each, {2} GB memory in all, {3} GB disks
 # 8. Start.
 if ($Mode -eq 'Service') {
   Start-Service $svc
-  $t = (Get-Date).AddMinutes(5)
-  while (-not (PipeOpen) -and (Get-Date) -lt $t) {
+  # MC-1558: as long as the host allows the helper to get ready (30 min: it restores every VM first), saying so after 5.
+  $t0 = Get-Date; $said = $false
+  while (-not (PipeOpen) -and ((Get-Date) - $t0).TotalMinutes -lt 30) {
     if ((Get-Service $svc).Status -eq 'Stopped') { throw "The service stopped: see $state\host.log and $state\helper.log." }
+    if (-not $said -and ((Get-Date) - $t0).TotalMinutes -ge 5) { Step 'The helper is still starting (it restores every pool VM first): waiting up to 30 minutes in all.'; $said = $true }
     Start-Sleep 1
   }
-  if (-not (PipeOpen)) { throw "The helper didn't open its pipe within 5 minutes: see $state\host.log and $state\helper.log." }
+  if (-not (PipeOpen)) { throw "The helper didn't open its pipe within 30 minutes: see $state\host.log and $state\helper.log." }
   Step 'The helper is running.'
 }
 # The pool's licences (MC-1513), read from the journal without writing it, by the helper's own code.

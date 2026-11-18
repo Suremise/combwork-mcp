@@ -10,7 +10,7 @@ const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
 const { spawnSync } = require('child_process')
-const { scratch, withPool } = require('./helpers')
+const { T, scratch, withPool } = require('./helpers')
 const { server } = require('../client')
 const { ps51Env } = require('../helper/hv')
 const { Helper } = require('../helper/core')
@@ -20,7 +20,7 @@ const BLOCK = (() => { const a = HV_PS.indexOf('\n$RestoreTo = {'); const e = a 
 
 // One case: states are the values each successive state probe returns (the last repeats); the clock advances only by
 // sleeps; a parent probe is recorded as a call (none is expected). Prints the result and what was called.
-function run(t, { states }) {
+function run(t, { states, offMs = null }) {
   const sc = scratch(`restorewait-${t}`)
   const file = path.join(sc.dir, 'case.ps1')
   fs.writeFileSync(file, `${BLOCK}
@@ -35,10 +35,10 @@ $io = @{
   sleep = { param($ms) $script:sleeps += $ms; $script:clock += $ms }
   now = { $script:clock }
 }
-$r = & $RestoreTo 'target' $io
+$r = & $RestoreTo 'target' $io${offMs ? ` ${offMs}` : ''}
 'OUT:' + (ConvertTo-Json -InputObject @{ r = $r; calls = @($script:calls); sleeps = @($script:sleeps); clock = $script:clock } -Compress -Depth 4)
 `)
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: ps51Env(), timeout: 60_000 })
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: ps51Env(), timeout: T.spawnMs })
   const line = r.stdout.split(/\r?\n/).find(l => l.startsWith('OUT:'))
   assert.ok(line, r.stdout + r.stderr)
   return JSON.parse(line.slice(4))
@@ -65,11 +65,17 @@ test('a Saved VM has its saved state removed, not turned off', { skip }, () => {
 })
 
 test('never Off: phase off timed out, and no restore issued; sleeps capped to the 20 s left, none after', { skip }, () => {
-  const o = run('neveroff', { states: ['Running', 'Stopping'] })
+  const o = run('neveroff', { states: ['Running', 'Stopping'], offMs: 20000 })
   assert.deepStrictEqual([o.r.ok, o.r.phase, o.r.timedOut, o.r.last], [false, 'off', true, 'Stopping'])
   assert.deepStrictEqual(o.calls, ['turnOff'], 'no restore')
   assert.strictEqual(o.clock, 20000, 'exactly the deadline, no sleep beyond it')
   assert.ok(o.sleeps.every(ms => ms <= 500))
+})
+
+test('MC-1558: the off-wait is given by the caller (offWaitMs), 120 s when none is given', { skip }, () => {
+  const o = run('neveroff-default', { states: ['Running', 'Stopping'] })
+  assert.deepStrictEqual([o.r.ok, o.r.phase, o.r.timedOut], [false, 'off', true])
+  assert.strictEqual(o.clock, 120000, 'the default off-wait, exactly')
 })
 
 // core's restoreVia on a bare helper: hv is a fake whose facts-vm replies come from a list (each advancing the fake
@@ -199,7 +205,7 @@ test('the caller refuses a timed-out Off even though the facts read afterwards m
 })
 
 test('a lease restore that never lands is refused in phase parent, and never started; the checkpoint is unchanged', async t => {
-  const { sc, s, stubVm } = await lease(t, 'rw-never', { HYPERV_MCP_RESTORE_VERIFY_MS: '1500' })
+  const { sc, s, stubVm } = await lease(t, 'rw-never', T.profile('restoreVerifyShort'))
   const when = path.join(sc.dir, 'never-now')
   sc.patchStub(st => { st.restoreNeverLands = when })
   await s.call('vm_start', {})

@@ -3,14 +3,7 @@
 // finishes; unknown (null) is never accepted; a queue that never finishes fails late with its state; every call bounded
 // by the time left. core.js's own provisionProfiles, logon and waitProvisioned on a bare object, with a clock that moves
 // only by its calls: guest-logon 10, guest-session 5, guest-provisioned 5, the undo 5.
-process.env.HYPERV_MCP_PROVISION_WAIT_MS = '200'
-process.env.HYPERV_MCP_PROVISION_QUIET_MS = '20'
-process.env.HYPERV_MCP_PROVISION_POLL_MS = '1'
-process.env.HYPERV_MCP_POLL_MS = '1'
-process.env.HYPERV_MCP_LOGON_STABLE_MS = '10'
-process.env.HYPERV_MCP_BUILD_LOGON_WAIT_MS = '100'
-process.env.HYPERV_MCP_LOGON_SNAPSHOT_MS = '90'
-process.env.HYPERV_MCP_FIRST_LOGON_SIGN_MS = '15'
+Object.assign(process.env, require('./helpers').T.profile('provisionReadiness')) // test/timing.json (MC-1558): read before core.js loads
 const test = require('node:test')
 const assert = require('assert')
 const { Helper } = require('../helper/core')

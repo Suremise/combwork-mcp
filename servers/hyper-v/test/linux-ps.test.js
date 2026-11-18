@@ -10,7 +10,7 @@ const path = require('path')
 const crypto = require('crypto')
 const { spawnSync } = require('child_process')
 const { ps51Env } = require('../helper/hv')
-const { scratch } = require('./helpers')
+const { T, scratch } = require('./helpers')
 
 const HV = path.join(__dirname, '..', 'helper', 'hv.ps1')
 const skip = process.platform !== 'win32'
@@ -102,7 +102,7 @@ test('com-read: lines across a quiet spell longer than its wait and a line split
   const t0 = Date.now()
   const r = hv('read-quiet', 'com-read', { pipe, ms: 30_000 }, serve(pipe, [['boot noise\\n[  1.0] x HVMCP-DIAG stage=seed-read vmbus=present\\r\\n', 6500, 'HVMCP-DIAG stage=sock', 300, 'et-up vsock_listen=active\\nafter\\n', 3000]]))
   assert.deepStrictEqual(r.answer.result, { lines: ['HVMCP-DIAG stage=seed-read vmbus=present', 'HVMCP-DIAG stage=socket-up vsock_listen=active'], connected: true, complete: true, overflow: false, stopped: false })
-  assert.ok(Date.now() - t0 < 25_000, 'it ended at the last stage, not the deadline')
+  assert.ok(Date.now() - t0 < T.bounds.lastStageEndsMs, 'it ended at the last stage, not the deadline')
 })
 
 test('com-read: the pipe closing and coming back (a guest restart) is read on; 64 KB without a newline stops it; a silent guest ends at the deadline', { skip }, () => {
@@ -129,7 +129,7 @@ test('MC-1545 com-read through the wait: the seed\'s last stage doesn\'t end it,
   const t0 = Date.now()
   const r = hv('read-through', 'com-read', { pipe, ms: 30_000, through: true, stopFile }, serve(pipe, [['HVMCP-DIAG stage=socket-up k=v\n', 1500, 'HVMCP-DIAG stage=conn-start n=1\n', 500, 'HVMCP-DIAG stage=conn-end result=exit-code code=exited status=255\n', 500, 'STOPFILE', 20000]], stopFile))
   assert.deepStrictEqual(r.answer.result, { lines: ['HVMCP-DIAG stage=socket-up k=v', 'HVMCP-DIAG stage=conn-start n=1', 'HVMCP-DIAG stage=conn-end result=exit-code code=exited status=255'], connected: true, complete: true, overflow: false, stopped: true })
-  assert.ok(Date.now() - t0 < 20_000, 'the stop file ended it, not the deadline')
+  assert.ok(Date.now() - t0 < T.bounds.stopFileEndsMs, 'the stop file ended it, not the deadline')
   for (const bad of [path.join(sc.dir, 'elsewhere', `${pipe}.stop`), path.join(sc.dir, 'runs', 'hvmcp-diag-0000000000000000.stop')]) {
     assert.deepStrictEqual(hv('read-badstop', 'com-read', { pipe, ms: 100, through: true, stopFile: bad }).answer, { error: 'bad stop file' })
   }
@@ -145,9 +145,9 @@ test('MC-1545 HvMcpVsock.exe, compiled by the in-box compiler as setup does: its
   assert.strictEqual(u.status, 2)
   assert.match(u.stderr, /usage: HvMcpVsock\.exe <vmId> <port>/)
   const t0 = Date.now()
-  const r = spawnSync(exe, ['00000000-0000-0000-0000-000000000001', '22'], { encoding: 'utf8', input: '', timeout: 30_000 })
+  const r = spawnSync(exe, ['00000000-0000-0000-0000-000000000001', '22'], { encoding: 'utf8', input: '', timeout: T.probeMs })
   assert.strictEqual(r.status, 255, r.stderr)
   assert.match(r.stderr, /^HvMcpVsock: (can't connect to the guest's vsock port 22: |connect timed out after \d+ ms)/)
-  assert.ok(Date.now() - t0 < 25_000, 'bounded by its own 20 s connect timeout at most')
+  assert.ok(Date.now() - t0 < T.bounds.connectBoundMs, 'bounded by its own 20 s connect timeout at most')
   // The connected and closed lines need a real guest's listener: MC-1542's trial shows them.
 })

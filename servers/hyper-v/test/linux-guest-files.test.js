@@ -9,7 +9,7 @@ const path = require('path')
 const { execFileSync, spawnSync } = require('child_process')
 const sshkeys = require('../helper/sshkeys')
 const seed = require('../helper/seed')
-const { BASE } = require('./helpers')
+const { T, BASE } = require('./helpers')
 
 const SSH_KEYGEN = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'OpenSSH', 'ssh-keygen.exe')
 
@@ -124,7 +124,7 @@ test('MC-1551: under the Hyper-V socket transport (no network) the seed masks th
 function hostPython() {
   const tries = [process.env.HYPERV_TEST_PYTHON && process.env.HYPERV_TEST_PYTHON.split(' '), ['python'], ['py', '-3'], ['python3']].filter(Boolean)
   for (const argv of tries) {
-    const r = spawnSync(argv[0], [...argv.slice(1), '-c', 'import sys; print(sys.version_info[0])'], { encoding: 'utf8', timeout: 20_000, windowsHide: true })
+    const r = spawnSync(argv[0], [...argv.slice(1), '-c', 'import sys; print(sys.version_info[0])'], { encoding: 'utf8', timeout: T.probeMs, windowsHide: true })
     if (r.status === 0 && r.stdout.trim() === '3') return argv
   }
   return null
@@ -133,7 +133,7 @@ const HOST_PY = hostPython()
 
 test('MC-1551 round 2: guest.py\'s run files and the build\'s finish, executed on a host Python with systemd and accounts mocked (guest_unit_check.py)', { skip: HOST_PY ? false : 'no host Python 3 (HYPERV_TEST_PYTHON, python or py -3)' }, () => {
   // -B: no bytecode written anywhere (round 3: an import beside helper/guest.py would ship in the zip).
-  const r = spawnSync(HOST_PY[0], [...HOST_PY.slice(1), '-I', '-B', path.join(__dirname, 'guest_unit_check.py'), path.join(__dirname, '..', 'helper', 'guest.py'), BASE], { encoding: 'utf8', timeout: 120_000, windowsHide: true })
+  const r = spawnSync(HOST_PY[0], [...HOST_PY.slice(1), '-I', '-B', path.join(__dirname, 'guest_unit_check.py'), path.join(__dirname, '..', 'helper', 'guest.py'), BASE], { encoding: 'utf8', timeout: T.spawnMs, windowsHide: true })
   assert.strictEqual(r.status, 0, `${r.stdout}${r.stderr}`)
   const m = /^OK (\d+)$/m.exec(r.stdout)
   assert.ok(m && Number(m[1]) >= 48, r.stdout)
@@ -143,10 +143,10 @@ test('MC-1551 round 2: guest.py\'s run files and the build\'s finish, executed o
 /** A Linux Python: HYPERV_TEST_LINUX_PYTHON ("wsl -d Debian -e python3", say), or the first WSL distro that has one. */
 function linuxPython() {
   if (process.env.HYPERV_TEST_LINUX_PYTHON) return { argv: process.env.HYPERV_TEST_LINUX_PYTHON.split(' '), wsl: /^wsl(\.exe)?$/i.test(process.env.HYPERV_TEST_LINUX_PYTHON.split(' ')[0]) }
-  const l = spawnSync('wsl.exe', ['-l', '-q'], { encoding: 'utf16le', timeout: 15_000 })
+  const l = spawnSync('wsl.exe', ['-l', '-q'], { encoding: 'utf16le', timeout: T.probeMs })
   if (l.status !== 0) return null
   for (const d of l.stdout.split(/\r?\n/).map(x => x.replace(/\0/g, '').trim()).filter(Boolean)) {
-    const v = spawnSync('wsl.exe', ['-d', d, '-e', 'python3', '-c', 'import sys; print(sys.version_info >= (3, 8))'], { encoding: 'utf8', timeout: 30_000 })
+    const v = spawnSync('wsl.exe', ['-d', d, '-e', 'python3', '-c', 'import sys; print(sys.version_info >= (3, 8))'], { encoding: 'utf8', timeout: T.probeMs })
     if (v.status === 0 && v.stdout.trim() === 'True') return { argv: ['wsl.exe', '-d', d, '-e', 'python3'], wsl: true }
   }
   return null
@@ -156,7 +156,7 @@ const py = process.platform === 'win32' ? linuxPython() : { argv: ['python3'], w
 test('the dispatcher, run for real under Linux: sync\'s no-follow rules and execute bits, refusals with nothing changed, read-out skipping links', { skip: !py && 'no Linux Python here (WSL with python3, or HYPERV_TEST_LINUX_PYTHON): the real trial covers it' }, () => {
   const wslPath = p => p.replace(/^([A-Za-z]):\\/, (_, d) => `/mnt/${d.toLowerCase()}/`).replace(/\\/g, '/')
   const conv = py.wsl ? wslPath : p => p
-  const r = spawnSync(py.argv[0], [...py.argv.slice(1), conv(path.join(__dirname, 'guest_py_check.py')), conv(path.join(__dirname, '..', 'helper', 'guest.py'))], { encoding: 'utf8', timeout: 120_000 })
+  const r = spawnSync(py.argv[0], [...py.argv.slice(1), conv(path.join(__dirname, 'guest_py_check.py')), conv(path.join(__dirname, '..', 'helper', 'guest.py'))], { encoding: 'utf8', timeout: T.spawnMs })
   assert.strictEqual(r.status, 0, `${r.stdout}\n${r.stderr}`)
   assert.match(r.stdout, /^OK \d+/m)
 })

@@ -15,7 +15,7 @@ const fs = require('fs')
 const path = require('path')
 const net = require('../helper/net')
 const policy = require('../helper/policy')
-const { scratch, startHelper, withPool, approve, waitFor, seedImage, HOST_NETWORK } = require('./helpers')
+const { T, scratch, startHelper, withPool, approve, waitFor, seedImage, HOST_NETWORK } = require('./helpers')
 
 const only = sc => Object.values(sc.stub().vms)[0]
 const noViolations = sc => assert.deepStrictEqual(sc.stub().violations || [], [], 'never Running on a switch without its exact ACLs')
@@ -26,7 +26,7 @@ async function resize(sc, admin, args) {
   assert.ok(plan.data?.planId, plan.text)
   approve(sc, plan.data.planId)
   await admin.request('pool_resize', { planId: plan.data.planId })
-  await waitFor(async () => /Last pool job: resize finished/.test((await admin.request('status')).text), 60_000, 'the resize job')
+  await waitFor(async () => /Last pool job: resize finished/.test((await admin.request('status')).text), T.waitForMs, 'the resize job')
   return plan
 }
 
@@ -173,7 +173,7 @@ test('plans: the mode in every create and resize (default none), refused above t
   assert.match(plan.text, /- network: none: no network: the VM's adapter is disconnected\./)
   approve(sc, plan.data.planId)
   await admin.request('pool_create', { planId: plan.data.planId })
-  await waitFor(async () => /Last pool job: create finished/.test((await admin.request('status')).text), 60_000, 'the create job')
+  await waitFor(async () => /Last pool job: create finished/.test((await admin.request('status')).text), T.waitForMs, 'the create job')
   assert.ok(!sc.journal().some(r => r.t === 'pool-network'), 'none needs no record')
   assert.match((await admin.request('status')).text, /network none \(approved in a plan/)
   await assert.rejects(admin.request('pool_plan', { action: 'resize' }), /nothing to change/)
@@ -317,7 +317,7 @@ test('host mode\'s checks fail closed: a clashing interface, a missing switch, a
 })
 
 test('the guest\'s network: a wobble settles; one that never settles restores the VM to clean and fails the start', async t => {
-  const sc = scratch('net-guest')
+  const sc = scratch('net-guest', { timing: ['HYPERV_MCP_NET_WAIT_MS'] }) // the never-settling case runs its wait out
   const { h } = await withPool(sc, 1, { network: 'internet' })
   t.after(() => h.stop())
   const a = h.conn(10)
@@ -428,7 +428,7 @@ test('setup: the host-subnet check loads helper/net.js and refuses a bad or clas
     block[0],
     "'checked'"
   ].join('\n'))
-  const run = (subnet, clash = '') => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, '-src', path.join(__dirname, '..'), '-subnet', subnet, '-clash', clash], { encoding: 'utf8', env: ps51Env(), timeout: 60_000 })
+  const run = (subnet, clash = '') => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, '-src', path.join(__dirname, '..'), '-subnet', subnet, '-clash', clash], { encoding: 'utf8', env: ps51Env(), timeout: T.spawnMs })
   const good = run('10.137.42.0/24')
   assert.strictEqual(good.status, 0, good.stdout + good.stderr)
   assert.match(good.stdout, /checked/)

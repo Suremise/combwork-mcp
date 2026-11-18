@@ -18,8 +18,9 @@ const sshkeys = require('../sshkeys')
 const seed = require('../seed')
 const net = require('../net')
 
-const READY_MS = Number(process.env.HYPERV_MCP_LINUX_READY_MS || 10 * 60_000)
-const CLOUD_INIT_MS = Number(process.env.HYPERV_MCP_LINUX_CLOUD_INIT_MS || 15 * 60_000)
+// MC-1558: a new Linux VM's readiness and cloud-init waits are the job's timings (guestReadyMinutes, cloudInitMinutes);
+// HYPERV_MCP_LINUX_READY_MS stays a test-only base for the readiness wait.
+const LINUX_READY_BASE = Number(process.env.HYPERV_MCP_LINUX_READY_MS || 0)
 const POLL_MS = Number(process.env.HYPERV_MCP_POLL_MS || 3000)
 const ATTEMPT_MS = Number(process.env.HYPERV_MCP_LINUX_ATTEMPT_MS || 60_000) // one readiness attempt's bound (test-only override)
 const DIAG_KEYS = ['stage', 'vmbus', 'hv_sock_driver', 'hv_sock_modinfo', 'vsock_listen', 'sshd_config_ok', 'sshd_error', 'kernel', 'n', 'result', 'code', 'status']
@@ -172,6 +173,7 @@ class LinuxDriver {
     // MC-1545: COM1 is read through the whole readiness wait (the guest reports each SSH connection's start and end),
     // and ended by a stop file the build writes when the wait is over, so its answer is never lost to a kill.
     let reader = null
+    const READY_MS = LINUX_READY_BASE || h.tm().ms.guestReadyMinutes
     const stopFile = join(h.dir, 'runs', `${pipe}.stop`)
     fs.rmSync(stopFile, { force: true })
     const diag = h.hv('com-read', { pipe, ms: READY_MS + 30_000, through: true, stopFile }, { timeoutMs: READY_MS + 90_000, onChild: c => { reader = c } }).then(r => r, e => ({ lines: [], error: e.message }))
@@ -207,7 +209,7 @@ class LinuxDriver {
     // MC-1551: cloud-init's cached seed (a second copy of the host key's private half) must be gone before the clean
     // checkpoint. An older dispatcher says nothing of it; this one lists what it couldn't remove.
     if (Array.isArray(fin?.seedCacheLeft) && fin.seedCacheLeft.length) throw new Error(`cloud-init's cached seed is still there: ${fin.seedCacheLeft.join(', ')}`)
-    const off = await h.hv('guest-shutdown', h.ident(vm), { timeoutMs: 6 * 60_000 })
+    const off = await h.hv('guest-shutdown', { ...h.ident(vm), shutdownMs: h.tm().ms.shutdownMinutes }, { timeoutMs: h.tm().d.shutdownCallMs })
     if (off.state !== 'Off') throw new Error(`the guest didn't shut down (the VM is ${off.state})`)
     const com = await h.hv('com-detach', h.ident(vm))
     if (com.path) throw new Error(`its COM port is still set (${com.path})`)
@@ -242,6 +244,7 @@ class LinuxDriver {
   async waitCloudInit(vm) {
     const t0 = Date.now()
     let last = null
+    const CLOUD_INIT_MS = this.h.tm().ms.cloudInitMinutes
     while (Date.now() - t0 < CLOUD_INIT_MS) {
       last = await this.dispatch(vm, { op: 'verify' }, { timeoutMs: 90_000 }).catch(e => ({ error: e.message }))
       if (last.cloudInit === 'done') return last

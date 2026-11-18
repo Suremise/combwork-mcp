@@ -5,7 +5,7 @@
 //
 // 1. Supervises `node helper.js`: started inside its own job object (KILL_ON_JOB_CLOSE), so the helper and every
 //    PowerShell it starts die with the job. The helper does nothing until the host has assigned it ("go"). When the
-//    helper exits, closes its output, or misses heartbeats (ping every 10 s, no pong in 30 s), the host closes every
+//    helper exits, closes its output, or misses heartbeats (ping every 10 s, no pong in 5 min), the host closes every
 //    client connection, stops accepting, terminates the job (no old operation carries on), and starts a new helper,
 //    which recovers before it says "ready". 3 restarts within 10 minutes: the host exits with an error and leaves the
 //    restart to the Service Control Manager's recovery actions.
@@ -67,6 +67,10 @@ class Supervisor {
   Process helper; IntPtr job = IntPtr.Zero; StreamWriter helperIn; readonly object helperLock = new object();
   ManualResetEvent helperReady, helperGone;
   int nextConn = 0; long lastPong = 0; long pingN = 0;
+  // MC-1558: a helper is killed (every lease ends) only after 5 min without a pong: a host under memory pressure can stall
+  // a healthy Node process for half a minute. The tests set a shorter one (HYPERV_MCP_HOST_HEARTBEAT_MS).
+  static readonly TimeSpan HeartbeatTimeout = TimeSpan.FromMilliseconds(EnvMs("HYPERV_MCP_HOST_HEARTBEAT_MS", 5 * 60 * 1000));
+  static int EnvMs(string name, int dflt) { int v; return int.TryParse(Environment.GetEnvironmentVariable(name), out v) && v > 0 ? v : dflt; }
   readonly List<DateTime> restarts = new List<DateTime>();
   public int ExitCode = 0;
 
@@ -151,7 +155,7 @@ class Supervisor {
       int w = WaitHandle.WaitAny(new WaitHandle[] { helperGone, stopping }, 10000);
       if (w == 0) { KillHelper("the helper exited or closed its output"); break; }
       if (w == 1) { KillHelper("stopping"); break; }
-      if ((DateTime.UtcNow.Ticks - Interlocked.Read(ref lastPong)) > TimeSpan.FromSeconds(30).Ticks) { KillHelper("the helper missed its heartbeats"); break; }
+      if ((DateTime.UtcNow.Ticks - Interlocked.Read(ref lastPong)) > HeartbeatTimeout.Ticks) { KillHelper("the helper missed its heartbeats"); break; }
       ToHelper("ping " + Interlocked.Increment(ref pingN));
     }
     acceptor.Join(5000);

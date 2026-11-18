@@ -75,7 +75,7 @@ process.stdin.on('end', () => {
   // MC-1501: com-read runs alongside a Linux build's other calls, so it only reads: it never saves (a save racing
   // another call's read could hand that call a half-written file).
   const keep = op !== 'com-read'
-  s.calls.push({ op, argv: process.argv.slice(2), vmId: a.vmId, command: a.command })
+  s.calls.push({ op, argv: process.argv.slice(2), vmId: a.vmId, command: a.command, ...(a.kind ? { kind: a.kind } : {}) })
   if (keep) save(s) // logged before it runs, so a test can see a call in progress
   try {
     if (s.fail[op] > 0) { s.fail[op]--; if (keep) save(s); throw new Error(`injected failure of ${op}`) }
@@ -197,9 +197,10 @@ function run(s, op, a) {
     }
     // MC-1531 knobs: setupMarker (written to C:\marker.txt, a stand-in for a fix the setup applies), setupThrows,
     // setupEntered + setupGate (held as it begins).
-    case 'guest-setup': { const vm = own(s, a); if (s.setupEntered) fs.writeFileSync(s.setupEntered, 'entered'); if (s.setupGate) while (!fs.existsSync(s.setupGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25); if (s.setupThrows) throw new Error('injected: the guest setup failed'); vm.disk['C:\\build'] = ''; if (s.setupMarker) vm.disk['C:\\marker.txt'] = Buffer.from(s.setupMarker).toString('base64'); return { editionId: s.guestEdition ?? 'EnterpriseEval', build: '26200', ubr: 6584, disableForceUnload: 1, ...(s.setupOverride || {}) } }
+    case 'guest-setup': { const vm = own(s, a); if (s.setupEntered) fs.writeFileSync(s.setupEntered, 'entered'); if (s.setupGate) while (!fs.existsSync(s.setupGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25); s.setupCalls = (s.setupCalls || 0) + 1; if (s.setupTransport > 0) { s.setupTransport--; save(s); throw new Error('the PowerShell Direct connection was lost (injected)') } if (s.setupHang > 0) { s.setupHang--; save(s); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3_600_000) } if (s.setupThrows) throw new Error('injected: the guest setup failed'); vm.disk['C:\\build'] = ''; if (s.setupMarker) vm.disk['C:\\marker.txt'] = Buffer.from(s.setupMarker).toString('base64'); return { editionId: s.guestEdition ?? 'EnterpriseEval', build: '26200', ubr: 6584, disableForceUnload: 1, folders: true, buildProtected: true, ...(s.setupOverride || {}) } }
     case 'make-clean': {
       const vm = own(s, a)
+      s.makeCleans = [...(s.makeCleans || []), a.shutdownMs ?? null] // MC-1558: the job's shutdown wait
       vm.state = 'Off'
       vm.dvd = null
       vm.switchName = null
@@ -211,6 +212,9 @@ function run(s, op, a) {
     }
     case 'restore': {
       const vm = own(s, a)
+      // MC-1558: each restore's off-wait (the lease's, a job's or the default), and restoreSlowMs: the restore takes this long.
+      s.restores = [...(s.restores || []), { vmId: a.vmId, offWaitMs: a.offWaitMs ?? null }]
+      if (s.restoreSlowMs) { save(s); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, s.restoreSlowMs) }
       if (s.restoreGate) while (!fs.existsSync(s.restoreGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25) // held until the test opens the gate
       const cp = vm.checkpoints.find(c => c.id === a.checkpointId)
       if (!cp) throw new Error('its clean checkpoint (by id) is missing')
@@ -378,7 +382,7 @@ function run(s, op, a) {
       if (vm.state !== 'Running') throw new Error('the VM is not running')
       return stubNet.readGuestNet(s, vm, a.lookup)
     }
-    case 'guest-shutdown': { const vm = own(s, a); if (!s.shutdownFails) { vm.state = 'Off'; vm.loggedOn = null; vm.watcher = false } return facts(vm) }
+    case 'guest-shutdown': { const vm = own(s, a); s.shutdowns = [...(s.shutdowns || []), a.shutdownMs ?? null]; if (!s.shutdownFails) { vm.state = 'Off'; vm.loggedOn = null; vm.watcher = false } return facts(vm) }
     case 'pool-take': {
       const vm = own(s, a)
       if (s.poolTakeEntered) fs.writeFileSync(s.poolTakeEntered, 'entered')
@@ -415,30 +419,55 @@ function run(s, op, a) {
       }
       return { removed: !vm.checkpoints.some(c => c.id === a.checkpointId) }
     }
-    case 'copy-in': {
-      const vm = own(s, a)
-      const walk = (dir, rel) => {
-        for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-          const r = rel ? `${rel}\\${e.name}` : e.name
-          if (e.isDirectory()) walk(join(dir, e.name), r)
-          else vm.disk[`C:\\build\\${r}`] = fs.readFileSync(join(dir, e.name)).toString('base64')
-        }
-      }
-      walk(a.source, '')
-      return { ms: 5 }
-    }
-    case 'sync-in': {
-      // As guest-sync.ps1 on the guest's disk map (its path checks are proved on real trees by guest-sync.test.js).
-      // syncGate: a host path; the apply waits for it (records its PID in syncPidFile first), to be killed mid-apply.
+    // MC-1558: a Windows copy-in or vm_sync in bounded calls, as hv.ps1 and guest-sync.ps1 do it, on the guest's disk map:
+    // the stage is vm.stages[guestStage] (canonical path -> base64 content). Knobs: copySlowMs (each item of copy-part
+    // takes this long), copyStallAt: k (the k-th item ever blocks until the call is killed, once), copyStallAll (every
+    // item blocks), copyStallRel (every item of that file blocks), syncGate and
+    // syncPidFile (the apply waits for the gate file, to be killed mid-apply).
+    case 'copy-prepare': case 'copy-part': case 'copy-lengths': case 'copy-apply': {
       const vm = own(s, a)
       if (vm.state !== 'Running') throw new Error('the VM is not running')
       if (!/^C:\\hvmcp\\sync-\d{1,9}$/.test(a.guestStage)) throw new Error('bad guest staging folder')
-      s.syncs = [...(s.syncs || []), { files: a.files, remove: a.remove, full: a.full, delete: a.delete }]
+      const keyOfRel = r => String(r).replace(/\//g, '\\').toUpperCase()
+      vm.stages = vm.stages || {}
+      if (op === 'copy-prepare') { vm.stages = { [a.guestStage]: {} }; return { prepared: true } }
+      const st = vm.stages[a.guestStage]
+      if (!st) throw new Error(`the staging folder '${a.guestStage}' does not exist`)
+      if (op === 'copy-lengths') {
+        const lengths = {}
+        for (const r of a.rels) lengths[r] = st[keyOfRel(r)] === undefined ? -1 : Buffer.from(st[keyOfRel(r)], 'base64').length
+        return { lengths }
+      }
+      if (op === 'copy-part') {
+        let appended = 0, skipped = 0, n = 0
+        s.copyPartCalls = [...(s.copyPartCalls || []), a.items.map(it => `${it.rel}@${it.offset}`)]
+        save(s)
+        for (const it of a.items) {
+          s.copyItems = (s.copyItems || 0) + 1
+          if (s.copyStallAll || s.copyStallRel === it.rel || s.copyStallAt === s.copyItems) { if (!s.copyStallAll) delete s.copyStallAt; save(s); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3_600_000) }
+          if (s.copySlowMs) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, s.copySlowMs)
+          const bytes = fs.readFileSync(it.src)
+          if (bytes.length !== it.length) throw new Error(`part of '${it.rel}' is ${bytes.length} bytes, not ${it.length}`)
+          const k = keyOfRel(it.rel)
+          const cur = st[k] === undefined ? null : Buffer.from(st[k], 'base64')
+          const len = cur ? cur.length : 0
+          if (cur && len >= it.offset + it.length) { skipped++; continue }
+          if (len !== it.offset) throw new Error(`the staged file '${it.rel}' is ${len} bytes, not the ${it.offset} this part follows`)
+          st[k] = Buffer.concat([cur || Buffer.alloc(0), bytes]).toString('base64')
+          appended++; n++
+          s.copyParts = (s.copyParts || 0) + 1
+          save(s) // each item is committed as it goes: a killed call keeps what it finished
+        }
+        return { appended, skipped }
+      }
+      // copy-apply
+      if (a.kind === 'sync') s.syncs = [...(s.syncs || []), { files: a.files, remove: a.remove, full: a.full, delete: a.delete }]
       if (s.syncGate) {
         if (s.syncPidFile) fs.writeFileSync(s.syncPidFile, String(process.pid))
         save(s)
         while (!fs.existsSync(s.syncGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25)
       }
+      for (const f of a.files) if (st[keyOfRel(String(f).replace(/\//g, '\\'))] === undefined) throw new Error(`the staged file '${f}' is missing or not a plain file`)
       const B = 'c:\\build\\'
       const rel = p => String(p).replace(/\//g, '\\')
       const keysUnder = k => Object.keys(vm.disk).filter(d => d.toLowerCase() === k.toLowerCase() || d.toLowerCase().startsWith(k.toLowerCase() + '\\'))
@@ -459,9 +488,10 @@ function run(s, op, a) {
       for (const f of a.files) {
         const dst = `C:\\build\\${rel(f)}`
         for (const d of Object.keys(vm.disk)) if (d.toLowerCase() === dst.toLowerCase()) delete vm.disk[d]
-        vm.disk[dst] = fs.readFileSync(join(a.source, ...rel(f).split('\\'))).toString('base64')
+        vm.disk[dst] = st[keyOfRel(rel(f))]
       }
-      return { ms: 5, copied: a.files.length, removed }
+      delete vm.stages[a.guestStage]
+      return { copied: a.files.length, removed }
     }
     case 'guest-logon': {
       const vm = own(s, a)

@@ -734,13 +734,61 @@ A pool can hold VMs built from several verified images, and so of several kinds:
 | `HYPERV_MCP_MAX_BUILD_MB` | Optional. A cap this server applies before streaming a build (default 2048). The policy's `maxBuildMB` is the helper's own cap. |
 | `HYPERV_MCP_PIPE` | Optional. The pipe's name (default `hyperv-mcp`). |
 | `HYPERV_MCP_REPLY_MS` | Optional. How long a slow tool, or `vm_wait`, waits before replying "still in progress" (default 45000, at least 1000; see "Slow operations"). Keep it under your MCP client's tool-call timeout. |
+| `HYPERV_MCP_*_MINUTES`, `HYPERV_MCP_*_SECONDS` | Optional. How long the helper waits for slow work (see "Timings" below). |
+
+### Timings
+
+How long the helper waits before it gives up on slow work (MC-1558). The defaults are generous, sized for a slow or busy
+PC rather than a fast one. Change one only if your PC needs it: in Combwork, add the key to this server's `env` (the MCP
+editor, `.combwork/mcp/hyper-v.json`). This server sends them to the helper each time it connects, and the helper keeps
+each within its range and within setup's caps (below). vm_status shows the values in effect for your connection.
+
+| Key | Default | Range | What it bounds |
+|---|---|---|---|
+| `HYPERV_MCP_GUEST_READY_MINUTES` | 10 | 2-60 | a started or restored guest answering (and a new Linux VM's first boot) |
+| `HYPERV_MCP_RESTORE_MINUTES` | 10 | 2-30 | a checkpoint restore once the VM is off |
+| `HYPERV_MCP_OFF_WAIT_SECONDS` | 120 | 20-600 | a VM reaching Off before a restore. The restore's call allows this plus the restore |
+| `HYPERV_MCP_RESTORE_VERIFY_SECONDS` | 180 | 30-900 | a restored VM's new checkpoint showing, read fresh after the restore |
+| `HYPERV_MCP_CHECKPOINT_MINUTES` | 10 | 2-60 | taking a checkpoint, or removing one (removing merges its disk) |
+| `HYPERV_MCP_QUEUE_KEEP_MINUTES` | 10 | 2-60 | a place in vm_acquire's line between two calls |
+| `HYPERV_MCP_LOGON_MINUTES` | 10 | 5-30 | an interactive logon at vm_start |
+| `HYPERV_MCP_SHUTDOWN_MINUTES` | 5 | 2-30 | a guest shutting down cleanly (its call allows 1 min more; the clean checkpoint's, 10) |
+| `HYPERV_MCP_INSTALL_MINUTES` | 90 | 30-360 | Windows setup in a new pool VM |
+| `HYPERV_MCP_PROVISION_MINUTES` | 30 | 15-120 | each account's first-logon provisioning at build |
+| `HYPERV_MCP_CLOUD_INIT_MINUTES` | 15 | 5-60 | cloud-init in a new Linux VM |
+| `HYPERV_MCP_COPY_IDLE_MINUTES` | 5 | 1-9 | a Windows build copy or vm_sync with no 32 MB part or file finished (below) |
+
+- **Whose values apply.** A lease keeps the values its connection had when it was acquired: for everything done for it,
+  its restore at release, disconnect or deadline included (which then runs to its own bound, but never runs guest work
+  after the lease ended). A pool job keeps the values of the connection that applied it. Work with no client behind it
+  (start-up recovery, retrying a quarantined VM) uses the defaults. A place in line uses the waiting connection's.
+- **Setup's caps.** policy.json may hold `timingCaps`, `{ key: highest value }` with the keys above in their camelCase
+  form (`guestReadyMinutes`, `offWaitSeconds`, ...), each within its range. A cap lowers the default too. An invalid one
+  stops the helper from starting, saying why. policy.json is only writable by Administrators.
+- **Windows copies.** A build's copy-in and vm_sync go in calls of at most 64 MB and 500 files, a file over 32 MB as 32 MB
+  parts, each appended in the guest at once. The copy fails only when a call finishes no part or file within
+  `HYPERV_MCP_COPY_IDLE_MINUTES`: a large copy at a slow but steady rate never meets a whole-copy limit. A call cut off
+  after finishing some goes on with only what the guest hasn't committed, never resending the rest; one that finished
+  nothing new fails. Each append is marked before it starts, so one cut off inside a part is rolled back to the part's
+  start rather than resumed half-way. Progress is counted in whole parts or files, not bytes. The cap
+  of 9 minutes stays under PowerShell Direct's own limit of about 10 minutes per call.
+- **Linux copies** go over SSH, which has no such limit, in one call bounded by size, not progress: 30 minutes plus one
+  per 100 MB.
+- **Fixed waits**, the same for every client: the service host kills a helper that doesn't answer its heartbeat for 5
+  minutes (every lease then ends); a VM's turn-off after a failed online step 3 min; a run's poll at least 30 s and its
+  kill's cleanup 60 s; removing a VM 10 min; the client's roots/list answer 30 s; setup waits up to 30 min for the helper
+  to start (saying so after 5) and 5 min for the service to stop. The build's guest setup is one call of up to 8
+  minutes, retried once after a timeout or a lost connection (its script can run twice), never after another error.
+  The build presses Enter for 60 s for the "Press any key to boot from CD or DVD" prompt: a fixed window, not a check
+  that the VM booted.
 
 Test-only:
 - `HYPERV_MCP_PS_STUB`, `HYPERV_MCP_STUB_STATE`: a fake `hv.ps1`;
 - `HYPERV_MCP_CRASH_AT`: crash injection;
 - `HYPERV_MCP_STATE_DIR`;
-- timing: `HYPERV_MCP_POLL_MS`, `HYPERV_MCP_READY_WAIT_MS`, `HYPERV_MCP_INSTALL_WAIT_MS`, `HYPERV_MCP_RETRY_MS`,
-  `HYPERV_MCP_MINUTE_MS`, `HYPERV_MCP_LOGON_STABLE_MS`, `HYPERV_MCP_WAIT_MS`, `HYPERV_MCP_KEEP_MS`;
+- timing: the `HYPERV_MCP_*_MS` variables in `test\timing.json` (its defaults, narrow values and named profiles; each
+  replaces a default, below its range), plus
+  `HYPERV_MCP_MINUTE_MS`, `HYPERV_MCP_COPY_PART_BYTES` and the service host's `HYPERV_MCP_HOST_HEARTBEAT_MS`;
 - `HYPERV_MCP_MIN_ISO_BYTES`.
 
 The service's environment is set by its host, which users can't change.
@@ -1017,9 +1065,9 @@ path from the registry or the inventory.
   So no run holds a call open: it is started (or, in the interactive session, published to the session's watcher) in
   one short call, then its exit file is polled with short calls (every second at first, then every few seconds) until
   it's there or `timeoutSec` passes. A poll that fails is retried within that same deadline. A process started from a
-  call goes on after the call ends. **Copies are still single calls:** `vm_start`'s build copy and `vm_sync` each copy in
-  one call, so one that takes more than about 10 minutes (a big build on a slow host) ends with that same error, and
-  `C:\build` is then untrusted until a full sync or a reset. `maxBuildMB` limits bytes, not time.
+  call goes on after the call ends. Windows copies (`vm_start`'s build copy and `vm_sync`) go in bounded calls of at most
+  64 MB each (MC-1558, see "Timings"), so a big build on a slow host never meets that limit; a copy that stops making
+  progress fails, and `C:\build` is then untrusted until a full sync or a reset. `maxBuildMB` limits bytes, not time.
 - Windows guests, and Debian and Ubuntu Linux guests from their pinned images only (see "Linux guests"). An evaluation VM lasts about 90 days from its activation at build (see "Windows licences").
   Building from a ready-made VHDX isn't supported: an own copy comes from an ISO.
 - A sync tracks only what the helper copied into `C:\build`. A run that changes `C:\build` itself isn't seen; a
@@ -1033,7 +1081,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\restorewait.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js test\linux-image.test.js test\linux-guest-files.test.js test\linux.test.js test\linux-ps.test.js test\bridge.test.js test\network.test.js test\uninstall.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\restorewait.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js test\linux-image.test.js test\linux-guest-files.test.js test\linux.test.js test\linux-ps.test.js test\bridge.test.js test\network.test.js test\uninstall.test.js test\timing.test.js
 ```
 
 - `units.test.js`:
@@ -1290,6 +1338,12 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
     host check fails, or the guest's network never settles (restored to clean, disconnected);
   - crashes after the ACLs, the connect and the guest's network, and a call dying between connect and start: the next
     helper restores the VM disconnected with no ACLs; leftover ACLs at a release quarantine the VM.
+- `timing.test.js` (MC-1558): the timings' defaults, floors, caps and derived call bounds; an invalid `timingCaps`
+  refusing the start; values per connection, kept by a lease through its cleanup after a disconnect and by a pool job,
+  defaults for recovery, the queue place's, what server.js sends; the restore call holding the off-wait; a Windows copy
+  in parts, past one call's bound, stalled, resumed and cancelled; guest-setup retried once after a timeout or a lost
+  connection and never after another error, at build and at refresh; and no literal waits in the test files, which all
+  read `test\timing.json`.
 - `uninstall.test.js` (MC-1557), removing everything without agents:
   - the recorded inventory: its label, each item's manual step (a quote in a path doubled), what's out of scope; the
     helper writing it at start and rewriting it after a create, resize and remove, never torn;
@@ -1345,6 +1399,6 @@ repo, and `npm test` clears earlier runs' folders first.
 - `setup\install.ps1`, `setup\uninstall.ps1`: the only elevated steps besides approvals. `setup\teardown.ps1` is
   uninstall's teardown, and `setup\appsentry.ps1` the Installed apps entry, its launcher and the last phase (MC-1557);
   setup copies `uninstall.ps1`, `teardown.ps1`, `acl.ps1`, `appsentry.ps1` and `Storage.cs` into
-  `%ProgramFiles%\hyperv-mcp\uninstall`. `helper\inventory.js` renders the helper's recorded inventory. `setup\acl.ps1` holds
+  `%ProgramFiles%\hyperv-mcp\uninstall`. `helper\inventory.js` renders the helper's recorded inventory. `helper\timing.js` holds the timings' keys, defaults, ranges and caps (MC-1558). `setup\acl.ps1` holds
   setup's storage and ACL routines, with `setup\Storage.cs` for the Windows calls they need (both tested non-elevated
   by `test\acl-check.ps1`).
