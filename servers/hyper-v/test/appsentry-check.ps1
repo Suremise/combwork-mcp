@@ -24,7 +24,7 @@ function New-Case([hashtable]$Extra = @{}) {
   $b = Join-Path $Dir "c$($script:n)"
   New-Item -ItemType Directory -Force (Join-Path $b 'pf') | Out-Null
   $base = "Software\hvmcp-apps-test-$([guid]::NewGuid().ToString('n'))"
-  $o = @{ pf = (Join-Path $b 'pf'); state = (Join-Path $b 'state'); hive = 'CurrentUser'; stateKey = "$base\state"; entryKey = "$base\entry"; service = "hvmcp-no-such-service-$($script:n)"; trusted = @($me, $SYSTEM, $ADMINS); elevate = $false; pause = $false }
+  $o = @{ pf = (Join-Path $b 'pf'); state = (Join-Path $b 'state'); regRoot = 'CurrentUser'; stateKey = "$base\state"; entryKey = "$base\entry"; service = "hvmcp-no-such-service-$($script:n)"; trusted = @($me, $SYSTEM, $ADMINS); elevate = $false; pause = $false }
   foreach ($k in $Extra.Keys) { $o[$k] = $Extra[$k] }
   $cmd = Get-LauncherCommand (Get-LauncherText $o)
   Set-AppsEntry $HKCU $o.entryKey $cmd.command '9.9.9' (Join-Path $o.pf 'hyperv-mcp')
@@ -138,7 +138,84 @@ $c = New-Case; New-Item -ItemType Directory -Force $c.o.state | Out-Null
 $refuse.stateFolder = Get-Refusal $c @($c.o.state); Remove-Case $c
 $c = New-Case; $k = $HKCU.CreateSubKey($c.o.stateKey); $k.SetValue('InstallId', 'abc'); $k.SetValue('Teardown', '{"phase":"stopped"}'); $k.Dispose()
 $refuse.record = Get-Refusal $c @(); Remove-Case $c
+# Round 1: nothing is run unless its folder, parents and files are trusted. A complete set behind a junction (for
+# uninstall.retiring\, and for uninstall\), a folder or a file others may write: each refused, no script run, nothing
+# removed.
+function Get-NoRun($c, [string[]]$files) {
+  $x = Invoke-Entry $c
+  return [ordered]@{ code = $x.code; launched = (Get-Launched $c); entry = (Test-Entry $c); intact = (@($files | Where-Object { -not (Test-Path -LiteralPath $_) }).Count -eq 0); out = ($x.out -replace '\s+', ' ').Trim() }
+}
+function Grant-Write([string]$p) {
+  $acl = Get-Acl -LiteralPath $p
+  $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier 'S-1-5-32-545'), 'Modify', 'Allow')))
+  Set-Acl -LiteralPath $p -AclObject $acl
+}
+foreach ($where in @('uninstall.retiring', 'uninstall')) {
+  $c = New-Case; $target = Join-Path $c.base 'outside'; New-Item -ItemType Directory -Force $target, $c.inst | Out-Null
+  foreach ($f in $set) { Set-Content -LiteralPath (Join-Path $target $f) -Value $(if ($f -eq 'uninstall.ps1') { "Set-Content -LiteralPath '$($c.rec)' -Value (`$args -join ' ')" } else { "# $f" }) }
+  & cmd.exe /c mklink /J (Join-Path $c.inst $where) $target | Out-Null
+  $refuse["junctionComplete_$where"] = Get-NoRun $c @($set | ForEach-Object { Join-Path $target $_ }); Remove-Case $c
+}
+$c = New-Case; Add-Files $c 'uninstall.retiring' $set; Grant-Write (Join-Path $c.inst 'uninstall.retiring')
+$refuse.writableFolder = Get-NoRun $c @($set | ForEach-Object { Join-Path $c.inst "uninstall.retiring\$_" }); Remove-Case $c
+$c = New-Case; Add-Files $c 'uninstall' $set; Grant-Write (Join-Path $c.inst 'uninstall\uninstall.ps1')
+$refuse.writableFile = Get-NoRun $c @($set | ForEach-Object { Join-Path $c.inst "uninstall\$_" }); Remove-Case $c
+$c = New-Case; Add-Files $c 'uninstall' ($set + @('extra.ps1'))
+$refuse.extraInSet = Get-NoRun $c @((Join-Path $c.inst 'uninstall\extra.ps1')); Remove-Case $c
+$c = New-Case; Add-Files $c 'uninstall.retiring' @('acl.ps1'); Grant-Write (Join-Path $c.inst 'uninstall.retiring\acl.ps1')
+$refuse.writablePartial = Get-NoRun $c @((Join-Path $c.inst 'uninstall.retiring\acl.ps1')); Remove-Case $c
 $r.refuse = $refuse
+
+# The uninstaller's top level (Invoke-UninstallFlow), with a fake world: what it decides and in what order, on every
+# switch, an interruption after the teardown and after the switch, and -WhatIf (with -Retire too) changing nothing.
+function New-World([hashtable]$w = @{}) {
+  $s = @{ service = $true; state = $true; key = $true; kept = $false; install = $true; entry = $true; switch = $true; leftover = $null; ask = 'remove'; calls = New-Object Collections.ArrayList }
+  foreach ($k in $w.Keys) { $s[$k] = $w[$k] }
+  return $s
+}
+function New-X($s, [switch]$ReadOnly) {
+  $mut = { param($n) if ($ReadOnly) { throw "WHATIF MUTATED $n" } }.GetNewClosure()
+  return @{
+    Say = { param($m) [void]$s.calls.Add("say:$m") }.GetNewClosure()
+    ServiceHere = { $s.service }.GetNewClosure(); StateHere = { $s.state }.GetNewClosure(); KeyHere = { $s.key }.GetNewClosure()
+    KeptMark = { $s.kept }.GetNewClosure(); InstallHere = { $s.install }.GetNewClosure(); EntryHere = { $s.entry }.GetNewClosure()
+    ShowInventory = { [void]$s.calls.Add('inventory') }.GetNewClosure(); ShowChoices = { [void]$s.calls.Add('choices') }.GetNewClosure()
+    Ask = { [void]$s.calls.Add('ask'); $s.ask }.GetNewClosure()
+    Teardown = { param($m, $w) [void]$s.calls.Add("teardown:$m$(if ($w) { ':whatif' })"); if (-not $w) { & $mut 'teardown'; $s.service = $false; if ($m -eq 'remove') { $s.state = $false; $s.key = $false } } }.GetNewClosure()
+    HostSwitches = { if ($s.switch) { 1 } else { 0 } }.GetNewClosure()
+    RemoveHostSwitches = { & $mut 'switch'; [void]$s.calls.Add('switch'); $s.switch = $false }.GetNewClosure()
+    Leftovers = { param($m) [void]$s.calls.Add("check:$m"); $l = @(); if ($s.switch) { $l += 'switch' }; if ($s.service) { $l += 'service' }; if ($m -eq 'remove' -and ($s.state -or $s.key)) { $l += 'state' }; if ($s.leftover) { $l += $s.leftover }; $l }.GetNewClosure()
+    WriteKept = { & $mut 'kept'; [void]$s.calls.Add('kept'); $s.kept = $true }.GetNewClosure()
+    Retire = { & $mut 'retire'; [void]$s.calls.Add('retire'); $s.install = $false; $s.entry = $false }.GetNewClosure()
+  }
+}
+function Get-Flow($s, [hashtable]$p, [string]$crashAt, [switch]$ReadOnly) {
+  $crash = { param($n) if ($n -eq $crashAt) { throw "CRASH $n" } }.GetNewClosure()
+  $res = try { Invoke-UninstallFlow $p (New-X $s -ReadOnly:$ReadOnly) $crash } catch { $_.Exception.Message }
+  return [ordered]@{ result = $res; calls = (@($s.calls | Where-Object { $_ -notlike 'say:*' }) -join ','); switch = $s.switch; install = $s.install; entry = $s.entry; kept = $s.kept }
+}
+$flow = [ordered]@{}
+$flow.remove = Get-Flow (New-World) @{ RemovePool = $true }
+$flow.keep = Get-Flow (New-World) @{ KeepPool = $true }
+$flow.menuRemove = Get-Flow (New-World) @{}
+$flow.menuCancel = Get-Flow (New-World @{ ask = $null }) @{}
+$flow.menuList = Get-Flow (New-World @{ ask = 'list' }) @{} -ReadOnly
+foreach ($at in @('after:teardown', 'before:switch', 'after:switch', 'before:retire')) {
+  $s = New-World
+  $first = Get-Flow $s @{ RemovePool = $true } $at
+  [void]$s.calls.Clear()
+  # The rerun, as the Installed apps entry starts it (the menu; a run that finds only leftovers needs no answer).
+  $flow["resume_$at"] = [ordered]@{ first = $first.result; second = (Get-Flow $s @{}) }
+}
+$flow.leftover = Get-Flow (New-World @{ leftover = 'a VM' }) @{ RemovePool = $true }
+$flow.whatIf = Get-Flow (New-World) @{ WhatIf = $true } -ReadOnly
+$flow.whatIfRemove = Get-Flow (New-World) @{ RemovePool = $true; WhatIf = $true } -ReadOnly
+$flow.retireWhatIf = Get-Flow (New-World @{ service = $false; state = $false; key = $false }) @{ Retire = $true; WhatIf = $true } -ReadOnly
+$flow.leftoverOnlyWhatIf = Get-Flow (New-World @{ service = $false; state = $false; key = $false }) @{ WhatIf = $true } -ReadOnly
+$flow.retireKeep = Get-Flow (New-World @{ service = $false; kept = $true; switch = $false }) @{ Retire = $true }
+$flow.keptThenRemove = Get-Flow (New-World @{ service = $false; kept = $true }) @{ RemovePool = $true } -ReadOnly
+$flow.nothing = Get-Flow (New-World @{ service = $false; state = $false; key = $false; install = $false; entry = $false; switch = $false }) @{} -ReadOnly
+$r.flow = $flow
 
 # d (keep): a verified KeptPool record bound to this InstallId; the state folder and key stay.
 function New-Kept([hashtable]$Extra = @{}, [string]$marker = 'same', [switch]$Record) {

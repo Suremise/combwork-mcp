@@ -200,61 +200,42 @@ function Get-Leftovers([string]$m, [string[]]$diskFolders) {
 }
 function Invoke-RetirePhase { Invoke-Retire -ProgramFiles ([Environment]::GetFolderPath('ProgramFiles')) -Trusted $trustedKey -RootOwners @($SYSTEM, $ADMINS) -Launcher $launcher -Expected $expected }
 
-if ($Retire) { Step 'Finishing the uninstall: the uninstaller''s own files and the Installed apps entry.'; Invoke-RetirePhase; exit 0 }
-
-# The leftover-only case (s9): nothing of the helper is installed (no service, state folder or registry records), only
-# the uninstaller's own folder or entry: fixed targets, verified, then removed.
-$nothing = -not (Get-Service $svc -ErrorAction SilentlyContinue) -and -not (Test-Path -LiteralPath $state) -and -not (Test-KeyHere)
-if ($nothing) {
-  $entry = $HKLM.OpenSubKey($script:EntryKeyPath); $hasEntry = [bool]$entry; if ($entry) { $entry.Dispose() }
-  if (-not (Test-Path -LiteralPath $install) -and -not $hasEntry) { Write-Host 'Nothing of the hyper-v MCP is installed.' -ForegroundColor Green; exit 0 }
-  if ($WhatIf) { Step "Nothing of the helper is installed: would remove what is left of the uninstaller ($install) and the Installed apps entry."; exit 0 }
-  Step 'Nothing of the helper is installed: removing what is left of the uninstaller and its Installed apps entry.'
-  Invoke-RetirePhase
-  exit 0
-}
-
-$choice = if ($RemovePool) { 'remove' } elseif ($KeepPool) { 'keep' } else { $null }
-if (-not $choice) {
-  Show-Inventory
-  Show-Choices
-  if ($WhatIf) { $choice = 'remove' }
-  else {
-    $a = Read-Host 'Remove everything (R, the default), keep the pool (K), list only (L), anything else cancels'
-    switch -Regex ($a) { '^\s*[Rr]?\s*$' { $choice = 'remove' } '^\s*[Kk]\s*$' { $choice = 'keep' } '^\s*[Ll]\s*$' { $WhatIf = $true; $choice = 'remove' } default { Write-Host 'Cancelled: nothing was changed.'; exit 1 } }
-  }
-} elseif ($WhatIf) { Show-Inventory }
-if ($choice -eq 'remove' -and (Get-KeyValue 'KeptPool') -and -not (Get-Service $svc -ErrorAction SilentlyContinue)) {
-  throw 'An earlier uninstall kept the pool and removed the helper, which removes it: run setup again (from the repo) to restore the helper, then uninstall. Nothing was changed.'
-}
 $receipts = @()
 $rk = $HKLM.OpenSubKey("$keyPath\Storage"); if ($rk) { $receipts = @($rk.GetValueNames()); $rk.Dispose() }
 $diskFolders = @($receipts | Where-Object { $_ -ne $state.ToLowerInvariant() -and -not $_.StartsWith($state.ToLowerInvariant() + '\') })
-
-Invoke-Teardown -Mode $choice -State $state -Install $install -LegacyDiskFolder $LegacyDiskFolder `
-  -Root $HKLM -KeyPath $keyPath `
-  -Trusted $trustedKey -RootOwners @($SYSTEM, $ADMINS) -Who @($SYSTEM, $ADMINS, $runnerSid) -KeyOwner $ADMINS `
-  -Ops $ops -WhatIf:$WhatIf
-if ($WhatIf) { Write-Host 'Nothing was changed (-WhatIf).' -ForegroundColor Green; exit 0 }
-# MC-1556: setup's host-mode switch (its name and the Notes setup wrote, never the name alone), with this PC's address on
-# it, in both modes (setup makes it again). Idempotent: an interrupted uninstall run again removes it then.
-foreach ($x in (Get-HostSwitch)) {
-  Remove-VMSwitch -VMSwitch $x -Force
-  Step "Host-mode switch hvmcp-host removed (and this PC's address on it)."
+# The decisions are Invoke-UninstallFlow's (appsentry.ps1); these are the real actions it takes.
+$X = @{
+  Say = { param($m) Step $m }
+  ServiceHere = { [bool](Get-Service $svc -ErrorAction SilentlyContinue) }
+  StateHere = { Test-Path -LiteralPath $state }
+  KeyHere = { Test-KeyHere }
+  KeptMark = { [bool](Get-KeyValue 'KeptPool') }
+  InstallHere = { Test-Path -LiteralPath $install }
+  EntryHere = { $e = $HKLM.OpenSubKey($script:EntryKeyPath); if ($e) { $e.Dispose(); $true } else { $false } }
+  ShowInventory = { Show-Inventory }
+  ShowChoices = { Show-Choices }
+  Ask = {
+    $a = Read-Host 'Remove everything (R, the default), keep the pool (K), list only (L), anything else cancels'
+    switch -Regex ($a) { '^\s*[Rr]?\s*$' { 'remove' } '^\s*[Kk]\s*$' { 'keep' } '^\s*[Ll]\s*$' { 'list' } default { $null } }
+  }
+  Teardown = {
+    param($m, $w)
+    Invoke-Teardown -Mode $m -State $state -Install $install -LegacyDiskFolder $LegacyDiskFolder -Root $HKLM -KeyPath $keyPath `
+      -Trusted $trustedKey -RootOwners @($SYSTEM, $ADMINS) -Who @($SYSTEM, $ADMINS, $runnerSid) -KeyOwner $ADMINS -Ops $ops -WhatIf:$w
+  }
+  # MC-1556: setup's host-mode switch (its name and the Notes setup wrote, never the name alone), with this PC's address
+  # on it, in both modes (setup makes it again).
+  HostSwitches = { (Get-HostSwitch).Count }
+  RemoveHostSwitches = { foreach ($x in (Get-HostSwitch)) { Remove-VMSwitch -VMSwitch $x -Force; Step "Host-mode switch hvmcp-host removed (and this PC's address on it)." } }
+  Leftovers = { param($m) Get-Leftovers $m $diskFolders }
+  WriteKept = {
+    Assert-KeyProtected $HKLM $keyPath $trustedKey
+    $k = $HKLM.OpenSubKey($keyPath, $true)
+    try { $k.SetValue('KeptPool', (@{ installId = [string]$k.GetValue('InstallId'); at = [DateTimeOffset]::UtcNow.ToString('o') } | ConvertTo-Json -Compress)) } finally { $k.Dispose() }
+    if (Test-Path -LiteralPath $inventoryFile) { Add-Content -LiteralPath $inventoryFile -Value "`r`n$([DateTimeOffset]::Now.ToString('yyyy-MM-dd HH:mm')): helper removed by uninstall -KeepPool; the pool, its state and disk folders are kept (setup recognises them). To remove this kept pool later, run setup again (it restores the helper and the Installed apps entry), then uninstall." }
+  }
+  Retire = { Invoke-RetirePhase }
 }
-# R1, then (keep) the verified record that the kept state is meant to stay, then the retire phase.
-$left = @(Get-Leftovers $choice $diskFolders)
-if ($left.Count) {
-  Write-Host 'These are still there:' -ForegroundColor Yellow
-  foreach ($l in $left) { Write-Host "  - $l" }
-  Write-Host 'The Installed apps entry and the uninstaller stay: run it again once these are resolved (the manual steps are in the inventory).'
-  exit 1
-}
-if ($choice -eq 'keep') {
-  Assert-KeyProtected $HKLM $keyPath $trustedKey
-  $k = $HKLM.OpenSubKey($keyPath, $true)
-  try { $k.SetValue('KeptPool', (@{ installId = [string]$k.GetValue('InstallId'); at = [DateTimeOffset]::UtcNow.ToString('o') } | ConvertTo-Json -Compress)) } finally { $k.Dispose() }
-  if (Test-Path -LiteralPath $inventoryFile) { Add-Content -LiteralPath $inventoryFile -Value "`r`n$([DateTimeOffset]::Now.ToString('yyyy-MM-dd HH:mm')): helper removed by uninstall -KeepPool; the pool, its state and disk folders are kept (setup recognises them). To remove this kept pool later, run setup again (it restores the helper and the Installed apps entry), then uninstall." }
-}
-Invoke-RetirePhase
-Write-Host 'If you set anything up beside the MCP (Ollama''s settings, a firewall rule for host mode named ''hyper-v MCP host mode: *''), undo it as you were told when it was made.'
+$code = Invoke-UninstallFlow @{ KeepPool = [bool]$KeepPool; RemovePool = [bool]$RemovePool; WhatIf = [bool]$WhatIf; Retire = [bool]$Retire } $X
+if ($code -eq 0 -and -not $WhatIf) { Write-Host 'If you set anything up beside the MCP (Ollama''s settings, a firewall rule for host mode named ''hyper-v MCP host mode: *''), undo it as you were told when it was made.' }
+exit $code

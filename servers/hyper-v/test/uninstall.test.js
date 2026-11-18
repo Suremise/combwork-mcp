@@ -104,8 +104,8 @@ test('the Installed apps entry, run for real (5.1, non-elevated, scratch Program
   for (const [k, re] of Object.entries({
     extraFile: /uninstall\.retiring holds evil\.txt, which isn't one of the uninstaller's own files/,
     extraFolder: /hyperv-mcp holds stray, which the uninstaller doesn't leave behind/,
-    junction: /uninstall\.retiring is a link or has an unexpected owner/,
-    untrustedOwner: /hyperv-mcp is a link, isn't a folder, or has an unexpected owner/,
+    junction: /uninstall\.retiring is a link\./,
+    untrustedOwner: /\\pf has an unexpected owner/,
     service: /the service EventLog is still installed/,
     stateFolder: /the helper's state folder .* is still there/,
     record: /An uninstall is unfinished/
@@ -113,6 +113,18 @@ test('the Installed apps entry, run for real (5.1, non-elevated, scratch Program
     assert.strictEqual(R[k].code, 1, k); assert.strictEqual(R[k].entry, true, k); assert.strictEqual(R[k].intact, true, k); assert.match(R[k].out, re, k)
   }
   assert.strictEqual(R.otherEntry.entry, true); assert.match(R.otherEntry.out, /isn't the one setup writes: it was left in place/)
+  // Round 1: nothing runs unless its folder, parents and files are trusted: a complete set behind a junction (either
+  // folder), a folder or file others may write, an extra file in the set: no script run, nothing removed.
+  for (const [k, re] of Object.entries({
+    'junctionComplete_uninstall.retiring': /Nothing was run or removed: .*uninstall\.retiring is a link\./,
+    junctionComplete_uninstall: /Nothing was run or removed: .*\\uninstall is a link\./,
+    writableFolder: /Nothing was run or removed: .*uninstall\.retiring can be changed by S-1-5-32-545/,
+    writableFile: /Nothing was run or removed: .*uninstall\\uninstall\.ps1 can be changed by S-1-5-32-545/,
+    extraInSet: /Nothing was run or removed: .*uninstall holds extra\.ps1, which setup doesn't put there/,
+    writablePartial: /Nothing was removed: .*acl\.ps1 can be changed by S-1-5-32-545/
+  })) {
+    assert.strictEqual(R[k].code, 1, k); assert.strictEqual(R[k].launched, null, `${k}: no script ran`); assert.strictEqual(R[k].entry, true, k); assert.strictEqual(R[k].intact, true, k); assert.match(R[k].out, re, k)
+  }
   // Keep: the entry goes on a verified KeptPool record only; the state and key stay.
   assert.deepStrictEqual(a.kept.ok, { code: 0, entry: false, state: true, key: true, said: true })
   for (const k of ['noMarker', 'otherInstall']) assert.deepStrictEqual(a.kept[k], { code: 1, entry: true, state: true }, k)
@@ -128,6 +140,29 @@ test('the Installed apps entry, run for real (5.1, non-elevated, scratch Program
   assert.strictEqual(a.retire['after:R2'].helper, true, 'R3a not yet run'); assert.strictEqual(a.retire['after:R3a'].helper, false)
   assert.deepStrictEqual([a.retire.none.first, a.retire.none.instAfter, a.retire.none.entryAfter], ['finished', false, false])
   assert.match(a.retire.junction.result, /uninstall is a link: it won't be used/); assert.strictEqual(a.retire.junction.target, true); assert.strictEqual(a.retire.junction.entry, true)
+  // The uninstaller's top level (Invoke-UninstallFlow) with a fake world.
+  const F = a.flow
+  const done = { switch: false, install: false, entry: false }
+  assert.deepStrictEqual(F.remove, { result: 0, calls: 'teardown:remove,switch,check:remove,retire', ...done, kept: false })
+  assert.deepStrictEqual(F.keep, { result: 0, calls: 'teardown:keep,switch,check:keep,kept,retire', ...done, kept: true }, 'the mark after the check, before the retire')
+  assert.deepStrictEqual(F.menuRemove, { result: 0, calls: 'inventory,choices,ask,teardown:remove,switch,check:remove,retire', ...done, kept: false })
+  assert.deepStrictEqual([F.menuCancel.result, F.menuCancel.calls, F.menuCancel.install], [1, 'inventory,choices,ask', true])
+  assert.deepStrictEqual([F.menuList.result, F.menuList.calls], [0, 'inventory,choices,ask,teardown:remove:whatif'])
+  // Round 1: interrupted after the teardown (the service, state and records gone), before or after the switch, or
+  // before the retire: the rerun from the entry removes the switch if it's there, checks, and only then retires.
+  for (const [at, calls] of Object.entries({ 'after:teardown': 'switch,check:remove,retire', 'before:switch': 'switch,check:remove,retire', 'after:switch': 'check:remove,retire', 'before:retire': 'check:remove,retire' })) {
+    const x = F[`resume_${at}`]
+    assert.strictEqual(x.first, `CRASH ${at}`)
+    assert.deepStrictEqual(x.second, { result: 0, calls, ...done, kept: false }, at)
+  }
+  assert.deepStrictEqual([F.leftover.result, F.leftover.calls, F.leftover.install, F.leftover.entry], [1, 'teardown:remove,switch,check:remove', true, true], 'a leftover keeps the recovery route')
+  // Round 1: -WhatIf changes nothing on any path, -Retire included (every mutating action throws in these runs).
+  for (const [k, calls] of Object.entries({ whatIf: 'inventory,choices,teardown:remove:whatif', whatIfRemove: 'inventory,teardown:remove:whatif', retireWhatIf: '', leftoverOnlyWhatIf: '' })) {
+    assert.deepStrictEqual(F[k], { result: 0, calls, switch: true, install: true, entry: true, kept: false }, k)
+  }
+  assert.deepStrictEqual(F.retireKeep, { result: 0, calls: 'check:keep,retire', ...done, kept: true })
+  assert.match(F.keptThenRemove.result, /kept the pool and removed the helper.*Nothing was changed/); assert.strictEqual(F.keptThenRemove.calls, '')
+  assert.deepStrictEqual([F.nothing.result, F.nothing.calls], [0, ''])
   // The protected temporary copy.
   assert.deepStrictEqual(a.copy, { files: ['acl.ps1', 'appsentry.ps1', 'Storage.cs', 'teardown.ps1', 'uninstall.ps1'], problems: [], protected: true })
 })

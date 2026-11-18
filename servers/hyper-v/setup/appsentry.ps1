@@ -27,7 +27,7 @@ $script:EntryKeyPath = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Hype
 $script:RetiringSet = @('uninstall.ps1', 'teardown.ps1', 'acl.ps1', 'appsentry.ps1', 'Storage.cs')
 
 # The launcher's text. $Overrides (tests only): a hashtable of config values that replace the production ones (pf,
-# state, hive, stateKey, entryKey, service, trusted, elevate, pause).
+# state, regRoot, stateKey, entryKey, service, trusted, elevate, pause).
 function Get-LauncherText([hashtable]$Overrides = @{}) {
   $over = if ($Overrides.Count) { ($Overrides | ConvertTo-Json -Compress -Depth 4) -replace "'", "''" } else { '' }
   return @'
@@ -35,7 +35,7 @@ $ErrorActionPreference = 'Stop'
 $c = @{
   pf = [Environment]::GetFolderPath('ProgramFiles')
   state = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'hyperv-mcp'
-  hive = 'LocalMachine'
+  regRoot = 'LocalMachine'
   stateKey = 'SOFTWARE\hyperv-mcp'
   entryKey = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\HyperVMcp'
   service = 'HyperVMcp'
@@ -70,15 +70,50 @@ if (-not $finishOnly -and $c.elevate -and -not $admin) {
 $inst = Join-Path $c.pf 'hyperv-mcp'
 $ret = Join-Path $inst 'uninstall.retiring'
 $set = @('uninstall.ps1', 'teardown.ps1', 'acl.ps1', 'appsentry.ps1', 'Storage.cs')
-$root = if ($c.hive -eq 'CurrentUser') { [Microsoft.Win32.Registry]::CurrentUser } else { [Microsoft.Win32.Registry]::LocalMachine }
+$root = if ($c.regRoot -eq 'CurrentUser') { [Microsoft.Win32.Registry]::CurrentUser } else { [Microsoft.Win32.Registry]::LocalMachine }
 $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-if (-not $finishOnly) {
-  $main = Join-Path $inst 'uninstall\uninstall.ps1'
-  if (Test-Path -LiteralPath $main -PathType Leaf) { & $ps -NoProfile -ExecutionPolicy Bypass -File $main -Interactive; Close-Launcher $LASTEXITCODE }
-  if (@($set | Where-Object { Test-Path -LiteralPath (Join-Path $ret $_) -PathType Leaf }).Count -eq $set.Count) { & $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ret 'uninstall.ps1') -Retire; Close-Launcher $LASTEXITCODE }
-}
+# Trust, for anything the launcher runs or deletes (MC-1557 round 1): it exists, isn't a link (reparse point), its owner
+# is trusted, and no one else may write to, delete or re-permission it (inherit-only entries, which apply only to new
+# children, aside).
 function Test-OwnerOk([string]$p) { try { return $c.trusted -contains (Get-Acl -LiteralPath $p).GetOwner([Security.Principal.SecurityIdentifier]).Value } catch { return $false } }
 function Test-Plain([string]$p) { return -not ((Get-Item -LiteralPath $p -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) }
+function Get-TrustProblem([string]$p) {
+  if (-not (Test-Path -LiteralPath $p)) { return "$p is missing" }
+  if (-not (Test-Plain $p)) { return "$p is a link" }
+  if (-not (Test-OwnerOk $p)) { return "$p has an unexpected owner" }
+  $write = 2 -bor 4 -bor 16 -bor 64 -bor 256 -bor 65536 -bor 262144 -bor 524288 -bor 0x40000000 -bor 0x10000000
+  foreach ($r in (Get-Acl -LiteralPath $p).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])) {
+    if ($r.AccessControlType -ne 'Allow' -or ($r.PropagationFlags -band [Security.AccessControl.PropagationFlags]::InheritOnly)) { continue }
+    if (([int]$r.FileSystemRights -band $write) -and $c.trusted -notcontains $r.IdentityReference.Value) { return "$p can be changed by $($r.IdentityReference.Value)" }
+  }
+  return $null
+}
+# A script folder the launcher may run from: its parents (Program Files and the install folder) and itself trusted, and
+# holding exactly the uninstaller's files, each a trusted regular file.
+function Get-SetProblem([string]$dir) {
+  foreach ($p in @($c.pf, $inst, $dir)) { $w = Get-TrustProblem $p; if ($w) { return $w } }
+  $names = @(Get-ChildItem -LiteralPath $dir -Force | ForEach-Object { $_.Name })
+  $odd = @($names | Where-Object { $set -notcontains $_ }); if ($odd.Count) { return "$dir holds $($odd[0]), which setup doesn't put there" }
+  foreach ($n in $set) {
+    $f = Join-Path $dir $n
+    if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { return "$f is missing" }
+    $w = Get-TrustProblem $f; if ($w) { return $w }
+  }
+  return $null
+}
+if (-not $finishOnly) {
+  $un = Join-Path $inst 'uninstall'
+  if (Test-Path -LiteralPath $un) {
+    $w = Get-SetProblem $un
+    if ($w) { Stop-Launcher "Nothing was run or removed: $w. Run the uninstaller from the repo (servers\hyper-v\setup\uninstall.ps1, in an admin Windows PowerShell)." }
+    & $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $un 'uninstall.ps1') -Interactive; Close-Launcher $LASTEXITCODE
+  }
+  if ((Test-Path -LiteralPath $ret) -and @($set | Where-Object { Test-Path -LiteralPath (Join-Path $ret $_) }).Count -eq $set.Count) {
+    $w = Get-SetProblem $ret
+    if ($w) { Stop-Launcher "Nothing was run or removed: $w. Run the uninstaller from the repo (servers\hyper-v\setup\uninstall.ps1, in an admin Windows PowerShell)." }
+    & $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ret 'uninstall.ps1') -Retire; Close-Launcher $LASTEXITCODE
+  }
+}
 $svcHere = [bool](Get-Service -Name $c.service -ErrorAction SilentlyContinue)
 $sk = $root.OpenSubKey($c.stateKey)
 $record = $false; $kp = $null; $iid = $null; $keyWhy = $null
@@ -97,16 +132,20 @@ $manual = "Run the uninstaller from the repo (servers\hyper-v\setup\uninstall.ps
 # c: the uninstaller's own leftovers, only in exactly the shape it leaves them.
 if (Test-Path -LiteralPath $inst) {
   $why = $null
-  if (-not (Test-Path -LiteralPath $inst -PathType Container) -or -not (Test-Plain $inst) -or -not (Test-OwnerOk $inst)) { $why = "$inst is a link, isn't a folder, or has an unexpected owner" }
-  else {
+  $why = $null
+  foreach ($p in @($c.pf, $inst)) { if (-not $why) { $why = Get-TrustProblem $p } }
+  if (-not $why -and -not (Test-Path -LiteralPath $inst -PathType Container)) { $why = "$inst isn't a folder" }
+  if (-not $why) {
     $kids = @(Get-ChildItem -LiteralPath $inst -Force)
     $odd = @($kids | Where-Object { $_.Name -ne 'uninstall.retiring' -or -not $_.PSIsContainer })
     if ($odd.Count) { $why = "$inst holds $($odd[0].Name), which the uninstaller doesn't leave behind" }
     elseif ($kids.Count) {
-      if (-not (Test-Plain $ret) -or -not (Test-OwnerOk $ret)) { $why = "$ret is a link or has an unexpected owner" }
-      else {
-        $bad = @(Get-ChildItem -LiteralPath $ret -Force | Where-Object { $set -notcontains $_.Name -or $_.PSIsContainer -or -not (Test-Plain $_.FullName) -or -not (Test-OwnerOk $_.FullName) })
-        if ($bad.Count) { $why = "$ret holds $($bad[0].Name), which isn't one of the uninstaller's own files as it leaves them" }
+      $why = Get-TrustProblem $ret
+      if (-not $why) {
+        foreach ($x in @(Get-ChildItem -LiteralPath $ret -Force)) {
+          if ($set -notcontains $x.Name -or $x.PSIsContainer) { $why = "$ret holds $($x.Name), which isn't one of the uninstaller's own files as it leaves them"; break }
+          $w = Get-TrustProblem $x.FullName; if ($w) { $why = $w; break }
+        }
       }
     }
   }
@@ -203,4 +242,59 @@ function Invoke-Retire([string]$ProgramFiles, [string[]]$Trusted, [string[]]$Roo
     }
   } finally { Close-Pins $pins }
   & $Launcher 'finish' $Expected
+}
+
+# The uninstaller's top level (uninstall.ps1 wires the real actions in $X; test\appsentry-check.ps1 fakes them), so its
+# decisions are tested as they run. $P: KeepPool, RemovePool, WhatIf, Retire. $X: Say, ServiceHere, StateHere, KeyHere,
+# KeptMark, InstallHere, EntryHere, ShowInventory, ShowChoices, Ask ('remove' | 'keep' | 'list' | $null), Teardown
+# (mode, whatIf), HostSwitches (count), RemoveHostSwitches, Leftovers (mode: the list), WriteKept, Retire. Returns the
+# exit code.
+# -WhatIf changes nothing on every path, -Retire included. Whatever a run was interrupted after (the teardown, the
+# switch's removal), a rerun ends the same way: setup's host-mode switch removed, then the live leftover check for the
+# mode, and only when it passes the kept-pool mark (keep) and the retire phase, which retires the recovery route last.
+function Invoke-UninstallFlow([hashtable]$P, [hashtable]$X, [scriptblock]$Crash) {
+  $boundary = { param($n) if ($Crash) { & $Crash $n } }
+  $finish = {
+    param($mode)
+    if ([int](& $X.HostSwitches)) { & $boundary 'before:switch'; [void](& $X.RemoveHostSwitches); & $boundary 'after:switch' }
+    $left = @(& $X.Leftovers $mode)
+    if ($left.Count) {
+      [void](& $X.Say "These are still there: $($left -join '; '). The Installed apps entry and the uninstaller stay: run it again once these are resolved (the manual steps are in the inventory).")
+      return 1
+    }
+    if ($mode -eq 'keep' -and -not (& $X.KeptMark)) { [void](& $X.WriteKept); & $boundary 'after:kept' }
+    & $boundary 'before:retire'
+    [void](& $X.Retire)
+    return 0
+  }
+  $kept = [bool](& $X.KeptMark)
+  if ($P.Retire) {
+    if ($P.WhatIf) { [void](& $X.Say 'Would finish the uninstall: setup''s host-mode switch if it is still there, the live check, then the uninstaller''s own files and the Installed apps entry. Nothing was changed (-WhatIf).'); return 0 }
+    [void](& $X.Say 'Finishing the uninstall: the uninstaller''s own files and the Installed apps entry.')
+    return (& $finish $(if ($kept) { 'keep' } else { 'remove' }))
+  }
+  # The leftover-only case (s9): nothing of the helper is installed (no service, state folder or registry records).
+  if (-not (& $X.ServiceHere) -and -not (& $X.StateHere) -and -not (& $X.KeyHere)) {
+    if (-not (& $X.InstallHere) -and -not (& $X.EntryHere) -and -not [int](& $X.HostSwitches)) { [void](& $X.Say 'Nothing of the hyper-v MCP is installed.'); return 0 }
+    if ($P.WhatIf) { [void](& $X.Say 'Nothing of the helper is installed: would remove setup''s host-mode switch if it is still there, then what is left of the uninstaller and the Installed apps entry. Nothing was changed (-WhatIf).'); return 0 }
+    [void](& $X.Say 'Nothing of the helper is installed: finishing with what is left (setup''s switch, the uninstaller and its Installed apps entry).')
+    return (& $finish 'remove')
+  }
+  $whatIf = [bool]$P.WhatIf
+  $choice = if ($P.RemovePool) { 'remove' } elseif ($P.KeepPool) { 'keep' } else { $null }
+  if (-not $choice) {
+    [void](& $X.ShowInventory); [void](& $X.ShowChoices)
+    if ($whatIf) { $choice = 'remove' }
+    else {
+      $a = & $X.Ask
+      if ($a -eq 'list') { $whatIf = $true; $choice = 'remove' } elseif ($a -eq 'remove' -or $a -eq 'keep') { $choice = $a } else { [void](& $X.Say 'Cancelled: nothing was changed.'); return 1 }
+    }
+  } elseif ($whatIf) { [void](& $X.ShowInventory) }
+  if ($choice -eq 'remove' -and $kept -and -not (& $X.ServiceHere)) {
+    throw 'An earlier uninstall kept the pool and removed the helper, which removes it: run setup again (from the repo) to restore the helper, then uninstall. Nothing was changed.'
+  }
+  [void](& $X.Teardown $choice $whatIf)
+  if ($whatIf) { [void](& $X.Say 'Nothing was changed (-WhatIf).'); return 0 }
+  & $boundary 'after:teardown'
+  return (& $finish $choice)
 }

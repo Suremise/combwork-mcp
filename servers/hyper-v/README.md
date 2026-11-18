@@ -986,11 +986,14 @@ to run while an uninstall is unfinished. A finished `-KeepPool` leaves only its 
 installation: a later setup clears it and takes the pool over, and `-RemovePool` then works as usual.
 
 **The last phase (MC-1557): the uninstaller's own files and the Installed apps entry.** Step 5 leaves the install
-folder's `uninstall\`, the entry's route. Once everything else is checked gone (for `-KeepPool`: the helper's parts
+folder's `uninstall\`, the entry's route. Setup's host-mode switch is removed next, on every run that gets this far,
+including a rerun after an interruption. Once everything else is checked gone (for `-KeepPool`: the helper's parts
 gone, the kept ones present), `uninstall\` is renamed to `uninstall.retiring\` in one step, the rest of the install
 folder is removed, then its last files and the entry. The entry runs a fixed launcher (an encoded PowerShell command
 with its paths from Windows' known folders, never from the registry), so whichever point an interruption leaves, the
-entry finishes it: it runs the uninstaller while its files are whole; otherwise it removes the uninstaller's own
+entry finishes it: it runs the uninstaller while its files are whole and trusted (the folder, its parents and each
+file not a link, owned by Administrators, SYSTEM or TrustedInstaller, and writable by no one else; anything else is
+refused and nothing runs); otherwise it removes the uninstaller's own
 leftovers itself, but only when they are exactly what it leaves (no links, nothing else in the folder, owned by
 Administrators, SYSTEM or TrustedInstaller, no service and no unfinished uninstall); then its own registry key, only
 when nothing of the MCP is left, or a verified `KeptPool` mark says the kept state is meant to stay. Anything else
@@ -1298,7 +1301,13 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
     file or folder, a junction, an untrusted owner, a service still installed, the state folder, an unfinished
     uninstall, an entry that isn't setup's, a missing or other install's mark), each with everything left in place; an
     InstallLocation pointing elsewhere never a target; the last phase crashed after its rename and after removing the
-    rest, each finished by relaunching the entry; a junction for `uninstall\` refused; the protected temporary copy.
+    rest, each finished by relaunching the entry; a junction for `uninstall\` refused; the protected temporary copy;
+  - nothing run unless trusted: a complete set behind a junction (either folder), a folder or file others may write,
+    an extra file in the set, each refused with no script run;
+  - the uninstaller's top level (`Invoke-UninstallFlow`) with a fake world: remove, keep (the mark after the check,
+    before the retire), the menu (remove, list, cancel); interrupted after the teardown, before and after the switch's
+    removal and before the retire, each rerun removing the switch, checking, then retiring; a leftover keeping the
+    route; `-WhatIf` changing nothing on every path, `-Retire -WhatIf` included; a remove after a finished keep refused.
 
 **The trial** on a real host (not automated): setup, then `pool_plan` → approval → `pool_create` from the pinned 25H2
 ISO, then:
