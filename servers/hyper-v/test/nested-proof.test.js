@@ -32,7 +32,7 @@ test('targetProblems: the outer VM passes; each mismatch is named', () => {
   bad({ marker: { biosGuid: GUID, token: 'other' } }, /token differs/)
   bad({ marker: { biosGuid: '11111111-1111-1111-1111-111111111111', token: 'tok-1' } }, /marker's BIOS GUID/)
   bad({ model: 'Precision 7865' }, /model/)
-  bad({ hostname: 'DARREN-PC' }, /hostname/)
+  bad({ hostname: 'WORKSTATION-1' }, /hostname/)
   assert.ok(P.targetProblems({ biosGuid: GUID }, GOOD).some(p => /no expected token/.test(p)))
 })
 
@@ -195,7 +195,7 @@ test('matrix: an identity mismatch before a lease stops the run; no session star
   assert.ok(!remote.calls.includes('session'))
   assert.strictEqual(remote.calls[remote.calls.length - 1], 'cleanup')
   // The first check failing: nothing at all is started or cleaned.
-  const r2 = fakeRemote({ identity: () => ({ ...GOOD, hostname: 'DARREN-PC' }) })
+  const r2 = fakeRemote({ identity: () => ({ ...GOOD, hostname: 'WORKSTATION-1' }) })
   await assert.rejects(P.matrix(r2, EXPECTED, { lan: { ip: '192.168.1.1', port: 80 }, internetTcp: { ip: '1.1.1.1', port: 443 }, https: 'https://www.microsoft.com/', repoDir: 'C:\\r' }, () => {}), /hostname/)
   assert.deepStrictEqual(r2.calls, ['identity'], 'nothing started, nothing cleaned up on an unconfirmed target')
 })
