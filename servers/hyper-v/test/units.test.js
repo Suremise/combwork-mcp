@@ -192,7 +192,7 @@ test('policy: problems named; disk folders strictly inside; caps', () => {
   assert.deepStrictEqual(policy.checkPool(p, [vm, vm]), [])
   assert.match(policy.checkPool(p, Array(5).fill(vm)).join(), /5 VMs is more than the policy's 4/)
   assert.match(policy.checkPool(p, [{ ...vm, memoryMB: 4097 }]).join(), /even number/)
-  assert.match(policy.checkPool({ ...p, allowNetwork: false }, [vm], { network: true }).join(), /does not allow networking/)
+  assert.match(policy.checkPool({ ...p, maxNetwork: 'none' }, [vm], { network: 'host' }).join(), /network host is above the policy's none/)
 })
 
 test('journal: flushed records replay; a torn last line (a crash mid-write) is cut off; damage in the middle is an error', () => {

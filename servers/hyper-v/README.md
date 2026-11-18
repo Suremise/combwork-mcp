@@ -49,10 +49,10 @@ Hyper-V Administrators, so agents running as you can't drive Hyper-V directly.
 | The server (its helper) can | It can't |
 |---|---|
 | Act on VMs it created: names start with the pool prefix (`hvmcp-`) **and** the VM id is in its journal **and** the VM is in its own folder. All three are checked, twice: in the helper and again in `hv.ps1`. | Touch any other VM, checkpoint, disk or switch: start, stop, change, delete or even name it. A VM renamed into the prefix still doesn't match an id. |
-| Create VMs, disks and one internal switch, **only** from a plan the user approved in an elevated prompt, and **within the policy** setup wrote (max VMs, cores per VM, total memory, disk per VM, disk folders, networking allowed). | Exceed the policy, whatever a plan or an approval says. Create an external switch or a NAT, or change any host setting: Hyper-V's settings, other switches, the firewall, Defender, features or services. |
+| Create VMs and disks, **only** from a plan the user approved in an elevated prompt, and **within the policy** setup wrote (max VMs, cores per VM, total memory, disk per VM, disk folders, the highest network mode). Each plan states the pool's cores, memory, disk and network mode for the user to confirm. | Exceed the policy, whatever a plan or an approval says. Create a switch, an external switch or a NAT, or change any host setting: Hyper-V's settings, other switches, the firewall, Defender, features or services. Setup (run by you, elevated) makes the one host-mode switch and its address. |
 | Write only to its state folder (`%ProgramData%\hyperv-mcp`: the journal, plans, per-run staging under `runs\`, guest credentials) and the disk folders named at setup. | Write anywhere else on the host. Files read back from a guest are returned as data, never written to the host. |
 | Copy a build into a VM: the files of a folder that resolves, by real path, under your MCP roots or a build folder an admin named at setup, **copied** to `C:\build`. | Share or map any host folder into a guest: the guest never sees a live host path, so it can't change your files. Copy a build from outside your roots and the admin's build folders, or from your profile itself, its dot-folders (`~/.ssh`, `~/.claude`, …), `AppData` or its top folders, or anything under `AppData\Roaming`. Follow a link or junction in the build (they're skipped and named). |
-| Connect one VM to the pool's **internal** switch for one run, only when `vm_start` asks (`network: true`) and the policy allows it. | Give a running guest the internet or your LAN. It's off by default: the adapter is disconnected, and the restore at stop puts it back. The one exception is at build, not run: a new VM goes online once, through Windows' Default Switch, to activate Windows, when the plan you approved says so (see "Windows licences"). |
+| Connect one VM for one run in the network mode `vm_start` asks for, at or below the mode you approved for the pool (see "Network modes"): **none** (the default), **host**, **internet** or **internet-lan**. | Use a mode above the pool's or the policy's. Connect a run any other way. Off is the default: the adapter is disconnected, and the restore at stop disconnects it again and removes its rules. A new VM also goes online once at build, through Windows' Default Switch, to activate Windows, when the plan you approved says so (see "Windows licences"). |
 | Reserve CPU for one run (`reserveCpu`, a percentage of the VM's cores), up to the policy's cap; reset at stop. | Reserve beyond the cap, or change a VM's CPU outside a run. |
 | Restore the clean checkpoint **by id** before every start, unconditionally, and at every stop and release, then check that the VM is Off, at that checkpoint, disconnected, with no reserve. Keep a VM unrestored for inspection **only when asked**, until its lease ends. | Start a VM from anything but the clean checkpoint, or let one lease's changes reach the next. A VM that can't be confirmed clean is **quarantined**: never leased until a restore confirms it. |
 | Keep a leased VM running for a **work session**: several runs in one guest, with `vm_sync` copying changed files into its `C:\build` (no restore between them), and the lease renewed up to the policy's `maxLeaseMinutes` at a time and `maxSessionMinutes` in all. | Carry anything past the lease: release, the deadline and the session's connection closing all restore and verify it as above. Write anywhere in the guest but `C:\build` and its own staging folder when syncing, or follow a link or junction there. |
@@ -119,9 +119,10 @@ using the new server: the helper's protocol and features changed, and an older h
      Administrators and the service. `policy.json` and `approvals\` in there are writable only by Administrators and
      SYSTEM. How setup makes them trustworthy is under "Storage" below;
    - `policy.json`, the pool's hard limits. By default they're derived from the host: up to a quarter of its logical
-     CPUs per VM (at most 8), half its memory in all, up to 4 VMs, 128 GB disks, networking allowed (internal switch
-     only), unpinned ISOs refused. Override any of them: `-MaxVms`, `-MaxCoresPerVm`, `-MaxMemoryGB`,
-     `-MaxDiskGBPerVm`, `-AllowNetwork $false`, `-MaxReservePercent`, `-MaxLeaseMinutes`, `-MaxSessionMinutes`
+     CPUs per VM (at most 8), half its memory in all, up to 4 VMs, 128 GB disks, network mode up to none (a new
+     install; a rerun keeps the current value), unpinned ISOs refused. Override any of them: `-MaxVms`,
+     `-MaxCoresPerVm`, `-MaxMemoryGB`, `-MaxDiskGBPerVm`, `-MaxNetwork None|Host|Internet|InternetLan` (with
+     `-HostSubnet`; see "Network modes"), `-MaxReservePercent`, `-MaxLeaseMinutes`, `-MaxSessionMinutes`
      (a work session's cap for `vm_renew`: 5-1440 and at least `-MaxLeaseMinutes`; left out, 480 or
      `-MaxLeaseMinutes` if that is more), `-MaxBuildMB`, `-AllowUnpinnedIso`. `-BuildRoot` names folders builds may also
      come from (see "Build folders set by an admin"). `-ProjectsFile` names the projects that share the pool fairly (see
@@ -206,9 +207,10 @@ approval → change**:
 
 1. **Plan.** Ask an agent for a pool, for example "plan a hyper-v pool of 2 VMs from
    D:\Downloads\Win11_Eval.iso". It calls `pool_plan`, which reads the host (CPUs, memory, free disk, Hyper-V) and the
-   policy. It proposes the exact plan: VM names, cores, static memory, disk size and folder, the switch (only if you
-   asked for networking) and the image. The plan changes nothing. The first plan also checks the image, which takes a
-   few minutes (see "The image"); the agent then plans again.
+   policy. It proposes the exact plan: VM names, cores, static memory, disk size and folder, the image, the VMs it
+   keeps, and the pool's network mode (none unless you choose another; the agent describes the options, see "Network
+   modes"). The plan changes nothing. The first plan also checks the image, which takes a few minutes (see "The
+   image"); the agent then plans again.
 2. **Approve.** The plan's reply holds one line for **you** to run in an **admin PowerShell** (one UAC prompt):
    ```
    powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\hyperv-mcp\approve.ps1" -Plan p-0123456789abcdef
@@ -295,7 +297,8 @@ Each VM records its Windows licence when it is built, and `vm_status`, `pool_sta
     and never recomputed or extended (no re-arm, no clock changes);
   - if the step fails, the VM is turned off and disconnected, then removed; if that fails too, `pool_status` warns that
     it may still be online, and the helper retries every few minutes and at its next start;
-  - no start ever uses the Default Switch: runs only ever get the pool's internal switch.
+  - a run uses the Default Switch only in an internet mode, and only when the plan you approved for the pool allows it
+    (see "Network modes").
   A host without the Default Switch can't build evaluation VMs (setup says whether it has one). Within an hour of its
   end, a VM is no longer leased, and leases and renewals never run past it. VMs built before licences were recorded
   show "licence unknown": rebuild them to record it.
@@ -343,7 +346,7 @@ non-evaluation Windows 11 ISO (see "Windows licences").
 | Tool | What it does |
 |---|---|
 | `vm_acquire({ minutes=60, keepOnFailure=false, wait=false, os='windows', distro?, image?, vm? })` | Leases one VM of that OS (`distro: 'debian' \| 'ubuntu'` for a Linux VM of that distro; and image, when given; or the VM named by `vm`, for trials, see "One VM by name") to this session (one VM per session) until `vm_release`, its deadline (at most the policy's `maxLeaseMinutes`), or this server exiting. Without `wait`, it refuses when none is free for this session's project, saying why (none free, the project's cap, a VM kept for another project), when the next lease ends, and where it would stand in line. With `wait: true` it waits in line about 20 s, and a repeat call within 2 minutes keeps its place (see "Sharing the pool between projects"). |
-| `vm_start({ build?, network=false, reserveCpu=0, interactive=false })` | Restores the clean checkpoint (always), applies this run's network and CPU reserve, and starts the VM. It waits for the guest, then copies `build` in to `C:\build` and leaves an empty `C:\out`. With `interactive: 'user'` (the standard user) or `'admin'`, it first logs that account on interactively: autologon, one guest restart, then it waits up to 10 minutes for the account's desktop session (often 2–4 minutes on a first logon; see "The interactive session"). Refused on a VM kept for inspection: release it, and acquire again. |
+| `vm_start({ build?, network='none', reserveCpu=0, interactive=false })` | Restores the clean checkpoint (always), applies this run's network mode (`none`, `host`, `internet` or `internet-lan`, at or below the pool's; see "Network modes") and CPU reserve, and starts the VM. It waits for the guest, then copies `build` in to `C:\build` and leaves an empty `C:\out`. With `interactive: 'user'` (the standard user) or `'admin'`, it first logs that account on interactively: autologon, one guest restart, then it waits up to 10 minutes for the account's desktop session (often 2–4 minutes on a first logon; see "The interactive session"). Refused on a VM kept for inspection: release it, and acquire again. |
 | `vm_renew({ minutes=60 })` | Sets the lease's deadline to now + `minutes` (1 to the policy's `maxLeaseMinutes`), never past the work session's end: `maxSessionMinutes` after `vm_acquire` (`vm_status` shows both). Refused once the deadline has passed, even a moment before the helper ends the lease. |
 | `vm_sync({ build?, full=false, delete=true })` | Copies only the files that changed in `build` (default: the folder last started or synced) into the **running** guest's `C:\build`, without a restore: `C:\out`, installed software and anything else the runs left stay. The server hashes the folder (same roots checks as `vm_start`, every time; links skipped); the helper compares that with what it placed in `C:\build` and takes only the new or changed files, hashing them itself as they arrive. Files gone from the folder are removed unless `delete` is false. Only what the helper copied is tracked: if your runs changed `C:\build` themselves, use `full: true` (clears `C:\build`, copies everything) or `vm_reset`. After a sync fails, only those two are accepted. |
 | `vm_reset({ build?, network?, reserveCpu?, interactive? })` | A clean VM now: exactly `vm_start` (restore first, verified), with this session's last start's `network`, `reserveCpu` and `interactive` and its last build unless given. |
@@ -357,7 +360,7 @@ non-evaluation Windows 11 ISO (see "Windows licences").
 | `vm_release()` | Restores the VM (as `vm_stop`) and ends the lease. |
 | `vm_status()` | The pool, every lease, your VM, any pool job, the policy, and where builds may come from. Works with the server turned off. |
 | `vm_wait()` | Waits for this session's slow operation and gives its result (MC-1553, see "Slow operations"). Each call waits up to 45 s, `HYPERV_MCP_REPLY_MS`. |
-| `pool_plan({ action='create'\|'resize'\|'remove', vms?, cores?, memoryGB?, diskGB?, location?, network?, image?, activate? })` | Plans a pool change and changes nothing (see "Building the pool"). `image` is a new ISO to check (`{ iso \| download, edition? }`), or a verified image's SHA-256: build from it, or resize only its group (see "A pool from more than one image"). An evaluation image's plan always activates Windows online once per new VM; `activate: true` asks the same for your own copy (see "Windows licences"). |
+| `pool_plan({ action='create'\|'resize'\|'remove', vms?, cores?, memoryGB?, diskGB?, location?, network?, image?, activate? })` | Plans a pool change and changes nothing (see "Building the pool"). `network` is the pool's network mode, the highest a run may use (default `none` for a create, the current mode for a resize; a resize may change only this; see "Network modes"). `image` is a new ISO to check (`{ iso \| download, edition? }`), or a verified image's SHA-256: build from it, or resize only its group (see "A pool from more than one image"). An evaluation image's plan always activates Windows online once per new VM; `activate: true` asks the same for your own copy (see "Windows licences"). |
 | `pool_create` / `pool_resize` / `pool_remove({ planId })` | Carries out an approved plan in the background. |
 | `pool_status()` | The pool, the image, and any job or image check in progress. |
 
@@ -475,6 +478,48 @@ projects start from (MC-1532) and refreshing the clean checkpoint in place (MC-1
   `vm_status`.
 - **Limits:** a checkpoint never moves the lease's deadline or the VM's evaluation end, which come from the host's own
   records, not the guest's clock.
+
+## Network modes
+
+Each run has a network mode (MC-1556). There are two caps, as with CPUs, memory and disk:
+- **setup's policy**, the highest mode any pool may have: `-MaxNetwork None|Host|Internet|InternetLan`. A new install
+  is `None`; a rerun keeps the current value (an older install's `-AllowNetwork $true` becomes `Host`);
+- **the pool's mode**, chosen in the plan you approve (`pool_plan`'s `network`). An agent describes the options when
+  the pool is planned; every create and resize plan states it, and changing it is a resize you approve.
+
+A run asks for a mode at or below the pool's (`vm_start` or `vm_reset`'s `network`, default `none`). A run already
+going when the pool's mode is lowered keeps its mode until its next start, reset or restore, which is checked against
+both caps then and refused above either. A Linux checkpoint restarts the VM: above a cap, it restarts with network
+`none` and says so.
+
+| Mode | The VM reaches | How |
+|---|---|---|
+| `none` (default) | nothing | the adapter is disconnected |
+| `host` | only this PC, at its host-mode address, and only on the ports this PC's firewall allows | setup's internal switch `hvmcp-host` on `-HostSubnet` (default `10.137.42.0/24`: this PC is `.1`, VMs `.10` up). The helper gives the guest its address at start; the adapter's rules allow only this PC's address and block everything else, other VMs and IPv6 included |
+| `internet` | the internet; not your LAN | Windows' Default Switch (its own NAT: nothing new on your network). The guest's traffic leaves this PC under its address. The adapter's rules block private address ranges (except the switch's gateway, which the guest needs for DHCP and DNS) and IPv6 |
+| `internet-lan` | the internet and your LAN | the Default Switch; only IPv6 is blocked |
+
+In every connected mode the order is fixed: the VM is off and disconnected, its rules are added and read back, and only
+then is it connected and started. Then the guest's network is read back until it holds steady: the address on the
+VM's own adapter (host: exactly its address, no gateway; internet: a DHCP address, a default route, DNS and one lookup
+that answers). If any step fails, the VM is restored to clean and the start fails. Stop, release and recovery
+disconnect the VM, then remove its rules. The clean checkpoint is always offline.
+
+**Host mode and your firewall.** Setup makes the switch and this PC's address on it, and refuses a subnet that
+overlaps anything else on this PC (a VPN, another network). A host-mode start checks the same again. Setup changes no
+firewall rule: a VM can reach a service on this PC only if you let it. Setup prints the lines, for example for Ollama:
+```
+New-NetFirewallRule -DisplayName 'hyper-v MCP host mode: TCP 11434' -Direction Inbound -Protocol TCP -LocalPort 11434 -LocalAddress 10.137.42.1 -RemoteAddress 10.137.42.0/24 -Action Allow
+```
+and the service must listen beyond localhost (for Ollama, `OLLAMA_HOST` set to `10.137.42.1:11434` or `0.0.0.0:11434`).
+Open a port only for a service you're happy for test code to call.
+
+**Internet modes.** Test code in the VM can download things and talk to any internet service, as you could from this
+PC. Use them for builds that need it, and still keep real sign-ins and tokens out of the VM.
+
+Linux guests get their address from a fixed script of the helper's own, run as root through the same path as a run:
+systemd-networkd, when it runs, is given a runtime network file for the VM's adapter; otherwise `ip` (host mode) or
+the image's DHCP client (internet modes). Nothing of it survives a restore.
 
 ## Linux guests
 
@@ -756,7 +801,10 @@ mid-write) is cut off the file first, so nothing is ever appended onto it. Then:
 - an unfinished remove is finished;
 - an unfinished switch change is finished, on the pool's switch only. That's the one with its recorded id or its token
   in its Notes, never a switch that merely has the same name: a same-named switch of someone else's is left
-  untouched and reported. A start with networking also connects to the switch by its id, never its name;
+  untouched and reported. (Only pools from before MC-1556 have such a switch: runs no longer use it.) A connected
+  start connects by switch id, never by name;
+- a run's network change needs no journal record: the adapter's rules go on before it connects, and every VM is
+  restored below, which disconnects it and removes them (see "Network modes");
 - open jobs are closed;
 - every VM is restored, and every lease from before is void.
 
@@ -939,7 +987,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\restorewait.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js test\linux-image.test.js test\linux-guest-files.test.js test\linux.test.js test\linux-ps.test.js test\bridge.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\restorewait.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js test\linux-image.test.js test\linux-guest-files.test.js test\linux.test.js test\linux-ps.test.js test\bridge.test.js test\network.test.js
 ```
 
 - `units.test.js`:
@@ -1173,7 +1221,9 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   - a Linux lease through `server.js`: build, runs, refusals, read-out, sync, reset and release;
   - a timeout killed by its unit; a lease checkpoint taken Off;
   - the helper killed mid-run and recovered;
-  - pool checkpoints and refresh-clean on Linux, and the feature gate.
+  - pool checkpoints and refresh-clean on Linux, and the feature gate;
+  - a host-mode run, its address set by the helper's own script, and a checkpoint restart after the pool's mode was
+    lowered, which goes on with network `none`.
 - `linux-ps.test.js`: hv.ps1's Linux actions run for real under Windows PowerShell 5.1, with the Hyper-V cmdlets
   mocked:
   - `com-attach` and `com-detach` (the exact `\\.\pipe\<name>` path, read back) and `vhd-convert`'s path checks;
@@ -1183,6 +1233,16 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   (compiled with `HVMCP_TEST`, TCP to a local fake SSH server instead of a VM). The client's KEXINIT and ECDH init reach
   the server, and the bridge's byte counts show it. The build setup ships has no TCP mode. ssh runs in the kill-on-close
   job of `jobrun.exe`.
+- `network.test.js` (MC-1556), the network modes:
+  - the rules: the modes' order and caps, each mode's port ACLs, the host-mode checks (switch by id, the host's
+    address, subnet clashes), guest address allocation, the guest read-backs, the Linux scripts, the policy;
+  - plans: the mode in every create and resize (default `none`), the policy's cap, a network-only resize, the kept
+    VMs' sizes, the journal record, no host network or no Default Switch;
+  - runs in each mode: the switch, the ACLs added and read back before the connect, the guest's network read back
+    until steady; refused above the pool's mode, also after it's lowered; fail-closed when the ACLs don't read back, a
+    host check fails, or the guest's network never settles (restored to clean, disconnected);
+  - crashes after the ACLs, the connect and the guest's network, and a call dying between connect and start: the next
+    helper restores the VM disconnected with no ACLs; leftover ACLs at a release quarantine the VM.
 
 **The trial** on a real host (not automated): setup, then `pool_plan` → approval → `pool_create` from the pinned 25H2
 ISO, then:

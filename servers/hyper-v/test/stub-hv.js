@@ -35,10 +35,17 @@
  * only the seed's public parts: the host key's public half, hvadmin's authorized_keys line, the sudoers rule; never a
  * private key); com-attach/com-detach set and unset COM1, com-read answers state.diagLines (default: every stage, hv_sock
  * present; comReadFails); vhd-convert copies the VHD. The guest itself is test/stub-guest.js (the SSH transport's stub).
+ * Network modes (MC-1556): each VM's adapter has port ACLs (vm.acls: { action, remote }, both directions); net-prepare
+ * (Off only) disconnects, clears and installs them (aclsDrop: n leaves the last n out, a half-done install;
+ * prepareStaysConnected), configure-start connects by kind (host: state.hostNet's switch by id; default: the Default
+ * Switch), net-host and net-default read the host (hostRead / defaultRead: fields reported instead), restore and
+ * net-disconnect disconnect then clear them, and guest-net / guest-net-read are stub-net.js's. After every call,
+ * stub-net's invariant is checked on every VM.
  */
 const fs = require('fs')
 const crypto = require('crypto')
 const { join } = require('path')
+const stubNet = require('./stub-net')
 
 const FILE = process.env.HYPERV_MCP_STUB_STATE
 // A read that catches another stub process mid-write (a torn file) is retried, never taken as an empty state.
@@ -73,6 +80,7 @@ process.stdin.on('end', () => {
   try {
     if (s.fail[op] > 0) { s.fail[op]--; if (keep) save(s); throw new Error(`injected failure of ${op}`) }
     const r = run(s, op, a)
+    for (const vm of Object.values(s.vms)) stubNet.checkInvariant(s, vm, op)
     if (keep) save(s)
     answer({ result: r })
   } catch (e) {
@@ -89,9 +97,12 @@ function own(s, a) {
   if (!under(vm.location, a.folder)) throw new Error(`VM ${a.name} is not in its pool folder: not the pool's`)
   return vm
 }
-const facts = vm => ({ vmId: vm.id, state: vm.state, parentCheckpointId: vm.parent, checkpointIds: vm.checkpoints.map(c => c.id), switchName: vm.switchName, reserve: vm.reserve })
+const swId = (s, name) => name === 'Default Switch' ? 'c08cb7b8-9b3c-408e-8e30-5e16a3aeb444' : name ? s.switches[name]?.id ?? null : null
+let S = null // the state, for facts' switch id
+const facts = vm => ({ vmId: vm.id, state: vm.state, parentCheckpointId: vm.parent, checkpointIds: vm.checkpoints.map(c => c.id), switchName: vm.switchName, switchId: swId(S, vm.switchName), mac: stubNet.macOf(vm), acls: (vm.acls || []).flatMap(e => ['Inbound', 'Outbound'].map(direction => ({ action: e.action, direction, remote: e.remote }))), reserve: vm.reserve })
 
 function run(s, op, a) {
+  S = s
   switch (op) {
     case 'facts': return { hyperv: true, logicalCpus: 16, memoryMB: 65536, folders: (a.folders || []).map(folder => ({ folder, freeGB: s.freeGB ?? 500 })), defaultSwitch: !s.noDefaultSwitch }
     case 'guest-activate': {
@@ -220,6 +231,8 @@ function run(s, op, a) {
       vm.state = 'Off'
       vm.parent = cp.id
       vm.switchName = null
+      vm.acls = s.aclsStay ? vm.acls : [] // MC-1556: after the disconnect
+      vm.guestNet = null
       vm.reserve = 0
       vm.disk = { ...cp.disk }
       vm.loggedOn = null; vm.watcher = false; vm.elevated = false
@@ -233,12 +246,17 @@ function run(s, op, a) {
       if (s.configureEntered) fs.writeFileSync(s.configureEntered, 'entered')
       if (s.configureGate) while (!fs.existsSync(s.configureGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25)
       if (vm.state !== 'Off') throw new Error('the VM is not Off after its restore')
-      if (a.switchName) {
+      if (a.kind === 'host') {
         const sw = s.switches[a.switchName]
-        if (!a.switchId) throw new Error(`no recorded id for switch ${a.switchName}`)
         if (!sw || sw.id !== a.switchId || sw.type !== 'Internal') throw new Error(`switch ${a.switchName} (id ${a.switchId}) is missing, renamed or not internal`)
+        if (!(vm.acls || []).length) throw new Error('its port ACLs are missing: not connected')
         vm.switchName = a.switchName
+      } else if (a.kind === 'default') {
+        if (s.noDefaultSwitch) throw new Error('this host has no Default Switch')
+        if (!(vm.acls || []).length) throw new Error('its port ACLs are missing: not connected')
+        vm.switchName = 'Default Switch'
       } else vm.switchName = null // MC-1529: network off is disconnected, whatever a restored checkpoint's adapter said
+      if (s.crashAfterConnect) { delete s.crashAfterConnect; throw new Error('injected: the call died after connecting') }
       vm.reserve = a.reserve
       vm.state = 'Running'
       vm.boot = (vm.boot || 0) + 1
@@ -275,7 +293,7 @@ function run(s, op, a) {
       // productionCallDies: the call itself fails (transport, a killed process): the outcome is unknown.
       if (s.productionCallDies) { vm.checkpointType = orig; throw new Error('injected: the take call died') }
       const id = crypto.randomUUID()
-      const cp = { id, name: a.snapName, parentId: vm.parent, disk: { ...vm.disk }, switchName: vm.switchName, reserve: vm.reserve, production: true }
+      const cp = { id, name: a.snapName, parentId: vm.parent, disk: { ...vm.disk }, switchName: vm.switchName, acls: vm.acls || [], reserve: vm.reserve, production: true }
       if (s.productionFailDelayed) { vm.delayedTake = { cp, listings: 0 }; vm.checkpointType = orig; throw new Error('injected: the take call failed; Hyper-V finishes it later') }
       vm.checkpoints.push(cp)
       vm.parent = id
@@ -308,6 +326,7 @@ function run(s, op, a) {
       vm.parent = cp.id
       vm.disk = { ...cp.disk }
       vm.switchName = cp.switchName ?? null // the checkpoint's own configuration, until the start reapplies the lease's
+      vm.acls = cp.acls || []
       vm.reserve = cp.reserve ?? 0
       vm.loggedOn = null; vm.watcher = false; vm.elevated = false
       return { ...facts(vm), parentCheckpointId: before, restore: { ok: true, phase: 'restored', timedOut: false, last: 'Off', waitedMs: 0 } }
@@ -325,7 +344,40 @@ function run(s, op, a) {
     }
     // MC-1532: a pool checkpoint's steps. Knobs: disconnectFails (the adapter stays connected), shutdownFails (the guest
     // stays Running), poolTakeFail (Hyper-V's terminal failure), poolTakeEntered + poolTakeGate (held before the take).
-    case 'net-disconnect': { const vm = own(s, a); if (!s.disconnectFails) vm.switchName = null; return facts(vm) }
+    case 'net-disconnect': { const vm = own(s, a); if (!s.disconnectFails) { vm.switchName = null; vm.acls = [] } return facts(vm) }
+    case 'net-prepare': {
+      const vm = own(s, a)
+      if (vm.state !== 'Off') throw new Error('the VM is not Off')
+      if (!s.prepareStaysConnected) vm.switchName = null
+      vm.acls = []
+      const want = (a.acls || []).map(x => ({ action: x.action, remote: x.remote }))
+      vm.acls = s.aclsDrop ? want.slice(0, Math.max(0, want.length - s.aclsDrop)) : want
+      if (s.crashAfterAcls) { delete s.crashAfterAcls; throw new Error('injected: the call died after the ACLs') }
+      return facts(vm)
+    }
+    case 'net-host': {
+      const h = s.hostNet
+      const sw = h && Object.entries(s.switches).find(([, x]) => x.id === a.switchId)
+      return {
+        switch: sw ? { id: sw[1].id, name: sw[0], type: sw[1].type } : null,
+        hostAddrs: sw ? [{ ip: h.hostAddress, prefix: 24 }] : [],
+        others: [{ alias: 'Ethernet', ip: '192.168.1.20', prefix: 24 }, ...(s.hostClash ? [s.hostClash] : [])],
+        routes: [{ alias: 'Ethernet', prefix: '0.0.0.0/0', ours: false }, { alias: 'Ethernet', prefix: '192.168.1.0/24', ours: false }],
+        ...(s.hostRead || {})
+      }
+    }
+    case 'net-default': return s.noDefaultSwitch ? { present: false, ip: null, prefix: null } : { present: true, ...stubNet.dflt(s), ...(s.defaultRead || {}) }
+    case 'guest-net': {
+      const vm = own(s, a)
+      if (vm.state !== 'Running') throw new Error('the VM is not running')
+      stubNet.setGuestNet(s, vm, a.mode, a.address)
+      return a.mode === 'none' ? { reset: true } : { set: true }
+    }
+    case 'guest-net-read': {
+      const vm = own(s, a)
+      if (vm.state !== 'Running') throw new Error('the VM is not running')
+      return stubNet.readGuestNet(s, vm, a.lookup)
+    }
     case 'guest-shutdown': { const vm = own(s, a); if (!s.shutdownFails) { vm.state = 'Off'; vm.loggedOn = null; vm.watcher = false } return facts(vm) }
     case 'pool-take': {
       const vm = own(s, a)

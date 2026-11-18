@@ -74,13 +74,80 @@ function RestoreIo($vm, $cp) {
 function Facts($vm) {
   $vm = Get-VM -Id $vm.Id
   $nic = @(Get-VMNetworkAdapter -VM $vm)
-  $sw = ($nic | Where-Object { $_.SwitchName } | Select-Object -First 1).SwitchName
+  $on = $nic | Where-Object { $_.SwitchName } | Select-Object -First 1
+  $mac = [string]($nic | Select-Object -First 1).MacAddress
   return @{
     vmId = $vm.Id.ToString(); state = $vm.State.ToString()
     parentCheckpointId = if ($vm.ParentCheckpointId) { $vm.ParentCheckpointId.ToString() } else { $null }
     checkpointIds = @(Get-VMSnapshot -VM $vm | ForEach-Object { $_.Id.ToString() })
-    switchName = if ($sw) { $sw } else { $null }
+    switchName = if ($on) { [string]$on.SwitchName } else { $null }
+    switchId = if ($on -and $on.SwitchId) { ([string]$on.SwitchId).ToLower() } else { $null }
+    mac = if ($mac -and $mac -ne '000000000000') { $mac } else { $null } # MC-1556: dynamic until the VM first runs
+    acls = @(Read-Acls $vm)
     reserve = [int](Get-VMProcessor -VM $vm).Reserve
+  }
+}
+
+# MC-1556: the VM's port ACLs (simple ACLs by remote address), read and cleared. Each entry is one direction.
+function Read-Acls($vm) {
+  @(Get-VMNetworkAdapterAcl -VM $vm -ErrorAction SilentlyContinue | ForEach-Object {
+    @{ action = [string]$_.Action; direction = [string]$_.Direction; remote = [string]$_.RemoteAddress }
+  })
+}
+function Clear-Acls($vm) {
+  foreach ($e in @(Get-VMNetworkAdapterAcl -VM $vm -ErrorAction SilentlyContinue)) {
+    Remove-VMNetworkAdapterAcl -VM $vm -Action $e.Action -Direction $e.Direction -RemoteIPAddress ([string]$e.RemoteAddress)
+  }
+}
+# MC-1556: the host's vEthernet adapter for a switch (by the switch's id), as a NetAdapter, or $null.
+function Host-Adapter($switchId) {
+  $m = Get-VMNetworkAdapter -ManagementOS -ErrorAction SilentlyContinue | Where-Object { ([string]$_.SwitchId).ToLower() -eq ([string]$switchId).ToLower() } | Select-Object -First 1
+  if (-not $m) { return $null }
+  Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object { ($_.MacAddress -replace '-', '') -eq [string]$m.MacAddress } | Select-Object -First 1
+}
+
+# MC-1556: a Windows guest's network, set (PowerShell Direct) for a mode: host (a static address on the NIC with the
+# VM's MAC, no DHCP, no gateway, no DNS), internet (DHCP), or none (every adapter back to DHCP, manual addresses
+# removed: a pool checkpoint's reset). Read back separately (guest-net-read).
+$GuestNet = {
+  param([string]$mode, [string]$mac, [string]$address)
+  $ErrorActionPreference = 'Stop'
+  $nics = if ($mode -eq 'none') { @(Get-NetAdapter) } else { @(Get-NetAdapter | Where-Object { ($_.MacAddress -replace '-', '') -eq $mac }) }
+  if ($mode -ne 'none' -and $nics.Count -ne 1) { throw "no single adapter with MAC $mac in the guest" }
+  foreach ($n in $nics) {
+    $i = $n.ifIndex
+    if ($mode -eq 'host') {
+      Set-NetIPInterface -InterfaceIndex $i -AddressFamily IPv4 -Dhcp Disabled -RouterDiscovery Disabled
+      Get-NetIPAddress -InterfaceIndex $i -AddressFamily IPv4 -ErrorAction SilentlyContinue | Remove-NetIPAddress -Confirm:$false
+      Get-NetRoute -InterfaceIndex $i -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Remove-NetRoute -Confirm:$false
+      New-NetIPAddress -InterfaceIndex $i -IPAddress $address -PrefixLength 24 | Out-Null
+      Set-DnsClientServerAddress -InterfaceIndex $i -ResetServerAddresses
+    } else {
+      Get-NetIPAddress -InterfaceIndex $i -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.PrefixOrigin -eq 'Manual' } | Remove-NetIPAddress -Confirm:$false
+      Get-NetRoute -InterfaceIndex $i -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object { $_.Protocol -eq 'NetMgmt' } | Remove-NetRoute -Confirm:$false
+      Set-NetIPInterface -InterfaceIndex $i -AddressFamily IPv4 -Dhcp Enabled -RouterDiscovery Enabled
+      Set-DnsClientServerAddress -InterfaceIndex $i -ResetServerAddresses
+    }
+  }
+  if ($mode -eq 'none') {
+    $left = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.PrefixOrigin -eq 'Manual' -and $_.InterfaceAlias -notlike 'Loopback*' })
+    $static = @(Get-NetIPInterface -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -notlike 'Loopback*' -and $_.Dhcp -ne 'Enabled' })
+    if ($left.Count -or $static.Count) { throw 'its network settings could not be confirmed back to DHCP' }
+    return @{ reset = $true }
+  }
+  @{ set = $true }
+}
+$GuestNetRead = {
+  param([bool]$lookup)
+  $nics = @(Get-NetAdapter)
+  $idx = @($nics | ForEach-Object { $_.ifIndex })
+  @{
+    nics = @($nics | ForEach-Object { $n = $_; @{ name = [string]$n.Name; mac = ($n.MacAddress -replace '-', ''); ipv4 = @(Get-NetIPAddress -InterfaceIndex $n.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object { @{ ip = [string]$_.IPAddress; prefix = [int]$_.PrefixLength } }) } })
+    routes = @(Get-NetRoute -ErrorAction SilentlyContinue | Where-Object { $idx -contains $_.ifIndex -and ($_.AddressFamily -eq 'IPv4' -or $_.DestinationPrefix -eq '::/0') } | ForEach-Object {
+      @{ dest = [string]$_.DestinationPrefix; gateway = $(if ($_.NextHop -in '0.0.0.0', '::') { $null } else { [string]$_.NextHop }) }
+    })
+    dns = @($nics | ForEach-Object { (Get-DnsClientServerAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses } | Where-Object { $_ })
+    lookup = $(if ($lookup) { try { [bool](Resolve-DnsName -Name 'dns.msftncsi.com' -Type A -DnsOnly -QuickTimeout -ErrorAction Stop) } catch { $false } } else { $null })
   }
 }
 
@@ -881,6 +948,8 @@ try {
       $cp = Get-VMSnapshot -VM $vm | Where-Object { $_.Id.ToString() -eq [string]$a.checkpointId }
       if (-not $cp) { throw "its $(if ($a.label) { [string]$a.label } else { 'clean' }) checkpoint (by id) is missing" }
       $r = & $RestoreTo $cp.Id.ToString() (RestoreIo $vm $cp)
+      # MC-1556: an Off VM's adapter disconnected, then its port ACLs removed (in that order); both read back in Facts.
+      if ((Get-VM -Id $vm.Id).State -eq 'Off') { Get-VMNetworkAdapter -VM $vm | Disconnect-VMNetworkAdapter; Clear-Acls $vm }
       $f = Facts $vm
       $f.restore = $r
       $f
@@ -928,7 +997,53 @@ try {
     'net-disconnect' {
       $vm = Get-OwnVm $a
       Get-VMNetworkAdapter -VM $vm | Disconnect-VMNetworkAdapter
+      Clear-Acls $vm # MC-1556: after the disconnect, never before
       Facts $vm
+    }
+    # MC-1556: a start's network, fail-closed. net-prepare (the VM Off): the adapter disconnected, every port ACL
+    # removed, then the mode's set added; the helper checks the read-back before configure-start connects anything.
+    'net-prepare' {
+      $vm = Get-OwnVm $a
+      if ($vm.State -ne 'Off') { throw 'the VM is not Off' }
+      Get-VMNetworkAdapter -VM $vm | Disconnect-VMNetworkAdapter
+      Clear-Acls $vm
+      foreach ($x in @($a.acls)) {
+        if ([string]$x.action -notin 'Allow', 'Deny' -or [string]$x.remote -notmatch '^[0-9a-fA-F:.]+/\d{1,3}$') { throw 'a bad port ACL' }
+        Add-VMNetworkAdapterAcl -VM $vm -RemoteIPAddress ([string]$x.remote) -Direction Both -Action ([string]$x.action)
+      }
+      Facts $vm
+    }
+    # MC-1556: host mode's switch (setup's, by id) and what the host has on and beside it, read only.
+    'net-host' {
+      $sw = Get-VMSwitch -Id ([guid]$a.switchId) -ErrorAction SilentlyContinue
+      $if = if ($sw) { Host-Adapter $sw.Id } else { $null }
+      $ix = if ($if) { $if.ifIndex } else { -1 }
+      @{
+        switch = if ($sw) { @{ id = $sw.Id.ToString(); name = [string]$sw.Name; type = [string]$sw.SwitchType } } else { $null }
+        hostAddrs = @(if ($if) { Get-NetIPAddress -InterfaceIndex $ix -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object { @{ ip = [string]$_.IPAddress; prefix = [int]$_.PrefixLength } } })
+        others = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.InterfaceIndex -ne $ix } | ForEach-Object { @{ alias = [string]$_.InterfaceAlias; ip = [string]$_.IPAddress; prefix = [int]$_.PrefixLength } })
+        routes = @(Get-NetRoute -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.ifIndex -ne $ix } | ForEach-Object { @{ alias = [string]$_.InterfaceAlias; prefix = [string]$_.DestinationPrefix; ours = $false } })
+      }
+    }
+    # MC-1556: the Default Switch's host address (its gateway for guests) and prefix, read only.
+    'net-default' {
+      $sw = Get-VMSwitch -Id $DEFAULT_SWITCH -ErrorAction SilentlyContinue
+      $if = if ($sw) { Host-Adapter $sw.Id } else { $null }
+      $ip = if ($if) { Get-NetIPAddress -InterfaceIndex $if.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.IPAddress -notlike '169.254.*' } | Select-Object -First 1 } else { $null }
+      @{ present = [bool]$sw; ip = if ($ip) { [string]$ip.IPAddress } else { $null }; prefix = if ($ip) { [int]$ip.PrefixLength } else { $null } }
+    }
+    'guest-net' {
+      $vm = Get-OwnVm $a
+      if ($vm.State -ne 'Running') { throw 'the VM is not running' }
+      if ([string]$a.mode -notin 'none', 'host', 'internet') { throw 'a bad network mode' }
+      if ($a.mode -ne 'none' -and [string]$a.mac -notmatch '^[0-9A-Fa-f]{12}$') { throw 'a bad MAC address' }
+      if ($a.mode -eq 'host' -and [string]$a.address -notmatch '^\d{1,3}(\.\d{1,3}){3}$') { throw 'a bad address' }
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestNet -ArgumentList ([string]$a.mode), ([string]$a.mac).ToUpper(), ([string]$a.address)
+    }
+    'guest-net-read' {
+      $vm = Get-OwnVm $a
+      if ($vm.State -ne 'Running') { throw 'the VM is not running' }
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestNetRead -ArgumentList ([bool]$a.lookup)
     }
     'guest-shutdown' {
       $vm = Get-OwnVm $a
@@ -966,11 +1081,17 @@ try {
     'configure-start' {
       $vm = Get-OwnVm $a
       if ($vm.State -ne 'Off') { throw 'the VM is not Off after its restore' }
-      if ($a.switchName) {
-        # The pool's switch by its journalled id, never by name alone.
-        if (-not $a.switchId) { throw "no recorded id for switch $($a.switchName)" }
+      # MC-1556: after net-prepare (the ACLs read back by the helper). A connected mode connects by switch id only: host
+      # mode to setup's internal switch (its id and name both), internet modes to Windows' Default Switch.
+      if ($a.kind -eq 'host') {
         $sw = Get-VMSwitch -Id ([guid]$a.switchId) -ErrorAction SilentlyContinue
         if (-not $sw -or $sw.Name -cne [string]$a.switchName -or $sw.SwitchType -ne 'Internal') { throw "switch $($a.switchName) (id $($a.switchId)) is missing, renamed or not internal" }
+      } elseif ($a.kind -eq 'default') {
+        $sw = Get-VMSwitch -Id $DEFAULT_SWITCH -ErrorAction SilentlyContinue
+        if (-not $sw) { throw 'this host has no Default Switch' }
+      } elseif ($a.kind) { throw 'a bad network kind' } else { $sw = $null }
+      if ($sw) {
+        if (-not @(Get-VMNetworkAdapterAcl -VM $vm -ErrorAction SilentlyContinue).Count) { throw 'its port ACLs are missing: not connected' }
         Get-VMNetworkAdapter -VM $vm | Connect-VMNetworkAdapter -VMSwitch $sw
       } else {
         # MC-1529: network off means disconnected, whatever the restored checkpoint's adapter said.

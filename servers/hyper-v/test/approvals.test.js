@@ -184,7 +184,7 @@ function quiesceApproval(sc, over = {}) {
 
 test('uninstall -RemovePool end to end: quiesce (remove-pool) → plan → approve → remove; only that remove is allowed', async t => {
   const sc = scratch('uninstall-remove')
-  const { h, admin } = await withPool(sc, 2, { network: true })
+  const { h, admin } = await withPool(sc, 2, { network: 'host' })
   t.after(() => h.stop())
   const a = h.conn(10)
   await a.request('acquire')
@@ -198,8 +198,8 @@ test('uninstall -RemovePool end to end: quiesce (remove-pool) → plan → appro
   await admin.request('pool_remove', { planId: p })
   await waitFor(async () => /Last pool job: remove finished/.test((await admin.request('status')).text))
   assert.deepStrictEqual(Object.keys(sc.stub().vms), [])
-  assert.deepStrictEqual(sc.stub().switches, {})
-  assert.match((await admin.request('status')).text, /Pool: no VMs; switch: none/)
+  assert.deepStrictEqual(Object.keys(sc.stub().switches), ['hvmcp-host'], 'setup\'s switch is setup\'s: uninstall.ps1 removes it, not a pool remove')
+  assert.match((await admin.request('status')).text, /Pool: no VMs; network none/)
 })
 
 test('uninstall -RemovePool interrupted mid-remove, then run again: recovery finishes it, and a new quiesce works', async t => {

@@ -38,6 +38,9 @@ function readState(file) {
 }
 
 let seq = 0
+// MC-1556: setup's host-mode switch, as setup records it in policy.json and as the stub's Hyper-V has it.
+const HOST_SWITCH_ID = '5e7a1c2b-0d3e-4f5a-8b6c-7d8e9f0a1b2c'
+const HOST_NETWORK = { switchId: HOST_SWITCH_ID, switchName: 'hvmcp-host', subnet: '10.137.42.0/24', hostAddress: '10.137.42.1' }
 /** A fresh folder: state (policy.json), disks, a fake profile and builds, and the stub's state. */
 function scratch(name, { policy = {}, stub = {} } = {}) {
   const dir = path.join(BASE, `${process.pid}-${++seq}-${name}`)
@@ -50,10 +53,10 @@ function scratch(name, { policy = {}, stub = {} } = {}) {
   const disks = path.join(dir, 'disks')
   fs.writeFileSync(path.join(dir, 'state/policy.json'), JSON.stringify({
     schema: 1, prefix: 'hvmcp', maxVms: 3, maxCoresPerVm: 4, maxMemoryMBTotal: 24576, maxDiskGBPerVm: 128, diskFolders: [disks],
-    allowNetwork: true, maxReservePercent: 50, maxLeaseMinutes: 240, maxBuildMB: 64, allowUnpinnedIso: false, ...policy
+    maxNetwork: 'internet-lan', hostNetwork: HOST_NETWORK, maxReservePercent: 50, maxLeaseMinutes: 240, maxBuildMB: 64, allowUnpinnedIso: false, ...policy
   }))
   const state = path.join(dir, 'stub.json')
-  fs.writeFileSync(state, JSON.stringify(stub))
+  fs.writeFileSync(state, JSON.stringify({ switches: { 'hvmcp-host': { id: HOST_SWITCH_ID, type: 'Internal', notes: 'hvmcp:host:' + 'ab'.repeat(16) } }, hostNet: HOST_NETWORK, ...stub }))
   return {
     dir,
     stateDir: path.join(dir, 'state'),
@@ -81,6 +84,8 @@ function scratch(name, { policy = {}, stub = {} } = {}) {
       HYPERV_MCP_INSTALL_WAIT_MS: '3000',
       HYPERV_MCP_LOGON_STABLE_MS: '30',
       HYPERV_MCP_RETRY_MS: '600000',
+      HYPERV_MCP_NET_STABLE_MS: '30',
+      HYPERV_MCP_NET_WAIT_MS: '3000',
       HYPERV_MCP_CRASH_AT: ''
     },
     stub: () => JSON.parse(readState(state)),
@@ -198,4 +203,4 @@ async function withPool(sc, n = 2, planArgs = {}) {
   return { h, admin }
 }
 
-module.exports = { scratch, startHelper, approve, seedImage, waitFor, withPool, STUB, SSH_STUB, HELPER, SERVER, BASE }
+module.exports = { HOST_NETWORK, scratch, startHelper, approve, seedImage, waitFor, withPool, STUB, SSH_STUB, HELPER, SERVER, BASE }
