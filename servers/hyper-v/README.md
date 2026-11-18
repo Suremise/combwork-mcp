@@ -1081,7 +1081,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\restorewait.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js test\linux-image.test.js test\linux-guest-files.test.js test\linux.test.js test\linux-ps.test.js test\bridge.test.js test\network.test.js test\uninstall.test.js test\timing.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\restorewait.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js test\linux-image.test.js test\linux-guest-files.test.js test\linux.test.js test\linux-ps.test.js test\bridge.test.js test\network.test.js test\guestnet.test.js test\uninstall.test.js test\timing.test.js
 ```
 
 - `units.test.js`:
@@ -1338,6 +1338,14 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
     host check fails, or the guest's network never settles (restored to clean, disconnected);
   - crashes after the ACLs, the connect and the guest's network, and a call dying between connect and start: the next
     helper restores the VM disconnected with no ACLs; leftover ACLs at a release quarantine the VM.
+- `guestnet.test.js` (MC-1563): hv.ps1's own `$GuestNet` (a Windows guest's network for a mode) run with Windows
+  PowerShell 5.1 against stub network cmdlets that return real CimInstances:
+  - host and internet set exactly the one adapter with the VM's MAC, also among other adapters;
+  - none or two adapters with that MAC are refused with nothing changed;
+  - none resets to DHCP.
+
+  Every network cmdlet name in the block is renamed to a stub before it runs, and the test refuses to run on one it
+  doesn't stub, so nothing reaches the PC's real network settings.
 - `timing.test.js` (MC-1558): the timings' defaults, floors, caps and derived call bounds; an invalid `timingCaps`
   refusing the start; values per connection, kept by a lease through its cleanup after a disconnect and by a pool job,
   defaults for recovery, the queue place's, what server.js sends; the restore call holding the off-wait; a Windows copy

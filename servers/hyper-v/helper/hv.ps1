@@ -112,7 +112,9 @@ function Host-Adapter($switchId) {
 $GuestNet = {
   param([string]$mode, [string]$mac, [string]$address)
   $ErrorActionPreference = 'Stop'
-  $nics = if ($mode -eq 'none') { @(Get-NetAdapter) } else { @(Get-NetAdapter | Where-Object { ($_.MacAddress -replace '-', '') -eq $mac }) }
+  # MC-1563: @() around the whole if: an if-expression unrolls a one-element array to the single CimInstance, whose
+  # .Count is $null in PowerShell 5.1, so the check below refused every connected start of a Windows guest.
+  $nics = @(if ($mode -eq 'none') { Get-NetAdapter } else { Get-NetAdapter | Where-Object { ($_.MacAddress -replace '-', '') -eq $mac } })
   if ($mode -ne 'none' -and $nics.Count -ne 1) { throw "no single adapter with MAC $mac in the guest" }
   foreach ($n in $nics) {
     $i = $n.ifIndex
