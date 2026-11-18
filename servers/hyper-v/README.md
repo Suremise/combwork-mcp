@@ -1081,7 +1081,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\restorewait.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js test\linux-image.test.js test\linux-guest-files.test.js test\linux.test.js test\linux-ps.test.js test\bridge.test.js test\network.test.js test\guestnet.test.js test\uninstall.test.js test\timing.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\restorewait.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js test\linux-image.test.js test\linux-guest-files.test.js test\linux.test.js test\linux-ps.test.js test\bridge.test.js test\network.test.js test\guestnet.test.js test\uninstall.test.js test\timing.test.js test\nested-proof.test.js
 ```
 
 - `units.test.js`:
@@ -1390,6 +1390,146 @@ ISO, then:
 Test scratch goes to `HYPERV_TEST_SCRATCH` (default `%LOCALAPPDATA%\combwork-mcp-tests\hyperv-mcp-tests`), never the
 repo, and `npm test` clears earlier runs' folders first.
 
+- `nested-proof.test.js` (MC-1559): the nested live proof's driver, offline, with a fake outer VM:
+  - the identity guard before every remote change and the cleanup, a mismatch stopping the run; the cleanup read back,
+    never claimed when unverified; pool VM names in the helper's real format;
+  - pinned SSH;
+  - the exact ACL sets;
+  - bounded, validated probes;
+  - verdicts: a negative passes only with its positive controls, else it is unclaimed;
+  - the 18081 firewall check;
+  - the refusals;
+  - every PowerShell script it sends, parsed by Windows PowerShell's parser.
+
+### Live proof in a nested VM
+
+`test\live\nested-proof.js` proves the merged code on a real Hyper-V host **without touching this PC's installed
+helper or pool** (MC-1559; MC-1560 and MC-1561 reuse it). It runs inside one hand-made VM, `hvnest-proof`, with nested
+virtualization: setup, the service, approvals, pools, the network modes and (later) the uninstaller, all inside that
+VM.
+
+**What it proves:** the merged code, end to end, on an isolated Windows host that is slower than this PC.
+**What it doesn't prove:** this PC's own installed service after an upgrade, which gets a short check at the upgrade.
+
+**Pool VMs can't be used.** The tools can't expose virtualization extensions on them, and a lease restores them to
+clean. A separate VM also has its own lifetime and leaves the pool alone.
+
+**Who runs what.** The user runs every host line in an admin Windows PowerShell 5.1, and every in-VM line in the VM's
+console. The driver runs on the host as the user, with no admin rights. It only uses `ssh` and `scp` to the VM, and
+never acts on this PC's Hyper-V.
+
+**Before each change** (deploy, setup, each approval, each pool change, the listeners, the firewall rule, the matrix),
+it checks the target is the VM:
+- the guest's BIOS GUID equals the one in `C:\hvnest-proof\identity.txt` on the host (written by H1);
+- the guest's marker holds the same GUID, and the token the user copied from V1;
+- the model is `Virtual Machine` and the name is `HVNEST-PROOF`.
+
+SSH only accepts the host key pinned from V2's output (`StrictHostKeyChecking=yes`, its own `known_hosts`). Logs go to
+`%USERPROFILE%\hvnest-proof-logs\<run>\` as each call returns. They hold the target's identity, the commit, and each
+command with its exit code and output, outside every folder the uninstaller removes.
+
+**Resources:**
+- the outer VM: 6 vCPUs, 16 GB static memory, a 200 GB dynamic disk in `C:\hvnest-proof`;
+- inside it, one Windows VM (2 vCPUs, 4 GB, 64 GB) and one Debian VM (2 vCPUs, 2 GB, 64 GB).
+
+H1 refuses with under 20 GB of host memory free. Start it when the pool is quiet; don't shrink the pool for it.
+
+**H1, create the VM** (one line; set `$iso` to the Windows 11 Enterprise evaluation ISO). Every check runs first and
+stops it, nothing created, if it fails. The VM's id goes into `identity.txt` right after `New-VM`.
+```
+$ErrorActionPreference='Stop'; $iso='<ISO>'; $d='C:\hvnest-proof'; $o=Get-CimInstance Win32_OperatingSystem; if ([int]$o.BuildNumber -lt 22621) { throw "host build $($o.BuildNumber) < 22621: nothing created" }; if ($o.FreePhysicalMemory/1MB -lt 20) { throw ("only {0:N1} GB free (need 20): nothing created" -f ($o.FreePhysicalMemory/1MB)) }; $ver=(Get-VMHostSupportedVersion -Default).Version; if ($ver -lt [version]'9.3') { throw "VM configuration version $ver < 9.3: nothing created" }; if (-not (Get-VMSwitch -Name 'Default Switch' -ErrorAction SilentlyContinue)) { throw 'no Default Switch: nothing created' }; if (Get-VM -Name hvnest-proof -ErrorAction SilentlyContinue) { throw 'a VM named hvnest-proof exists: nothing created' }; if (Test-Path -LiteralPath $d) { throw "$d exists: nothing created" }; if (-not (Test-Path -LiteralPath $iso -PathType Leaf)) { throw "no ISO at ${iso}: nothing created" }; if ((Get-PSDrive C).Free -lt 250GB) { throw 'under 250 GB free on C: nothing created' }; New-Item -ItemType Directory $d | Out-Null; $vm=New-VM -Name hvnest-proof -Generation 2 -Version $ver -MemoryStartupBytes 16GB -NewVHDPath "$d\hvnest-proof.vhdx" -NewVHDSizeBytes 200GB -Path $d -SwitchName 'Default Switch'; "vmId=$($vm.Id)`nfolder=$d" | Set-Content "$d\identity.txt"; Set-VM -VM $vm -ProcessorCount 6 -StaticMemory -AutomaticCheckpointsEnabled $false; Set-VMProcessor -VM $vm -ExposeVirtualizationExtensions $true; Set-VMKeyProtector -VM $vm -NewLocalKeyProtector; Enable-VMTPM -VM $vm; $dvd=Add-VMDvdDrive -VM $vm -Path $iso -Passthru; Set-VMFirmware -VM $vm -FirstBootDevice $dvd -EnableSecureBoot On -SecureBootTemplate MicrosoftWindows; $bios=(Get-CimInstance -Namespace root\virtualization\v2 -ClassName Msvm_VirtualSystemSettingData -Filter "VirtualSystemIdentifier='$($vm.Id)' AND VirtualSystemType='Microsoft:Hyper-V:System:Realized'").BIOSGUID.Trim('{}').ToLower(); Add-Content "$d\identity.txt" "biosGuid=$bios"; Get-Content "$d\identity.txt"; Start-VM $vm
+```
+**If H1 stops part-way:**
+- `identity.txt` has a `vmId=` line: run H9a to see what exists, then H9b and H9c.
+- It doesn't: run `Get-ChildItem -LiteralPath C:\hvnest-proof -Force` and `Get-VM -Name hvnest-proof` and stop there.
+  Clean up by hand only what they show. Nothing here widens a deletion to fit.
+
+**H2, install Windows** over the VM's console:
+- a local admin account `proofadmin` ("Domain join instead");
+- then a standard account `proofuser`, signed in once so its profile exists.
+
+**V1** (in the VM, admin Windows PowerShell): renames it, turns on Hyper-V and OpenSSH, writes the marker, restarts.
+```
+$ErrorActionPreference='Stop'; Rename-Computer -NewName hvnest-proof; Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V -All -NoRestart; Add-WindowsCapability -Online -Name OpenSSH.Server~~~~0.0.1.0; Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0; Set-Service sshd -StartupType Automatic; New-Item -ItemType Directory C:\ProgramData\hvnest-proof -Force | Out-Null; @{ biosGuid=(Get-CimInstance Win32_ComputerSystemProduct).UUID.Trim('{}').ToLower(); token=[guid]::NewGuid().Guid } | ConvertTo-Json | Set-Content C:\ProgramData\hvnest-proof\identity.json; Get-Content C:\ProgramData\hvnest-proof\identity.json; Restart-Computer
+```
+**Keys, on the host (no admin):** `node test\live\nested-proof.js keys` makes one key per account in
+`%USERPROFILE%\.ssh\hvnest-proof\` and prints their public halves for V2.
+
+**V2** (after the restart; the two public keys pasted in): adds the keys and starts sshd. It prints the marker and the
+host key: copy them back.
+```
+$ErrorActionPreference='Stop'; if ($env:COMPUTERNAME -ne 'HVNEST-PROOF') { throw 'not renamed: rerun V1' }; Set-Content C:\ProgramData\ssh\administrators_authorized_keys '<key-admin>'; icacls C:\ProgramData\ssh\administrators_authorized_keys /inheritance:r /grant 'Administrators:F' /grant 'SYSTEM:F'; $p='C:\Users\proofuser\.ssh'; New-Item -ItemType Directory $p -Force | Out-Null; Set-Content "$p\authorized_keys" '<key-user>'; icacls "$p\authorized_keys" /inheritance:r /grant 'proofuser:F' /grant 'SYSTEM:F'; Start-Service sshd; Get-NetFirewallRule -Name OpenSSH-Server-In-TCP | Select Enabled,Profile; Get-Content C:\ProgramData\hvnest-proof\identity.json; Get-Content C:\ProgramData\ssh\ssh_host_ed25519_key.pub
+```
+**Then, on the host:**
+1. `nested-proof.js pin "<the host key line>"`.
+2. Write `%USERPROFILE%\.ssh\hvnest-proof\proof.json`:
+   ```
+   { "address": "hvnest-proof.mshome.net", "token": "<V1's token>", "lan": { "ip": "192.168.1.1", "port": 80 } }
+   ```
+   The address is the Default Switch's name for the VM, or its IP from the console. The LAN endpoint is one the user
+   agrees on; it must answer from the VM itself.
+
+**Inside the VM, with the user's permission for that VM only**, the driver runs these in order:
+- `preflight` (read-only: elevation, Hyper-V, the Default Switch, a clash with 10.137.42.0/24, node, free space);
+- `install-node <node-vX.Y.Z-x64.msi>` (downloaded from nodejs.org on the host; installed only if Authenticode-valid
+  and signed by the OpenJS Foundation) and `upload <the Windows ISO>`, each checked by SHA-256;
+- `deploy` (a `git archive` of a commit, checked by SHA-256);
+- `setup --max-network InternetLan`;
+- `call pool_plan ...` with `approve <plan>`, which types the digest approve.ps1 shows; then `call pool_create ...`
+  for one Windows VM and one Debian VM, at pool network `internet-lan`. If approve.ps1 can't read the digest over SSH,
+  or the user prefers it, the user runs the approve line in the VM's console instead;
+- `matrix`;
+- `refusal ...`;
+- `cleanup`.
+
+**The matrix:**
+- **Listeners:** the driver starts node listeners (`nested-listener.js`) on the VM's host-mode address, ports 18080
+  and 18081, and records each pid and start time. It starts them through WMI (`Win32_Process.Create`), because
+  Windows' sshd kills a session's processes when the session ends. A later session then confirms the listener still
+  runs and listens on both ports, and the VM reaches both itself; otherwise the run stops before any guest. It adds the
+  one firewall rule, for 18080, in the VM. Afterwards it
+  checks the VM's identity again, stops the listeners (only that pid with that start time) and removes the rule by its
+  exact name, then reads both back. If the identity can't be confirmed, or the readback still shows either, it changes
+  nothing more, says **CLEANUP NOT VERIFIED** with the lines to remove them by hand, and exits non-zero. `cleanup` on
+  its own does the same.
+- **Controls:** the VM's own reach (both listeners locally, the LAN endpoint, 1.1.1.1:443 and an HTTPS page) is every
+  target's positive control.
+- **Probes:** each guest probes in each mode, with bounded probes:
+  - Windows: `TcpClient.ConnectAsync(...).Wait(5000)` and `Invoke-WebRequest -TimeoutSec 15`;
+  - Debian: `timeout 5 bash -c '</dev/tcp/...'` and python3 `urlopen(timeout=15)`.
+
+  Each records its destination address and result. An HTTPS probe tries twice, recording both attempts: a reach on
+  either counts, and a block needs both to fail.
+- **Verdicts:**
+  - A positive row that missed while the VM itself couldn't reach that target is unclaimed, not failed.
+  - A negative row passes only when its probe failed, the VM itself reached the target, and the same guest reached
+    it in its control mode (host for 18080; internet-lan for the LAN, internet and HTTPS).
+  - 18081's control is the VM's own connection. An allow rule that could cover 18081, or a profile that doesn't
+    block, leaves its rows unclaimed.
+  - IPv6 is always unclaimed (no working control here): the Deny ::/0 rules are recorded.
+  - A row is never passed on a guess.
+- **ACLs:** `Get-VMNetworkAdapterAcl` reads back the exact set for each mode, and none, disconnected, after `vm_stop`
+  and after `vm_release`.
+- **Refusals:** `refusal <os> <mode> pool|policy` passes only when the run is refused for that cap.
+
+Results go to `results.md` and `results.json` beside the log.
+
+**At the end** (host, admin), H9a to H9c, each run separately:
+- **H9a**, read-only, shows what will go:
+  ```
+  $id=(Select-String -LiteralPath C:\hvnest-proof\identity.txt -Pattern '^vmId=').Line.Substring(5); $vm=Get-VM -Id $id; $vm | Select Name,Id,State,Path,ConfigurationLocation; Get-VMHardDiskDrive -VM $vm | Select Path; Get-ChildItem -LiteralPath C:\hvnest-proof -Recurse -Force | Select FullName,Length
+  ```
+- **H9b** removes the VM by id, only if its name, folder and disks are where H1 put them:
+  ```
+  $ErrorActionPreference='Stop'; $id=(Select-String -LiteralPath C:\hvnest-proof\identity.txt -Pattern '^vmId=').Line.Substring(5); $vm=Get-VM -Id $id; if ($vm.Name -ne 'hvnest-proof' -or $vm.Path.TrimEnd('\') -ne 'C:\hvnest-proof' -or $vm.ConfigurationLocation.TrimEnd('\') -ne 'C:\hvnest-proof' -or @(Get-VMHardDiskDrive -VM $vm | ? { $_.Path -notlike 'C:\hvnest-proof\*' }).Count) { throw 'identity or location mismatch: nothing removed' }; Stop-VM -VM $vm -TurnOff -Force; Remove-VM -VM $vm -Force
+  ```
+- **H9c** deletes the fixed folder, once the listing was read and the VM is gone:
+  ```
+  $ErrorActionPreference='Stop'; if (Get-VM | ? { $_.Path -like 'C:\hvnest-proof*' }) { throw 'a VM still lives in C:\hvnest-proof: nothing deleted' }; Remove-Item -LiteralPath C:\hvnest-proof -Recurse -Force
+  ```
+
+Then delete `%USERPROFILE%\.ssh\hvnest-proof\`. No host firewall rule, switch or service was changed.
+
 ## Files
 
 - `server.js`: the MCP server. `roots.js` is a copy of the repo's [`shared/roots.js`](../../shared/roots.js), and
@@ -1410,3 +1550,6 @@ repo, and `npm test` clears earlier runs' folders first.
   `%ProgramFiles%\hyperv-mcp\uninstall`. `helper\inventory.js` renders the helper's recorded inventory. `helper\timing.js` holds the timings' keys, defaults, ranges and caps (MC-1558). `setup\acl.ps1` holds
   setup's storage and ACL routines, with `setup\Storage.cs` for the Windows calls they need (both tested non-elevated
   by `test\acl-check.ps1`).
+- `test\live\`: the nested live proof (MC-1559, "Live proof in a nested VM"). `nested-proof.js` is the host-side
+  driver (ssh and scp only); `nested-inner.js` bridges it to one server.js session inside the outer VM;
+  `nested-listener.js` is the host-mode test listener. Dev-only: not packed.
