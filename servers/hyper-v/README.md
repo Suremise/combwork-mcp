@@ -909,13 +909,44 @@ there (0x8007045A, `ERROR_DLL_INIT_FAILED`). A logged-on user's session (1 or mo
     restore and a restart, and keeps the rule simple: nothing from an unfinished interactive run can outlive it.
   - A watcher keeps nothing in memory: a restarted one never runs a request again.
 
+## Removing everything without agents
+
+You don't need an agent, or this repo, to put the PC back (MC-1557). Setup installs the uninstaller with the helper, and
+it works out what to remove when it runs, from the helper's own records: the pool, VMs, checkpoints, images, switch,
+service and folders as they are then, whoever made them. Nobody has to keep a script up to date.
+
+- **Settings > Apps > Installed apps > "Hyper-V MCP helper and test VMs" > Uninstall.** It asks for admin rights, shows
+  what is installed, and asks: remove everything (the default), keep the pool and remove only the helper, or list only.
+- Or, in an admin PowerShell (one line), the installed copy:
+  ```
+  powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\hyperv-mcp\uninstall\uninstall.ps1"
+  ```
+  Add `-RemovePool` or `-KeepPool` to skip the question, or `-WhatIf` to see what each would remove, changing nothing
+  (no record, no approval, no service change).
+- **What is installed, in plain text:** `C:\ProgramData\hyperv-mcp\inventory.txt`, the helper's recorded inventory,
+  rewritten after every change it makes. Each item has the command to remove it by hand, for when the uninstaller
+  can't run. The uninstaller shows it first, and checks every item live before deleting anything; it never runs the
+  file's text.
+- **Interrupted?** Run the Installed apps entry again: it finishes what's left, down to its own files and itself.
+
+Remove everything takes the pool's VMs and their checkpoints, the cached images, the disk folders, the helper's state,
+setup's host-mode switch, the service, its rights, the group, the install folder, the registry records and the entry.
+Keep the pool keeps the VMs, their checkpoints, the images, the disk folders and the helper's state with their records,
+and removes the rest, the entry included. To remove a kept pool later, run setup again (it restores the helper and
+the entry), then uninstall.
+
+It doesn't undo what was set up beside the MCP, such as Ollama's settings or a firewall rule you added for host mode:
+undo those as you were told when they were made. Its last line reminds you.
+
 ## Uninstall
 
-In an admin PowerShell (one line):
+From Installed apps, or in an admin PowerShell (one line), with the installed copy or the repo's:
 ```
+powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\hyperv-mcp\uninstall\uninstall.ps1" -KeepPool
 powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\combwork-mcp\servers\hyper-v\setup\uninstall.ps1" -KeepPool
 ```
-Choose one:
+An installed copy runs itself from a protected temporary copy (only SYSTEM and Administrators), so it can remove its own
+folder. With neither option it asks (see above). Choose one:
 - `-KeepPool` removes the service, its rights, the group and the code, and **keeps** the VMs, the helper's state (the
   journal, policy and guest credentials), the disk folders and their storage receipts. Running setup again recognises
   them by their receipts.
@@ -951,8 +982,20 @@ started again since.
 **Interrupted?** Run it again with the same options: it resumes from its record (`HKLM\SOFTWARE\hyperv-mcp`). That
 record is bound to this installation and to the options it started with, and a rerun with other options is refused.
 Every step does nothing when its work is already done, so no rerun needs anything an earlier run removed. Setup refuses
-to run while an uninstall is unfinished. A finished `-KeepPool` leaves no record, so a later setup and `-RemovePool`
-work as usual.
+to run while an uninstall is unfinished. A finished `-KeepPool` leaves only its `KeptPool` mark, bound to this
+installation: a later setup clears it and takes the pool over, and `-RemovePool` then works as usual.
+
+**The last phase (MC-1557): the uninstaller's own files and the Installed apps entry.** Step 5 leaves the install
+folder's `uninstall\`, the entry's route. Once everything else is checked gone (for `-KeepPool`: the helper's parts
+gone, the kept ones present), `uninstall\` is renamed to `uninstall.retiring\` in one step, the rest of the install
+folder is removed, then its last files and the entry. The entry runs a fixed launcher (an encoded PowerShell command
+with its paths from Windows' known folders, never from the registry), so whichever point an interruption leaves, the
+entry finishes it: it runs the uninstaller while its files are whole; otherwise it removes the uninstaller's own
+leftovers itself, but only when they are exactly what it leaves (no links, nothing else in the folder, owned by
+Administrators, SYSTEM or TrustedInstaller, no service and no unfinished uninstall); then its own registry key, only
+when nothing of the MCP is left, or a verified `KeptPool` mark says the kept state is meant to stay. Anything else
+is left untouched, with the manual step printed. Only the uninstaller's fixed folder and key are targets here: never a
+path from the registry or the inventory.
 
 ## Limits
 
@@ -987,7 +1030,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\restorewait.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js test\linux-image.test.js test\linux-guest-files.test.js test\linux.test.js test\linux-ps.test.js test\bridge.test.js test\network.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\restorewait.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js test\linux-image.test.js test\linux-guest-files.test.js test\linux.test.js test\linux-ps.test.js test\bridge.test.js test\network.test.js test\uninstall.test.js
 ```
 
 - `units.test.js`:
@@ -1010,7 +1053,8 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
     - a file written with its own ACL, not the old file's;
     - for the install folder: earlier grants removed, VM grants kept, links refused before any change;
   - uninstall's teardown (`setup\teardown.ps1`), non-elevated with strict fakes for its outside actions
-    (`test\teardown-check.ps1`):
+    (`test\teardown-check.ps1`), including `-WhatIf` changing nothing (no outside action, no record, files and key as
+    they were) and the install folder's `uninstall\` kept for the last phase:
     - a crash at each of 25 points (before and after every action and every record write), then a rerun to
       completion, without asking any action to redo what was undone;
     - a forged `policy.json`, with and without a journal, refused, nothing deleted;
@@ -1243,6 +1287,18 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
     host check fails, or the guest's network never settles (restored to clean, disconnected);
   - crashes after the ACLs, the connect and the guest's network, and a call dying between connect and start: the next
     helper restores the VM disconnected with no ACLs; leftover ACLs at a release quarantine the VM.
+- `uninstall.test.js` (MC-1557), removing everything without agents:
+  - the recorded inventory: its label, each item's manual step (a quote in a path doubled), what's out of scope; the
+    helper writing it at start and rewriting it after a create, resize and remove, never torn;
+  - setup copying the uninstaller's files and writing the entry, and clearing a kept-pool mark;
+  - the Installed apps entry, run for real under Windows PowerShell 5.1 as Windows runs an UninstallString, with a
+    scratch Program Files and HKCU keys (`test\appsentry-check.ps1`): the uninstaller launched while its files are
+    whole; every partial set of its last files, an empty `uninstall.retiring\` and an empty install folder finished by
+    the launcher alone; the entry removed when nothing is left, or on a verified kept-pool mark; refusals (an extra
+    file or folder, a junction, an untrusted owner, a service still installed, the state folder, an unfinished
+    uninstall, an entry that isn't setup's, a missing or other install's mark), each with everything left in place; an
+    InstallLocation pointing elsewhere never a target; the last phase crashed after its rename and after removing the
+    rest, each finished by relaunching the entry; a junction for `uninstall\` refused; the protected temporary copy.
 
 **The trial** on a real host (not automated): setup, then `pool_plan` → approval → `pool_create` from the pinned 25H2
 ISO, then:
@@ -1277,6 +1333,9 @@ repo, and `npm test` clears earlier runs' folders first.
     `guest-agent.ps1` (the interactive session's watcher), each run in the guest by `hv.ps1`;
   - `approve.ps1`;
   - `host\HvMcpHost.cs` (the service host's source).
-- `setup\install.ps1`, `setup\uninstall.ps1`: the only elevated steps besides approvals. `setup\acl.ps1` holds
+- `setup\install.ps1`, `setup\uninstall.ps1`: the only elevated steps besides approvals. `setup\teardown.ps1` is
+  uninstall's teardown, and `setup\appsentry.ps1` the Installed apps entry, its launcher and the last phase (MC-1557);
+  setup copies `uninstall.ps1`, `teardown.ps1`, `acl.ps1`, `appsentry.ps1` and `Storage.cs` into
+  `%ProgramFiles%\hyperv-mcp\uninstall`. `helper\inventory.js` renders the helper's recorded inventory. `setup\acl.ps1` holds
   setup's storage and ACL routines, with `setup\Storage.cs` for the Windows calls they need (both tested non-elevated
   by `test\acl-check.ps1`).

@@ -78,8 +78,19 @@ if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
 
 . (Join-Path $PSScriptRoot 'acl.ps1')     # trusted storage (Use-StorageFolder, receipts, ancestors) and ACL checks
 . (Join-Path $PSScriptRoot 'teardown.ps1') # Assert-NoTeardown
+. (Join-Path $PSScriptRoot 'appsentry.ps1') # MC-1557: the Installed apps entry and its launcher
 # No install while an uninstall is unfinished (no helper may start during one).
 Assert-NoTeardown ([Microsoft.Win32.Registry]::LocalMachine) 'SOFTWARE\hyperv-mcp'
+# MC-1557: a finished keep-pool uninstall's record (KeptPool) ends here: this setup restores the helper for that pool.
+$kpKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\hyperv-mcp')
+if ($kpKey) {
+  $hadKp = $null -ne $kpKey.GetValue('KeptPool'); $kpKey.Dispose()
+  if ($hadKp) {
+    Assert-KeyProtected ([Microsoft.Win32.Registry]::LocalMachine) 'SOFTWARE\hyperv-mcp' @('S-1-5-18', 'S-1-5-32-544', $script:TrustedInstaller)
+    $kpKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\hyperv-mcp', $true); $kpKey.DeleteValue('KeptPool', $false); $kpKey.Dispose()
+    Step 'The pool an earlier uninstall kept is taken over again.'
+  }
+}
 $src = Split-Path -Parent $PSScriptRoot   # servers\hyper-v
 # Locations from Windows' known-folder API, not from environment variables.
 $install = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'hyperv-mcp'
@@ -254,11 +265,19 @@ if ($bad.Count) { throw "$install isn't admin-only after setting its ACL: $($bad
 # Nothing earlier in it is kept: every file the service runs is copied fresh below (a stray file could be loaded instead).
 Get-ChildItem -LiteralPath $install -Force | Remove-Item -Recurse -Force
 New-Item -ItemType Directory -Path (Join-Path $install 'guests') -Force | Out-Null
-foreach ($f in 'core.js', 'helper.js', 'hv.js', 'hv.ps1', 'guest-sync.ps1', 'guest-agent.ps1', 'images.js', 'iso.js', 'journal.js', 'net.js', 'paths.js', 'policy.js', 'unattend.js', 'approve.ps1', 'linux-images.js', 'openpgp.js', 'qcow2.js', 'seed.js', 'ssh.js', 'sshkeys.js', 'guest.py', 'guests\linux.js') {
+foreach ($f in 'core.js', 'helper.js', 'hv.js', 'hv.ps1', 'guest-sync.ps1', 'guest-agent.ps1', 'images.js', 'iso.js', 'journal.js', 'net.js', 'paths.js', 'policy.js', 'inventory.js', 'unattend.js', 'approve.ps1', 'linux-images.js', 'openpgp.js', 'qcow2.js', 'seed.js', 'ssh.js', 'sshkeys.js', 'guest.py', 'guests\linux.js') {
   Copy-Item -LiteralPath (Join-Path $src "helper\$f") -Destination (Join-Path $install $f) -Force
 }
 Copy-Item -LiteralPath (Join-Path $src 'meta.json') -Destination (Join-Path $install 'meta.json') -Force
 Step "Helper code copied to $install (only Administrators and SYSTEM can write there)."
+# MC-1557: the uninstaller, installed with the helper (no repo needed to remove everything), and its Installed apps
+# entry, whose launcher is fixed text (appsentry.ps1): neither needs updating when the pool changes, since the uninstaller
+# reads what to remove from the helper's records when it runs.
+New-Item -ItemType Directory -Path (Join-Path $install 'uninstall') -Force | Out-Null
+foreach ($f in $script:RetiringSet) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $f) -Destination (Join-Path $install "uninstall\$f") -Force }
+$appsVersion = (Get-Content -LiteralPath (Join-Path $src 'meta.json') -Raw | ConvertFrom-Json).version
+Set-AppsEntry ([Microsoft.Win32.Registry]::LocalMachine) $script:EntryKeyPath (Get-LauncherCommand (Get-LauncherText)).command $appsVersion $install
+Step "Uninstaller copied to $install\uninstall; Installed apps lists 'Hyper-V MCP helper and test VMs' (its Uninstall removes everything, or keeps the pool)."
 
 # MC-1501: Linux guests. The helper reaches a Linux guest by SSH (Windows' in-box OpenSSH Client) over a Hyper-V
 # socket: HvMcpVsock.exe, compiled here, is ssh.exe's ProxyCommand, and the vsock port 22's service id is registered as

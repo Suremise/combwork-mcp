@@ -1,6 +1,10 @@
-# Removes the hyper-v MCP helper. Run in an admin PowerShell (one line):
+# Removes the hyper-v MCP helper. Settings > Apps > Installed apps > "Hyper-V MCP helper and test VMs" > Uninstall runs
+# it (MC-1557), or in an admin PowerShell (one line), from the installed copy (no repo needed) or the repo's:
+#   powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\hyperv-mcp\uninstall\uninstall.ps1"
 #   powershell -NoProfile -ExecutionPolicy Bypass -File "<repo>\servers\hyper-v\setup\uninstall.ps1" -KeepPool
 #   powershell -NoProfile -ExecutionPolicy Bypass -File "<repo>\servers\hyper-v\setup\uninstall.ps1" -RemovePool
+# With neither option it shows the helper's recorded inventory and asks: remove everything (the default), keep the pool,
+# or list only. -WhatIf lists what each would remove and changes nothing (no record, no approval, no service change).
 # For an install made by an older setup (no storage receipts), also name its disk folder: -LegacyDiskFolder D:\hyperv-mcp
 # (you'll be shown exactly what it will delete, and asked to type DELETE).
 #
@@ -9,8 +13,11 @@
 #   -RemovePool removes the pool first, through the helper's own journalled remove (you approve that plan as usual), then
 #               the storage setup created (only folders it can verify as setup's: see teardown.ps1), then everything else.
 # The steps and their order, the record that lets an interrupted uninstall be finished by running it again with the same
-# options, and what may be deleted, are in teardown.ps1.
-param([switch]$KeepPool, [switch]$RemovePool, [string]$LegacyDiskFolder, [ValidateSet('Service', 'Direct')][string]$Mode = 'Service', [string]$User = [Security.Principal.WindowsIdentity]::GetCurrent().Name)
+# options, and what may be deleted, are in teardown.ps1. The Installed apps entry, its launcher and the last phase that
+# retires the uninstaller itself are in appsentry.ps1.
+#   -Interactive the menu (the default with neither option); -Retire only the last phase (the entry's launcher runs it
+#   from uninstall.retiring\); -FromCopy internal: run from the protected temporary copy of an installed uninstaller.
+param([switch]$KeepPool, [switch]$RemovePool, [switch]$Interactive, [switch]$WhatIf, [switch]$Retire, [string]$LegacyDiskFolder, [ValidateSet('Service', 'Direct')][string]$Mode = 'Service', [string]$User = [Security.Principal.WindowsIdentity]::GetCurrent().Name, [string]$FromCopy)
 # Windows PowerShell 5.1 only (MC-1506), refused before any check or change:
 # it uses setup's storage and ACL routines, which need .NET Framework calls
 # that PowerShell 7 doesn't have.
@@ -28,13 +35,14 @@ function PipeOpen { return [bool]([IO.Directory]::GetFiles('\\.\pipe\') | Where-
 
 $me = New-Object Security.Principal.WindowsPrincipal ([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run this in an admin PowerShell (Run as administrator).' }
-if ($KeepPool -eq $RemovePool) { throw 'Choose -KeepPool or -RemovePool.' }
+if ($KeepPool -and $RemovePool) { throw 'Choose -KeepPool or -RemovePool, not both.' }
 if ($LegacyDiskFolder) {
   $LegacyDiskFolder = [IO.Path]::GetFullPath($LegacyDiskFolder).TrimEnd('\')
   if ($LegacyDiskFolder -notmatch '^[A-Za-z]:\\[^\\]+$' -or (New-Object IO.DriveInfo $LegacyDiskFolder.Substring(0, 2)).DriveType -ne 'Fixed') { throw '-LegacyDiskFolder must be a top-level folder on a local fixed drive, such as D:\hyperv-mcp.' }
 }
 . (Join-Path $PSScriptRoot 'acl.ps1')
 . (Join-Path $PSScriptRoot 'teardown.ps1')
+. (Join-Path $PSScriptRoot 'appsentry.ps1')
 
 $install = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'hyperv-mcp'
 $state = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'hyperv-mcp'
@@ -43,6 +51,21 @@ $svcAccount = "NT SERVICE\$svc"
 $groupName = 'Hyper-V MCP Users'
 $HVADMINS = 'S-1-5-32-578'
 $SYSTEM = 'S-1-5-18'; $ADMINS = 'S-1-5-32-544'
+
+# MC-1557: an installed uninstaller (under the install folder) runs from a protected temporary copy, so it can remove
+# its own folder and nothing holds it open: the same arguments, then the copy is removed.
+$here = [IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\')
+if (-not $FromCopy -and $here.ToLowerInvariant().StartsWith($install.ToLowerInvariant() + '\')) {
+  $tmp = New-ProtectedCopy (Join-Path $env:SystemRoot 'Temp') @($script:RetiringSet | ForEach-Object { Join-Path $here $_ }) -Owners @($ADMINS) -Grants @($SYSTEM, $ADMINS) -SetOwner
+  $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $tmp 'uninstall.ps1'))
+  foreach ($kv in $PSBoundParameters.GetEnumerator()) {
+    if ($kv.Value -is [Management.Automation.SwitchParameter]) { if ($kv.Value.IsPresent) { $argList += "-$($kv.Key)" } } else { $argList += "-$($kv.Key)"; $argList += [string]$kv.Value }
+  }
+  $argList += @('-FromCopy', $here)
+  Push-Location -LiteralPath $tmp
+  try { & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') @argList; $code = $LASTEXITCODE } finally { Pop-Location; Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+  exit $code
+}
 $runnerSid = if ($Mode -eq 'Service') {
   $line = (& sc.exe showsid $svc) | Where-Object { $_ -match 'SERVICE SID:\s*(S-1-5-80-[\d-]+)' } | Select-Object -First 1
   if (-not $line) { throw "sc.exe showsid $svc gave no service SID." }
@@ -135,14 +158,103 @@ $ops = @{
   }
 }
 
-Invoke-Teardown -Mode $(if ($RemovePool) { 'remove' } else { 'keep' }) -State $state -Install $install -LegacyDiskFolder $LegacyDiskFolder `
-  -Root ([Microsoft.Win32.Registry]::LocalMachine) -KeyPath 'SOFTWARE\hyperv-mcp' `
-  -Trusted @($SYSTEM, $ADMINS, $script:TrustedInstaller) -RootOwners @($SYSTEM, $ADMINS) -Who @($SYSTEM, $ADMINS, $runnerSid) -KeyOwner $ADMINS `
-  -Ops $ops
+$HKLM = [Microsoft.Win32.Registry]::LocalMachine
+$keyPath = 'SOFTWARE\hyperv-mcp'
+$trustedKey = @($SYSTEM, $ADMINS, $script:TrustedInstaller)
+$launcherText = Get-LauncherText
+$launcher = [scriptblock]::Create($launcherText)
+$expected = (Get-LauncherCommand $launcherText).b64
+$inventoryFile = Join-Path $state 'inventory.txt'
+function Get-KeyValue([string]$name) { $k = $HKLM.OpenSubKey($keyPath); if (-not $k) { return $null }; try { return $k.GetValue($name) } finally { $k.Dispose() } }
+function Test-KeyHere { $k = $HKLM.OpenSubKey($keyPath); if ($k) { $k.Dispose(); return $true }; return $false }
+function Get-HostSwitch { @(Get-VMSwitch -Name 'hvmcp-host' -ErrorAction SilentlyContinue | Where-Object { $_.Name -ceq 'hvmcp-host' -and $_.SwitchType -eq 'Internal' -and [string]$_.Notes -match '^hvmcp:host:[0-9a-f]{32}$' }) }
+function Show-Inventory {
+  if (Test-Path -LiteralPath $inventoryFile) { Write-Host ''; Get-Content -LiteralPath $inventoryFile | ForEach-Object { Write-Host "  $_" }; Write-Host '' }
+  else { Step "No recorded inventory ($inventoryFile isn't there)." }
+}
+# What keep and remove each mean, as the menu, -WhatIf and the leftover check judge them.
+function Show-Choices {
+  Write-Host 'Remove everything (R): the pool''s VMs and their checkpoints, cached images, the disk folders, the helper''s state, setup''s host-mode switch, the service, its rights, the group, the install folder, the registry records and this Installed apps entry.'
+  Write-Host 'Keep the pool (K): keeps the VMs and their checkpoints, cached images, the disk folders and the helper''s state with their records (setup recognises them when run again); removes the service, its rights, the group, the vsock registration, setup''s host-mode switch (setup makes it again), the install folder and this Installed apps entry.'
+}
+# R1: what is still there that the chosen mode removes (or, for keep, what it should have kept and didn't), read live.
+function Get-Leftovers([string]$m, [string[]]$diskFolders) {
+  $left = @()
+  if (Get-Service $svc -ErrorAction SilentlyContinue) { $left += "the service $svc" }
+  if (Get-LocalGroup -Name $groupName -ErrorAction SilentlyContinue) { $left += "the group '$groupName'" }
+  if (@(Get-LocalGroupMember -SID $HVADMINS -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq $svcAccount }).Count) { $left += "$svcAccount in Hyper-V Administrators" }
+  if ((Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Virtualization\GuestCommunicationServices\00000016-facb-11e6-bd58-64006a7986d3' -ErrorAction SilentlyContinue).ElementName -eq 'hyper-v MCP: SSH to Linux guests (vsock port 22)') { $left += 'the Linux guests'' vsock port registration' }
+  if ((Get-HostSwitch).Count) { $left += 'setup''s host-mode switch hvmcp-host' }
+  if (Test-Path -LiteralPath $install) { $odd = @(Get-ChildItem -LiteralPath $install -Force | Where-Object { @('uninstall', 'uninstall.retiring') -notcontains $_.Name }); if ($odd.Count) { $left += "$install still holds $($odd[0].Name)" } }
+  if ($m -eq 'remove') {
+    if (Test-Path -LiteralPath $state) { $left += "the state folder $state" }
+    foreach ($d in $diskFolders) { if (Test-Path -LiteralPath $d) { $left += "the disk folder $d" } }
+    $vms = @(try { Get-VM -ErrorAction Stop | Where-Object { $p = [string]$_.Path; @($diskFolders | Where-Object { $p.ToLowerInvariant().StartsWith($_.ToLowerInvariant().TrimEnd('\') + '\') }).Count } } catch { @() })
+    foreach ($v in $vms) { $left += "the VM $($v.Name) ($($v.Id)) in $($v.Path)" }
+    if (Test-KeyHere) { $left += "the registry key HKLM\$keyPath" }
+  } else {
+    if (-not (Test-Path -LiteralPath $state)) { $left += "(kept) the state folder $state is missing" }
+    if (-not (Get-KeyValue 'InstallId')) { $left += "(kept) HKLM\$keyPath has no InstallId" }
+  }
+  return $left
+}
+function Invoke-RetirePhase { Invoke-Retire -ProgramFiles ([Environment]::GetFolderPath('ProgramFiles')) -Trusted $trustedKey -RootOwners @($SYSTEM, $ADMINS) -Launcher $launcher -Expected $expected }
+
+if ($Retire) { Step 'Finishing the uninstall: the uninstaller''s own files and the Installed apps entry.'; Invoke-RetirePhase; exit 0 }
+
+# The leftover-only case (s9): nothing of the helper is installed (no service, state folder or registry records), only
+# the uninstaller's own folder or entry: fixed targets, verified, then removed.
+$nothing = -not (Get-Service $svc -ErrorAction SilentlyContinue) -and -not (Test-Path -LiteralPath $state) -and -not (Test-KeyHere)
+if ($nothing) {
+  $entry = $HKLM.OpenSubKey($script:EntryKeyPath); $hasEntry = [bool]$entry; if ($entry) { $entry.Dispose() }
+  if (-not (Test-Path -LiteralPath $install) -and -not $hasEntry) { Write-Host 'Nothing of the hyper-v MCP is installed.' -ForegroundColor Green; exit 0 }
+  if ($WhatIf) { Step "Nothing of the helper is installed: would remove what is left of the uninstaller ($install) and the Installed apps entry."; exit 0 }
+  Step 'Nothing of the helper is installed: removing what is left of the uninstaller and its Installed apps entry.'
+  Invoke-RetirePhase
+  exit 0
+}
+
+$choice = if ($RemovePool) { 'remove' } elseif ($KeepPool) { 'keep' } else { $null }
+if (-not $choice) {
+  Show-Inventory
+  Show-Choices
+  if ($WhatIf) { $choice = 'remove' }
+  else {
+    $a = Read-Host 'Remove everything (R, the default), keep the pool (K), list only (L), anything else cancels'
+    switch -Regex ($a) { '^\s*[Rr]?\s*$' { $choice = 'remove' } '^\s*[Kk]\s*$' { $choice = 'keep' } '^\s*[Ll]\s*$' { $WhatIf = $true; $choice = 'remove' } default { Write-Host 'Cancelled: nothing was changed.'; exit 1 } }
+  }
+} elseif ($WhatIf) { Show-Inventory }
+if ($choice -eq 'remove' -and (Get-KeyValue 'KeptPool') -and -not (Get-Service $svc -ErrorAction SilentlyContinue)) {
+  throw 'An earlier uninstall kept the pool and removed the helper, which removes it: run setup again (from the repo) to restore the helper, then uninstall. Nothing was changed.'
+}
+$receipts = @()
+$rk = $HKLM.OpenSubKey("$keyPath\Storage"); if ($rk) { $receipts = @($rk.GetValueNames()); $rk.Dispose() }
+$diskFolders = @($receipts | Where-Object { $_ -ne $state.ToLowerInvariant() -and -not $_.StartsWith($state.ToLowerInvariant() + '\') })
+
+Invoke-Teardown -Mode $choice -State $state -Install $install -LegacyDiskFolder $LegacyDiskFolder `
+  -Root $HKLM -KeyPath $keyPath `
+  -Trusted $trustedKey -RootOwners @($SYSTEM, $ADMINS) -Who @($SYSTEM, $ADMINS, $runnerSid) -KeyOwner $ADMINS `
+  -Ops $ops -WhatIf:$WhatIf
+if ($WhatIf) { Write-Host 'Nothing was changed (-WhatIf).' -ForegroundColor Green; exit 0 }
 # MC-1556: setup's host-mode switch (its name and the Notes setup wrote, never the name alone), with this PC's address on
-# it. Idempotent: an interrupted uninstall run again removes it then.
-foreach ($x in @(Get-VMSwitch -Name 'hvmcp-host' -ErrorAction SilentlyContinue | Where-Object { $_.Name -ceq 'hvmcp-host' -and $_.SwitchType -eq 'Internal' -and [string]$_.Notes -match '^hvmcp:host:[0-9a-f]{32}$' })) {
+# it, in both modes (setup makes it again). Idempotent: an interrupted uninstall run again removes it then.
+foreach ($x in (Get-HostSwitch)) {
   Remove-VMSwitch -VMSwitch $x -Force
   Step "Host-mode switch hvmcp-host removed (and this PC's address on it)."
 }
-Write-Host 'Done.' -ForegroundColor Green
+# R1, then (keep) the verified record that the kept state is meant to stay, then the retire phase.
+$left = @(Get-Leftovers $choice $diskFolders)
+if ($left.Count) {
+  Write-Host 'These are still there:' -ForegroundColor Yellow
+  foreach ($l in $left) { Write-Host "  - $l" }
+  Write-Host 'The Installed apps entry and the uninstaller stay: run it again once these are resolved (the manual steps are in the inventory).'
+  exit 1
+}
+if ($choice -eq 'keep') {
+  Assert-KeyProtected $HKLM $keyPath $trustedKey
+  $k = $HKLM.OpenSubKey($keyPath, $true)
+  try { $k.SetValue('KeptPool', (@{ installId = [string]$k.GetValue('InstallId'); at = [DateTimeOffset]::UtcNow.ToString('o') } | ConvertTo-Json -Compress)) } finally { $k.Dispose() }
+  if (Test-Path -LiteralPath $inventoryFile) { Add-Content -LiteralPath $inventoryFile -Value "`r`n$([DateTimeOffset]::Now.ToString('yyyy-MM-dd HH:mm')): helper removed by uninstall -KeepPool; the pool, its state and disk folders are kept (setup recognises them). To remove this kept pool later, run setup again (it restores the helper and the Installed apps entry), then uninstall." }
+}
+Invoke-RetirePhase
+Write-Host 'If you set anything up beside the MCP (Ollama''s settings, a firewall rule for host mode named ''hyper-v MCP host mode: *''), undo it as you were told when it was made.'
