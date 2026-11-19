@@ -267,7 +267,7 @@ ssh.exe child by its handle on timeout. The README's "runs no program but powers
   10-minute limit on SSH, but one shape keeps the server and the tests the same, and survives a dropped call.
 - **Timeout:** `systemctl kill` then `stop` on the run's own unit kills its **whole cgroup**, so no PID reuse question.
   A command that daemonised inside its unit dies with it.
-- **The reply is the same:** the exit code and 16 KB of each stream.
+- **The reply is the same:** the exit code and 16 KB of each stream by default (`HYPERV_MCP_OUTPUT_BYTES`, up to the 1 MB `guest.py` returns).
 
 **`vm_start` / `vm_sync` / `copyIn`:** the server-side manifest, hashing, roots checks, plans, generations and
 untrusted-until-full-sync rules don't change; they're the helper's, not the guest's. Only the last hop differs. The

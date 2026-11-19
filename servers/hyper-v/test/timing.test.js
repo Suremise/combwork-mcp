@@ -46,35 +46,47 @@ test('no literal waits in the test files: waitFor bounds, spawn timeouts, sleeps
 
 // ---------- timing.js ----------
 
-test('timing.js: defaults, floors and caps (a cap applies to the default too), notes, derived call bounds, the env a server sends', () => {
+test('timing.js: defaults, no floors, ceilings only where a value breaks (a setup cap applies to the default too), notes, derived call bounds, the env a server sends', () => {
   const d = timing.resolve({}, null, {})
-  assert.deepStrictEqual([d.values.guestReadyMinutes, d.values.restoreMinutes, d.values.offWaitSeconds, d.values.restoreVerifySeconds, d.values.checkpointMinutes, d.values.queueKeepMinutes, d.values.copyIdleMinutes], [10, 10, 120, 180, 10, 10, 5])
+  assert.deepStrictEqual([d.values.guestReadyMinutes, d.values.restoreMinutes, d.values.offWaitSeconds, d.values.restoreVerifySeconds, d.values.checkpointMinutes, d.values.queueKeepMinutes, d.values.copyIdleMinutes, d.values.outputBytes], [10, 10, 120, 180, 10, 10, 5, 16384])
   assert.deepStrictEqual(d.notes, [])
-  const r = timing.resolve({ guestReadyMinutes: 1, offWaitSeconds: 9999, logonMinutes: 'x', copyIdleMinutes: 20 }, { checkpointMinutes: 4, queueKeepMinutes: 3 }, {})
-  assert.deepStrictEqual([r.values.guestReadyMinutes, r.values.offWaitSeconds, r.values.logonMinutes, r.values.copyIdleMinutes], [2, 600, 10, 9], 'floors, maxima')
+  // MC-1579: any value above 0 is used as given; the ceilings left are copyIdle's 9 min (PowerShell Direct's call), the
+  // output's 1 MB (guest.py) and Node's timer limit, each named with its reason; 0 or less, or not a number, is ignored.
+  const r = timing.resolve({ guestReadyMinutes: 1, offWaitSeconds: 9999, installMinutes: 1000, logonMinutes: 'x', shutdownMinutes: 0, copyIdleMinutes: 20, outputBytes: 4 * 1024 * 1024, restoreMinutes: 40 * 24 * 60 }, { checkpointMinutes: 4, queueKeepMinutes: 3 }, {})
+  assert.deepStrictEqual([r.values.guestReadyMinutes, r.values.offWaitSeconds, r.values.installMinutes, r.values.logonMinutes, r.values.shutdownMinutes, r.values.copyIdleMinutes, r.values.outputBytes], [1, 9999, 1000, 10, 5, 9, 1024 * 1024], 'no floors; the ceilings that break something')
+  assert.strictEqual(r.ms.restoreMinutes, timing.TIMER_MAX_MS, 'Node\'s timer limit')
   assert.deepStrictEqual([r.values.checkpointMinutes, r.values.queueKeepMinutes], [4, 3], 'the policy cap lowers the defaults, no key sent')
-  assert.ok(r.notes.some(n => /guestReadyMinutes 1 min is outside 2-60: 2 used/.test(n)))
   assert.ok(r.notes.some(n => /logonMinutes must be a number: ignored/.test(n)))
-  // A conflicting choice: the longest off-wait and the shortest restore still fit their call.
+  assert.ok(r.notes.some(n => /shutdownMinutes must be above 0: ignored/.test(n)))
+  assert.ok(r.notes.some(n => /copyIdleMinutes 20 min is over the most it can be, 9 min \(PowerShell Direct ends any one call after about 10 minutes/.test(n)))
+  assert.ok(r.notes.some(n => /outputBytes 4194304 bytes is over the most it can be, 1048576 bytes \(a Linux guest's dispatcher/.test(n)))
+  assert.ok(r.notes.some(n => /restoreMinutes 57600 min is over the most it can be, .*Node's timers/.test(n)))
+  assert.ok(timing.resolve({ checkpointMinutes: 9 }, { checkpointMinutes: 4 }, {}).notes.some(n => /checkpointMinutes 9 min is over setup's cap, 4 min: 4 min used/.test(n)))
+  // Fractions become whole milliseconds, at least 1; outputBytes whole bytes.
+  assert.strictEqual(timing.resolve({ offWaitSeconds: 0.0001, outputBytes: 100.7 }, null, {}).ms.offWaitSeconds, 1)
+  assert.strictEqual(timing.resolve({ outputBytes: 100.7 }, null, {}).ms.outputBytes, 100)
+  // A conflicting choice: a long off-wait and a short restore still fit their call.
   const c = timing.resolve({ offWaitSeconds: 600, restoreMinutes: 2 }, null, {})
   assert.deepStrictEqual(timing.derived(c.ms), { restoreCallMs: 12 * 60_000, shutdownCallMs: 6 * 60_000, makeCleanCallMs: 15 * 60_000 })
   // The test-only bases replace a default (below its floor), a client's value still wins.
   assert.strictEqual(timing.resolve({}, null, { HYPERV_MCP_READY_WAIT_MS: '1234' }).ms.guestReadyMinutes, 1234)
   assert.strictEqual(timing.resolve({ guestReadyMinutes: 3 }, null, { HYPERV_MCP_READY_WAIT_MS: '1234' }).ms.guestReadyMinutes, 180_000)
-  assert.deepStrictEqual(timing.fromEnv({ HYPERV_MCP_GUEST_READY_MINUTES: '15', HYPERV_MCP_OFF_WAIT_SECONDS: 'x', HYPERV_MCP_COPY_IDLE_MINUTES: ' ', OTHER: '1' }), { guestReadyMinutes: 15 })
+  assert.deepStrictEqual(timing.fromEnv({ HYPERV_MCP_GUEST_READY_MINUTES: '15', HYPERV_MCP_OFF_WAIT_SECONDS: 'x', HYPERV_MCP_COPY_IDLE_MINUTES: ' ', HYPERV_MCP_OUTPUT_BYTES: '65536', OTHER: '1' }), { guestReadyMinutes: 15, outputBytes: 65536 })
   assert.match(timing.describe(c), /restoreMinutes 2 min, offWaitSeconds 600 s; restore call 720 s/)
-  // policy.json's timingCaps: known keys, numbers within each floor and maximum.
+  // policy.json's timingCaps: known keys, numbers above 0 and at most what a value can be.
   const base = { ...policy.DEFAULTS, diskFolders: ['D:\\hv'] }
   assert.deepStrictEqual(policy.problems({ ...base, timingCaps: { guestReadyMinutes: 30 } }), [])
-  assert.match(policy.problems({ ...base, timingCaps: { guestReadyMinutes: 1 } }).join(), /timingCaps\.guestReadyMinutes must be a number from 2 to 60/)
+  assert.deepStrictEqual(policy.problems({ ...base, timingCaps: { guestReadyMinutes: 1, installMinutes: 5000 } }), [], 'no range of its own')
+  assert.match(policy.problems({ ...base, timingCaps: { guestReadyMinutes: 0 } }).join(), /timingCaps\.guestReadyMinutes must be a number above 0/)
+  assert.match(policy.problems({ ...base, timingCaps: { copyIdleMinutes: 10 } }).join(), /timingCaps\.copyIdleMinutes must be a number above 0, at most 9 min \(PowerShell Direct/)
   assert.match(policy.problems({ ...base, timingCaps: { nope: 3 } }).join(), /timingCaps\.nope isn't a known timing/)
   assert.match(policy.problems({ ...base, timingCaps: { copyIdleMinutes: '5' } }).join(), /copyIdleMinutes must be a number/)
   assert.match(policy.problems({ ...base, timingCaps: [] }).join(), /timingCaps must be an object/)
 })
 
 test('an invalid timingCaps refuses the helper\'s start (never an impossible range)', async () => {
-  const sc = scratch('timing-badcaps', { policy: { timingCaps: { restoreMinutes: 0.5 } } })
-  await assert.rejects(startHelper(sc), /timingCaps\.restoreMinutes must be a number from 2 to 30/)
+  const sc = scratch('timing-badcaps', { policy: { timingCaps: { restoreMinutes: -1 } } })
+  await assert.rejects(startHelper(sc), /timingCaps\.restoreMinutes must be a number above 0/)
 })
 
 // ---------- per connection, lease and job ----------
@@ -83,10 +95,10 @@ test('set-timing: clamped per connection, shown in vm_status; a lease keeps its 
   const sc = scratch('timing-leases')
   let { h, admin } = await withPool(sc, 2)
   const a = h.conn(10); const b = h.conn(11)
-  const set = await a.request('set-timing', { timing: { offWaitSeconds: 300, guestReadyMinutes: 1 } })
-  assert.match(set.text, /offWaitSeconds 300 s.*guestReadyMinutes 1 min is outside 2-60: 2 used/)
+  const set = await a.request('set-timing', { timing: { offWaitSeconds: 300, guestReadyMinutes: 1, copyIdleMinutes: 12 } })
+  assert.match(set.text, /offWaitSeconds 300 s.*copyIdleMinutes 12 min is over the most it can be, 9 min/)
   await b.request('set-timing', { timing: { offWaitSeconds: 400 } })
-  assert.match((await a.request('status')).text, /Timings for this connection: guestReadyMinutes 2 min, .*offWaitSeconds 300 s.*; restore call 900 s/)
+  assert.match((await a.request('status')).text, /Timings for this connection: guestReadyMinutes 1 min, .*offWaitSeconds 300 s.*; restore call 900 s/)
   assert.doesNotMatch((await admin.request('status')).text, /offWaitSeconds/, 'another connection\'s values aren\'t this one\'s')
   const restores = () => sc.stub().restores.map(x => x.offWaitMs)
   await a.request('acquire'); await a.request('start')
@@ -123,6 +135,62 @@ test('the queue place is kept for the waiting connection\'s queueKeepMinutes; se
     assert.match(w.text, new RegExp(`Call vm_acquire with wait: true again within ${keep} s to keep your place`), name)
     await h.stop()
   }
+})
+
+test('MC-1579: the shipped json lists every setting in its env with its default, and its description no longer lists ranges', () => {
+  const ex = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'combwork-mcp.example.json'), 'utf8'))
+  for (const d of Object.values(timing.KEYS)) assert.strictEqual(ex.env[d.env], String(d.def), d.env)
+  for (const [k, v] of Object.entries({ HYPERV_MCP_ENABLED: '1', HYPERV_MCP_MODE: 'service', HYPERV_MCP_ROOTS_FROM_CWD: '1', HYPERV_MCP_ALLOWED_ROOTS: '', HYPERV_MCP_MAX_BUILD_MB: '2048', HYPERV_MCP_PIPE: 'hyperv-mcp' })) assert.strictEqual(ex.env[k], v, k)
+  // The reply wait: the json's value is server.js's own default.
+  const replyDefault = /HYPERV_MCP_REPLY_MS\) \|\| ([\d_]+)\)/.exec(fs.readFileSync(path.join(__dirname, '..', 'server.js'), 'utf8'))
+  assert.ok(replyDefault, 'server.js\'s reply-wait default')
+  assert.strictEqual(Number(ex.env.HYPERV_MCP_REPLY_MS), Number(replyDefault[1].replace(/_/g, '')))
+  // Every HYPERV_MCP_ key the server and helper read outside the tests is in it (the test-only ones aside).
+  const src = ['server.js', 'roots.js', ...fs.readdirSync(path.join(__dirname, '..', 'helper')).filter(f => f.endsWith('.js')).map(f => path.join('helper', f))]
+    .map(f => fs.readFileSync(path.join(__dirname, '..', f), 'utf8')).join('\n')
+  const testOnly = /_MS$|^HYPERV_MCP_(PS_STUB|STUB_STATE|CRASH_AT|STATE_DIR|MIN_ISO_BYTES|MINUTE_MS|COPY_PART_BYTES|TEST_NO_ACL|INSTALL_DIR|HOST_HEARTBEAT_MS|SSH_STUB|POWERSHELL)$/ // POWERSHELL: set by the service host (host.config)
+  const read = [...new Set([...src.matchAll(/process\.env\.(HYPERV_MCP_[A-Z0-9_]+)/g)].map(m => m[1]))].filter(k => !testOnly.test(k) || k === 'HYPERV_MCP_REPLY_MS')
+  for (const k of read) assert.ok(k in ex.env, `${k} is in the json`)
+  assert.doesNotMatch(ex.description, /\(\d+-\d+\)/, 'no ranges listed')
+})
+
+test('MC-1579: vm_run\'s output per stream is the connection\'s outputBytes (default 16384), kept by its lease', async t => {
+  const sc = scratch('timing-output')
+  const { h } = await withPool(sc, 2)
+  t.after(() => h.stop())
+  const a = h.conn(10); const b = h.conn(11)
+  await a.request('set-timing', { timing: { outputBytes: 1000 } })
+  await a.request('acquire'); await a.request('start')
+  await b.request('acquire'); await b.request('start')
+  const mine = await a.request('run', { command: 'big' })
+  assert.match(mine.text, /--- stdout \(first 1000 bytes\) ---\nx{1000}\n--- stderr/)
+  await a.request('set-timing', { timing: { outputBytes: 50 } })
+  assert.match((await a.request('run', { command: 'big' })).text, /first 1000 bytes/, 'the lease keeps the value it was acquired with')
+  assert.match((await b.request('run', { command: 'big' })).text, /--- stdout \(first 16384 bytes\) ---\nx{16384}\n/, 'another connection: the default')
+})
+
+test('MC-1579: a lease deadline past Node\'s timer limit is waited for in steps, never ended early', () => {
+  const h = Object.create(Helper.prototype)
+  let now = 0
+  h.now = () => now
+  h.timers = new Set()
+  const ended = []
+  h.endLease = (l, why) => { ended.push(why) }
+  const armed = []
+  const real = global.setTimeout
+  global.setTimeout = (fn, ms) => { armed.push({ fn, ms }); return { unref() {} } }
+  try {
+    const lease = { deadline: 60 * 24 * 60 * 60_000 } // 60 days
+    h.armDeadline(lease)
+    assert.strictEqual(armed.at(-1).ms, timing.TIMER_MAX_MS, 'the first step: Node\'s limit, not a delay that fires at once')
+    now += timing.TIMER_MAX_MS; armed.at(-1).fn()
+    assert.deepStrictEqual(ended, [], 'not ended after the first step')
+    assert.strictEqual(armed.at(-1).ms, timing.TIMER_MAX_MS, 'the second step')
+    now += timing.TIMER_MAX_MS; armed.at(-1).fn()
+    assert.strictEqual(armed.at(-1).ms, lease.deadline - now, 'the rest')
+    now = lease.deadline; armed.at(-1).fn()
+    assert.deepStrictEqual(ended, ['its deadline passed'])
+  } finally { global.setTimeout = real }
 })
 
 test('a pool job keeps the applying connection\'s timings (the build\'s shutdown wait); another connection\'s change doesn\'t reach it', async t => {
@@ -299,23 +367,24 @@ test('server.js sends its env\'s timing keys to the helper on connecting (direct
   const s = server({ ...sc.env, HYPERV_MCP_ENABLED: '1', HYPERV_MCP_MODE: 'direct', ...T.profile('serverSettings') })
   t.after(() => s.close())
   const st = (await s.call('vm_status')).text
-  assert.match(st, /Timings for this connection: .*offWaitSeconds 250 s.*queueKeepMinutes 60 min.*; restore call 850 s/, 'the env\'s keys, clamped (99 min to 60)')
+  assert.match(st, /Timings for this connection: .*offWaitSeconds 250 s.*queueKeepMinutes 99 min.*; restore call 850 s/, 'the env\'s keys, as given (MC-1579: no ceiling of their own)')
 })
 
 // ---------- MC-1566: the guest network's wait ----------
 
-test('MC-1566: networkSeconds is a timing like the others: default, floor, cap, setup\'s cap, the env a server sends, vm_status', () => {
+test('MC-1566: networkSeconds is a timing like the others: default, no floor or ceiling of its own (MC-1579), setup\'s cap, the env a server sends, vm_status', () => {
   assert.strictEqual(timing.resolve({}, null, {}).values.networkSeconds, 90)
   const r = timing.resolve({ networkSeconds: 5 }, null, {})
-  assert.strictEqual(r.values.networkSeconds, 30, 'its floor')
-  assert.ok(r.notes.some(n => /networkSeconds 5 s is outside 30-600: 30 used/.test(n)))
-  assert.strictEqual(timing.resolve({ networkSeconds: 9999 }, null, {}).values.networkSeconds, 600, 'its maximum')
+  assert.strictEqual(r.values.networkSeconds, 5, 'no floor')
+  assert.deepStrictEqual(r.notes, [])
+  assert.strictEqual(timing.resolve({ networkSeconds: 9999 }, null, {}).values.networkSeconds, 9999, 'no ceiling of its own')
   assert.strictEqual(timing.resolve({ networkSeconds: 300 }, { networkSeconds: 120 }, {}).values.networkSeconds, 120, 'setup\'s cap')
   assert.strictEqual(timing.resolve({}, { networkSeconds: 60 }, {}).values.networkSeconds, 60, 'a cap lowers the default too')
   assert.deepStrictEqual(timing.fromEnv({ HYPERV_MCP_NETWORK_SECONDS: '240' }), { networkSeconds: 240 })
   assert.match(timing.describe(timing.resolve({ networkSeconds: 240 }, null, {})), /networkSeconds 240 s/)
   const base = { ...policy.DEFAULTS, diskFolders: ['D:\\hv'] }
-  assert.match(policy.problems({ ...base, timingCaps: { networkSeconds: 10 } }).join(), /timingCaps\.networkSeconds must be a number from 30 to 600/)
+  assert.deepStrictEqual(policy.problems({ ...base, timingCaps: { networkSeconds: 10 } }), [], 'any cap above 0')
+  assert.match(policy.problems({ ...base, timingCaps: { networkSeconds: 0 } }).join(), /timingCaps\.networkSeconds must be a number above 0/)
 })
 
 /** A helper whose guestNet runs on a fake clock that moves only by its own sleeps and calls; reads from readAt(t). */
@@ -347,7 +416,7 @@ test('MC-1566: the guest network waits on its read-back (a condition), bounded o
   // A lease ready only after 150 s: a 120 s wait gives up, saying which setting to raise; 240 s waits for it.
   const late = t => t >= 150_000 ? READY : APIPA
   const short = netHelper(120_000, late)
-  await assert.rejects(short.h.guestNet(NET_VM, NET_LEASE), /its network \(internet\) wasn't ready and steady within 120 s \(HYPERV_MCP_NETWORK_SECONDS, up to 600 s, if it needs longer\): no DHCP address from the Default Switch yet \(it has 169\.254\.137\.170\/16\)/)
+  await assert.rejects(short.h.guestNet(NET_VM, NET_LEASE), /its network \(internet\) wasn't ready and steady within 120 s \(raise HYPERV_MCP_NETWORK_SECONDS if it needs longer\): no DHCP address from the Default Switch yet \(it has 169\.254\.137\.170\/16\)/)
   assert.ok(short.now() > 120_000 && short.now() < 150_000, `gave up at its own ceiling (${short.now()})`)
   const long = netHelper(240_000, late)
   await long.h.guestNet(NET_VM, NET_LEASE)
@@ -366,5 +435,5 @@ test('MC-1566: the network wait is the lease\'s own value (kept from its connect
   const dflt = netHelper(0, late)
   delete dflt.h.tm
   dflt.h.defaultTiming = timing.resolve({}, null, {})
-  await assert.rejects(dflt.h.guestNet(NET_VM, NET_LEASE), /within 90 s \(HYPERV_MCP_NETWORK_SECONDS, up to 600 s/)
+  await assert.rejects(dflt.h.guestNet(NET_VM, NET_LEASE), /within 90 s \(raise HYPERV_MCP_NETWORK_SECONDS/)
 })

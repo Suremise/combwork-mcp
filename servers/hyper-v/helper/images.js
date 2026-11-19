@@ -27,11 +27,10 @@ const isEvalEdition = e => /Eval$/.test(String(e))
 const EDITION_RE = /^[A-Za-z][A-Za-z0-9]{0,63}$/
 // HYPERV_MCP_MIN_ISO_BYTES: test-only, so the tests can use small fixture images.
 const minSize = () => Number(process.env.HYPERV_MCP_MIN_ISO_BYTES || 1024 ** 3)
-const MAX_SIZE = 16 * 1024 ** 3
 /** The shapes an image request no longer takes (MC-1572), and what to pass instead. */
 const NO_DOWNLOAD = 'The helper doesn\'t download images: download the ISO yourself, then pass image { iso: "<its path>" } (or { file: "<path to a Linux qcow2 cloud image>" }). The plan you approve names it and its hash.'
 
-/** Copies a stream into `file` while hashing it; resolves { sha256, size }. Caps the size. */
+/** Copies a stream into `file` while hashing it; resolves { sha256, size }. MC-1579: no size cap (formerly 16 GB). */
 function copyHashing(input, file, progress) {
   return new Promise((resolve, reject) => {
     const hash = crypto.createHash('sha256')
@@ -40,7 +39,6 @@ function copyHashing(input, file, progress) {
     let last = 0
     input.on('data', d => {
       size += d.length
-      if (size > MAX_SIZE) { input.destroy(new Error('the image is larger than 16 GB')); return }
       hash.update(d)
       if (size - last > 256 * 1024 * 1024) { last = size; progress?.(`copied and hashed ${(size / 1024 ** 3).toFixed(1)} GB`) }
     })
@@ -59,7 +57,7 @@ function localIso(p, ownDirs) {
   for (const d of ownDirs) if (real.toLowerCase().startsWith(d.toLowerCase() + '\\')) throw new Error('image.iso can\'t be in the helper\'s own folders')
   const st = fs.lstatSync(real)
   if (!st.isFile()) throw new Error('image.iso is not a plain file')
-  if (st.size < minSize() || st.size > MAX_SIZE) throw new Error('image.iso is not the size of a Windows install ISO')
+  if (st.size < minSize()) throw new Error('image.iso is not the size of a Windows install ISO')
   return real
 }
 

@@ -18,7 +18,11 @@ const { join } = require('path')
 
 const SCRIPT = join(__dirname, 'hv.ps1')
 const MARK = 'HVJSON:'
-const OUT_CAP = 4 * 1024 * 1024
+// hv.ps1's reply, read up to this many characters. MC-1579: room for a vm_run poll at the most output a stream may be
+// (timing.js outputBytes, 1 MB), twice, with ConvertTo-Json writing a character as up to six (\uXXXX).
+const OUT_CAP = 16 * 1024 * 1024
+// Node's timers fire at once past this (about 24.8 days): a longer call bound waits this long instead (MC-1579).
+const TIMER_MAX_MS = 2 ** 31 - 1
 const counts = new Map()
 // PowerShell 7's own module folders: its user and Program Files ones and $PSHOME\Modules, but none of WindowsPowerShell's.
 const PS7_MODULES = /(?<!Windows)PowerShell\\(\d[^\\]*\\)?Modules\\?$/i
@@ -118,7 +122,7 @@ function hv(op, args = {}, { timeoutMs = 120_000, onChild } = {}) {
     const timer = setTimeout(() => {
       try { child.kill() } catch { /* gone */ }
       finish(reject, new Error(`Hyper-V operation ${op} timed out after ${Math.round(timeoutMs / 1000)} s`))
-    }, timeoutMs)
+    }, Math.min(timeoutMs, TIMER_MAX_MS))
     child.stdout.on('data', d => { if (out.length < OUT_CAP) out += d })
     child.stderr.on('data', d => { if (err.length < 64 * 1024) err += d })
     child.on('error', e => finish(reject, new Error(`can't run PowerShell for ${op}: ${e.message}`)))

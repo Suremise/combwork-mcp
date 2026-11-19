@@ -414,8 +414,8 @@ test('renew: refused at the deadline even before its timer fires; within maxLeas
 test('renew: the policy\'s maxSessionMinutes is checked against maxLeaseMinutes, and sets the cap', async t => {
   const base = { ...policy.DEFAULTS, diskFolders: ['D:\\hv'] }
   assert.deepStrictEqual(policy.problems({ ...base, maxSessionMinutes: undefined }), [])
-  assert.match(policy.problems({ ...base, maxLeaseMinutes: 240, maxSessionMinutes: 100 }).join(), /maxSessionMinutes must be 5-1440 and at least maxLeaseMinutes/)
-  assert.match(policy.problems({ ...base, maxSessionMinutes: 2000 }).join(), /maxSessionMinutes/)
+  assert.match(policy.problems({ ...base, maxLeaseMinutes: 240, maxSessionMinutes: 100 }).join(), /maxSessionMinutes must be a whole number, at least maxLeaseMinutes/)
+  assert.deepStrictEqual(policy.problems({ ...base, maxSessionMinutes: 2000 }), [], 'MC-1579: no ceiling (formerly 1440)')
   assert.strictEqual(policy.sessionMinutes({ maxLeaseMinutes: 240 }), 480)
   assert.strictEqual(policy.sessionMinutes({ maxLeaseMinutes: 600 }), 600)
   assert.strictEqual(policy.sessionMinutes({ maxLeaseMinutes: 60, maxSessionMinutes: 90 }), 90)
@@ -424,6 +424,22 @@ test('renew: the policy\'s maxSessionMinutes is checked against maxLeaseMinutes,
   clock.now += 50 * MIN
   assert.throws(() => helper.renew('a', { minutes: 60 }), /at most 40 minutes now/)
   assert.match(helper.status('a').text, /leases up to 60 min at a time, renewable to 90 min per work session\./)
+})
+
+test('MC-1579 round 2: a session cap past JavaScript\'s last date ends the session on that date; renewing past it is refused by name, never a RangeError', async t => {
+  const huge = Number.MAX_SAFE_INTEGER
+  const { helper, clock } = await inProcess(t, 'renew-datemax', { maxLeaseMinutes: huge, maxSessionMinutes: huge })
+  // An own copy (its ready record's licence): no evaluation end to cap the session first.
+  for (const r of helper.journal.records) if (r.t === 'ready') r.licence = { kind: 'own' }
+  await helper.acquire('a', { minutes: 60 })
+  const lease = [...helper.leases.values()][0]
+  assert.strictEqual(lease.sessionEnd, 8.64e15, 'the last date JavaScript can hold')
+  assert.doesNotThrow(() => new Date(lease.sessionEnd).toISOString())
+  assert.throws(() => helper.renew('a', { minutes: huge }), /past this work session's end, \+275760-09-13T00:00:00\.000Z \(the last date JavaScript can hold\)/)
+  const left = Math.floor((lease.sessionEnd - clock.now) / MIN)
+  helper.renew('a', { minutes: left })
+  assert.ok(lease.deadline <= lease.sessionEnd)
+  assert.doesNotThrow(() => helper.status('a').text)
 })
 
 test('renew: the deadline timer is re-armed (old ones dropped, not piling up) and the renewed deadline ends the lease', async t => {

@@ -7,7 +7,7 @@
  *   hv.ps1 'vhd-convert', Hyper-V's Convert-VHD) to the base VHDX a create copies. The VHDX's SHA-256 is recorded and
  *   rechecked before each copy (guests/linux.js).
  * - **Limits, not gates:** a qcow2 file (the format the distros publish cloud images in; qcow2.js refuses a backing
- *   file, encryption and the like) of at most 4 GB, and a guest the build can drive: cloud-init (NoCloud seed),
+ *   file, encryption and the like), and a guest the build can drive: cloud-init (NoCloud seed),
  *   systemd, OpenSSH and the hv_sock module (guests/linux.js). An image without one of those fails at the build step
  *   that needs it, by name. Run so far on Debian 13 and Ubuntu 26.04.
  * - The guest's own report at its build (/etc/os-release) is recorded on the VM; for an image recorded with a distro
@@ -18,7 +18,9 @@ const crypto = require('crypto')
 const { join, win32 } = require('path')
 const qcow2 = require('./qcow2')
 
-const MAX_IMAGE = 4 * 1024 ** 3
+// MC-1579: the image file has no size cap of its own (formerly 4 GB): the disk it holds is bounded by its virtual size,
+// which qcow2.toVhd holds to the policy's maxDiskGBPerVm and VHD's own limit.
+const MAX_IMAGE = Infinity
 /** A distro as vm_acquire's distro names it: the guest's /etc/os-release ID (debian, ubuntu, fedora, ...). */
 const DISTRO_RE = /^[a-z0-9][a-z0-9._-]{0,31}$/
 

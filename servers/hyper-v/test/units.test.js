@@ -229,7 +229,19 @@ test('policy: problems named; disk folders strictly inside; caps', () => {
   assert.deepStrictEqual(policy.problems({ ...p, buildRoots: ['C:\\Users\\u\\AppData\\Local\\combwork-cli\\'] }), [])
   for (const b of ['C:\\', '\\\\server\\share\\x', '\\\\?\\C:\\x', 'relative\\x', 'C:\\a\\..\\b', 42]) assert.match(policy.problems({ ...p, buildRoots: [b] }).join(), /build root .* must be an absolute local folder/, String(b))
   assert.match(policy.problems({ ...p, buildRoots: 'C:\\x' }).join(), /buildRoots must be a list/)
-  assert.match(policy.problems({ ...p, buildRoots: Array(17).fill('C:\\x') }).join(), /at most 16/)
+  assert.deepStrictEqual(policy.problems({ ...p, buildRoots: Array(40).fill('C:\\x') }), [], 'MC-1579: any number of them')
+  // MC-1579: no ceilings of the policy's own; Hyper-V's own maximums, each named, and lower bounds where less can't work.
+  // Round 2: VMs, cores, memory and disk have no ceiling here (Hyper-V's own depend on its version, and it refuses past
+  // them itself); leases and sessions none (a session ends by JavaScript's last date: sessions.test.js).
+  for (const ok of [{ maxVms: 5000 }, { maxCoresPerVm: 4096 }, { maxMemoryMBTotal: 512 * 1024 * 1024 }, { maxDiskGBPerVm: 1024 * 1024 }, { maxLeaseMinutes: 1, maxSessionMinutes: 1 }, { maxLeaseMinutes: 60 * 24 * 90, maxSessionMinutes: 60 * 24 * 365 }, { maxLeaseMinutes: 1e9 + 1, maxSessionMinutes: Number.MAX_SAFE_INTEGER }, { maxBuildMB: 1024 * 1024 }, { maxLeaseCheckpoints: 20, maxCheckpointsPerVm: 28 }, { minFreeGBForCheckpoint: 0 }, { minFreeGBForCheckpoint: 5000 }]) {
+    assert.deepStrictEqual(policy.problems({ ...p, ...ok }), [], JSON.stringify(ok))
+  }
+  assert.match(policy.problems({ ...p, maxVms: 0 }).join(), /maxVms must be a whole number, at least 1/)
+  assert.match(policy.problems({ ...p, maxLeaseMinutes: 0 }).join(), /maxLeaseMinutes must be a whole number, at least 1/)
+  assert.match(policy.problems({ ...p, maxLeaseMinutes: Number.MAX_SAFE_INTEGER + 2 }).join(), /maxLeaseMinutes must be a whole number/)
+  assert.match(policy.problems({ ...p, maxCheckpointsPerVm: 49 }).join(), /maxCheckpointsPerVm must be 0-48/)
+  assert.match(policy.problems({ ...p, maxLeaseCheckpoints: 25, maxCheckpointsPerVm: 24 }).join(), /together must be at most 48 \(they are 49\): Hyper-V keeps at most 50 checkpoints of a VM/)
+  assert.match(policy.problems({ ...p, maxLeaseCheckpoints: 45 }).join(), /they are 49/, 'with the other\'s default')
   for (const f of ['D:\\hyperv-mcp\\pool\\i-1', 'd:\\HYPERV-MCP\\x']) assert.ok(policy.underDiskFolder(p, f), f)
   for (const f of ['D:\\hyperv-mcp', 'D:\\hyperv-mcp-evil\\x', 'D:\\hyperv-mcp\\..\\x', 'C:\\x', 'relative\\x', 42]) assert.ok(!policy.underDiskFolder(p, f), String(f))
   const vm = { cores: 2, memoryMB: 4096, diskGB: 64, folder: 'D:\\hyperv-mcp\\pool\\i-1' }
@@ -547,26 +559,23 @@ for (const E of ENGINES) test(`uninstall teardown under PowerShell ${E.name} (no
 })
 
 // install.ps1's -BuildRoot checks, run as setup runs them (the block itself, cut from the script, not elevated): they
-// refuse what the helper's policy check would (more than 16, a drive root, '..'), before setup changes anything.
+// refuse what the helper's policy check would (a drive root, '..'; any number of them, MC-1579), before setup changes
+// anything.
 for (const E of ENGINES) test(`setup: -BuildRoot is refused as the policy would, before anything changes (PowerShell ${E.name})`, () => {
   const { spawnSync } = require('child_process')
   const src = fs.readFileSync(path.join(__dirname, '..', 'setup', 'install.ps1'), 'utf8')
-  const block = /^\$buildRoots = @\(\$BuildRoot[\s\S]*?^if \(\$buildRoots\.Count -gt 16\).*$/m.exec(src)
+  const block = /^\$buildRoots = @\(\$BuildRoot[\s\S]*?^\} \| Select-Object -Unique\)$/m.exec(src)
   assert.ok(block, 'the -BuildRoot block is in install.ps1')
   const sc = scratch('setup-buildroots')
   const file = path.join(sc.dir, 'buildroots.ps1')
   fs.writeFileSync(file, `param([string[]]$BuildRoot = @())\n$ErrorActionPreference = 'Stop'\n${block[0]}\nConvertTo-Json -Compress @{ buildRoots = @($buildRoots) }\n`)
   const run = roots => spawnSync(E.exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', `& '${file}' -BuildRoot ${roots.map(r => `'${r}'`).join(',')} 3>$null`], { encoding: 'utf8', env: E.env })
   const many = n => Array.from({ length: n }, (_, i) => path.join(sc.dir, `root-${i}`))
-  const sixteen = run([...many(16), path.join(sc.dir, 'root-0') + '\\'])
-  assert.strictEqual(sixteen.status, 0, sixteen.stderr)
-  const written = JSON.parse(sixteen.stdout.trim()).buildRoots
-  assert.strictEqual(written.length, 16, 'a repeat (with a trailing \\) counts once')
+  const twenty = run([...many(20), path.join(sc.dir, 'root-0') + '\\'])
+  assert.strictEqual(twenty.status, 0, twenty.stderr)
+  const written = JSON.parse(twenty.stdout.trim()).buildRoots
+  assert.strictEqual(written.length, 20, 'a repeat (with a trailing \\) counts once; more than the former 16')
   assert.deepStrictEqual(policy.problems({ ...policy.DEFAULTS, diskFolders: ['D:\\hv'], buildRoots: written }), [])
-  const seventeen = run(many(17))
-  assert.notStrictEqual(seventeen.status, 0)
-  assert.match(seventeen.stderr + seventeen.stdout, /At most 16 build roots: 17 were given/)
-  assert.match(policy.problems({ ...policy.DEFAULTS, diskFolders: ['D:\\hv'], buildRoots: many(17) }).join(), /at most 16/)
   for (const bad of ['C:\\', 'relative', path.join(sc.dir, 'a') + '\\..\\b']) {
     const r = run([bad])
     assert.notStrictEqual(r.status, 0, bad)
@@ -597,10 +606,11 @@ for (const E of ENGINES) test(`setup: -MaxSessionMinutes is checked as the helpe
   const file = path.join(sc.dir, 'session.ps1')
   fs.writeFileSync(file, `param([int]$MaxLeaseMinutes = 240, [int]$MaxSessionMinutes = 0)\n$ErrorActionPreference = 'Stop'\n${line[0]}\n'ok'\n`)
   const run = (lease, session) => spawnSync(E.exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, '-MaxLeaseMinutes', String(lease), '-MaxSessionMinutes', String(session)], { encoding: 'utf8', env: E.env })
-  for (const [lease, session, ok] of [[240, 0, true], [240, 480, true], [240, 240, true], [240, 239, false], [60, 4, false], [240, 1441, false]]) {
+  // MC-1579: no upper limit (formerly 1440), and no floor beyond one lease.
+  for (const [lease, session, ok] of [[240, 0, true], [240, 480, true], [240, 240, true], [240, 239, false], [60, 4, false], [240, 1441, true], [2880, 100000, true], [1, 1, true]]) {
     const r = run(lease, session)
     assert.strictEqual(r.status === 0, ok, `${lease}/${session}: ${r.stdout}${r.stderr}`)
-    if (!ok) assert.match(r.stdout + r.stderr, /-MaxSessionMinutes must be 5-1440 and at least -MaxLeaseMinutes/)
+    if (!ok) assert.match(r.stdout + r.stderr, /-MaxSessionMinutes must be at least -MaxLeaseMinutes/)
     if (session) assert.strictEqual(policy.problems({ ...policy.DEFAULTS, diskFolders: ['D:\\hv'], maxLeaseMinutes: lease, maxSessionMinutes: session }).length === 0, ok, `the helper agrees: ${lease}/${session}`)
   }
 })
