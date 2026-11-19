@@ -116,6 +116,31 @@ try {
   $r.diskHyperVKept = Has $dvhd 'S-1-5-83-0'
   $r.diskWriterAfter = & { try { & $useDisk $null } catch { $_.Exception.Message } }
 
+  # MC-1581 round 1: while the question is open, the account being removed (it can still write) plants a file and a
+  # folder symbolic link to targets outside, each carrying its own Users grant. The removal must change neither
+  # target; setup's strict check after it finds the links and refuses the folder.
+  $outside = Join-Path $base 'outside'
+  New-Item -ItemType Directory -Force (Join-Path $outside 'dir') | Out-Null
+  Set-Content (Join-Path $outside 'marker.txt') 'outside data'
+  & icacls.exe (Join-Path $outside 'marker.txt') /grant "*${USERS}:(RX)" /Q | Out-Null
+  & icacls.exe (Join-Path $outside 'dir') /grant "*${USERS}:(OI)(CI)RX" /Q | Out-Null
+  $outsideAcl = { @((Join-Path $outside 'marker.txt'), (Join-Path $outside 'dir')) | ForEach-Object { (Get-Acl -LiteralPath $_).GetSecurityDescriptorSddlForm('Access') } }
+  $before = & $outsideAcl
+  & icacls.exe $dx /grant "*${USERS}:(OI)(CI)F" /Q | Out-Null
+  $plant = {
+    param($p, $x)
+    # mklink, as an unprivileged program would (Windows PowerShell 5.1's New-Item asks for admin even in Developer Mode).
+    $f = & cmd.exe /d /c mklink (Join-Path $dx 'pool\planted.txt') (Join-Path $outside 'marker.txt') 2>&1
+    $g = & cmd.exe /d /c mklink /D (Join-Path $dx 'pool\planted-dir') (Join-Path $outside 'dir') 2>&1
+    $script:linksMade = if ((Test-Path -LiteralPath (Join-Path $dx 'pool\planted.txt')) -and (Test-Path -LiteralPath (Join-Path $dx 'pool\planted-dir'))) { $true } else { "no: $f $g" }
+    $true
+  }
+  $script:linksMade = $null
+  $r.plantedResult = & { try { & $useDisk $plant } catch { $_.Exception.Message } }
+  $r.linksMade = $script:linksMade
+  $r.outsideUnchanged = ((& $outsideAcl) -join '|') -eq ($before -join '|')
+  $r.outsideData = (Get-Content -LiteralPath (Join-Path $outside 'marker.txt') -Raw).Trim()
+
   # MC-1581: an extra account's read-only grant (as Explorer's "Continue" adds: inherited by everything in it) on a
   # folder whose identity matches its receipt: shown, and removed only when the admin agrees; then trusted again.
   $exp = Join-Path $base 'explored'

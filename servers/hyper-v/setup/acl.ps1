@@ -125,10 +125,13 @@ function Get-ExtraGrants([string]$Path, [string[]]$Allowed, [string]$AllowPatter
 }
 
 # MC-1581: removes $Sids' grants from $Path and everything under it (icacls /remove:g, explicit ones on each item; the
-# inherited copies go with the folder's own). Only after the caller has shown them and the admin has agreed.
+# inherited copies go with the folder's own). Only after the caller has shown them and the admin has agreed. /L: a link
+# is changed itself, never its target. The account being removed may still write here while the question is open, and
+# could plant a symbolic link to a file outside, whose permissions setup would otherwise change with admin rights.
+# (Setup's strict check after the removal then finds the link, and refuses the folder.)
 function Remove-ExtraGrants([string]$Path, [string[]]$Sids) {
   foreach ($sid in $Sids) {
-    $o = & icacls.exe $Path /remove:g "*$sid" /T /C /Q 2>&1
+    $o = & icacls.exe $Path /remove:g "*$sid" /T /C /L /Q 2>&1
     if ($LASTEXITCODE -ne 0) { throw "removing $sid's grant from $Path failed: $o" }
   }
 }

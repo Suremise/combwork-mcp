@@ -409,6 +409,12 @@ for (const E of ENGINES) test(`setup storage and ACLs under PowerShell ${E.name}
   assert.strictEqual(a.diskWriterGone, true, 'gone from the folder and everything in it')
   assert.strictEqual(a.diskHyperVKept, true, 'Hyper-V\'s own grants kept')
   assert.strictEqual(a.diskWriterAfter, 'trusted', 'trusted again after')
+  // Round 1: links planted while the question is open (a file and a folder symbolic link to outside targets): the
+  // removal changes neither target (icacls /L), and the folder is refused for the links.
+  assert.strictEqual(a.linksMade, true, `this test needs symbolic links (Developer Mode, or the right to create them): ${a.linksMade}`)
+  assert.match(a.plantedResult, /planted(-dir|\.txt) is a link.*It won't be used/)
+  assert.strictEqual(a.outsideUnchanged, true, 'the outside targets\' permissions are exactly as they were')
+  assert.strictEqual(a.outsideData, 'outside data')
   assert.strictEqual(a.readerBefore, true, 'the folder and its contents carried the read grant')
   assert.match(a.readerNoQuestion, /can read it, and the grant wasn't removed\. Nothing was changed: run setup again and agree to remove it/)
   assert.match(a.readerNo, /can read it, and the grant wasn't removed/)
