@@ -70,8 +70,11 @@ function Set-ExclusiveAcl([string]$Path, [string[]]$Grants, [switch]$SetOwner, [
 
 # Problems: every Allow grant on $Path or anything under it whose SID isn't in $Allowed (or, for $Writers, any write
 # right held by a SID not in $Writers), and every owner not in $Owners. Empty when the folder is as setup made it.
-function Test-ExclusiveAcl([string]$Path, [string[]]$Allowed, [string[]]$Writers = $Allowed, [string[]]$Owners, [string]$AllowPattern) {
-  $writeMask = 0x2 -bor 0x4 -bor 0x40 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
+# -IgnoreReadOnly (MC-1581): a grant to a SID not in $Allowed that holds no write right (Explorer's "Continue" adds one
+# for the user) isn't counted here: Get-ExtraReaders lists those, for the caller to show and remove.
+$script:WriteMask = 0x2 -bor 0x4 -bor 0x40 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
+function Test-ExclusiveAcl([string]$Path, [string[]]$Allowed, [string[]]$Writers = $Allowed, [string[]]$Owners, [string]$AllowPattern, [switch]$IgnoreReadOnly) {
+  $writeMask = $script:WriteMask
   $out = @()
   $items = @(Get-Item -LiteralPath $Path -Force) + @(Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction Stop)
   foreach ($i in $items) {
@@ -82,7 +85,10 @@ function Test-ExclusiveAcl([string]$Path, [string[]]$Allowed, [string[]]$Writers
       $sid = try { $ace.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { $ace.IdentityReference.Value }
       if ($sid -eq 'S-1-3-0') { continue } # CREATOR OWNER: applies to whoever creates a child, who must already be allowed
       if ($AllowPattern -and $sid -match $AllowPattern) { continue } # e.g. Hyper-V's per-VM SIDs on a VM's own files
-      if ($Allowed -notcontains $sid) { $out += "$($i.FullName): $($ace.IdentityReference) has $($ace.FileSystemRights)" }
+      if ($Allowed -notcontains $sid) {
+        if ($IgnoreReadOnly -and -not ([int64]$ace.FileSystemRights -band $writeMask)) { continue }
+        $out += "$($i.FullName): $($ace.IdentityReference) has $($ace.FileSystemRights)"
+      }
       elseif (([int64]$ace.FileSystemRights -band $writeMask) -and $Writers -notcontains $sid) { $out += "$($i.FullName): $($ace.IdentityReference) can write" }
     }
     if ($Owners) {
@@ -93,10 +99,42 @@ function Test-ExclusiveAcl([string]$Path, [string[]]$Allowed, [string[]]$Writers
   return $out
 }
 
+# MC-1581: the read-only grants on $Path and everything under it to SIDs outside $Allowed (and $AllowPattern): one entry
+# per SID, { sid, name, rights (each distinct), where (how many items carry it), first (one of them) }. A grant with any
+# write right isn't listed (Test-ExclusiveAcl refuses it).
+function Get-ExtraReaders([string]$Path, [string[]]$Allowed, [string]$AllowPattern) {
+  $by = [ordered]@{}
+  $items = @(Get-Item -LiteralPath $Path -Force) + @(Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction Stop)
+  foreach ($i in $items) {
+    if ($i.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+    foreach ($ace in (Get-Acl -LiteralPath $i.FullName).Access) {
+      if ($ace.AccessControlType -ne 'Allow') { continue }
+      $sid = try { $ace.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value } catch { $ace.IdentityReference.Value }
+      if ($sid -eq 'S-1-3-0' -or $Allowed -contains $sid -or ($AllowPattern -and $sid -match $AllowPattern)) { continue }
+      if ([int64]$ace.FileSystemRights -band $script:WriteMask) { continue }
+      if (-not $by.Contains($sid)) { $by[$sid] = [pscustomobject]@{ sid = $sid; name = [string]$ace.IdentityReference; rights = @(); where = 0; first = $i.FullName } }
+      $e = $by[$sid]
+      if ($e.rights -notcontains [string]$ace.FileSystemRights) { $e.rights += [string]$ace.FileSystemRights }
+      $e.where++
+    }
+  }
+  return @($by.Values)
+}
+
+# MC-1581: removes $Sids' grants from $Path and everything under it (icacls /remove:g, explicit ones on each item; the
+# inherited copies go with the folder's own). Only after the caller has shown them and the admin has agreed.
+function Remove-ExtraReaders([string]$Path, [string[]]$Sids) {
+  foreach ($sid in $Sids) {
+    $o = & icacls.exe $Path /remove:g "*$sid" /T /C /Q 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "removing $sid's grant from $Path failed: $o" }
+  }
+}
+
 # ---------- trusted storage (design MC-1488/s52) ----------
 #
 # The state folder, its approvals\ and the disk folders hold what the helper trusts (journal, plans, approvals, secrets,
-# verified images). Setup never changes the owner or ACL of any of them once they exist, and trusts one only if:
+# verified images). Setup never changes the owner or ACL of any of them once they exist (MC-1581's one exception: an
+# extra account's read-only grant, removed when the admin agrees after seeing it), and trusts one only if:
 #   - it created it itself, with CreateDirectoryW and its final security descriptor in that one call (so nobody else could
 #     ever write there or hold a handle into it), and recorded a receipt of its identity (volume serial + file id) in a
 #     registry key only Administrators and SYSTEM can write; or
@@ -198,7 +236,8 @@ function Open-ReceiptKey([Microsoft.Win32.RegistryKey]$Root, [string]$SubKey, [s
 # missing and before it creates it (the boundary where someone else could create it first).
 function Use-StorageFolder {
   param([string]$Path, [string[]]$Grants, [string]$OwnerSid, [Microsoft.Win32.RegistryKey]$Receipts,
-    [string[]]$Allowed, [string[]]$Writers, [string[]]$Owners, [string]$AllowPattern, [Collections.ArrayList]$Pins, [scriptblock]$BeforeCreate)
+    [string[]]$Allowed, [string[]]$Writers, [string[]]$Owners, [string]$AllowPattern, [Collections.ArrayList]$Pins, [scriptblock]$BeforeCreate,
+    [scriptblock]$Confirm)
   if (-not $Writers) { $Writers = $Allowed }
   $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
   $name = $full.ToLowerInvariant()
@@ -236,12 +275,34 @@ function Use-StorageFolder {
     throw "$full isn't the folder setup created (its identity differs from the receipt), so its contents can't be trusted. Nothing was changed."
   }
   $owner = Get-OwnerSid (Get-HandleSecurity $h)
-  $bad = @(Test-ExclusiveAcl $full -Allowed $Allowed -Writers $Writers -Owners $Owners -AllowPattern $AllowPattern)
+  $bad = @(Test-ExclusiveAcl $full -Allowed $Allowed -Writers $Writers -Owners $Owners -AllowPattern $AllowPattern -IgnoreReadOnly)
   if ($Owners -notcontains $owner) { $bad = @("$full is owned by $owner") + $bad }
   if ($bad.Count) {
     throw "$full has its receipt, but its contents aren't as setup and the helper leave them ($($bad[0])$(if ($bad.Count -gt 1) { "; and $($bad.Count - 1) more" })). Nothing was changed."
   }
-  return 'trusted'
+  # MC-1581: its identity matches and only setup's accounts can write it, but another account was given read access
+  # (opening it in Explorer and clicking Continue does that). Nobody else could have changed what's in it, so it stays
+  # trusted once that grant is gone: shown, then removed only if the admin agrees ($Confirm), and checked again.
+  $readers = @(Get-ExtraReaders $full $Allowed $AllowPattern)
+  if (-not $readers.Count) { return 'trusted' }
+  if (-not $Confirm -or -not (& $Confirm $full $readers)) {
+    throw "$full has its receipt, but $(@($readers | ForEach-Object { $_.name }) -join ', ') can read it, and the grant wasn't removed. Nothing was changed: run setup again and agree to remove it, or remove it yourself."
+  }
+  Remove-ExtraReaders $full @($readers | ForEach-Object { $_.sid })
+  $bad = @(Test-ExclusiveAcl $full -Allowed $Allowed -Writers $Writers -Owners $Owners -AllowPattern $AllowPattern)
+  if ($bad.Count) { throw "$full still isn't as setup leaves it after removing the extra read access ($($bad[0])). It won't be used." }
+  return 'trusted (extra read access removed)'
+}
+
+# MC-1581: setup's question before Remove-ExtraReaders: the folder, each extra account and what it can do. True only
+# when the admin types REMOVE.
+function Confirm-RemoveReaders([string]$Path, $Readers) {
+  Write-Host ''
+  Write-Host "$Path is setup's own folder (its identity matches its receipt), and only setup's accounts can change it, but" -ForegroundColor Yellow
+  Write-Host 'these accounts were also given read access (opening it in Explorer and clicking Continue does this):' -ForegroundColor Yellow
+  foreach ($r in $Readers) { Write-Host "  $($r.name) ($($r.sid)): $($r.rights -join ', '), on $($r.where) item(s), e.g. $($r.first)" }
+  Write-Host 'They could read what is in it while the grant was there, but not change it. Setup can remove that access and go on.'
+  return ((Read-Host 'Type REMOVE to remove it (anything else stops, with nothing changed)') -ceq 'REMOVE')
 }
 
 # Writes a file with exactly this security from the moment it exists: a new file under a temporary name (CreateNew, with

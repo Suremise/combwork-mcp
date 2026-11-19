@@ -92,6 +92,34 @@ try {
   $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier $USERS), 'Modify', 'Allow')))
   Set-Acl -LiteralPath $vhdx -AclObject $acl
   $r.hyperVPlusUsers = & { try { Use-StorageFolder $disk $grants $me $receipts -Allowed $trusted -Owners $trusted -AllowPattern $script:HyperVGrantees -Pins $pins } catch { $_.Exception.Message } }
+  # MC-1581: write access by another account is still refused, even when the admin would agree to a removal.
+  $r.writeWithYes = & { try { Use-StorageFolder $disk $grants $me $receipts -Allowed $trusted -Owners $trusted -AllowPattern $script:HyperVGrantees -Pins $pins -Confirm { $true } } catch { $_.Exception.Message } }
+
+  # MC-1581: an extra account's read-only grant (as Explorer's "Continue" adds: inherited by everything in it) on a
+  # folder whose identity matches its receipt: shown, and removed only when the admin agrees; then trusted again.
+  $exp = Join-Path $base 'explored'
+  [void](& $use $exp $null)
+  New-Item -ItemType Directory -Force (Join-Path $exp 'pool') | Out-Null
+  Set-Content (Join-Path $exp 'pool\disk.vhdx') 'v'
+  & icacls.exe $exp /grant "*${USERS}:(OI)(CI)RX" /Q | Out-Null
+  $r.readerBefore = (Has $exp $USERS) -and (Has (Join-Path $exp 'pool\disk.vhdx') $USERS)
+  $r.readerNoQuestion = & { try { Use-StorageFolder $exp $grants $me $receipts -Allowed $trusted -Owners $trusted -Pins $pins } catch { $_.Exception.Message } }
+  $script:shown = $null
+  $r.readerNo = & { try { Use-StorageFolder $exp $grants $me $receipts -Allowed $trusted -Owners $trusted -Pins $pins -Confirm { param($p, $rd) $script:shown = $rd; $false } } catch { $_.Exception.Message } }
+  $r.readerKeptOnNo = Has $exp $USERS
+  $r.readerShown = @($script:shown | ForEach-Object { [ordered]@{ sid = $_.sid; rights = ($_.rights -join ','); where = $_.where } })
+  $r.readerYes = & { try { Use-StorageFolder $exp $grants $me $receipts -Allowed $trusted -Owners $trusted -Pins $pins -Confirm { $true } } catch { $_.Exception.Message } }
+  $r.readerGone = -not ((Has $exp $USERS) -or (Has (Join-Path $exp 'pool') $USERS) -or (Has (Join-Path $exp 'pool\disk.vhdx') $USERS))
+  $r.readerAfter = & $use $exp $null
+  $r.readerDataKept = (Get-Content -LiteralPath (Join-Path $exp 'pool\disk.vhdx') -Raw).Trim() -eq 'v'
+
+  # MC-1581: uninstall's teardown lets a read-only grant through (a reader can't have changed anything), not a write one.
+  . (Join-Path $PSScriptRoot '..\setup\teardown.ps1')
+  & icacls.exe $exp /grant "*${USERS}:(OI)(CI)RX" /Q | Out-Null
+  $tp = New-Object Collections.ArrayList
+  try { $r.teardownReader = [bool](Test-Target $exp $trusted $trusted $tp $null) } catch { $r.teardownReader = $_.Exception.Message } finally { Close-Pins $tp }
+  & icacls.exe $exp /grant "*${USERS}:(W)" /Q | Out-Null
+  try { $r.teardownWriter = [bool](Test-Target $exp $trusted $trusted $tp $null) } catch { $r.teardownWriter = $_.Exception.Message } finally { Close-Pins $tp }
 
   # The injected boundary: after setup found the path missing, someone creates it first and plants a forged journal.
   $race = Join-Path $base 'race'

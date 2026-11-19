@@ -116,11 +116,12 @@ $runnerSid = if ($Mode -eq 'Service') {
   if (-not $line) { throw "sc.exe showsid $svc gave no service SID." }
   $Matches[1]
 } else { (New-Object Security.Principal.NTAccount $User).Translate([Security.Principal.SecurityIdentifier]).Value }
-# Disk folders: a top-level folder on a local fixed drive (X:\name), the supported location. Its only parent is the
-# volume root, which can't be renamed or replaced.
+# Disk folders: a folder at any depth on a local fixed drive (MC-1581; was top-level only), not a drive root. Every
+# parent is checked and held before anything changes (Open-TrustedAncestors): owned by Administrators, SYSTEM or
+# TrustedInstaller, and with nobody else able to rename or replace what is under it.
 $folders = @($DiskFolder | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') })
 foreach ($d in $folders) {
-  if ($d -notmatch '^[A-Za-z]:\\[^\\]+$') { throw "Disk folder $d must be a top-level folder on a local drive, such as D:\hyperv-mcp." }
+  if ($d -notmatch '^[A-Za-z]:\\[^\\]') { throw "Disk folder $d must be a folder on a local drive, such as D:\hyperv-mcp or D:\VMs\hyperv-mcp, not a drive root." }
   if ((New-Object IO.DriveInfo $d.Substring(0, 2)).DriveType -ne 'Fixed') { throw "Disk folder $d must be on a local fixed drive." }
 }
 # Build roots: absolute local folders, not a drive root, with no link or junction on the way (the server refuses one
@@ -219,10 +220,10 @@ $trusted = @($SYSTEM, $ADMINS, $script:TrustedInstaller)
 foreach ($p in @($state, $install) + $folders) { Open-TrustedAncestors $p $trusted $pins }
 $receipts = Open-ReceiptKey ([Microsoft.Win32.Registry]::LocalMachine) 'SOFTWARE\hyperv-mcp\Storage' @($SYSTEM, $ADMINS) $ADMINS
 $who = @($SYSTEM, $ADMINS, $runnerSid)
-$stateIs = Use-StorageFolder $state @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=Modify") $ADMINS $receipts -Allowed $who -Owners $who -Pins $pins
+$stateIs = Use-StorageFolder $state @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=Modify") $ADMINS $receipts -Allowed $who -Owners $who -Pins $pins -Confirm ${function:Confirm-RemoveReaders}
 $approvals = Join-Path $state 'approvals'
-$apprIs = Use-StorageFolder $approvals @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=ReadAndExecute") $ADMINS $receipts -Allowed $who -Writers $SYSTEM, $ADMINS -Owners $SYSTEM, $ADMINS -Pins $pins
-$diskIs = foreach ($d in $folders) { "$d $(Use-StorageFolder $d @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=FullControl") $ADMINS $receipts -Allowed $who -Owners $who -AllowPattern $script:HyperVGrantees -Pins $pins)" }
+$apprIs = Use-StorageFolder $approvals @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=ReadAndExecute") $ADMINS $receipts -Allowed $who -Writers $SYSTEM, $ADMINS -Owners $SYSTEM, $ADMINS -Pins $pins -Confirm ${function:Confirm-RemoveReaders}
+$diskIs = foreach ($d in $folders) { "$d $(Use-StorageFolder $d @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=FullControl") $ADMINS $receipts -Allowed $who -Owners $who -AllowPattern $script:HyperVGrantees -Pins $pins -Confirm ${function:Confirm-RemoveReaders})" }
 Step "Storage: state $stateIs, approvals $apprIs, disks $($diskIs -join ', ') (parents checked and held while setup runs)."
 # This installation's generation: an uninstall's record is bound to it.
 $ik = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\hyperv-mcp', $true)

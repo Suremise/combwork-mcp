@@ -397,6 +397,20 @@ for (const E of ENGINES) test(`setup storage and ACLs under PowerShell ${E.name}
   assert.strictEqual(a.pinnedRename, 'MethodInvocationException', 'a pinned parent can\'t be renamed while setup runs')
   assert.strictEqual(a.unpinnedRename, 'moved', 'and can once released')
   assert.match(a.weakKey, /isn't protected \(S-1-5-32-545 can write it\)/, 'a receipts key that Users can write is refused')
+  // MC-1581: an extra account's read-only grant (Explorer's "Continue") is shown, and removed only if the admin agrees;
+  // write access by another account, or a changed identity, is still refused.
+  assert.match(a.writeWithYes, /contents aren't as setup and the helper leave them.*S-1-5-32-545|BUILTIN.Users/, 'a Users write grant is refused even with a yes')
+  assert.strictEqual(a.readerBefore, true, 'the folder and its contents carried the read grant')
+  assert.match(a.readerNoQuestion, /can read it, and the grant wasn't removed\. Nothing was changed: run setup again and agree to remove it/)
+  assert.match(a.readerNo, /can read it, and the grant wasn't removed/)
+  assert.strictEqual(a.readerKeptOnNo, true, 'a no changes nothing')
+  assert.deepStrictEqual(a.readerShown.map(x => ({ ...x, where: x.where >= 3 })), [{ sid: 'S-1-5-32-545', rights: 'ReadAndExecute, Synchronize', where: true }], 'shown: the account, its rights, on the folder and everything in it')
+  assert.strictEqual(a.readerYes, 'trusted (extra read access removed)')
+  assert.strictEqual(a.readerGone, true, 'gone from the folder and everything in it')
+  assert.strictEqual(a.readerAfter, 'trusted', 'and trusted unchanged on the next run')
+  assert.strictEqual(a.readerDataKept, true, 'its contents untouched')
+  assert.strictEqual(a.teardownReader, true, 'uninstall lets a read-only grant through')
+  assert.match(a.teardownWriter, /isn't as setup and the helper leave it \(.*(BUILTIN.Users|S-1-5-32-545) has Write.*\), so it won't be deleted/, 'but not a write grant')
 })
 
 for (const E of ENGINES) test(`approve.ps1 runs only from the installed, admin-only folder (PowerShell ${E.name})`, () => {
@@ -544,6 +558,30 @@ for (const E of ENGINES) test(`uninstall teardown under PowerShell ${E.name} (no
   assert.strictEqual(a.keepsUninstall, 'ok')
   assert.strictEqual(a.keepsUninstallLeft, 'uninstall')
   assert.strictEqual(a.keepsUninstallFile, true)
+})
+
+// MC-1581: install.ps1's -DiskFolder check, run as setup runs it (the block cut from the script): a folder at any depth
+// on a local fixed drive (its parents are checked later, by Open-TrustedAncestors, before anything changes); never a
+// drive root. The policy agrees.
+for (const E of ENGINES) test(`setup: -DiskFolder at any depth, not a drive root (PowerShell ${E.name})`, () => {
+  const { spawnSync } = require('child_process')
+  const src = fs.readFileSync(path.join(__dirname, '..', 'setup', 'install.ps1'), 'utf8')
+  const block = /^\$folders = @\(\$DiskFolder[\s\S]*?\r?\n\}\r?\n/m.exec(src)
+  assert.ok(block, 'the -DiskFolder block in install.ps1')
+  const sc = scratch(`setup-diskfolder-${E.name}`)
+  const file = path.join(sc.dir, 'disk.ps1')
+  fs.writeFileSync(file, `param([string[]]$DiskFolder)\n$ErrorActionPreference = 'Stop'\n${block[0]}\n'ok: ' + ($folders -join '|')\n`)
+  const drive = (process.env.SystemDrive || 'C:').slice(0, 2)
+  const run = d => spawnSync(E.exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, '-DiskFolder', d], { encoding: 'utf8', env: E.env })
+  for (const d of [`${drive}\\hyperv-mcp`, `${drive}\\VMs\\hyperv-mcp`, `${drive}\\VMs\\Pools\\hyperv mcp\\`]) {
+    const r = run(d)
+    assert.strictEqual(r.status, 0, `${d}: ${r.stdout}${r.stderr}`)
+    assert.match(r.stdout, new RegExp(`ok: ${d.replace(/\\+$/, '').replace(/\\/g, '\\\\')}`), d)
+    assert.deepStrictEqual(policy.problems({ ...policy.DEFAULTS, diskFolders: [d.replace(/\\+$/, '')] }), [], `the policy takes ${d}`)
+  }
+  const root = run(`${drive}\\`)
+  assert.notStrictEqual(root.status, 0)
+  assert.match(root.stdout + root.stderr, /must be a folder on a local drive, such as D:\\hyperv-mcp or D:\\VMs\\hyperv-mcp, not a drive root/)
 })
 
 // install.ps1's -BuildRoot checks, run as setup runs them (the block itself, cut from the script, not elevated): they
