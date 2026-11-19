@@ -72,7 +72,7 @@ function scratch(name, { policy = {}, stub = {}, timing = null } = {}) {
   const disks = path.join(dir, 'disks')
   fs.writeFileSync(path.join(dir, 'state/policy.json'), JSON.stringify({
     schema: 1, prefix: 'hvmcp', maxVms: 3, maxCoresPerVm: 4, maxMemoryMBTotal: 24576, maxDiskGBPerVm: 128, diskFolders: [disks],
-    maxNetwork: 'internet-lan', hostNetwork: HOST_NETWORK, maxReservePercent: 50, maxLeaseMinutes: 240, maxBuildMB: 64, allowUnpinnedIso: false, ...policy
+    maxNetwork: 'internet-lan', hostNetwork: HOST_NETWORK, maxReservePercent: 50, maxLeaseMinutes: 240, maxBuildMB: 64, ...policy
   }))
   const state = path.join(dir, 'stub.json')
   fs.writeFileSync(state, JSON.stringify({ switches: { 'hvmcp-host': { id: HOST_SWITCH_ID, type: 'Internal', notes: 'hvmcp:host:' + 'ab'.repeat(16) } }, hostNet: HOST_NETWORK, ...stub }))

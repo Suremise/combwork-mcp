@@ -1,12 +1,12 @@
 // The helper's pieces on their own: the bounded UDF/WIM reader against real UDF images (made with the in-box IMAPI2
-// through hv.ps1's make-iso) and malformed ones; the image checks (pinned, downloaded, local and unpinned, signatures,
-// edition); the policy; the journal (a torn last line); canonical plan text; the answer file's escaping.
+// through hv.ps1's make-iso) and malformed ones; the image checks (MC-1572: any local ISO, copied while hashed; signatures
+// as information; x64 and one edition per ISO); the policy; the journal (a torn last line); canonical plan text; the answer file's escaping.
 const test = require('node:test')
 const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
-const { T, scratch } = require('./helpers')
+const { T, scratch, startHelper, approve, waitFor } = require('./helpers')
 const iso = require('../helper/iso')
 const images = require('../helper/images')
 const policy = require('../helper/policy')
@@ -95,81 +95,124 @@ test('wim: XML out of range or missing is refused', () => {
   assert.throws(() => iso.wimImages((o, l) => empty.subarray(o, o + l), empty.length), /lists no images/)
 })
 
-test('images: an unpinned local ISO is refused unless the policy allows it, and then marked not authenticated', { skip: !windows }, async () => {
+test('images (MC-1572): any local ISO the user names is taken, copied while hashed, with its path; no pin, no policy, no override', { skip: !windows }, async () => {
   const sc = scratch('images-local')
   process.env.HYPERV_MCP_MIN_ISO_BYTES = '1'
   const f = await udf(sc, 'local', goodFiles())
   const sig = async (op, a) => ({ files: a.files.map(file => ({ file, ok: true })) })
-  await assert.rejects(images.prepare({ want: { iso: f }, dir: path.join(sc.disks, 'images'), hv: sig, policy: { allowUnpinnedIso: false } }), /not a known Microsoft image, and the policy doesn't allow unpinned local images/)
-  assert.deepStrictEqual(fs.readdirSync(path.join(sc.disks, 'images')).filter(n => n.endsWith('.iso')), [], 'the refused copy is deleted')
-  const img = await images.prepare({ want: { iso: f }, dir: path.join(sc.disks, 'images'), hv: sig, policy: { allowUnpinnedIso: true } })
-  assert.strictEqual(img.pinned, false)
-  assert.strictEqual(img.source, 'local')
-  assert.strictEqual(img.build, '26200.6584')
+  const img = await images.prepare({ want: { iso: f }, dir: path.join(sc.disks, 'images'), hv: sig })
+  assert.deepStrictEqual([img.source, img.path, img.edition, img.build, img.evaluation, img.pinned], ['local', fs.realpathSync.native(f), 'EnterpriseEval', '26200.6584', true, undefined])
+  assert.deepStrictEqual(img.signature, { microsoft: true, note: 'setup.exe and sources\\setup.exe validly signed by Microsoft' })
   assert.strictEqual(img.sha256, crypto.createHash('sha256').update(fs.readFileSync(f)).digest('hex'))
   assert.ok(fs.existsSync(img.file) && path.dirname(img.file) === path.join(sc.disks, 'images'), 'its own copy')
-  const again = await images.prepare({ want: { iso: f }, dir: path.join(sc.disks, 'images'), hv: sig, policy: { allowUnpinnedIso: true }, known: new Map([[img.sha256, img]]) })
+  assert.strictEqual(await images.hashFile(img.file), img.sha256, 'the build\'s recheck of the copy')
+  const again = await images.prepare({ want: { iso: f }, dir: path.join(sc.disks, 'images'), hv: sig, known: new Map([[img.sha256, img]]) })
   assert.strictEqual(again.existing, true)
 })
 
-test('images: bad signatures, an edition not supported, and the helper\'s own folders are refused', { skip: !windows }, async () => {
-  const sc = scratch('images-bad')
+test('images (MC-1572): any x64 edition and build; signatures are information only; ARM and other limits refused by name; the helper never downloads', { skip: !windows }, async () => {
+  const sc = scratch('images-any')
   process.env.HYPERV_MCP_MIN_ISO_BYTES = '1'
-  const pol = { allowUnpinnedIso: true }
   const ok = async (op, a) => ({ files: a.files.map(file => ({ file, ok: true })) })
   const bad = async (op, a) => ({ files: a.files.map(file => ({ file, ok: false, why: 'signature NotSigned' })) })
+  const broken = async () => { throw new Error('powershell went away') }
   const f = await udf(sc, 'img', goodFiles())
-  await assert.rejects(images.prepare({ want: { iso: f }, dir: path.join(sc.disks, 'i1'), hv: bad, policy: pol }), /not validly signed by Microsoft: .*NotSigned/)
-  const home = await udf(sc, 'home', { ...goodFiles(), 'sources/install.wim': wim([{ edition: 'Core', build: 26200, sp: 1 }]) })
-  await assert.rejects(images.prepare({ want: { iso: home }, dir: path.join(sc.disks, 'i2'), hv: ok, policy: pol }), /should hold an x64 EnterpriseEval\/Enterprise\/Professional\/Education image; it holds Core/)
-  await assert.rejects(images.prepare({ want: { iso: f, edition: 'Core' }, dir: path.join(sc.disks, 'i2'), hv: ok, policy: pol }), /edition must be one of/)
+  // Unsigned, or the signature check failing: still taken, and the record says so for the plan.
+  const unsigned = await images.prepare({ want: { iso: f }, dir: path.join(sc.disks, 'i1'), hv: bad })
+  assert.deepStrictEqual(unsigned.signature, { microsoft: false, note: 'setup.exe: signature NotSigned; sources\\setup.exe: signature NotSigned' })
+  const unread = await images.prepare({ want: { iso: f }, dir: path.join(sc.disks, 'i1b'), hv: broken })
+  assert.deepStrictEqual(unread.signature, { microsoft: false, note: 'not read: powershell went away' })
+  // Editions and builds the helper once refused: Home (Core), Server, Windows 10, and Microsoft's newer 26H2 build.
+  for (const [name, edition, build, sp, evaluation] of [['home', 'Core', 26200, 1, false], ['server', 'ServerStandardEval', 26100, 1742, true], ['win10', 'Professional', 19045, 2965, false], ['h26', 'EnterpriseEval', 26300, 9457, true]]) {
+    const iso = await udf(sc, name, { ...goodFiles(), 'sources/install.wim': wim([{ edition, build, sp }]) })
+    const r = await images.prepare({ want: { iso }, dir: path.join(sc.disks, `e-${name}`), hv: ok })
+    assert.deepStrictEqual([r.edition, r.build, r.evaluation], [edition, `${build}.${sp}`, evaluation], name)
+  }
+  // Limits, not gates: an x64 host runs x64 guests; the edition asked must be in the ISO.
   const arm = await udf(sc, 'arm', { ...goodFiles(), 'sources/install.wim': wim([{ edition: 'EnterpriseEval', build: 26200, sp: 1, arch: 12 }]) })
-  await assert.rejects(images.prepare({ want: { iso: arm }, dir: path.join(sc.disks, 'i3'), hv: ok, policy: pol }), /arch 12/)
-  await assert.rejects(images.prepare({ want: { iso: f }, dir: path.join(sc.disks, 'i4'), hv: ok, policy: pol, ownDirs: [sc.dir] }), /helper's own folders/)
-  await assert.rejects(images.prepare({ want: { iso: 'relative.iso' }, dir: path.join(sc.disks, 'i5'), hv: ok, policy: pol }), /absolute local path/)
-  await assert.rejects(images.prepare({ want: { iso: f, download: 'https://x.microsoft.com/a.iso' }, dir: path.join(sc.disks, 'i6'), hv: ok, policy: pol }), /must be \{ iso/)
+  await assert.rejects(images.prepare({ want: { iso: arm }, dir: path.join(sc.disks, 'i3'), hv: ok }), /holds no x64 image \(it holds EnterpriseEval \(arch 12\)\): an x64 Hyper-V host runs x64 guests only/)
+  await assert.rejects(images.prepare({ want: { iso: f, edition: 'Education' }, dir: path.join(sc.disks, 'i2'), hv: ok }), /should hold one x64 Education image; it holds EnterpriseEval/)
+  await assert.rejects(images.prepare({ want: { iso: f, edition: '../x' }, dir: path.join(sc.disks, 'i2'), hv: ok }), /edition must be an edition ID/)
+  await assert.rejects(images.prepare({ want: { iso: f }, dir: path.join(sc.disks, 'i4'), hv: ok, ownDirs: [sc.dir] }), /helper's own folders/)
+  await assert.rejects(images.prepare({ want: { iso: 'relative.iso' }, dir: path.join(sc.disks, 'i5'), hv: ok }), /absolute local path/)
+  for (const want of [{ download: 'https://go.microsoft.com/fwlink/?LinkId=2382600' }, { download: 'win11-enterprise-eval' }, { iso: f, download: 'https://x.microsoft.com/a.iso' }, { url: 'https://example.com/x.iso' }]) {
+    await assert.rejects(images.prepare({ want, dir: path.join(sc.disks, 'i6'), hv: ok }), /The helper doesn't download images: download the ISO yourself, then pass image \{ iso: "<its path>" \}/)
+  }
+  assert.ok(!require('fs').readFileSync(path.join(__dirname, '../helper/images.js'), 'utf8').includes("require('https')"), 'images.js has no network code')
+})
+
+test('the user\'s ISO through the helper (MC-1572): the no-image hint names a file, never a download; the plan names the path and hash; create-vm gets that hash', { skip: !windows }, async () => {
+  const sc = scratch('user-iso', { stub: { setupOverride: { build: '26300', ubr: 9457 } } }) // the guest of a 26H2 image
+  const iso = await udf(sc, 'Win11_Eval_26H2', { ...goodFiles(), 'sources/install.wim': wim([{ edition: 'EnterpriseEval', build: 26300, sp: 9457 }]) })
+  const sha = crypto.createHash('sha256').update(fs.readFileSync(iso)).digest('hex')
+  const h = await startHelper(sc, { HYPERV_MCP_MIN_ISO_BYTES: '1' })
+  try {
+    const admin = h.conn(1)
+    const create = { action: 'create', vms: 1, cores: 2, memoryGB: 4 }
+    const hint = await admin.request('pool_plan', create).then(() => '', e => e.message)
+    assert.match(hint, /^No image yet: pass image \{ iso: "<path to a Windows ISO>" \}, or \{ file: "<path to a Linux qcow2 cloud image>" \}, the file the user chose for these VMs\. The plan they approve names it and its hash\.$/)
+    assert.doesNotMatch(hint, /download/i)
+    for (const image of [{ download: 'win11-enterprise-eval' }, { download: 'https://go.microsoft.com/fwlink/?LinkId=2382600' }, { distro: 'debian' }, { pin: 'debian-13-20261116-2664' }]) {
+      await assert.rejects(admin.request('pool_plan', { ...create, image }), /The helper doesn't download images/, JSON.stringify(image))
+    }
+    assert.match((await admin.request('pool_plan', { ...create, image: { iso } })).text, /Checking the image now/)
+    await waitFor(async () => /Image: ready: EnterpriseEval 26300\.9457/.test((await admin.request('status')).text), T.waitForMs, 'the image check')
+    const plan = await admin.request('pool_plan', create)
+    assert.ok(plan.text.includes(`- image: EnterpriseEval build 26300.9457, SHA-256 ${sha}, from ${fs.realpathSync.native(iso)}, copied into the helper's folder; the build uses that copy, checked against this SHA-256 first; setup files: signed by Microsoft`), plan.text)
+    assert.match(plan.text, /- activation: each new VM goes online once/, 'an evaluation edition is still activated at build')
+    const record = JSON.parse(fs.readFileSync(path.join(sc.stateDir, 'plans', `${plan.data.planId}.json`), 'utf8'))
+    assert.deepStrictEqual([record.image.sha256, record.image.path, record.image.signature.microsoft, record.image.pinned], [sha, fs.realpathSync.native(iso), true, undefined])
+    approve(sc, plan.data.planId)
+    await admin.request('pool_create', { planId: plan.data.planId })
+    const st = await waitFor(async () => { const t = (await admin.request('status')).text; return /Last pool job: create (finished|FAILED)/.test(t) && t }, T.poolJobMs, 'the pool job')
+    assert.match(st, /Last pool job: create finished/, st)
+    assert.deepStrictEqual(Object.values(sc.stub().vms).map(v => v.isoSha256), [sha], 'create-vm was given the approved hash to check the copy against')
+  } finally { await h.stop() }
+})
+
+test('hv.ps1 create-vm (MC-1572): an ISO copy whose SHA-256 is no longer the approved one is refused before anything is created', { skip: !windows }, async () => {
+  const sc = scratch('create-vm-swap')
+  const iso = path.join(sc.disks, 'swapped.iso')
+  fs.writeFileSync(iso, 'the bytes someone swapped in')
+  const folder = path.join(sc.disks, 'vm')
+  const args = { name: 'hvmcp-swap-test', folder, cores: 1, memoryMB: 1024, diskGB: 1, iso, unattendIso: iso }
+  await assert.rejects(hv('create-vm', { ...args, isoSha256: 'ab'.repeat(32) }), /has changed since it was checked and approved \(SHA-256 [0-9a-f]{64}, not (ab){32}\): refused, nothing created/)
+  await assert.rejects(hv('create-vm', args), /needs the approved image's SHA-256/)
+  assert.ok(!fs.existsSync(path.join(folder, 'disk.vhdx')), 'no disk was made')
 })
 
 test('images: one edition per ISO (MC-1513): a multi-edition ISO needs edition; its record keeps it; another edition of it is refused', { skip: !windows }, async () => {
   const sc = scratch('images-editions')
   process.env.HYPERV_MCP_MIN_ISO_BYTES = '1'
-  const pol = { allowUnpinnedIso: true }
   const ok = async (op, a) => ({ files: a.files.map(file => ({ file, ok: true })) })
   const multi = await udf(sc, 'multi', { ...goodFiles(), 'sources/install.wim': wim([{ edition: 'Core', build: 26200, sp: 1 }, { edition: 'Professional', build: 26200, sp: 1 }, { edition: 'Enterprise', build: 26200, sp: 1 }]) })
   const dir = path.join(sc.disks, 'images')
-  await assert.rejects(images.prepare({ want: { iso: multi }, dir, hv: ok, policy: pol }), /holds several editions \(Professional, Enterprise\): pass image \{ \.\.\., edition/)
-  const pro = await images.prepare({ want: { iso: multi, edition: 'Professional' }, dir, hv: ok, policy: pol })
+  await assert.rejects(images.prepare({ want: { iso: multi }, dir, hv: ok }), /holds several editions \(Core, Professional, Enterprise\): pass image \{ iso, edition/)
+  const pro = await images.prepare({ want: { iso: multi, edition: 'Professional' }, dir, hv: ok })
   assert.deepStrictEqual([pro.edition, pro.imageIndex, pro.evaluation], ['Professional', 2, false])
   const known = new Map([[pro.sha256, pro]])
-  await assert.rejects(images.prepare({ want: { iso: multi, edition: 'Enterprise' }, dir, hv: ok, policy: pol, known }), /recorded as Professional; another edition from the same ISO isn't supported/)
+  await assert.rejects(images.prepare({ want: { iso: multi, edition: 'Enterprise' }, dir, hv: ok, known }), /recorded as Professional; another edition from the same ISO isn't supported/)
   assert.deepStrictEqual([known.get(pro.sha256).edition, known.get(pro.sha256).imageIndex], ['Professional', 2], 'the record is unchanged')
   for (const want of [{ iso: multi, edition: 'Professional' }, { iso: multi }]) {
-    const again = await images.prepare({ want, dir, hv: ok, policy: pol, known })
+    const again = await images.prepare({ want, dir, hv: ok, known })
     assert.deepStrictEqual([again.existing, again.edition, again.imageIndex], [true, 'Professional', 2])
   }
   const one = await udf(sc, 'one', { ...goodFiles(), 'sources/install.wim': wim([{ edition: 'Education', build: 26200, sp: 1 }]) })
-  const edu = await images.prepare({ want: { iso: one }, dir, hv: ok, policy: pol })
+  const edu = await images.prepare({ want: { iso: one }, dir, hv: ok })
   assert.deepStrictEqual([edu.edition, edu.imageIndex, edu.evaluation], ['Education', 1, false])
-  const ev = await images.prepare({ want: { iso: await udf(sc, 'ev', goodFiles()) }, dir: path.join(sc.disks, 'ev'), hv: ok, policy: pol })
+  const ev = await images.prepare({ want: { iso: await udf(sc, 'ev', goodFiles()) }, dir: path.join(sc.disks, 'ev'), hv: ok })
   assert.strictEqual(ev.evaluation, true)
 })
 
-test('images: downloads only over https from microsoft.com hosts', async () => {
-  for (const u of ['https://software-static.download.prss.microsoft.com/dbazure/x.iso', 'https://go.microsoft.com/fwlink/?linkid=1']) assert.ok(images.allowedUrl(u), u)
-  for (const u of ['http://software-static.download.prss.microsoft.com/x.iso', 'https://microsoft.com.evil.example/x.iso', 'https://evilmicrosoft.com/x.iso', 'https://user:pw@download.microsoft.com/x', 'https://download.microsoft.com:8443/x', 'file:///C:/x.iso', 'not a url']) assert.ok(!images.allowedUrl(u), u)
-  const sc = scratch('images-download')
-  await assert.rejects(images.prepare({ want: { download: 'https://example.com/win.iso' }, dir: path.join(sc.disks, 'images'), hv: async () => ({}), policy: {} }), /only https on a microsoft\.com host/)
-})
-
-test('images: the pinned 25H2 image', () => {
-  const pin = images.PINNED.A61ADEAB895EF5A4DB436E0A7011C92A2FF17BB0357F58B13BBC4062E535E7B9
-  assert.deepStrictEqual([pin.size, pin.edition, pin.build], [7_092_807_680, 'EnterpriseEval', '26200.6584'])
-  const img = { edition: 'EnterpriseEval', build: '26200.6584' }
-  assert.strictEqual(images.guestReportProblem({ editionId: 'EnterpriseEval', build: '26200', disableForceUnload: 1 }, img), null)
-  assert.match(images.guestReportProblem({ editionId: 'Professional', build: '26200', disableForceUnload: 1 }, img), /edition/)
+test('images: the guest\'s report after the install is a sanity check against the image', () => {
+  const img = { edition: 'EnterpriseEval', build: '26300.9457' }
+  assert.strictEqual(images.guestReportProblem({ editionId: 'EnterpriseEval', build: '26300', disableForceUnload: 1 }, img), null)
+  assert.match(images.guestReportProblem({ editionId: 'Professional', build: '26300', disableForceUnload: 1 }, img), /edition/)
+  assert.match(images.guestReportProblem({ editionId: 'EnterpriseEval', build: '26200', disableForceUnload: 1 }, img), /build 26200, the image 26300\.9457/)
   // MC-1522: the registry policy must read back 1.
-  assert.match(images.guestReportProblem({ editionId: 'EnterpriseEval', build: '26200' }, img), /DisableForceUnload policy reads nothing, not 1/)
-  assert.match(images.guestReportProblem({ editionId: 'EnterpriseEval', build: '26200', disableForceUnload: 0 }, img), /reads 0, not 1/)
+  assert.match(images.guestReportProblem({ editionId: 'EnterpriseEval', build: '26300' }, img), /DisableForceUnload policy reads nothing, not 1/)
+  assert.match(images.guestReportProblem({ editionId: 'EnterpriseEval', build: '26300', disableForceUnload: 0 }, img), /reads 0, not 1/)
+  assert.ok(images.isEvalEdition('EnterpriseEval') && images.isEvalEdition('ServerDatacenterEval') && !images.isEvalEdition('Enterprise'))
 })
 
 test('policy: problems named; disk folders strictly inside; caps', () => {

@@ -919,6 +919,11 @@ try {
         @{ vmId = $vm.Id.ToString() }
         break
       }
+      # MC-1572: the ISO is the helper's copy of the image the user approved: its SHA-256 must still be the plan's, checked
+      # here, just before it is attached, with nothing created yet.
+      if ([string]$a.isoSha256 -notmatch '^[0-9a-f]{64}$') { throw 'create-vm needs the approved image''s SHA-256' }
+      $isoHash = (Get-FileHash -LiteralPath ([string]$a.iso) -Algorithm SHA256).Hash.ToLowerInvariant()
+      if ($isoHash -ne [string]$a.isoSha256) { throw "the image's copy ($([string]$a.iso)) has changed since it was checked and approved (SHA-256 $isoHash, not $([string]$a.isoSha256)): refused, nothing created" }
       New-VHD -Path $vhd -SizeBytes ([long]$a.diskGB * 1GB) -Dynamic | Out-Null
       $vm = New-VM -Name ([string]$a.name) -Generation 2 -Path $folder -VHDPath $vhd -MemoryStartupBytes ([long]$a.memoryMB * 1MB)
       Set-VMMemory -VM $vm -DynamicMemoryEnabled $false

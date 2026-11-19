@@ -178,8 +178,11 @@ function run(s, op, a) {
         if (s.failAfterCreate) { s.failAfterCreate = false; throw new Error('injected failure after New-VM') }
         return { vmId: id }
       }
+      // MC-1572: hv.ps1 hashes the ISO against isoSha256 before anything is created (tested for real in units.test.js);
+      // the stub only checks that the approved hash is passed, and keeps it for the tests to read.
+      if (!/^[0-9a-f]{64}$/.test(a.isoSha256 || '')) throw new Error('create-vm needs the approved image\'s SHA-256')
       fs.writeFileSync(join(a.folder, 'disk.vhdx'), 'vhd')
-      s.vms[id] = { id, name: a.name, location: join(a.folder, a.name), state: 'Off', checkpoints: [], parent: null, switchName: null, reserve: 0, disk: {}, cores: a.cores, memoryMB: a.memoryMB, installed: false }
+      s.vms[id] = { id, name: a.name, location: join(a.folder, a.name), state: 'Off', checkpoints: [], parent: null, switchName: null, reserve: 0, disk: {}, cores: a.cores, memoryMB: a.memoryMB, installed: false, isoSha256: a.isoSha256 }
       if (s.failAfterCreate) { s.failAfterCreate = false; throw new Error('injected failure after New-VM') }
       return { vmId: id }
     }

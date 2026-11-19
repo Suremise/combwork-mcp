@@ -508,6 +508,18 @@ class Helper {
     return sha
   }
 
+  /** MC-1572: a Linux VM's distro: its image's, when recorded (the earlier pinned images), else what its guest reported at its build. */
+  distroOf(vm) { return this.state.images.get(this.imageOf(vm))?.distro ?? vm.guest?.id ?? null }
+
+  /** The distros an image is known as: its recorded one, and what each VM built from it reported. */
+  imageDistros(sha) {
+    const out = new Set()
+    const d = this.state.images.get(sha)?.distro
+    if (d) out.add(d)
+    for (const v of this.state.vms.values()) if (v.guest?.id && this.imageOf(v) === sha) out.add(v.guest.id)
+    return out
+  }
+
   osOf(vm) { const sha = this.imageOf(vm); return sha === 'legacy' ? 'windows' : (this.state.images.get(sha)?.os || 'windows') }
 
   /** A verified image by its sha256 (or a unique prefix of 12 or more), or throws. */
@@ -527,7 +539,7 @@ class Helper {
     if (!p) return null
     if (p.maxVms?.[want.os] === 0) return `project ${project} may not use ${want.os} VMs`
     if (want.image && p.images.length && !p.images.includes(want.image)) return `project ${project} may not use image ${want.image.slice(0, 12)}`
-    if (want.distro && p.images.length && !p.images.some(sha => this.state.images.get(sha)?.distro === want.distro)) return `project ${project} may not use any ${want.distro} image`
+    if (want.distro && p.images.length && !p.images.some(sha => this.imageDistros(sha).has(want.distro))) return `project ${project} may not use any ${want.distro} image`
     // MC-1523: a named VM made before images were recorded (legacy) can't be on an image allowlist.
     if (want.vm && want.vmImage === 'legacy' && p.images.length) return `project ${project} may not use ${want.vm}: its image is unknown (made before images were recorded), so it isn't on the project's image list`
     return null
@@ -561,7 +573,7 @@ class Helper {
       if (want.vm && v.vmName !== want.vm) return false
       if (want.checkpoint && !this.poolCheckpointOn(v.vmId, want.checkpoint)) return false
       if (want.image && img !== want.image) return false
-      if (want.distro && this.state.images.get(img)?.distro !== want.distro) return false
+      if (want.distro && this.distroOf(v) !== want.distro) return false
       if (p?.images.length && !p.images.includes(img)) return false
       return true
     }).sort((a, b) => failedAt(a) - failedAt(b))
@@ -718,8 +730,9 @@ class Helper {
     if (osAsked !== undefined && !OSES.includes(osAsked)) throw new Error(`os must be ${OSES.join(' or ')}`)
     if (named !== undefined && (typeof named !== 'string' || !named || named.length > 64)) throw new Error('vm must be a VM name from vm_status.')
     if (checkpoint !== undefined && (typeof checkpoint !== 'string' || !POOL_CHECKPOINT_RE.test(checkpoint))) throw new Error("checkpoint must be a pool checkpoint's name (vm_status lists them).")
-    // MC-1501: distro ('debian' | 'ubuntu') narrows a Linux request to that distro's images, and implies os 'linux'.
-    if (distro !== undefined && !linuxImages.DISTROS.includes(distro)) throw new Error(`distro must be ${linuxImages.DISTROS.join(' or ')}`)
+    // MC-1501: distro narrows a Linux request to VMs of that distro, and implies os 'linux'. MC-1572: any distro, as the
+    // guest's /etc/os-release ID reported at its build (or an earlier pinned image's distro).
+    if (distro !== undefined && (typeof distro !== 'string' || !linuxImages.DISTRO_RE.test(distro))) throw new Error('distro must be a distro ID as /etc/os-release names it (debian, ubuntu, fedora, ...)')
     if (distro !== undefined && osAsked !== undefined && osAsked !== 'linux') throw new Error(`distro is for Linux VMs: ${distro} isn't a ${osAsked} distro.`)
     const os = osAsked ?? (distro !== undefined ? 'linux' : 'windows')
     const step = await this.poolLock(async () => {
@@ -742,11 +755,11 @@ class Helper {
         const tImg = this.imageOf(target)
         if (osAsked !== undefined && osAsked !== tOs) throw new Error(`${named} is a ${tOs} VM, not ${osAsked}.`)
         if (image !== undefined && this.verifiedImage(image).sha256 !== tImg) throw new Error(`${named} wasn't built from image ${String(image).slice(0, 12)}${tImg === 'legacy' ? ' (its image is unknown: made before images were recorded)' : ` (its image is ${tImg.slice(0, 12)})`}.`)
-        if (distro !== undefined && s.images.get(tImg)?.distro !== distro) throw new Error(`${named} isn't a ${distro} VM.`)
+        if (distro !== undefined && this.distroOf(target) !== distro) throw new Error(`${named} isn't a ${distro} VM.`)
         want = { os: tOs, ...(tImg !== 'legacy' ? { image: tImg } : {}), vm: named, vmImage: tImg }
       } else {
         want = { os, ...(image !== undefined ? { image: this.verifiedImage(image).sha256 } : {}), ...(distro !== undefined ? { distro } : {}) }
-        if (want.image && distro !== undefined && s.images.get(want.image)?.distro !== distro) throw new Error(`image ${want.image.slice(0, 12)} isn't a ${distro} image.`)
+        if (want.image && distro !== undefined && !this.imageDistros(want.image).has(distro)) throw new Error(`image ${want.image.slice(0, 12)} isn't a ${distro} image.`)
         // MC-1532: with a checkpoint and no os, the OS comes from the checkpoint's VMs (filtered by this image below).
         if (want.image && !(checkpoint !== undefined && osAsked === undefined) && (this.state.images.get(want.image)?.os || 'windows') !== os) throw new Error(`image ${want.image.slice(0, 12)} is a ${this.state.images.get(want.image)?.os || 'windows'} image, not ${os}.`)
       }
@@ -757,7 +770,7 @@ class Helper {
         if (!have.length) throw new Error(named !== undefined ? `${named} has no pool checkpoint "${checkpoint}" (vm_status lists each VM's).` : `No VM has a pool checkpoint "${checkpoint}" (vm_status lists them).`)
         if (osAsked !== undefined) { have = have.filter(x => this.osOf(s.vms.get(x.vmId)) === osAsked); if (!have.length) throw new Error(`No ${osAsked} VM has a pool checkpoint "${checkpoint}".`) }
         if (want.image) { have = have.filter(x => this.imageOf(s.vms.get(x.vmId)) === want.image); if (!have.length) throw new Error(`No VM of image ${want.image.slice(0, 12)} has a pool checkpoint "${checkpoint}".`) }
-        if (want.distro) { have = have.filter(x => s.images.get(this.imageOf(s.vms.get(x.vmId)))?.distro === want.distro); if (!have.length) throw new Error(`No ${want.distro} VM has a pool checkpoint "${checkpoint}".`) }
+        if (want.distro) { have = have.filter(x => this.distroOf(s.vms.get(x.vmId)) === want.distro); if (!have.length) throw new Error(`No ${want.distro} VM has a pool checkpoint "${checkpoint}".`) }
         const oses = [...new Set(have.map(x => this.osOf(s.vms.get(x.vmId))))]
         if (oses.length > 1) throw new Error(`The pool checkpoint "${checkpoint}" is on ${oses.join(' and ')} VMs: give os to choose.`)
         want = { ...want, os: oses[0], checkpoint: have[0].name }
@@ -2305,12 +2318,12 @@ class Helper {
       const unknown = this.unknownSnapshots.get(v.vmId)
       const unknownNote = unknown?.length ? `; unknown checkpoints left alone: ${unknown.join(', ')}` : ''
       const li = this.isLinux(v) ? s.images.get(img) : null
-      const osLabel = li?.distro ? `linux (${li.name || `${li.distro} ${li.release}`}, build ${li.serial})` : this.osOf(v)
+      const osLabel = li?.distro ? `linux (${li.name || `${li.distro} ${li.release}`}, build ${li.serial})` : this.isLinux(v) && v.guest?.id ? `linux (${v.guest.id} ${v.guest.versionId ?? ''}`.trimEnd() + ')' : this.osOf(v)
       return `- ${v.vmName}: ${osLabel}, image ${img === 'legacy' ? 'unknown (made before images were recorded)' : img.slice(0, 12)}; ${v.cores} cores, ${v.memoryMB} MB, ${v.diskGB} GB disk; ${state}${v.vmId === mine ? ' (yours)' : ''}${expiry(v, this.now())}${failed ? `; ${failed}` : ''}${fromNote}${pcNote}${cpNote}${unknownNote}`
     })
     const img = [...s.images.values()].at(-1)
     const lines = [
-      `Pool: ${vms.length ? `${vms.length} VM(s)` : 'no VMs'}; network ${s.network} (approved in a plan: ${net.DESCRIBE[s.network]})${s.switch ? `; old pool switch ${s.switch.name} (${s.switch.phase}, unused by runs)` : ''}; image: ${img ? (img.os === 'linux' ? linuxImages.describe(img) : `${img.edition} ${img.build} (${img.sha256.slice(0, 12)}…, ${img.pinned ? 'pinned' : img.source})`) : 'none'}.`,
+      `Pool: ${vms.length ? `${vms.length} VM(s)` : 'no VMs'}; network ${s.network} (approved in a plan: ${net.DESCRIBE[s.network]})${s.switch ? `; old pool switch ${s.switch.name} (${s.switch.phase}, unused by runs)` : ''}; image: ${img ? (img.os === 'linux' ? linuxImages.describe(img) : `${img.edition} ${img.build} (${img.sha256.slice(0, 12)}…${img.path ? `, from ${img.path}` : ''})`) : 'none'}.`,
       ...vms,
       ...this.shareLines(),
       this.job ? `Pool job in progress: ${this.job.op} (${this.job.jobId}): ${this.job.progress}` : this.lastJob ? `Last pool job: ${this.lastJob.op} ${this.lastJob.ok ? 'finished' : 'FAILED'}: ${this.lastJob.note}` : null,
@@ -2476,38 +2489,36 @@ class Helper {
     return `powershell -NoProfile -ExecutionPolicy Bypass -File "${dir}\\approve.ps1" -Plan ${planId}`
   }
 
-  /** The image for a plan: an already verified one, or start checking the one asked for. */
+  /**
+   * The image for a plan: an already verified one, or start checking the one asked for (MC-1572: any local file the user
+   * names; the helper never downloads). The plan the user approves names it and its hash.
+   */
   async planImage(want, location) {
     const s = this.state
     if (this.imageJob) return { ready: false, text: `The image is still being checked: ${this.imageJob.progress}. Call pool_status, then pool_plan again.` }
     const have = [...s.images.values()].filter(i => fs.existsSync(i.file))
     if (!want) {
       const img = have.at(-1)
-      if (!img) throw new Error('No verified image yet: pass image { iso: "<path to the Windows 11 Enterprise evaluation ISO>" } or image { download: "win11-enterprise-eval" }.')
+      if (!img) throw new Error('No image yet: pass image { iso: "<path to a Windows ISO>" }, or { file: "<path to a Linux qcow2 cloud image>" }, the file the user chose for these VMs. The plan they approve names it and its hash.')
       return { ready: true, image: pick(img) }
     }
-    // MC-1501: a Linux image: { distro, release? } or { pin }, downloaded, or { file }, a local copy of a pinned one.
-    const linux = typeof want === 'object' && want !== null && (want.distro !== undefined || want.pin !== undefined || want.file !== undefined)
-    if (linux && want.file === undefined) {
-      const pin = linuxImages.pinFor(want)
-      const ready = have.find(i => i.pin === pin.id)
-      if (ready) return { ready: true, image: pick(ready) }
-    }
+    if (typeof want !== 'object' || want === null || Array.isArray(want)) throw new Error('image must be { iso: "<path>" } or { file: "<path>" }, or a verified image\'s SHA-256')
+    // MC-1572: the shapes that asked the helper to download (Windows' download, Linux's pinned distro or pin) are gone.
+    if (want.download !== undefined || want.distro !== undefined || want.pin !== undefined || want.release !== undefined) throw new Error(images.NO_DOWNLOAD)
+    const linux = want.file !== undefined
+    if (linux && (want.iso !== undefined || want.edition !== undefined)) throw new Error('image is { iso, edition? } for Windows or { file } for Linux, not both')
     const job = { progress: 'starting' }
     this.imageJob = job
     const p = linux
       ? linuxImages.prepare({ want, dir: join(location, 'images'), hv: this.hv, known: s.images, ownDirs: [this.dir], progress: t => { job.progress = t }, maxVirtualBytes: this.policy.maxDiskGBPerVm * 1024 ** 3 })
-      : images.prepare({
-      want, dir: join(location, 'images'), hv: this.hv, policy: this.policy, known: s.images, ownDirs: [this.dir],
-      progress: t => { job.progress = t }
-    })
+      : images.prepare({ want, dir: join(location, 'images'), hv: this.hv, known: s.images, ownDirs: [this.dir], progress: t => { job.progress = t } })
     p.then(img => {
-      const what = img.os === 'linux' ? linuxImages.describe(img) : `${img.edition} ${img.build} (${img.sha256.slice(0, 12)}…${img.existing ? '' : `, ${img.pinned ? 'pinned' : img.source}`})`
+      const what = img.os === 'linux' ? linuxImages.describe(img) : `${img.edition} ${img.build} (${img.sha256.slice(0, 12)}…${img.path ? `, from ${img.path}` : ''})`
       if (img.existing) { this.lastImage = `ready: ${what}`; return }
       this.journal.append({ t: 'image', ...img })
-      this.lastImage = `verified: ${what}`
+      this.lastImage = `ready: ${what}`
     }, e => { this.lastImage = `REFUSED: ${e.message}` }).finally(() => { this.imageJob = null })
-    return { ready: false, text: linux ? 'Checking the Linux image now (downloaded or copied while hashed, its pin and the distro\'s published checksums checked, then converted to the base VHDX with nothing installed on the host). This takes a few minutes: call pool_status, then pool_plan again with the same image to use it.' : 'Checking the image now (copied into the helper\'s folder while hashed, then its files and signatures checked before anything runs). This takes a few minutes for a 7 GB ISO: call pool_status, then pool_plan again with no image to use it.' }
+    return { ready: false, text: linux ? 'Checking the Linux image now (copied into the helper\'s folder while hashed, then converted to the base VHDX with nothing installed on the host). This takes a few minutes: call pool_status, then pool_plan again with no image to use it.' : 'Checking the image now (copied into the helper\'s folder while hashed, then its editions and build read before anything runs). This takes a few minutes for a 7 GB ISO: call pool_status, then pool_plan again with no image to use it.' }
   }
 
   // ---------- pool changes (approved) ----------
@@ -2868,8 +2879,10 @@ class Helper {
     const unattendIso = join(a.folder, 'unattend.iso')
     await this.hv('make-iso', { source: media, out: unattendIso, label: 'HVMCP' })
     const img = this.state.images.get(plan.image.sha256)
-    step('creating the VM')
-    const c = await this.hv('create-vm', { name: a.name, folder: a.folder, cores: a.cores, memoryMB: a.memoryMB, diskGB: a.diskGB, iso: img.file, unattendIso })
+    // MC-1572: the bytes approved are the bytes built: hv.ps1 hashes the helper's copy against the approved SHA-256 just
+    // before it attaches it, and refuses a mismatch with nothing created.
+    step('checking the ISO copy against the approved SHA-256, then creating the VM')
+    const c = await this.hv('create-vm', { name: a.name, folder: a.folder, cores: a.cores, memoryMB: a.memoryMB, diskGB: a.diskGB, iso: img.file, isoSha256: plan.image.sha256, unattendIso }, { timeoutMs: 10 * 60_000 }) // hashing up to 16 GB first
     this.journal.append({ t: 'created', intentId: a.intentId, vmId: c.vmId })
     const vm = this.state.vms.get(c.vmId)
     step('installing Windows unattended (network off)')
@@ -3175,7 +3188,9 @@ const PROTOCOL = 'hyperv-mcp/3' // 2: renew, sync_plan, sync (MC-1497); 3: start
 // 'pool-checkpoints' = pool_plan's checkpoint actions, pool_checkpoint, acquire's and start's checkpoint (MC-1532).
 // 'refresh-clean' = pool_plan's refresh-clean and pool_refresh (MC-1531).
 // 'timing' = set-timing, a connection's timings (MC-1558).
-const FEATURES = ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean', 'linux', 'debug-keep', 'timing', 'network-modes']
+// 'user-images' = pool_plan's image is any local file the user names ({ iso } of any x64 edition, or a Linux { file }),
+// with no pins and no downloads; acquire's distro is any /etc/os-release ID (MC-1572).
+const FEATURES = ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean', 'linux', 'debug-keep', 'timing', 'network-modes', 'user-images']
 const LEASE_CHECKPOINT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$/
 // MC-1532: a pool checkpoint's name.
 const POOL_CHECKPOINT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._+-]{0,39}$/
@@ -3380,10 +3395,13 @@ function baselineProblem(f, vm) {
   return null
 }
 
-const isEval = img => img.evaluation ?? img.edition === images.EVAL
+const isEval = img => img.evaluation ?? images.isEvalEdition(img.edition)
+// MC-1572: path (the file the user named) and signature (information only) for images checked from now on.
 const pick = img => img.os === 'linux'
-  ? { sha256: img.sha256, size: img.size, imageIndex: 1, evaluation: false, pinned: img.pinned, source: img.source, os: 'linux', distro: img.distro ?? null, release: img.release ?? null, serial: img.serial ?? null, name: img.name ?? null, checksums: img.checksums ?? null } // MC-1501
-  : { sha256: img.sha256, size: img.size, edition: img.edition, build: img.build, imageIndex: img.imageIndex ?? 1, evaluation: isEval(img), pinned: img.pinned, source: img.source, os: img.os || 'windows' }
+  ? { sha256: img.sha256, size: img.size, imageIndex: 1, evaluation: false, source: img.source, path: img.path ?? null, os: 'linux', distro: img.distro ?? null, release: img.release ?? null, serial: img.serial ?? null, name: img.name ?? null } // MC-1501
+  : { sha256: img.sha256, size: img.size, edition: img.edition, build: img.build, imageIndex: img.imageIndex ?? 1, evaluation: isEval(img), source: img.source, path: img.path ?? null, signature: img.signature ?? null, os: img.os || 'windows' }
+/** MC-1572: where an image came from, for the plan: the user's file, or an earlier check's record. */
+const imageFrom = img => img.path ? `from ${img.path}, copied into the helper's folder; the build uses that copy, checked against this SHA-256 first` : 'checked earlier (the helper\'s copy, checked against this SHA-256 before the build uses it)'
 const OSES = ['windows', 'linux']
 
 function describePlan(plan, digest, approve, T) {
@@ -3401,10 +3419,10 @@ function describePlan(plan, digest, approve, T) {
   if (plan.networkWas && net.rank(plan.network) < net.rank(plan.networkWas)) lines.push(`- lowering it: a lease already running in a higher mode keeps it until its next start, reset, restore or checkpoint restart, each of which is checked against the new mode then (a start, reset or restore above it is refused; a checkpoint restart goes on with network none)`)
   if (plan.removeSwitch) lines.push(`- remove the switch ${plan.removeSwitch}`)
   const linux = plan.image?.os === 'linux' // MC-1501
-  if (linux) lines.push(`- image: ${linuxImages.describe(plan.image)}; checksums: ${plan.image.checksums || 'unknown'}`)
+  if (linux) lines.push(`- image: ${linuxImages.label(plan.image)}, SHA-256 ${plan.image.sha256}, ${imageFrom(plan.image)}`)
   if (linux && plan.add?.length) lines.push('- Linux build: each new VM is a copy of the image\'s verified base VHDX with a cloud-init seed (users hvadmin and hvuser with locked passwords; SSH keys made by the helper and held only by it; sshd only on the Hyper-V socket, for the helper\'s forced command), first booted offline; cloud-init is turned off and the seed removed before its clean checkpoint')
   if (plan.debugKeepFailedBuild) lines.push('- DEBUG (MC-1545): if a Linux build fails, its VM is kept, turned on, network disconnected, never leased, for an administrator to inspect in Hyper-V Manager (its console, its COM1 diagnostics, a host-side HvMcpVsock retry; no login or other access to the guest is added; its seed, with its host key, stays with it); a resize plan with no image and vms equal to the number of other VMs in the pool removes only it; any other create or resize removes it too, along with the changes it asks for; a remove plan removes the whole pool')
-  if (plan.image && !linux) lines.push(`- image: ${plan.image.edition}${plan.image.imageIndex > 1 ? ` (index ${plan.image.imageIndex})` : ''} build ${plan.image.build}, SHA-256 ${plan.image.sha256} (${plan.image.pinned ? 'pinned: a known Microsoft download' : plan.image.source === 'download' ? 'downloaded by the helper over HTTPS from Microsoft' : 'NOT AUTHENTICATED: a local file you chose to trust'})`)
+  if (plan.image && !linux) lines.push(`- image: ${plan.image.edition}${plan.image.imageIndex > 1 ? ` (index ${plan.image.imageIndex})` : ''} build ${plan.image.build}, SHA-256 ${plan.image.sha256}, ${imageFrom(plan.image)}${plan.image.signature ? `; setup files: ${plan.image.signature.microsoft ? 'signed by Microsoft' : `not signed by Microsoft (${plan.image.signature.note}): information only`}` : ''}`)
   if (plan.add?.length && !linux) lines.push('- registry: a user\'s registry isn\'t forcibly unloaded at logoff (the DisableForceUnload policy): the suspected cause of runs losing their HKCU after the short PowerShell Direct session that started them ends (MC-1522; its real-build trial is MC-1521)')
   if (plan.add?.length && !linux) lines.push(`- Defender: the test work folders ${DEFENDER_EXCLUSIONS.join(', ')} are excluded from Defender's scanning (real-time and scheduled scans) in the guest image; Defender stays on otherwise`)
   if (plan.add?.length && !linux) lines.push(`- provisioning: each new VM logs hvadmin and hvuser on interactively once (offline), waits for Windows' first-logon setup to finish, then turns autologon off and resets UAC and the watcher's start before its clean checkpoint; each account within ${Math.round(T.ms.provisionMinutes / 60_000)} min (a logon attempt up to ${Math.round(BUILD_LOGON_WAIT_MS / 60_000)} min once it has begun, one with no sign of a logon ${Math.round(FIRST_LOGON_SIGN_MS / 60_000)} min after its new boot is seen retried at once, then accepted once Windows' App Readiness reports the account's first-logon app setup finished and ${Math.round(PROVISION_QUIET_MS / 60_000)} min of observed quiet follow, one retry if needed; the time Windows itself suspends that setup isn't counted, up to ${Math.round(T.ms.provisionMinutes / 60_000)} min more)`)

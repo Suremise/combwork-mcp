@@ -5,8 +5,8 @@ clean checkpoint with a build copied in, runs commands and gets their output, re
 stops it, which restores it. Several agents can each hold a VM at the same time. Optionally, a run can have its own
 reserved CPU, for timed runs. For a work session, an agent can instead keep its VM running: `vm_sync` copies only the
 files that changed into it, `vm_reset` gives a clean VM again on request, and `vm_renew` extends the lease within the
-policy. Release still restores it. The pool can also hold **Linux** VMs (Debian and Ubuntu, from their pinned official
-cloud images) behind the same tools: see "Linux guests". Commands run in session 0 by default. For programs that need a real logged-on desktop
+policy. Release still restores it. The pool can also hold **Linux** VMs (from a qcow2 cloud image you choose; Debian and
+Ubuntu so far) behind the same tools: see "Linux guests". Commands run in session 0 by default. For programs that need a real logged-on desktop
 (their own desktops or windows), a start can log a guest account on, and runs can then go into that session.
 
 It's the catalogue's alternative to [`windows-sandbox`](../windows-sandbox/), for any project. Windows Sandbox runs
@@ -38,8 +38,8 @@ Hyper-V Administrators, so agents running as you can't drive Hyper-V directly.
   **Hyper-V**, then restart) and virtualisation on in the firmware.
 - **Node 18+**, installed for all users (under `Program Files`): the service runs it, so it must be a copy only
   administrators can change. Setup checks this.
-- A **Windows 11 x64 ISO** for the pool's VMs: Microsoft's Enterprise evaluation, or your own non-evaluation copy
-  (Enterprise, Pro or Education) with its product key (see "The image").
+- A **Windows x64 ISO** of your choice for the pool's VMs, for example Microsoft's Windows 11 Enterprise evaluation,
+  or your own copy with its product key (see "The image"). You download it; the helper never does.
 - Disk space: about 40 GB per VM, plus the ISO (7 GB).
 - For Linux guests only: Windows' in-box **OpenSSH Client** (Settings, System, Optional features; present by default on
   Windows 11). Setup checks it and says if it's missing; it never adds it.
@@ -58,8 +58,7 @@ Hyper-V Administrators, so agents running as you can't drive Hyper-V directly.
 | Keep a leased VM running for a **work session**: several runs in one guest, with `vm_sync` copying changed files into its `C:\build` (no restore between them), and the lease renewed up to the policy's `maxLeaseMinutes` at a time and `maxSessionMinutes` in all. | Carry anything past the lease: release, the deadline and the session's connection closing all restore and verify it as above. Write anywhere in the guest but `C:\build` and its own staging folder when syncing, or follow a link or junction there. |
 | Run commands in a leased Linux guest over SSH on a Hyper-V socket (no network), through Windows' own `ssh.exe` with fixed arguments, the guest's forced command and a per-VM key only the helper holds (see "Linux guests"). | Give an agent a key, an SSH endpoint or a shell in the guest other than the run it asked for. Run anything on the host but `powershell.exe` with its fixed script, `node` for itself, and, for Linux guests, `ssh.exe` from System32 and setup's own `HvMcpVsock.exe`, each with fixed arguments. |
 | Run commands in a leased guest over PowerShell Direct, as its admin or its standard user, with passwords only the helper holds. On request, log one of those accounts on in the guest (autologon, then a guest restart) and run commands in its desktop session through a watcher started at logon (`hvuser` as a standard user, or `hvadmin` elevated); a run there that doesn't finish cleanly restores the VM. | Run any program on the host except `powershell.exe` with its own fixed script (and `node` for itself). An agent's text never reaches a host command line or script: it's passed as JSON on stdin and arrives in the guest as data. Leave a logon behind: autologon and its password live only inside the guest, and the next restore of the clean checkpoint removes them. |
-| Download the evaluation ISO over HTTPS from a `microsoft.com` host, and check an ISO before anything runs it (see "The image"). | Use an image that fails its checks, or a local ISO that isn't a known Microsoft image, unless setup allowed that and the user approved it as "not authenticated". |
-| Download a **pinned** Debian or Ubuntu cloud image over HTTPS, check it against its pin and the distro's published checksums (Ubuntu's verified against its signing key), and convert it with its own code (see "Linux guests"). | Use any Linux image that isn't pinned, local or downloaded: there is no override. Install a converter or any other tool on the host. |
+| Build from the image file **you** name for these VMs (any x64 Windows ISO, or a Linux qcow2 cloud image): copy it into its own folder while hashing it, read its edition and build, and show its path and SHA-256 in the plan you approve (see "The image"). | Download an image, or choose one for you. Build from bytes other than the ones you approved: the copy is hashed again just before it is used. Install a converter or any other tool on the host. |
 
 **Don't put real sign-ins, tokens or real CLIs in a VM.** It's for testing a build on a clean Windows. Use fake CLIs
 and test accounts.
@@ -94,8 +93,8 @@ using the new server: the helper's protocol and features changed, and an older h
   service id.
 - For Linux guests, Windows' OpenSSH Client must be present: Settings, System, Optional features. Setup says if it's
   missing, and adds nothing.
-- Then plan Linux VMs: `pool_plan` with `action: "resize"`, the new `vms` count and `image: { distro: "debian" }` or
-  `{ distro: "ubuntu" }`. Approve it, then call `pool_resize`.
+- Then plan Linux VMs: `pool_plan` with `action: "resize"`, the new `vms` count and the image (from 4.0.0,
+  `image: { file: "<path to the qcow2>" }`). Approve it, then call `pool_resize`.
 - New in the server, with no rerun needed: slow tools reply within about 45 s, saying "still in progress … call
   vm_wait now", and the new `vm_wait` gives their result (see "Slow operations", MC-1553).
 
@@ -108,6 +107,14 @@ using the new server: the helper's protocol and features changed, and an older h
   `-MaxNetwork Internet` or `InternetLan` to allow more, then resize the pool to that mode (see "Network modes").
 - New: the timings in the server's env (see "Timings"), and an installed uninstaller with an Installed apps entry,
   which removes everything without agents or the repo (see "Uninstall"; the rerun installs it).
+
+**From 3.0.0 to 4.0.0 (your images, MC-1572): rerun setup to name your own image files.**
+- The helper no longer downloads images, pins them or refuses ones it doesn't know: you name any local file for the
+  VMs, and the plan you approve names it with its SHA-256 (see "The image"). `image: { download }`, Linux's
+  `{ distro }`/`{ pin }` and setup's `-AllowUnpinnedIso` are gone (setup accepts and ignores that switch).
+- Without the rerun, the 4.0.0 server refuses `image: { iso }` and `{ file }` on a 3.0.0 helper with "run setup
+  again" (it would refuse files it doesn't know). Images and VMs you already have are kept and stay usable.
+- `vm_acquire`'s `distro` takes any `/etc/os-release` ID (`debian`, `ubuntu`, `fedora`...).
 
 1. Turn on Hyper-V (see Requirements), and check `Get-Service vmms` says Running.
 2. In an **admin PowerShell**, run setup once (one line). Name a folder for the VMs' disks on a drive with room:
@@ -130,11 +137,12 @@ using the new server: the helper's protocol and features changed, and an older h
      SYSTEM. How setup makes them trustworthy is under "Storage" below;
    - `policy.json`, the pool's hard limits. By default they're derived from the host: up to a quarter of its logical
      CPUs per VM (at most 8), half its memory in all, up to 4 VMs, 128 GB disks, network mode up to none (a new
-     install; a rerun keeps the current value), unpinned ISOs refused. Override any of them: `-MaxVms`,
+     install; a rerun keeps the current value). Override any of them: `-MaxVms`,
      `-MaxCoresPerVm`, `-MaxMemoryGB`, `-MaxDiskGBPerVm`, `-MaxNetwork None|Host|Internet|InternetLan` (with
      `-HostSubnet`; see "Network modes"), `-MaxReservePercent`, `-MaxLeaseMinutes`, `-MaxSessionMinutes`
      (a work session's cap for `vm_renew`: 5-1440 and at least `-MaxLeaseMinutes`; left out, 480 or
-     `-MaxLeaseMinutes` if that is more), `-MaxBuildMB`, `-AllowUnpinnedIso`. `-BuildRoot` names folders builds may also
+     `-MaxLeaseMinutes` if that is more), `-MaxBuildMB`. (`-AllowUnpinnedIso` is no
+     longer needed, from 4.0.0: setup accepts it and ignores it.) `-BuildRoot` names folders builds may also
      come from (see "Build folders set by an admin"). `-ProjectsFile` names the projects that share the pool fairly (see
      "Sharing the pool between projects"). `-ProductKeyFile` names a file holding a Windows product key for VMs built
      from your own (non-evaluation) image (see "Windows licences"); a rerun without it keeps the key, and
@@ -300,7 +308,7 @@ the same `remove`, and only VMs with no lease can be removed.
 
 Each VM records its Windows licence when it is built, and `vm_status`, `pool_status` and setup show it.
 
-- **The evaluation** (the default image). Unactivated, it lasts only about a day: after that, Windows logs any
+- **An evaluation edition** (Windows 11 Enterprise evaluation, or any edition whose ID ends in `Eval`). Unactivated, it lasts only about a day: after that, Windows logs any
   interactive user off within seconds and shuts the guest down every hour. So each evaluation VM is **activated online
   once, as it is built**:
   - its plan says so, and your approval covers it: "each new VM goes online once, through Windows' Default Switch, to
@@ -316,9 +324,8 @@ Each VM records its Windows licence when it is built, and `vm_status`, `pool_sta
   A host without the Default Switch can't build evaluation VMs (setup says whether it has one). Within an hour of its
   end, a VM is no longer leased, and leases and renewals never run past it. VMs built before licences were recorded
   show "licence unknown": rebuild them to record it.
-- **Your own copy**: a non-evaluation Windows 11 x64 ISO (Enterprise, Professional or Education), for a project that has
-  a licence. A local one is unpinned, so setup needs `-AllowUnpinnedIso` and its plan says "NOT AUTHENTICATED". Its
-  product key comes from setup's `-ProductKeyFile` (a file, so it's never on a command line): it's stored in the
+- **Your own copy**: any other x64 edition (Pro, Enterprise, Education, Home, Server...), for a project that has a
+  licence. Its product key comes from setup's `-ProductKeyFile` (a file, so it's never on a command line): it's stored in the
   helper's secrets folder, readable only by SYSTEM, Administrators and the helper, and written only into that build's
   answer file, which is deleted after the build. It is never in a reply, a plan, the journal or the log. Such a VM stays
   offline unless its plan asks for the activation step (`pool_plan({ ..., activate: true })`); either way its licence
@@ -328,38 +335,51 @@ Each VM records its Windows licence when it is built, and `vm_status`, `pool_sta
 
 ### The image
 
-The pool is built from the **Windows 11 Enterprise evaluation** ISO, which Microsoft's
-[Evaluation Center](https://www.microsoft.com/evalcenter/evaluate-windows-11-enterprise) offers, or from your own
-non-evaluation Windows 11 ISO (see "Windows licences").
+**You choose the image, and the plan you approve is the trust decision** (MC-1572). The helper never downloads an image,
+keeps no list of "known" images and has no override to set: it builds from the file you name, and only from the bytes
+you approved.
 
-- **What authenticates it is where its bytes came from, and only that:**
-  - **Pinned:** a SHA-256 in the server's table of known images. Today that's the 25H2 image,
-    `26200.6584.250915-1905.25h2_ge_release_svc_refresh_CLIENTENTERPRISEEVAL_OEMRET_x64FRE_en-us.iso`, 7,092,807,680
-    bytes, SHA-256 `A61ADEAB895EF5A4DB436E0A7011C92A2FF17BB0357F58B13BBC4062E535E7B9`, downloaded over HTTPS from
-    Microsoft's server. Microsoft doesn't publish SHA-256 values for its evaluation ISOs, so the table records ones
-    downloaded from Microsoft.
-  - **Downloaded by the helper:** `image: { download: "<URL>" }`, an `https` URL on a `microsoft.com` host (redirects
-    too), with certificate checks on. TLS authenticates the server, and the hash is recorded for later rebuilds.
-  - **A local file that isn't pinned:** refused, unless setup was run with `-AllowUnpinnedIso`. Its plan then says
-    "NOT AUTHENTICATED: a local file you chose to trust", and approving it is your decision.
-- **No swaps.** The ISO is copied into the helper's own folder **while it is hashed**, and only that copy is used.
-- **Before anything runs it**, the helper reads the copy itself, without mounting it (a small bounded UDF reader):
-  - `setup.exe` and `sources\setup.exe` must have valid Authenticode signatures from Microsoft Corporation, chaining to
-    a Microsoft root (Root Certificate Authority 2010 or 2011, by thumbprint);
-  - `sources\install.wim`'s metadata must name an x64 `EnterpriseEval`, `Enterprise`, `Professional` or `Education`
-    image, with the build the pin expects. An ISO holding several of them needs `image: { iso, edition }`. **One edition
-    per ISO:** the first check records that edition and its index, the plan binds them, the build installs exactly
-    that one, and asking for another edition of the same ISO is refused.
+1. **You name the file** when you ask for VMs, for example "plan 2 VMs from D:\ISOs\Win11_Eval.iso". The agent calls
+   `pool_plan({ ..., image: { iso: "D:\\ISOs\\Win11_Eval.iso" } })`, or `image: { file: "<path to a .qcow2>" }` for a
+   Linux cloud image (see "Linux guests"). Any local file: download it yourself, from wherever you like. For example,
+   Microsoft's [Evaluation Center](https://www.microsoft.com/evalcenter/evaluate-windows-11-enterprise) offers the
+   Windows 11 Enterprise evaluation (an `.iso`; whichever build Microsoft serves today).
+2. **The helper copies it into its own folder while hashing it** (SHA-256), then reads the copy without mounting it (a
+   small bounded UDF reader): `sources\install.wim`'s editions and build. It also reads whether `setup.exe` and
+   `sources\setup.exe` carry valid Authenticode signatures from Microsoft Corporation (chaining to Microsoft Root
+   Certificate Authority 2010 or 2011): **information for you, never a refusal**. `pool_status` shows the check's
+   progress, then "ready" (or why the file can't be used); the agent plans again.
+3. **The plan names it:** its edition and build, the full SHA-256, the path it came from, and the signature line. The
+   approve line binds that hash, so approving is your decision to build from exactly those bytes.
+4. **The build uses only the helper's copy,** and hashes it again just before attaching it (hv.ps1 `create-vm`; a
+   Linux image's base VHDX before each copy): a file changed after you approved is refused, with nothing created. An
+   agent can't change an approved plan's image: another image is another plan, and another approval.
 
-  These are **consistency checks**: `install.wim` has no signature of its own, so they don't authenticate its
-  contents. The hash and where it came from do.
-- After the install, the guest's own report of its edition and build is a sanity check only.
+- **Reusing one:** a checked image is recorded with its hash. A later plan can name it by its SHA-256 (or its first 12+
+  hex digits), or leave `image` out to use the newest one. Each project's `images` list in the policy (see "Sharing
+  the pool between projects") still limits which images a project may use.
+- **One edition per ISO** (MC-1513): an ISO holding several x64 editions needs `image: { iso, edition: "<edition ID>" }`
+  on its first check (the reply lists them). The record keeps that edition and its index, the build installs exactly
+  that one, and asking for another edition of the same ISO is refused.
+- **Images checked before 4.0.0** stay usable by their hash; plans for them say "checked earlier".
+- After the install, the guest's own report of its edition and build is compared with the image, as a sanity check.
+
+**What the build can build: limits, not gates.**
+
+- **x64 only:** an x64 Hyper-V host doesn't run ARM guests, so an ISO with no x64 image is refused, saying so.
+- **Windows** needs `sources\install.wim` (an ISO with only `install.esd` isn't read) and an edition the unattended
+  install can drive: a Generation 2 VM with Secure Boot and a vTPM, `autounattend.xml` (UEFI partitions, two local
+  accounts, OOBE skipped), PowerShell Direct for the guest steps, and Defender exclusions. It has been run on Windows 11
+  (Enterprise evaluation 25H2). Windows 10 and Windows Server 2019 or later use the same steps but haven't been tried:
+  a step that can't work fails by name, and the build stops there.
+- **Linux** needs a qcow2 cloud image of at most 4 GB with cloud-init, systemd, OpenSSH and the `hv_sock` module (see
+  "Linux guests"). It has been run on Debian 13 and Ubuntu 26.04.
 
 ## Tools
 
 | Tool | What it does |
 |---|---|
-| `vm_acquire({ minutes=60, keepOnFailure=false, wait=false, os='windows', distro?, image?, vm? })` | Leases one VM of that OS (`distro: 'debian' \| 'ubuntu'` for a Linux VM of that distro; and image, when given; or the VM named by `vm`, for trials, see "One VM by name") to this session (one VM per session) until `vm_release`, its deadline (at most the policy's `maxLeaseMinutes`), or this server exiting. Without `wait`, it refuses when none is free for this session's project, saying why (none free, the project's cap, a VM kept for another project), when the next lease ends, and where it would stand in line. With `wait: true` it waits in line about 20 s, and a repeat call within 2 minutes keeps its place (see "Sharing the pool between projects"). |
+| `vm_acquire({ minutes=60, keepOnFailure=false, wait=false, os='windows', distro?, image?, vm? })` | Leases one VM of that OS (`distro`, an `/etc/os-release` ID such as `debian` or `ubuntu`, for a Linux VM of that distro; and image, when given; or the VM named by `vm`, for trials, see "One VM by name") to this session (one VM per session) until `vm_release`, its deadline (at most the policy's `maxLeaseMinutes`), or this server exiting. Without `wait`, it refuses when none is free for this session's project, saying why (none free, the project's cap, a VM kept for another project), when the next lease ends, and where it would stand in line. With `wait: true` it waits in line about 20 s, and a repeat call within 2 minutes keeps its place (see "Sharing the pool between projects"). |
 | `vm_start({ build?, network='none', reserveCpu=0, interactive=false })` | Restores the clean checkpoint (always), applies this run's network mode (`none`, `host`, `internet` or `internet-lan`, at or below the pool's; see "Network modes") and CPU reserve, and starts the VM. It waits for the guest, then copies `build` in to `C:\build` and leaves an empty `C:\out`. With `interactive: 'user'` (the standard user) or `'admin'`, it first logs that account on interactively: autologon, one guest restart, then it waits up to 10 minutes for the account's desktop session (often 2–4 minutes on a first logon; see "The interactive session"). Refused on a VM kept for inspection: release it, and acquire again. |
 | `vm_renew({ minutes=60 })` | Sets the lease's deadline to now + `minutes` (1 to the policy's `maxLeaseMinutes`), never past the work session's end: `maxSessionMinutes` after `vm_acquire` (`vm_status` shows both). Refused once the deadline has passed, even a moment before the helper ends the lease. |
 | `vm_sync({ build?, full=false, delete=true })` | Copies only the files that changed in `build` (default: the folder last started or synced) into the **running** guest's `C:\build`, without a restore: `C:\out`, installed software and anything else the runs left stay. The server hashes the folder (same roots checks as `vm_start`, every time; links skipped); the helper compares that with what it placed in `C:\build` and takes only the new or changed files, hashing them itself as they arrive. Files gone from the folder are removed unless `delete` is false. Only what the helper copied is tracked: if your runs changed `C:\build` themselves, use `full: true` (clears `C:\build`, copies everything) or `vm_reset`. After a sync fails, only those two are accepted. |
@@ -374,7 +394,7 @@ non-evaluation Windows 11 ISO (see "Windows licences").
 | `vm_release()` | Restores the VM (as `vm_stop`) and ends the lease. |
 | `vm_status()` | The pool, every lease, your VM, any pool job, the policy, and where builds may come from. Works with the server turned off. |
 | `vm_wait()` | Waits for this session's slow operation and gives its result (MC-1553, see "Slow operations"). Each call waits up to 45 s, `HYPERV_MCP_REPLY_MS`. |
-| `pool_plan({ action='create'\|'resize'\|'remove', vms?, cores?, memoryGB?, diskGB?, location?, network?, image?, activate? })` | Plans a pool change and changes nothing (see "Building the pool"). `network` is the pool's network mode, the highest a run may use (default `none` for a create, the current mode for a resize; a resize may change only this; see "Network modes"). `image` is a new ISO to check (`{ iso \| download, edition? }`), or a verified image's SHA-256: build from it, or resize only its group (see "A pool from more than one image"). An evaluation image's plan always activates Windows online once per new VM; `activate: true` asks the same for your own copy (see "Windows licences"). |
+| `pool_plan({ action='create'\|'resize'\|'remove', vms?, cores?, memoryGB?, diskGB?, location?, network?, image?, activate? })` | Plans a pool change and changes nothing (see "Building the pool"). `network` is the pool's network mode, the highest a run may use (default `none` for a create, the current mode for a resize; a resize may change only this; see "Network modes"). `image` is the file the user names, to check (`{ iso, edition? }` for Windows, `{ file }` for a Linux qcow2; never downloaded), or a checked image's SHA-256: build from it, or resize only its group (see "A pool from more than one image"). An evaluation image's plan always activates Windows online once per new VM; `activate: true` asks the same for your own copy (see "Windows licences"). |
 | `pool_create` / `pool_resize` / `pool_remove({ planId })` | Carries out an approved plan in the background. |
 | `pool_status()` | The pool, the image, and any job or image check in progress. |
 
@@ -545,19 +565,15 @@ approvals, the policy, trusted storage, leases and the line, the journal, the re
 warm sessions, lease and pool checkpoints. Each OS has a small **guest driver** inside the helper for the two things that
 differ: how a VM is built, and how the helper talks to its guest.
 
-- **Which distros:** Debian 13 (stable) and Ubuntu 26.04 LTS, each from the distro's own official cloud image. Debian 12
-  and Ubuntu 24.04 can follow as pins only. Others in the family aren't offered: Kali, Devuan (no systemd), Mint and the
-  desktop distros publish no comparable cloud-init images. Hyper-V can't run macOS.
-- **The images:** `pool_plan({ action: 'create' | 'resize', image: { distro: 'debian' | 'ubuntu' } })`.
-  - **Pinned, or refused.** The helper's table pins each image: distro, release, build serial, file, size and hash, from
-    a dated build folder on the distro's own host. Any other image is refused, local or downloaded, and no setting
-    changes that. `{ file: "<path>" }` takes a local copy of a pinned image.
-  - **The distro's checksums must agree.** Ubuntu's `SHA256SUMS` is first verified against its detached signature with
-    Ubuntu's pinned image-signing key, by the helper's own small OpenPGP check (no gpg). Debian publishes no signature for
-    its cloud images, so a Debian image is trusted by its pinned SHA-512 and HTTPS, as the user decided; the plan says so.
-    A checksum file must come from the distro's host itself; the image may be redirected to a mirror, since its hash
-    authenticates it.
-  - **Converted with nothing installed.** Both distros ship qcow2. The helper's own bounded reader writes a VHD, which
+- **Which distros:** any qcow2 cloud image you choose that the build can drive: cloud-init (a NoCloud seed), systemd,
+  OpenSSH and the `hv_sock` module. Debian 13's `genericcloud` and Ubuntu 26.04's `server-cloudimg` images have been
+  run. Others with those pieces should work the same way: one without them fails at the build step that needs it, by
+  name. Hyper-V can't run macOS.
+- **The images:** `pool_plan({ action: 'create' | 'resize', image: { file: "<path to the .qcow2>" } })`, a file you
+  downloaded yourself (from the distro's own cloud image pages; checking its published checksums is your step). As for
+  Windows (see "The image"), the helper copies it while hashing it, and the plan you approve names its path and
+  SHA-256: that approval is the trust. The helper downloads nothing and fetches no checksums.
+  - **Converted with nothing installed.** The distros ship qcow2. The helper's own bounded reader writes a VHD, which
     refuses backing files, encryption, snapshots, unknown features and anything out of bounds. Hyper-V's own
     `Convert-VHD` then makes the base VHDX. Its hash is recorded and checked again before each VM is copied from it.
 - **The build** (offline, about a minute or two per VM; the plan lists it):
@@ -1090,7 +1106,9 @@ path from the registry or the inventory.
   call goes on after the call ends. Windows copies (`vm_start`'s build copy and `vm_sync`) go in bounded calls of at most
   64 MB each (MC-1558, see "Timings"), so a big build on a slow host never meets that limit; a copy that stops making
   progress fails, and `C:\build` is then untrusted until a full sync or a reset. `maxBuildMB` limits bytes, not time.
-- Windows guests, and Debian and Ubuntu Linux guests from their pinned images only (see "Linux guests"). An evaluation VM lasts about 90 days from its activation at build (see "Windows licences").
+- Windows guests from an x64 ISO with `sources\install.wim`, run so far on Windows 11; Linux guests from a qcow2 cloud
+  image with cloud-init, systemd, OpenSSH and `hv_sock`, run so far on Debian 13 and Ubuntu 26.04 (see "The image" and
+  "Linux guests"). An evaluation VM lasts about 90 days from its activation at build (see "Windows licences").
   Building from a ready-made VHDX isn't supported: an own copy comes from an ISO.
 - A sync tracks only what the helper copied into `C:\build`. A run that changes `C:\build` itself isn't seen; a
   file renamed only in case on the host keeps its old spelling in the guest. `full: true` or `vm_reset` puts either
@@ -1109,8 +1127,10 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
 - `units.test.js`:
   - the UDF/WIM reader against real UDF images (made with the in-box IMAPI2 through `hv.ps1`), and malformed ones
     (truncated, corrupt checksums, byte flips, a missing or bad WIM);
-  - the image checks: pinned, downloaded, local and unpinned, signatures, edition and architecture, the helper's own
-    folders, download URLs;
+  - the image checks (MC-1572): any local ISO copied while hashed with its path, any x64 edition and build (Home,
+    Server, Windows 10, a newer evaluation build), signatures as information (unsigned, unread), ARM and missing
+    editions refused as limits, the helper's own folders, every download shape refused; hv.ps1's `create-vm` refusing an
+    ISO copy whose hash isn't the approved one, before anything is created;
   - the policy, the journal (a torn last line cut off, then reopen → append → reopen keeping every record),
     canonical plans, the answer file's escaping, the evaluation-expiry warning;
   - setup's storage and ACL routines themselves, non-elevated on temp folders and a test registry key
@@ -1316,11 +1336,9 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
 - `linux-image.test.js` (MC-1501):
   - the qcow2 reader and its VHD, read back exactly (data, compressed, zero and unallocated clusters, version 2, odd
     sizes), and every refusal;
-  - the OpenPGP check against the pinned release's real `SHA256SUMS` and `SHA256SUMS.gpg`, and crafted refusals
-    (another key, changed bytes, armor checksum, future, expired, text mode, unknown critical, SHA-1);
-  - `linux-images.prepare` with a fake download: pins, the distros' checksum lines, the signature, redirects, local
-    copies;
-  - the pinned table's dated folders.
+  - `linux-images.prepare` with the user's own file (MC-1572): any qcow2 copied while hashed, converted and recorded
+    with its path; a relative path, a folder, the helper's own folders and a non-qcow2 file refused; the guest's
+    report compared only with an image recorded with a distro.
 - `linux-guest-files.test.js`:
   - the helper's ed25519 keys read by Windows' own ssh-keygen;
   - the seed for each transport;
@@ -1401,8 +1419,8 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
     removal and before the retire, each rerun removing the switch, checking, then retiring; a leftover keeping the
     route; `-WhatIf` changing nothing on every path, `-Retire -WhatIf` included; a remove after a finished keep refused.
 
-**The trial** on a real host (not automated): setup, then `pool_plan` → approval → `pool_create` from the pinned 25H2
-ISO, then:
+**The trial** on a real host (not automated): setup, then `pool_plan` → approval → `pool_create` from the Windows 11
+Enterprise evaluation 25H2 ISO, then:
 - two VMs running at once, each restoring cleanly;
 - a run killed mid-way and recovered (the server, the helper and the host each killed in turn);
 - a sentinel written in one run and absent in the next, including after a keep and a guest shutdown;
@@ -1570,8 +1588,8 @@ Then delete `%USERPROFILE%\.ssh\hvnest-proof\`. No host firewall rule, switch or
 - `helper\`: the helper, installed by setup into `%ProgramFiles%\hyperv-mcp`:
   - `helper.js` (its entry under the host), `core.js` (the rules), `journal.js`, `policy.js`, `images.js`, `iso.js`,
     `unattend.js`, `paths.js`;
-  - Linux guests (MC-1501): `guests\linux.js` (the guest driver), `linux-images.js` (pins, checksums), `openpgp.js`
-    (Ubuntu's signature), `qcow2.js` (the converter), `seed.js` (the cloud-init seed), `sshkeys.js`, `ssh.js` (the
+  - Linux guests (MC-1501): `guests\linux.js` (the guest driver), `linux-images.js` (the user's qcow2, copied while
+    hashed), `qcow2.js` (the converter), `seed.js` (the cloud-init seed), `sshkeys.js`, `ssh.js` (the
     transport), `guest.py` (the guest's dispatcher), and `host\HvMcpVsock.cs` (the Hyper-V socket bridge, compiled by setup);
   - `hv.js` and `hv.ps1` (the only way it acts on Hyper-V), `guest-sync.ps1` (the guest side of `vm_sync`) and
     `guest-agent.ps1` (the interactive session's watcher), each run in the guest by `hv.ps1`;

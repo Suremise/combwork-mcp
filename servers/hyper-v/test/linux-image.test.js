@@ -1,6 +1,5 @@
-// Linux images (MC-1501): the qcow2 reader and its VHD output, the OpenPGP check of Ubuntu's signed checksums (against
-// the real SHA256SUMS and SHA256SUMS.gpg of the pinned release, and crafted signatures), and linux-images.prepare's
-// pin, checksum and signature rules with a fake download.
+// Linux images (MC-1501): the qcow2 reader and its VHD output, and linux-images.prepare with the user's own file
+// (MC-1572: no pins, no downloads, no checksum or signature fetching).
 const test = require('node:test')
 const assert = require('assert')
 const fs = require('fs')
@@ -8,7 +7,6 @@ const path = require('path')
 const zlib = require('zlib')
 const crypto = require('crypto')
 const qcow2 = require('../helper/qcow2')
-const openpgp = require('../helper/openpgp')
 const linux = require('../helper/linux-images')
 const { BASE } = require('./helpers')
 
@@ -202,183 +200,48 @@ test('VHD geometry follows the specification\'s algorithm', () => {
   assert.deepStrictEqual(qcow2.geometry(2000 * 1024 ** 3), { cylinders: 65535, heads: 16, spt: 255 })
 })
 
-// ---------- OpenPGP ----------
+// ---------- linux-images.prepare (MC-1572: the user's own qcow2 file; no pins, no downloads) ----------
 
-const FIX = path.join(__dirname, 'fixtures', 'ubuntu')
-const SUMS = fs.readFileSync(path.join(FIX, 'SHA256SUMS'))
-const SIG = fs.readFileSync(path.join(FIX, 'SHA256SUMS.gpg'))
-
-test('the pinned Ubuntu key verifies the real SHA256SUMS.gpg of the pinned release, which names the pinned image\'s hash', () => {
-  const r = openpgp.verifyDetached(SUMS, SIG, 'ubuntu-cloud-images', { now: Date.parse('2026-11-17T00:00:00Z') })
-  assert.strictEqual(r.fingerprint, 'D2EB44626FDDC30B513D5BB71A5D6C4C7DB87C81')
-  assert.strictEqual(r.hash, 'sha512')
-  const pin = linux.PINNED_LINUX.find(p => p.distro === 'ubuntu')
-  assert.strictEqual(linux.sumFor(SUMS.toString(), pin.file, 'sha256'), pin.sha256)
-})
-
-test('OpenPGP refusals: a changed file, a changed signature, its armor\'s checksum, a signature from the future, and a key that isn\'t pinned', () => {
-  const now = Date.now()
-  const changed = Buffer.from(SUMS); changed[100] ^= 1
-  assert.throws(() => openpgp.verifyDetached(changed, SIG, 'ubuntu-cloud-images', { now }), /digest does not match/)
-  // The signature's MPI changed (its check bytes still match the file): the RSA check fails.
-  const raw = openpgp.dearmor(SIG, 'SIGNATURE')
-  const evil = Buffer.from(raw); evil[evil.length - 10] ^= 0x40
-  assert.throws(() => openpgp.verifyDetached(SUMS, evil, 'ubuntu-cloud-images', { now }), /RSA signature is not valid/)
-  // The armor's own CRC-24.
-  const text = SIG.toString('latin1').replace(/\n=([A-Za-z0-9+/]{4})/, (_, c) => `\n=${c === 'AAAA' ? 'AAAB' : 'AAAA'}`)
-  assert.throws(() => openpgp.verifyDetached(SUMS, Buffer.from(text, 'latin1'), 'ubuntu-cloud-images', { now }), /armor's checksum/)
-  // Made "in the future" relative to the clock.
-  assert.throws(() => openpgp.verifyDetached(SUMS, SIG, 'ubuntu-cloud-images', { now: Date.parse('2026-11-01T00:00:00Z') }), /in the future/)
-  // A valid signature by another key, and the pinned key's slot faked with another packet.
-  const k = testKey()
-  const sig = signDetached(SUMS, k)
-  assert.throws(() => openpgp.verifyDetached(SUMS, sig, 'ubuntu-cloud-images', { now }), /issuer .* is not the pinned key/)
-  const saved = openpgp.KEYS['ubuntu-cloud-images'].packet
-  try {
-    openpgp.KEYS['ubuntu-cloud-images'].packet = k.packet.toString('base64')
-    assert.throws(() => openpgp.verifyDetached(SUMS, sig, 'ubuntu-cloud-images', { now }), /doesn't match its fingerprint/)
-  } finally { openpgp.KEYS['ubuntu-cloud-images'].packet = saved }
-  // Two packets, and a non-signature packet.
-  assert.throws(() => openpgp.verifyDetached(SUMS, Buffer.concat([raw, raw]), 'ubuntu-cloud-images', { now }), /exactly one signature packet/)
-  assert.throws(() => openpgp.verifyDetached(SUMS, Buffer.from([0xc0 | 13, 1, 0x41]), 'ubuntu-cloud-images', { now }), /exactly one signature packet/)
-})
-
-test('OpenPGP: a test key added to the table verifies its own signatures, and refuses expired, text-mode, unknown-critical and SHA-1 ones', () => {
-  const k = testKey()
-  openpgp.KEYS.test = { fingerprint: k.fingerprint, packet: k.packet.toString('base64') }
-  try {
-    const now = Date.now()
-    assert.strictEqual(openpgp.verifyDetached(SUMS, signDetached(SUMS, k), 'test', { now }).fingerprint, k.fingerprint)
-    assert.throws(() => openpgp.verifyDetached(SUMS, signDetached(SUMS, k, { expiresIn: 1, created: now / 1000 - 10 }), 'test', { now }), /expired/)
-    assert.throws(() => openpgp.verifyDetached(SUMS, signDetached(SUMS, k, { type: 1 }), 'test', { now }), /not a binary document signature/)
-    assert.throws(() => openpgp.verifyDetached(SUMS, signDetached(SUMS, k, { critical: 99 }), 'test', { now }), /unknown critical subpacket/)
-    assert.throws(() => openpgp.verifyDetached(SUMS, signDetached(SUMS, k, { hashAlg: 2 }), 'test', { now }), /hash algorithm 2/)
-    assert.throws(() => openpgp.verifyDetached(SUMS, signDetached(SUMS, k, { noCreated: true }), 'test', { now }), /no hashed creation time/)
-  } finally { delete openpgp.KEYS.test }
-})
-
-/** An RSA key as a v4 OpenPGP public-key packet body, with its fingerprint. */
-function testKey() {
-  const { publicKey, privateKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 })
-  const jwk = publicKey.export({ format: 'jwk' })
-  const mpiOf = b => { let i = 0; while (i < b.length - 1 && b[i] === 0) i++; b = b.subarray(i); const bits = (b.length - 1) * 8 + (32 - Math.clz32(b[0])); const h = Buffer.alloc(2); h.writeUInt16BE(bits); return Buffer.concat([h, b]) }
-  const head = Buffer.alloc(6); head[0] = 4; head.writeUInt32BE(1700000000, 1); head[5] = 1
-  const packet = Buffer.concat([head, mpiOf(Buffer.from(jwk.n, 'base64url')), mpiOf(Buffer.from(jwk.e, 'base64url'))])
-  const pre = Buffer.alloc(3); pre[0] = 0x99; pre.writeUInt16BE(packet.length, 1)
-  const fingerprint = crypto.createHash('sha1').update(pre).update(packet).digest('hex').toUpperCase()
-  return { privateKey, packet, fingerprint, mpiOf }
-}
-
-/** A v4 detached signature packet (binary) by key k, with knobs for the refusals. */
-function signDetached(data, k, { type = 0, hashAlg = 10, created = Math.floor(Date.now() / 1000) - 60, expiresIn, critical, noCreated } = {}) {
-  const sub = (t, body, crit) => Buffer.concat([Buffer.from([body.length + 1, crit ? 0x80 | t : t]), body])
-  const u32 = v => { const b = Buffer.alloc(4); b.writeUInt32BE(v); return b }
-  const hashedParts = [sub(33, Buffer.concat([Buffer.from([4]), Buffer.from(k.fingerprint, 'hex')]))]
-  if (!noCreated) hashedParts.push(sub(2, u32(Math.floor(created))))
-  if (expiresIn) hashedParts.push(sub(3, u32(expiresIn)))
-  if (critical) hashedParts.push(sub(critical, Buffer.from([1]), true))
-  const hashed = Buffer.concat(hashedParts)
-  const header = Buffer.concat([Buffer.from([4, type, 1, hashAlg]), Buffer.from([hashed.length >> 8, hashed.length & 0xff]), hashed])
-  const trailer = Buffer.concat([Buffer.from([4, 0xff]), u32(header.length)])
-  const alg = { 2: 'sha1', 8: 'sha256', 10: 'sha512' }[hashAlg]
-  const digest = crypto.createHash(alg).update(data).update(header).update(trailer).digest()
-  const sig = crypto.sign(alg, Buffer.concat([data, header, trailer]), { key: k.privateKey, padding: crypto.constants.RSA_PKCS1_PADDING })
-  const body = Buffer.concat([header, Buffer.from([0, 0]), digest.subarray(0, 2), k.mpiOf(sig)])
-  const len = body.length
-  return Buffer.concat([Buffer.from([0xc2, 0xff]), u32(len), body])
-}
-
-// ---------- linux-images.prepare ----------
-
-/** A fake download: URL → Buffer; records the calls with their sameHost flag. */
-function fakeFetch(map, calls = []) {
-  const { Readable } = require('stream')
-  return async (u, { sameHost }) => {
-    calls.push({ u, sameHost })
-    if (map[u] === undefined) throw new Error(`${new URL(u).hostname} answered HTTP 404`)
-    return Readable.from([map[u]])
-  }
-}
 const fakeHv = async (op, a) => { assert.strictEqual(op, 'vhd-convert'); fs.copyFileSync(a.vhd, a.vhdx); return { vhdx: a.vhdx } }
 
-function pins(img) {
-  const sha256 = crypto.createHash('sha256').update(img).digest('hex')
-  const sha512 = crypto.createHash('sha512').update(img).digest('hex')
-  return [
-    { id: 'debian-13-t', distro: 'debian', release: '13', codename: 'trixie', serial: 't', name: 'Debian 13 test', file: 'd.qcow2', size: img.length, url: 'https://cloud.debian.org/x/d.qcow2', sums: { url: 'https://cloud.debian.org/x/SHA512SUMS', alg: 'sha512', signature: null }, sha512 },
-    { id: 'ubuntu-26.04-t', distro: 'ubuntu', release: '26.04', codename: 'resolute', serial: 't', name: 'Ubuntu 26.04 test', file: 'u.img', size: img.length, url: 'https://cloud-images.ubuntu.com/x/u.img', sums: { url: 'https://cloud-images.ubuntu.com/x/SHA256SUMS', alg: 'sha256', signature: { url: 'https://cloud-images.ubuntu.com/x/SHA256SUMS.gpg', key: 'test' } }, sha256 }
-  ]
-}
-
-test('prepare: a pinned Debian image downloaded, its SHA512SUMS line agreeing, converted to the base VHDX and recorded; the image may be redirected, its sums may not', async () => {
-  const d = tmpDir('prep-debian')
+test('prepare: any qcow2 file the user names is copied while hashed, converted to the base VHDX and recorded with its path; again, it is the same record', async () => {
+  const d = tmpDir('prep-own')
   const img = makeQcow2({ virtualSize: 4 * 1024 * 1024, clusters: new Map([[0, { data: fill(65536, 8) }]]) })
-  const P = pins(img)
-  const calls = []
-  const fetch = fakeFetch({ [P[0].url]: img, [P[0].sums.url]: Buffer.from(`${'0'.repeat(128)}  other.qcow2\n${P[0].sha512}  d.qcow2\n`) }, calls)
-  const r = await linux.prepare({ want: { distro: 'debian' }, dir: d, hv: fakeHv, pins: P, fetch })
-  assert.strictEqual(r.os, 'linux')
-  assert.strictEqual(r.distro, 'debian')
-  assert.strictEqual(r.pinned, true)
-  assert.match(r.checksums, /unsigned/)
+  const local = path.join(d, 'fedora-cloud.qcow2')
+  fs.writeFileSync(local, img)
+  const dir = path.join(d, 'images')
+  const r = await linux.prepare({ want: { file: local }, dir, hv: fakeHv })
+  assert.deepStrictEqual([r.os, r.source, r.path, r.name, r.size], ['linux', 'local', fs.realpathSync.native(local), 'fedora-cloud.qcow2', img.length])
+  assert.strictEqual(r.sha256, crypto.createHash('sha256').update(img).digest('hex'))
+  assert.strictEqual(r.distro, undefined, 'no distro is claimed for it: its guest reports one at its build')
   assert.ok(fs.existsSync(r.file) && r.file.endsWith(`${r.sha256}.vhdx`))
   assert.strictEqual(r.vhdxSha256, await linux.hashFile(r.file))
-  assert.deepStrictEqual(calls.map(c => c.sameHost), [false, true], 'the image may follow redirects; the checksum file may not')
-  assert.deepStrictEqual(fs.readdirSync(d).filter(f => !f.endsWith('.vhdx')), [], 'nothing left behind but the base VHDX')
-  // Again: already verified.
-  const again = await linux.prepare({ want: { distro: 'debian' }, dir: d, hv: fakeHv, pins: P, fetch, known: new Map([[r.sha256, r]]) })
+  assert.deepStrictEqual(fs.readdirSync(dir).filter(f => !f.endsWith('.vhdx')), [], 'nothing left behind but the base VHDX')
+  const again = await linux.prepare({ want: { file: local }, dir, hv: fakeHv, known: new Map([[r.sha256, r]]) })
   assert.strictEqual(again.existing, true)
+  assert.match(linux.describe(r), new RegExp(`Linux image fedora-cloud\.qcow2, SHA-256 ${r.sha256.slice(0, 12)}, from .*fedora-cloud\.qcow2`))
 })
 
-test('prepare: Ubuntu\'s SHA256SUMS must carry a valid signature by the pinned key', async () => {
-  const d = tmpDir('prep-ubuntu')
-  const img = makeQcow2({ virtualSize: 4 * 1024 * 1024 })
-  const P = pins(img)
-  const k = testKey()
-  const sums = Buffer.from(`${P[1].sha256} *u.img\n`)
-  openpgp.KEYS.test = { fingerprint: k.fingerprint, packet: k.packet.toString('base64') }
-  try {
-    const good = { [P[1].url]: img, [P[1].sums.url]: sums, [P[1].sums.signature.url]: signDetached(sums, k) }
-    const r = await linux.prepare({ want: { distro: 'ubuntu' }, dir: d, hv: fakeHv, pins: P, fetch: fakeFetch(good) })
-    assert.match(r.checksums, new RegExp(`signed by Ubuntu's image key ${k.fingerprint}`))
-    const other = testKey()
-    await assert.rejects(linux.prepare({ want: { distro: 'ubuntu' }, dir: tmpDir('prep-ubuntu2'), hv: fakeHv, pins: P, fetch: fakeFetch({ ...good, [P[1].sums.signature.url]: signDetached(sums, other) }) }), /signature doesn't verify: .*not the pinned key/)
-    await assert.rejects(linux.prepare({ want: { distro: 'ubuntu' }, dir: tmpDir('prep-ubuntu3'), hv: fakeHv, pins: P, fetch: fakeFetch({ ...good, [P[1].sums.signature.url]: undefined }) }), /404|signature/)
-  } finally { delete openpgp.KEYS.test }
+test('prepare refuses: no file, a relative path, a folder, the helper\'s own folders, and a file that isn\'t an acceptable qcow2 (limits, by name)', async () => {
+  const d = tmpDir('prep-refuse')
+  const dir = path.join(d, 'images')
+  await assert.rejects(linux.prepare({ want: { distro: 'debian' }, dir, hv: fakeHv }), /image must be \{ file/)
+  await assert.rejects(linux.prepare({ want: { file: 'rel.qcow2' }, dir, hv: fakeHv }), /absolute local path/)
+  await assert.rejects(linux.prepare({ want: { file: d }, dir, hv: fakeHv }), /not a plain file/)
+  const own = path.join(d, 'own')
+  fs.mkdirSync(own)
+  fs.writeFileSync(path.join(own, 'x.qcow2'), makeQcow2({ virtualSize: 4 * 1024 * 1024 }))
+  await assert.rejects(linux.prepare({ want: { file: path.join(own, 'x.qcow2') }, dir, hv: fakeHv, ownDirs: [own] }), /helper's own folders/)
+  const raw = path.join(d, 'raw.img')
+  fs.writeFileSync(raw, Buffer.alloc(1024 * 1024))
+  await assert.rejects(linux.prepare({ want: { file: raw }, dir, hv: fakeHv }), /not an acceptable qcow2 image/)
+  assert.deepStrictEqual(fs.readdirSync(dir), [], 'a refused file leaves nothing behind')
 })
 
-test('prepare refuses: an unpinned file, a hash or size other than the pin\'s, sums that disagree or name it twice, and an unknown distro', async () => {
-  const img = makeQcow2({ virtualSize: 4 * 1024 * 1024 })
-  const P = pins(img)
-  const sumsOk = Buffer.from(`${P[0].sha512}  d.qcow2\n`)
-  const other = makeQcow2({ virtualSize: 8 * 1024 * 1024 })
-  await assert.rejects(linux.prepare({ want: { distro: 'debian' }, dir: tmpDir('r1'), hv: fakeHv, pins: P, fetch: fakeFetch({ [P[0].url]: other, [P[0].sums.url]: sumsOk }) }), /doesn't match the pin/)
-  await assert.rejects(linux.prepare({ want: { distro: 'debian' }, dir: tmpDir('r2'), hv: fakeHv, pins: P, fetch: fakeFetch({ [P[0].url]: img, [P[0].sums.url]: Buffer.from(`${'1'.repeat(128)}  d.qcow2\n`) }) }), /another hash than the pin/)
-  await assert.rejects(linux.prepare({ want: { distro: 'debian' }, dir: tmpDir('r3'), hv: fakeHv, pins: P, fetch: fakeFetch({ [P[0].url]: img, [P[0].sums.url]: Buffer.concat([sumsOk, sumsOk]) }) }), /no single line/)
-  const sized = P.map(p => ({ ...p, size: p.size + 1 }))
-  await assert.rejects(linux.prepare({ want: { distro: 'debian' }, dir: tmpDir('r4'), hv: fakeHv, pins: sized, fetch: fakeFetch({ [P[0].url]: img, [P[0].sums.url]: sumsOk }) }), /not its size/)
-  await assert.rejects(linux.prepare({ want: { distro: 'fedora' }, dir: tmpDir('r5'), hv: fakeHv, pins: P }), /debian or ubuntu/)
-  // A local file: accepted only as a pinned image (matched by its hash), refused otherwise.
-  const d = tmpDir('r6')
-  const local = path.join(d, 'mine.qcow2')
-  fs.writeFileSync(local, other)
-  await assert.rejects(linux.prepare({ want: { file: local }, dir: path.join(d, 'images'), hv: fakeHv, pins: P, fetch: fakeFetch({}) }), /not a pinned Linux image/)
-  fs.writeFileSync(local, img)
-  const r = await linux.prepare({ want: { file: local }, dir: path.join(d, 'images'), hv: fakeHv, pins: P, fetch: fakeFetch({ [P[0].sums.url]: sumsOk }) })
-  assert.strictEqual(r.source, 'local')
-  assert.strictEqual(r.distro, 'debian')
-})
-
-test('the pinned table: dated folders on each distro\'s own host, never latest/ or current/', () => {
-  for (const p of linux.PINNED_LINUX) {
-    const host = p.distro === 'debian' ? 'cloud.debian.org' : 'cloud-images.ubuntu.com'
-    for (const u of [p.url, p.sums.url, p.sums.signature?.url].filter(Boolean)) {
-      assert.strictEqual(new URL(u).hostname, host, u)
-      assert.doesNotMatch(u, /\/(latest|current)\//, u)
-      assert.ok(u.includes(p.serial), `${u} is in the build ${p.serial}'s folder`)
-    }
-    assert.ok(p.size > 100 * 1024 * 1024)
-    assert.ok(p.distro === 'debian' ? /^[0-9a-f]{128}$/.test(p.sha512) : /^[0-9a-f]{64}$/.test(p.sha256))
-  }
-  assert.deepStrictEqual(linux.PINNED_LINUX.map(p => p.distro).sort(), ['debian', 'ubuntu'])
+test('the guest\'s report is compared only with an image recorded with a distro (the earlier pinned ones)', () => {
+  assert.strictEqual(linux.guestReportProblem({ id: 'fedora', versionId: '43' }, { sha256: 'a' }), null)
+  assert.strictEqual(linux.guestReportProblem({ id: 'ubuntu', versionId: '26.04' }, { distro: 'debian', release: '13' }), 'the guest says it is ubuntu, the image debian')
+  assert.strictEqual(linux.guestReportProblem(null, {}), 'no report')
+  for (const d of ['debian', 'ubuntu', 'fedora', 'opensuse-leap', 'rhel']) assert.ok(linux.DISTRO_RE.test(d), d)
+  for (const d of ['', 'Debian', '../x', 'a b', 'x'.repeat(40)]) assert.ok(!linux.DISTRO_RE.test(d), d)
 })
