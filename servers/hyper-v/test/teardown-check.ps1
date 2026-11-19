@@ -26,7 +26,7 @@ function New-Fixture([int]$vms = 2) {
       # MC-1583: the helper's VMs as its remove plan names them; the one question's answer ($null: the mode asked, or
       # remove when asked to choose) and a hook run while it is open; the answer when asked again after a change.
       vmList = @(for ($i = 1; $i -le $vms; $i++) { [pscustomobject]@{ vmId = "vm-$i"; name = "hvmcp-$i"; folder = (Join-Path $b "disk\pool\i-$i") } })
-      answer = $null; onConfirm = $null; changeAnswer = $true; shown = @(); changes = @(); plans = 0; approved = $null }
+      answer = $null; onConfirm = $null; onQuiesce = $null; changeAnswer = $true; shown = @(); changes = @(); plans = 0; approved = $null }
   }
   $pins = New-Object Collections.ArrayList
   $rk = Open-ReceiptKey $HKCU "$($f.keyPath)\Storage" $trusted $me
@@ -61,7 +61,8 @@ function New-Ops($f) {
     RemoveRights = { $s.rights = $false; [void]$s.calls.Add('rights') }.GetNewClosure()
     RemoveGroup = { $s.group = $false; [void]$s.calls.Add('group') }.GetNewClosure()
     HelperStatus = { if ($s.helper) { [pscustomobject]@{ vms = $s.vms; job = $s.job } } else { $null } }.GetNewClosure()
-    Quiesce = { param($purpose) if (-not $s.helper) { & $strict 'quiesce without a helper' }; [void]$s.calls.Add("quiesce:$purpose") }.GetNewClosure()
+    # $s.onQuiesce (MC-1583 round 1): the pool changing between the status read before quiesce and quiesce itself.
+    Quiesce = { param($purpose) if (-not $s.helper) { & $strict 'quiesce without a helper' }; if ($s.onQuiesce) { & $s.onQuiesce; $s.onQuiesce = $null }; [void]$s.calls.Add("quiesce:$purpose") }.GetNewClosure()
     PlanRemove = {
       if (-not $s.helper) { & $strict 'plan without a helper' }
       $s.plans++
@@ -337,6 +338,21 @@ $bind.resumeEmpty = [ordered]@{ first = $first; result = (Try-Run $f 'remove'); 
 $f = New-Fixture
 $first = Try-Run $f 'remove' 'after:record'
 $bind.resumeSame = [ordered]@{ first = $first; result = (Try-Run $f 'remove'); asked = (@($f.sys.calls | Where-Object { $_ -eq 'confirm' }).Count); reasked = @($f.sys.changes).Count; gone = (Gone $f) }
+# Round 1: a VM made after phase 2's first status read, just before quiesce locks the pool (an empty pool confirmed):
+# the count is read again after quiesce, so it is seen and asked about. A no keeps the record at 'verified' with all
+# storage; a yes removes it through its own fresh remove plan.
+$newVm = { param($f) $f.sys.vmList = @([pscustomobject]@{ vmId = 'vm-q'; name = 'hvmcp-q'; folder = (Join-Path $f.disk 'pool\i-q') }); $f.sys.vms = 1 }
+$f = New-Fixture 0
+$f.sys.onQuiesce = { & $newVm $f }.GetNewClosure(); $f.sys.changeAnswer = $false
+$bind.atQuiesceNo = [ordered]@{ result = (Try-Run $f 'ask'); change = $f.sys.changes[0]; after = (& $state1 $f) }
+$f = New-Fixture 0
+$f.sys.onQuiesce = { & $newVm $f }.GetNewClosure()
+$bind.atQuiesceYes = [ordered]@{ result = (Try-Run $f 'ask'); change = $f.sys.changes[0]; plans = $f.sys.plans; approved = $f.sys.approved; removed = (@($f.sys.calls | Where-Object { $_ -eq 'remove-pool' }).Count); gone = (Gone $f) }
+# The same on a resume of an empty record: a VM made just before the resumed run's quiesce.
+$f = New-Fixture 0
+$first = Try-Run $f 'remove' 'after:record'
+$f.sys.onQuiesce = { & $newVm $f }.GetNewClosure(); $f.sys.changeAnswer = $false
+$bind.atQuiesceResume = [ordered]@{ first = $first; result = (Try-Run $f 'remove'); change = $f.sys.changes[0]; after = (& $state1 $f) }
 # None confirmed and still none: no plan, no second question.
 $f = New-Fixture 0
 $bind.zeroStill = [ordered]@{ result = (Try-Run $f 'ask'); plans = $f.sys.plans; reasked = @($f.sys.changes).Count; gone = (Gone $f) }

@@ -264,7 +264,11 @@ function Invoke-Teardown {
           # compared with the confirmed ones, always: an empty confirmation never covers a VM made since. Any difference
           # (one added, one replaced, the count alike or not) is asked again before anything is approved; a no stops
           # with the record kept, so a rerun asks again.
-          $plan = if ([int]$helper.vms -gt 0) { & $Ops.PlanRemove } else { $null }
+          # The count read again now, after quiesce (no pool change can start after it): one read before it could miss
+          # a VM made meanwhile, and treat the pool as empty (MC-1583 round 1).
+          $quiet = & $Ops.HelperStatus
+          if (-not $quiet) { throw 'The helper stopped answering after quiesce, so the pool can''t be confirmed removed: start it (Start-Service HyperVMcp) and run this again.' }
+          $plan = if ([int]$quiet.vms -gt 0) { & $Ops.PlanRemove } else { $null }
           $live = @(if ($plan) { $plan.vms })
           $confirmed = @(if ($rec.PSObject.Properties['pool']) { $rec.pool })
           if ((Get-VmSetKey $live) -ne (Get-VmSetKey $confirmed)) {

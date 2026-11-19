@@ -598,6 +598,10 @@ for (const E of ENGINES) test(`uninstall teardown under PowerShell ${E.name} (no
   assert.strictEqual(B.resumeEmpty.first, 'CRASH:after:record'); assert.match(B.resumeEmpty.result, changed); assert.strictEqual(B.resumeEmpty.asked, 1); assert.deepStrictEqual(B.resumeEmpty.change, { was: [], now: ['vm-late'] }); assert.deepStrictEqual(B.resumeEmpty.after, untouched)
   assert.deepStrictEqual(B.resumeSame, { first: 'CRASH:after:record', result: 'ok', asked: 1, reasked: 0, gone: true }, 'a resume against the same VMs asks nothing more')
   assert.deepStrictEqual(B.zeroStill, { result: 'ok', plans: 0, reasked: 0, gone: true }, 'none confirmed and none now: no plan, no second question')
+  // Round 1: a VM made just before quiesce (after phase 2's first status read): seen by the read after quiesce.
+  assert.match(B.atQuiesceNo.result, changed); assert.deepStrictEqual(B.atQuiesceNo.change, { was: [], now: ['vm-q'] }); assert.deepStrictEqual(B.atQuiesceNo.after, untouched, 'a no: record at verified, all storage kept')
+  assert.deepStrictEqual(B.atQuiesceYes, { result: 'ok', change: { was: [], now: ['vm-q'] }, plans: 1, approved: 'p-0000000000000001', removed: 1, gone: true }, 'a yes: removed through its own fresh remove plan')
+  assert.strictEqual(B.atQuiesceResume.first, 'CRASH:after:record'); assert.match(B.atQuiesceResume.result, changed); assert.deepStrictEqual(B.atQuiesceResume.change, { was: [], now: ['vm-q'] }); assert.deepStrictEqual(B.atQuiesceResume.after, untouched, 'on a resume too')
 })
 
 // MC-1583: approve.ps1 -Confirmed (the uninstaller's) only for a remove plan: any other plan still needs its digest.
