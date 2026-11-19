@@ -159,7 +159,7 @@ test('a named guest setup script: shown in the plan by path, size and SHA-256; r
   assert.ok(plan.text.includes(`- guest setup script: ${file} (${text.length} bytes, SHA-256 ${sha}), run once in each new VM as its admin, offline, before its clean checkpoint; a non-zero exit fails that VM's build`), plan.text)
   const runs = scriptRuns(sc)
   assert.strictEqual(runs.length, 1)
-  assert.strictEqual(runs[0].command, text, 'the script\'s own text')
+  assert.strictEqual(runs[0].command, `﻿${text}`, 'the script\'s own text, marked UTF-8 for Windows PowerShell')
   const ops = sc.stub().calls.map(c => c.op)
   const at = ops.indexOf('guest-run-start')
   assert.ok(ops.lastIndexOf('guest-logon-undo') < at && at < ops.indexOf('guest-run-clear') && ops.indexOf('guest-run-clear') < ops.indexOf('make-clean'), 'after the profiles, cleared, then the checkpoint')
@@ -177,7 +177,7 @@ test('the guest setup script runs from the helper\'s copy: a later change to the
     beforeApply: () => fs.writeFileSync(file, 'write C:\\swapped.txt no')
   })
   assert.match(same.line, /create finished/)
-  assert.strictEqual(scriptRuns(same.sc)[0].command, 'write C:\\approved.txt yes', 'the approved bytes ran')
+  assert.strictEqual(scriptRuns(same.sc)[0].command, '\uFEFFwrite C:\\approved.txt yes', 'the approved bytes ran')
   let tsc
   await assert.rejects(build(t, 'gs-copy-changed', {}, {
     planArgs: sc => ({ guestScript: userScript(sc, 'write C:\\approved.txt yes') }),
@@ -264,4 +264,60 @@ test('no registry policy of the build\'s own (MC-1577 removed MC-1522\'s): a gue
   const ok = await build(t, 'dfu-none', { setupOverride: { disableForceUnload: null } })
   assert.match(ok.line, /create finished/)
   assert.doesNotMatch(ok.plan.text, /- registry:/)
+})
+
+// MC-1577 round 1: a .ps1 saved by Windows PowerShell's Out-File is UTF-16 with its BOM. The script's text is decoded
+// from its encoding (the hash stays the file's own bytes), and goes to the guest marked UTF-8 for Windows PowerShell.
+const { decodeScript } = require('../helper/core')
+const UNICODE = "$p = Join-Path $env:HVMCP_TEST_OUT 'said.txt'\r\n[IO.File]::WriteAllText($p, 'caf\u00e9 \u2713 \u00fcber', (New-Object Text.UTF8Encoding $false))\r\nexit 0\r\n"
+const encodings = {
+  utf8: Buffer.from(UNICODE, 'utf8'),
+  utf8bom: Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(UNICODE, 'utf8')]),
+  utf16le: Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(UNICODE, 'utf16le')]),
+  utf16be: Buffer.concat([Buffer.from([0xfe, 0xff]), Buffer.from(UNICODE, 'utf16le').swap16()])
+}
+
+test('a guest setup script\'s text: UTF-8 (with or without BOM) and BOM-marked UTF-16 LE and BE decode alike; a .ps1 goes marked UTF-8; anything else is refused', () => {
+  for (const [name, bytes] of Object.entries(encodings)) {
+    assert.strictEqual(decodeScript(bytes, 'powershell'), `\uFEFF${UNICODE}`, name)
+    assert.strictEqual(decodeScript(bytes, 'bash'), UNICODE, `${name}: a .sh has no BOM (it would break a #! line)`)
+  }
+  for (const [name, bytes] of [['bad UTF-8', Buffer.from([0x63, 0xc3, 0x28])], ['UTF-16 without its BOM', Buffer.from('exit 0', 'utf16le')], ['a BOM alone', Buffer.from([0xff, 0xfe])], ['a NUL', Buffer.from('a\0b')]]) {
+    assert.throws(() => decodeScript(bytes, 'powershell'), /guestScript must be a text file: UTF-8, or UTF-16 with its byte order mark/, name)
+  }
+})
+
+test('a UTF-16 .ps1 (as Out-File writes it) is planned by its own bytes\' hash and runs as its decoded text', async t => {
+  let file
+  const { sc, plan, line } = await build(t, 'gs-utf16', {}, { planArgs: sc => { file = path.join(sc.dir, 'user', 'guest.ps1'); fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from('write C:/u.txt caf\u00e9', 'utf16le')])); return { guestScript: file } } })
+  assert.match(line, /create finished/, line)
+  const sha = crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
+  assert.ok(plan.text.includes(`(${fs.statSync(file).size} bytes, SHA-256 ${sha})`), plan.text)
+  assert.strictEqual(scriptRuns(sc)[0].command, '\uFEFFwrite C:/u.txt caf\u00e9')
+  assert.ok(vms(sc)[0].checkpoints[0].disk['C:/u.txt'])
+})
+
+// The guest side for real: hv.ps1's own $RunFiles writes the decoded script as a guest run does, and Windows PowerShell
+// 5.1 (a Windows guest's) runs it through the wrapper: the non-ASCII text arrives intact from each encoding.
+const HV_SOURCE = fs.readFileSync(path.join(__dirname, '..', 'helper', 'hv.ps1'), 'utf8')
+const RUN_FILES = (() => { const s = HV_SOURCE.indexOf('\n$RunFiles = {'); const e = s < 0 ? -1 : HV_SOURCE.indexOf('\n}\n', s + 1); return e < 0 ? null : HV_SOURCE.slice(s + 1, e + 3) })()
+
+test('each encoding of the same .ps1, decoded, written by hv.ps1\'s $RunFiles and run by Windows PowerShell 5.1: its non-ASCII text intact', { skip: process.platform !== 'win32' || !RUN_FILES }, () => {
+  const { spawnSync } = require('child_process')
+  const { ps51Env } = require('../helper/hv')
+  for (const [name, bytes] of Object.entries(encodings)) {
+    const sc = scratch(`gs-real-${name}`)
+    const out = path.join(sc.dir, 'out')
+    fs.mkdirSync(out, { recursive: true })
+    fs.writeFileSync(path.join(sc.dir, 'j.json'), JSON.stringify({ n: 800000001, command: decodeScript(bytes, 'powershell'), shell: 'powershell', cwd: sc.dir, out }), 'utf8')
+    const harness = path.join(sc.dir, 'harness.ps1')
+    fs.writeFileSync(harness, `$ErrorActionPreference = 'Stop'\n${RUN_FILES}\n$j = [IO.File]::ReadAllText('${path.join(sc.dir, 'j.json').replace(/'/g, "''")}', [Text.Encoding]::UTF8) | ConvertFrom-Json\n& $RunFiles $j '${path.join(sc.dir, 'hvmcp').replace(/'/g, "''")}'\n`)
+    const w = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', harness], { encoding: 'utf8', env: ps51Env(), timeout: T.spawnMs })
+    const wrapper = w.stdout.trim().split(/\r?\n/).pop()
+    assert.ok(wrapper && fs.existsSync(wrapper), `${name}: $RunFiles gave its wrapper: ${w.stdout}${w.stderr}`)
+    const r = spawnSync(process.env.ComSpec || 'cmd.exe', ['/d', '/c', wrapper], { encoding: 'utf8', env: { ...ps51Env(), HVMCP_TEST_OUT: out }, timeout: T.spawnMs })
+    assert.strictEqual(r.status, 0, `${name}: ${r.stdout}${r.stderr}`)
+    assert.strictEqual(fs.readFileSync(path.join(out, '.run-800000001.exit'), 'utf8').trim(), '0', `${name}: ${fs.existsSync(path.join(out, '.run-800000001.stderr.txt')) && fs.readFileSync(path.join(out, '.run-800000001.stderr.txt'), 'utf8')}`)
+    assert.strictEqual(fs.readFileSync(path.join(out, 'said.txt'), 'utf8'), 'caf\u00e9 \u2713 \u00fcber', `${name}: the script's text reached Windows PowerShell intact`)
+  }
 })

@@ -600,7 +600,7 @@ function run(s, op, a) {
       if (run.result) return run.result
       const blank = { stdout: '', stdoutCut: false, stderr: '', stderrCut: false }
       if (!run.taken || (run.interactive && (vm.loggedOn !== run.taken || !vm.watcher))) return { ...blank, done: false, pending: run.interactive }
-      const [cmd, ...rest] = run.command.split(' ')
+      const [cmd, ...rest] = run.command.replace(/^﻿/, '').split(' ') // MC-1577: a .ps1 setup script's BOM
       if (run.killed || cmd === 'sleep') return { ...blank, stdout: 'partial\r\n', done: false, pending: false }
       if (cmd === 'slow' && run.polls < Number(rest[0])) return { ...blank, done: false, pending: false }
       const put = (p, t) => { vm.disk[p.includes(':') ? p : `C:\\out\\${p}`] = Buffer.from(t).toString('base64') }

@@ -314,7 +314,8 @@ pool_plan({ action: "create", vms: 2, image: { iso: "D:\\Downloads\\Win11_Eval.i
 ```
 
 - **Windows guests** take a `.ps1` (run by Windows PowerShell), `.cmd` or `.bat`. **Linux guests** take a `.sh`
-  (run by bash).
+  (run by bash). The file may be UTF-8 (with or without its BOM) or UTF-16 with its BOM (as Windows PowerShell's
+  `Out-File` writes it); the helper decodes it, and a `.ps1` reaches the guest marked UTF-8, so non-ASCII text survives.
 - The helper reads the file when you plan, keeps its own copy, and the plan shows its path, size and SHA-256. You
   approve those exact bytes: a later change to your file doesn't change what runs (plan again to use it).
 - It runs once in each VM the plan builds, as the guest's admin (root on Linux), offline, in `C:\build` (`/build`),

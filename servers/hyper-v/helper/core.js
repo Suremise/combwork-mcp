@@ -98,6 +98,22 @@ const CLEANUP_MS = 60_000
 const hex = n => crypto.randomBytes(n).toString('hex')
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 const sha256 = buf => crypto.createHash('sha256').update(buf).digest('hex')
+/**
+ * MC-1577: a guest setup script's text, from its file's bytes: UTF-8 (with or without its BOM), or UTF-16 LE or BE
+ * marked by its BOM (as Windows PowerShell's Out-File writes it). Anything that doesn't decode cleanly, or holds a NUL,
+ * is refused. For a .ps1 the text goes to the guest with a BOM again (the run file is written as UTF-8), so Windows
+ * PowerShell 5.1 reads it as UTF-8 rather than the guest's ANSI code page; a .sh or .cmd goes without one.
+ */
+function decodeScript(bytes, shell) {
+  let text
+  try {
+    if (bytes[0] === 0xff && bytes[1] === 0xfe) text = new TextDecoder('utf-16le', { fatal: true }).decode(bytes.subarray(2))
+    else if (bytes[0] === 0xfe && bytes[1] === 0xff) text = new TextDecoder('utf-16be', { fatal: true }).decode(bytes.subarray(2))
+    else text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(bytes)
+  } catch { throw new Error('guestScript must be a text file: UTF-8, or UTF-16 with its byte order mark') }
+  if (!text.trim() || text.includes('\0')) throw new Error('guestScript must be a text file: UTF-8, or UTF-16 with its byte order mark')
+  return shell === 'powershell' ? `﻿${text}` : text
+}
 /** MC-1577: the end of a run's output, for a failure's reason (printable text only, at most 1500 characters). */
 const tail = r => {
   const t = `${r?.stdout || ''}${r?.stderr ? `\n${r.stderr}` : ''}`.replace(/[^\x20-\x7e\n\t]/g, '').trim()
@@ -2965,8 +2981,9 @@ class Helper {
     if (!st.isFile()) throw new Error('guestScript is not a plain file')
     if (st.size === 0 || st.size > GUEST_SCRIPT_MAX) throw new Error(`guestScript must hold 1 byte to ${GUEST_SCRIPT_MAX} bytes (the whole script goes to the guest in one call)`)
     const bytes = fs.readFileSync(real)
-    if (bytes.includes(0)) throw new Error('guestScript must be a text file')
-    const rec = { sha256: sha256(bytes), name: win32.basename(real), path: real, bytes: bytes.length, shell: ext === '.sh' ? 'bash' : ext === '.ps1' ? 'powershell' : 'cmd' }
+    const shell = ext === '.sh' ? 'bash' : ext === '.ps1' ? 'powershell' : 'cmd'
+    decodeScript(bytes, shell) // refused here, at plan time, unless it is text
+    const rec = { sha256: sha256(bytes), name: win32.basename(real), path: real, bytes: bytes.length, shell }
     const file = this.guestScriptFile(rec)
     fs.mkdirSync(join(this.dir, 'scripts'), { recursive: true })
     if (!fs.existsSync(file)) {
@@ -2991,7 +3008,7 @@ class Helper {
     this.scriptRuns = ((this.scriptRuns || 0) % 99_999_999) + 1
     const n = GUEST_SCRIPT_RUN_BASE + this.scriptRuns
     const base = { ...this.ident(vm), cred: creds.admin, n }
-    const started = await this.guestCall(vm, 'guest-run-start', { ...base, command: bytes.toString('utf8'), shell: gs.shell, cwd: this.paths(vm).build, cap: OUTPUT_CAP, runAs: null }, { timeoutMs: CALL_MS })
+    const started = await this.guestCall(vm, 'guest-run-start', { ...base, command: decodeScript(bytes, gs.shell), shell: gs.shell, cwd: this.paths(vm).build, cap: OUTPUT_CAP, runAs: null }, { timeoutMs: CALL_MS })
     const limitMs = this.tm().ms.guestScriptMinutes
     const deadline = this.now() + limitMs
     let last = null
@@ -3507,4 +3524,4 @@ function describePlan(plan, digest, approve, T) {
   return lines.join('\n')
 }
 
-module.exports = { Helper, canonical, baselineProblem, expiry, licenceOf, diagSummary, diagLine, keyOf, ancestorClash, PLAN_ID_RE, PROTOCOL }
+module.exports = { Helper, canonical, baselineProblem, expiry, licenceOf, diagSummary, diagLine, keyOf, ancestorClash, decodeScript, PLAN_ID_RE, PROTOCOL }
