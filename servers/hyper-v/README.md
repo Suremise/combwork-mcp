@@ -99,6 +99,14 @@ using the new server: the helper's protocol and features changed, and an older h
 - New in the server, with no rerun needed: slow tools reply within about 45 s, saying "still in progress … call
   vm_wait now", and the new `vm_wait` gives their result (see "Slow operations", MC-1553).
 
+**From 2.1.0 to 2.2.0 (network modes, timings, the live-proof fixes):**
+- Rerun setup to get them: almost all are in the helper (MC-1555 to MC-1568). Without the rerun, 2.2.0 still serves
+  2.1.0's helper as before, and a run that asks for any network gets 2.1.0's internal switch (host only).
+- The rerun keeps the policy's network as it was (an older `-AllowNetwork $true` becomes `-MaxNetwork Host`); pass
+  `-MaxNetwork Internet` or `InternetLan` to allow more, then resize the pool to that mode (see "Network modes").
+- New: the timings in the server's env (see "Timings"), and an installed uninstaller with an Installed apps entry,
+  which removes everything without agents or the repo (see "Uninstall"; the rerun installs it).
+
 1. Turn on Hyper-V (see Requirements), and check `Get-Service vmms` says Running.
 2. In an **admin PowerShell**, run setup once (one line). Name a folder for the VMs' disks on a drive with room:
    ```
