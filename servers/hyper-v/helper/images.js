@@ -1,47 +1,35 @@
 /**
- * The Windows image a pool is built from, and what authenticates it.
+ * The Windows image a pool is built from (MC-1572: the user's choice, never the helper's).
  *
- * - **Authenticity comes from the bytes' origin, and only that:** a SHA-256 in PINNED (a known Microsoft download), or
- *   a download the helper made itself over HTTPS from a Microsoft host (TLS authenticates the server; the hash is then
- *   recorded, trust on first use). A local file that isn't pinned is refused unless policy.allowUnpinnedIso, and its
- *   plan then says "not authenticated".
- * - The ISO is copied into the helper's own folder **while it is hashed**, and only that copy is used, so it can't be
- *   swapped after the check.
- * - **Before anything runs it**, iso.js reads the copy (no mounting): setup.exe and sources\setup.exe must carry valid
- *   Microsoft Authenticode signatures (hv.ps1 'signatures': chain to a pinned Microsoft root), and install.wim's metadata
- *   must name the expected edition and build. These are consistency checks: install.wim has no signature of its own,
- *   so they don't authenticate its contents. The hash and origin do.
- * - The guest's own report after the install is a sanity check only (guestReportProblem), never verification.
- * - **One edition per ISO** (MC-1513): the Windows 11 Enterprise evaluation, or a non-evaluation x64 Enterprise,
- *   Professional or Education image the user supplies (unpinned: setup's -AllowUnpinnedIso for a local file). A
- *   multi-edition ISO needs { edition } on its first check; the record keeps that edition and its index, and a later
- *   request for another edition of the same ISO is refused, so a verified image's identity never changes.
+ * - **The user names the ISO** when they provision: pool_plan's image { iso: "<path>" }, any local Windows ISO. There is
+ *   no pin table, no download and no override: the plan the user approves names the file, its SHA-256, edition and
+ *   build, and that approval is the trust decision.
+ * - The ISO is copied into the helper's own folder **while it is hashed**, and only that copy is used; the build hashes
+ *   it again before using it (core.js), so the bytes approved are the bytes built.
+ * - **Before anything runs it**, iso.js reads the copy (no mounting) for install.wim's editions and build. Whether
+ *   setup.exe and sources\setup.exe carry valid Microsoft signatures (hv.ps1 'signatures') is read too, and shown in the
+ *   plan as information: it refuses nothing.
+ * - **Limits, not gates:** an x64 image (an x64 Hyper-V host runs no ARM guest), and media with sources\install.wim
+ *   (the unattended install picks its image by index).
+ * - **One edition per ISO** (MC-1513): a multi-edition ISO needs { edition } on its first check; the record keeps that
+ *   edition and its index, and a later request for another edition of the same ISO is refused, so a verified image's
+ *   identity never changes.
+ * - The guest's own report after the install is a sanity check only (guestReportProblem).
  */
 const fs = require('fs')
-const https = require('https')
 const crypto = require('crypto')
 const { join, win32 } = require('path')
 const iso = require('./iso')
 
-/** Known images: SHA-256 (upper-case hex) → what it is. */
-const PINNED = {
-  A61ADEAB895EF5A4DB436E0A7011C92A2FF17BB0357F58B13BBC4062E535E7B9: {
-    size: 7_092_807_680, edition: 'EnterpriseEval', build: '26200.6584',
-    name: 'Windows 11 Enterprise Evaluation 25H2 (26200.6584.250915-1905), en-us, x64'
-  }
-}
 const EVAL = 'EnterpriseEval'
-const EDITIONS = [EVAL, 'Enterprise', 'Professional', 'Education']
+/** An evaluation edition (EnterpriseEval, ServerStandardEval, ...): it must be activated online once at build. */
+const isEvalEdition = e => /Eval$/.test(String(e))
+const EDITION_RE = /^[A-Za-z][A-Za-z0-9]{0,63}$/
 // HYPERV_MCP_MIN_ISO_BYTES: test-only, so the tests can use small fixture images.
 const minSize = () => Number(process.env.HYPERV_MCP_MIN_ISO_BYTES || 1024 ** 3)
 const MAX_SIZE = 16 * 1024 ** 3
-
-/** Whether a download URL is allowed: https, on a Microsoft host. */
-function allowedUrl(u) {
-  let url
-  try { url = new URL(u) } catch { return false }
-  return url.protocol === 'https:' && !url.username && !url.password && !url.port && /(^|\.)microsoft\.com$/i.test(url.hostname)
-}
+/** The shapes an image request no longer takes (MC-1572), and what to pass instead. */
+const NO_DOWNLOAD = 'The helper doesn\'t download images: download the ISO yourself, then pass image { iso: "<its path>" } (or { file: "<path to a Linux qcow2 cloud image>" }). The plan you approve names it and its hash.'
 
 /** Copies a stream into `file` while hashing it; resolves { sha256, size }. Caps the size. */
 function copyHashing(input, file, progress) {
@@ -63,22 +51,6 @@ function copyHashing(input, file, progress) {
   })
 }
 
-/** GET over HTTPS, following redirects only to allowed URLs. Resolves the response stream. */
-function download(u, redirects = 5) {
-  return new Promise((resolve, reject) => {
-    if (!allowedUrl(u)) return reject(new Error(`refusing to download from ${u}: only https on a microsoft.com host`))
-    https.get(u, { timeout: 60_000 }, res => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        res.resume()
-        if (!redirects) return reject(new Error('too many redirects'))
-        return resolve(download(new URL(res.headers.location, u).href, redirects - 1))
-      }
-      if (res.statusCode !== 200) { res.resume(); return reject(new Error(`the download answered HTTP ${res.statusCode}: the URL may have moved. Download the ISO by hand from Microsoft's Evaluation Center, then pass image { iso: "<path>" }.`)) }
-      resolve(res)
-    }).on('error', reject).on('timeout', function () { this.destroy(new Error('the download timed out')) })
-  })
-}
-
 /** Checks a local ISO path before reading it: a plain .iso file of a plausible size, not one of the helper's own. */
 function localIso(p, ownDirs) {
   if (typeof p !== 'string' || !win32.isAbsolute(p) || /^\\\\/.test(p)) throw new Error('image.iso must be an absolute local path to an .iso file')
@@ -92,20 +64,20 @@ function localIso(p, ownDirs) {
 }
 
 /**
- * Copies, hashes and checks an image into dir. want: { iso: path } or { download: url }. known: Map of verified images
- * (sha256 lower-case → record). Resolves { sha256 (lower), size, file, source, edition, build, pinned } or with
- * existing: true when that image is already verified.
+ * Copies, hashes and reads an image into dir. want: { iso: path, edition? }. known: Map of verified images (sha256
+ * lower-case → record). Resolves { sha256 (lower), size, file, source: 'local', path, edition, build, imageIndex,
+ * evaluation, signature } or, with existing: true, the record of an image already verified.
  */
-async function prepare({ want, dir, hv, policy, known, ownDirs = [], progress = () => {} }) {
-  if (!want || typeof want !== 'object' || (!want.iso === !want.download)) throw new Error('image must be { iso: "<path>" } or { download: "<https URL on microsoft.com>" }, with edition when the ISO holds several')
-  if (want.edition !== undefined && !EDITIONS.includes(want.edition)) throw new Error(`image.edition must be one of ${EDITIONS.join(', ')}`)
+async function prepare({ want, dir, hv, known, ownDirs = [], progress = () => {} }) {
+  if (want && typeof want === 'object' && (want.download !== undefined || want.url !== undefined)) throw new Error(NO_DOWNLOAD)
+  if (!want || typeof want !== 'object' || want.iso === undefined) throw new Error('image must be { iso: "<path to a Windows ISO>" }, with edition when the ISO holds several')
+  if (want.edition !== undefined && (typeof want.edition !== 'string' || !EDITION_RE.test(want.edition))) throw new Error('image.edition must be an edition ID from the ISO (e.g. Professional, Enterprise, ServerStandard)')
+  const real = localIso(want.iso, [...ownDirs, dir])
   fs.mkdirSync(dir, { recursive: true })
   const tmp = join(dir, `incoming-${crypto.randomBytes(6).toString('hex')}.iso`)
-  const source = want.iso ? 'local' : 'download'
   try {
-    progress(want.iso ? 'copying the ISO into the helper\'s folder while hashing it' : 'downloading the ISO over HTTPS while hashing it')
-    const input = want.iso ? fs.createReadStream(localIso(want.iso, [...ownDirs, dir])) : await download(want.download)
-    const { sha256, size } = await copyHashing(input, tmp, progress)
+    progress('copying the ISO into the helper\'s folder while hashing it')
+    const { sha256, size } = await copyHashing(fs.createReadStream(real), tmp, progress)
     const lower = sha256.toLowerCase()
     if (known?.has(lower) && fs.existsSync(known.get(lower).file)) {
       fs.rmSync(tmp, { force: true })
@@ -113,32 +85,43 @@ async function prepare({ want, dir, hv, policy, known, ownDirs = [], progress = 
       if (want.edition && want.edition !== rec.edition) throw new Error(`this ISO is recorded as ${rec.edition}; another edition from the same ISO isn't supported: use another ISO`)
       return { ...rec, existing: true }
     }
-    const pin = PINNED[sha256]
-    if (pin && pin.size !== size) throw new Error('the image matches a pinned hash but not its size')
-    if (!pin && source === 'local' && !policy.allowUnpinnedIso) {
-      throw new Error(`this ISO (SHA-256 ${sha256}) is not a known Microsoft image, and the policy doesn't allow unpinned local images. Use the pinned image, have the helper download one from Microsoft (image { download: "<URL>" }), or allow unpinned images at setup.`)
+    progress('reading the ISO\'s files (no mounting)')
+    const checkDir = join(dir, `check-${lower.slice(0, 12)}`)
+    let look
+    try { look = iso.inspect(tmp, checkDir) } catch (e) { fs.rmSync(checkDir, { recursive: true, force: true }); throw e }
+    let signature
+    try {
+      progress('reading its setup files\' signatures (shown in the plan; nothing is refused for them)')
+      const sig = await hv('signatures', { files: look.files })
+      const bad = (sig.files || []).filter(f => !f.ok)
+      signature = !sig.files?.length ? { microsoft: false, note: 'no answer' } : bad.length ? { microsoft: false, note: bad.map(f => `${win32.basename(String(f.file)).replace(/^sources-/, 'sources\\')}: ${f.why}`).join('; ') } : { microsoft: true, note: 'setup.exe and sources\\setup.exe validly signed by Microsoft' }
+    } catch (e) {
+      signature = { microsoft: false, note: `not read: ${e.message}` }
+    } finally {
+      fs.rmSync(checkDir, { recursive: true, force: true })
     }
-    progress('reading the ISO\'s files (no mounting) and checking their signatures')
-    const look = iso.inspect(tmp, join(dir, `check-${lower.slice(0, 12)}`))
-    const sig = await hv('signatures', { files: look.files })
-    fs.rmSync(join(dir, `check-${lower.slice(0, 12)}`), { recursive: true, force: true })
-    const badSig = (sig.files || []).filter(f => !f.ok)
-    if (!sig.files?.length || badSig.length) throw new Error(`the ISO's setup files are not validly signed by Microsoft: ${badSig.map(f => `${f.file}: ${f.why}`).join('; ') || 'no answer'}`)
-    const fits = look.images.filter(i => EDITIONS.includes(i.editionId) && i.arch === 9)
-    const imgs = want.edition ? fits.filter(i => i.editionId === want.edition) : fits
     const holds = look.images.map(i => `${i.editionId} (arch ${i.arch})`).join(', ')
+    const fits = look.images.filter(i => i.arch === 9)
+    const imgs = want.edition ? fits.filter(i => i.editionId === want.edition) : fits
     if (want.edition && imgs.length !== 1) throw new Error(`the ISO should hold one x64 ${want.edition} image; it holds ${holds}`)
-    if (!imgs.length) throw new Error(`the ISO should hold an x64 ${EDITIONS.join('/')} image; it holds ${holds}`)
-    if (imgs.length > 1) throw new Error(`the ISO holds several editions (${imgs.map(i => i.editionId).join(', ')}): pass image { ..., edition: "<one of them>" }`)
+    if (!imgs.length) throw new Error(`the ISO holds no x64 image (it holds ${holds}): an x64 Hyper-V host runs x64 guests only`)
+    if (imgs.length > 1) throw new Error(`the ISO holds several editions (${imgs.map(i => i.editionId).join(', ')}): pass image { iso, edition: "<one of them>" }`)
     const img = imgs[0]
     const build = `${img.build}.${img.spBuild}`
-    if (pin && (pin.edition !== img.editionId || pin.build !== build)) throw new Error(`the pinned image should be ${pin.edition} ${pin.build}, but its metadata says ${img.editionId} ${build}`)
     const file = join(dir, `${lower}.iso`)
     fs.renameSync(tmp, file)
-    return { sha256: lower, size, file, source, edition: img.editionId, build, imageIndex: img.index, pinned: !!pin, evaluation: img.editionId === EVAL }
+    return { sha256: lower, size, file, source: 'local', path: real, edition: img.editionId, build, imageIndex: img.index, evaluation: isEvalEdition(img.editionId), signature }
   } finally {
     fs.rmSync(tmp, { force: true })
   }
+}
+
+/** SHA-256 (lower-case hex) of a file, streaming: the build's recheck of the copy against the approved hash. */
+function hashFile(file) {
+  return new Promise((resolve, reject) => {
+    const h = crypto.createHash('sha256')
+    fs.createReadStream(file).on('data', d => h.update(d)).on('error', reject).on('end', () => resolve(h.digest('hex')))
+  })
 }
 
 /** The guest's report after the install, compared with the image: a sanity check, never authentication. */
@@ -151,4 +134,4 @@ function guestReportProblem(g, img) {
   return null
 }
 
-module.exports = { prepare, guestReportProblem, allowedUrl, localIso, PINNED, EDITIONS, EVAL }
+module.exports = { prepare, guestReportProblem, localIso, hashFile, isEvalEdition, NO_DOWNLOAD, EVAL }

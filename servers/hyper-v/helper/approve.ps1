@@ -57,8 +57,11 @@ if ($p.op -eq 'checkpoint') {
 if ($p.switch) { Write-Host "  create the internal switch $($p.switch) (host and guests only)" }
 if ($p.removeSwitch) { Write-Host "  remove the switch $($p.removeSwitch)" }
 if ($p.image) {
-  $trust = if ($p.image.pinned) { 'pinned: a known Microsoft download' } elseif ($p.image.source -eq 'download') { 'downloaded by the helper over HTTPS from Microsoft' } else { 'NOT AUTHENTICATED: a local file you chose to trust' }
-  Write-Host ("  image: {0} build {1}, SHA-256 {2} ({3})" -f $p.image.edition, $p.image.build, $p.image.sha256, $trust)
+  # MC-1572: the image is the file you chose; approving binds its SHA-256, and the build uses the helper's copy of exactly that.
+  $from = if ($p.image.path) { "from $($p.image.path)" } else { 'checked earlier' }
+  $what = if ($p.image.os -eq 'linux') { "Linux image $($p.image.name)" } else { "$($p.image.edition) build $($p.image.build)" }
+  Write-Host ("  image: {0}, SHA-256 {1} ({2})" -f $what, $p.image.sha256, $from)
+  if ($p.image.signature) { Write-Host ("  setup files: {0}" -f $(if ($p.image.signature.microsoft) { 'signed by Microsoft' } else { "not signed by Microsoft ($($p.image.signature.note)): information only" })) }
 }
 Write-Host ''
 Write-Host 'The full plan, as the helper recorded it:' -ForegroundColor DarkGray

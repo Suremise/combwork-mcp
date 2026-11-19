@@ -25,7 +25,6 @@ const DEFAULTS = {
   maxLeaseMinutes: 240,
   maxSessionMinutes: 480,
   maxBuildMB: 2048,
-  allowUnpinnedIso: false,
   buildRoots: []
 }
 
@@ -72,7 +71,8 @@ function problems(p) {
   if (p.minFreeGBForCheckpoint !== undefined && !int(p.minFreeGBForCheckpoint, 1, 1024)) out.push('minFreeGBForCheckpoint must be 1-1024')
   // MC-1532: pool checkpoints per VM, optional (default 4), counting retiring ones and ones being taken.
   if (p.maxCheckpointsPerVm !== undefined && !int(p.maxCheckpointsPerVm, 0, 8)) out.push('maxCheckpointsPerVm must be 0-8')
-  if (typeof p.allowUnpinnedIso !== 'boolean') out.push('allowUnpinnedIso must be true or false')
+  // MC-1572: allowUnpinnedIso is gone (any image the approved plan names is used); a policy from before may still hold it.
+  if (p.allowUnpinnedIso !== undefined && typeof p.allowUnpinnedIso !== 'boolean') out.push('allowUnpinnedIso, if present, must be true or false (it is no longer used)')
   // MC-1501: how the helper reaches Linux guests, optional (setup's -LinuxTransport): only the Hyper-V socket today.
   if (p.linuxTransport !== undefined && p.linuxTransport !== 'hvsocket') out.push('linuxTransport must be hvsocket')
   // Build folders an admin named at setup (install.ps1 -BuildRoot): optional, so a policy from before it stays usable.

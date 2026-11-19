@@ -1,5 +1,9 @@
 # MC-1500 design: Linux guests (Debian, Ubuntu) behind the same hyper-v tools
 
+> **Superseded in part by MC-1572 (hyper-v 4.0.0):** the pinned images, the helper's downloads and the checksum and
+> OpenPGP checks (§2) are gone. The user names any local qcow2 cloud image, and the plan they approve names its path and
+> SHA-256. The README's "The image" and "Linux guests" describe what holds now.
+
 One server, one pool, one helper. Linux plugs in as a new image kind on MC-1502's pool model (images tagged by OS,
 `vm_acquire({ os })`, per-OS caps). It also adds a **guest driver** per OS for the two things that differ: install and
 talking to the guest. The helper service, approvals, trusted storage, leases, the journal, the line, checkpoints, warm

@@ -59,7 +59,7 @@ test('groups by image: a resize with an image adds to, or takes from, that image
   let st = await status(admin)
   assert.strictEqual((st.match(/: windows, image abababababab;/g) || []).length, 2)
   assert.strictEqual((st.match(/: windows, image cdcdcdcdcdcd;/g) || []).length, 1)
-  assert.strictEqual((st.match(/: linux, image efefefefefef;/g) || []).length, 1)
+  assert.strictEqual((st.match(/: linux \(\w+ [\d.]+\), image efefefefefef;/g) || []).length, 1, 'MC-1572: a Linux VM shows the distro its guest reported') // e.g. linux (debian 13)
   // A's group down to 1: one A VM goes, B's and L's stay.
   const p = await change(sc, admin, { action: 'resize', image: A, vms: 1 })
   assert.match(p.text, /- remove hvmcp-/)
@@ -191,3 +191,26 @@ m.Helper.prototype.request = async function (connId, op, args) {
   assert.strictEqual(sent.length, 1)
   assert.ok(!('os' in sent[0]) && !('image' in sent[0]), 'nothing it can\'t honour was sent')
 })
+
+test('server.js (MC-1572): a helper without the user-images feature is never sent an image file: pool_plan refuses { iso } and { file } with "run setup again"; a hash or no image goes through', async t => {
+  const sc = scratch('img-feature')
+  const shim = path.join(sc.dir, 'older-core.js')
+  // A 3.0.0 helper: pins and downloads only. It would refuse the user's own file as "not a known image".
+  fs.writeFileSync(shim, `const m = require(${JSON.stringify(path.join(__dirname, '..', 'helper', 'core.js'))})
+m.Helper.prototype.request = async function (connId, op, args) {
+  if (op === 'version') return { text: 'hyperv-mcp/3', data: { protocol: 'hyperv-mcp/3', features: ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean', 'linux', 'debug-keep', 'timing', 'network-modes'], buildRoots: [] } }
+  if (args?.image && typeof args.image === 'object') throw new Error('should not be sent: ' + JSON.stringify(args.image))
+  if (op === 'pool_plan') return { text: 'pool_plan sent with image ' + JSON.stringify(args.image) }
+  throw new Error('unexpected ' + op)
+}
+`)
+  const env = { ...sc.env, HYPERV_MCP_ENABLED: '1', HYPERV_MCP_MODE: 'direct', USERPROFILE: path.join(sc.dir, 'home'), NODE_OPTIONS: `--require ${JSON.stringify(shim)}` }
+  const s = server(env, { roots: [sc.builds] })
+  t.after(() => s.close())
+  for (const image of [{ iso: 'D:\\ISOs\\win.iso' }, { file: 'D:\\images\\debian.qcow2' }]) {
+    assert.match((await s.call('pool_plan', { action: 'create', vms: 1, image })).text, /has no 'user-images' feature, which an image file the user names needs: run setup again/)
+  }
+  assert.match((await s.call('pool_plan', { action: 'create', vms: 1, image: A })).text, new RegExp(`^pool_plan sent with image "${A}"`))
+  assert.match((await s.call('pool_plan', { action: 'create', vms: 1 })).text, /^pool_plan sent with image undefined/)
+})
+

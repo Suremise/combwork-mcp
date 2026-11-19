@@ -68,7 +68,7 @@ test('a Linux build: seed and keys, first boot with its diagnostics, readiness, 
   // MC-1544: the job's reply names the Linux build, not Windows' unattended install.
   assert.match(built.accepted.text, /Creating a Linux VM copies its verified image and first boots it offline from its cloud-init seed/)
   assert.doesNotMatch(built.accepted.text, /installs Windows/)
-  assert.match(built.plan.text, /- image: Debian 13 test, build t, SHA-256 dededededede, pinned; checksums: SHA512SUMS, unsigned/)
+  assert.match(built.plan.text, /- image: Debian 13 test, build t, SHA-256 (de){32}, checked earlier \(the helper's copy, checked against this SHA-256 before the build uses it\)/)
   assert.match(built.plan.text, /- Linux build: each new VM is a copy of the image's verified base VHDX with a cloud-init seed/)
   assert.doesNotMatch(built.plan.text, /Defender|activation|provisioning|product key/, 'none of the Windows steps')
   // The journal's ready record.
@@ -274,7 +274,9 @@ test('refusals: distro with another os, an unknown distro, activate for a Linux 
   const { sc, h, admin } = await mixedPool('lx-refuse')
   const c = h.conn(7)
   await assert.rejects(c.request('acquire', { distro: 'debian', os: 'windows' }), /distro is for Linux VMs/)
-  await assert.rejects(c.request('acquire', { distro: 'fedora' }), /distro must be debian or ubuntu/)
+  // MC-1572: any /etc/os-release ID; a well-formed one with no VM of it is simply not free.
+  await assert.rejects(c.request('acquire', { distro: 'Fedora 43' }), /distro must be a distro ID as \/etc\/os-release names it/)
+  await assert.rejects(c.request('acquire', { distro: 'fedora' }), /No VM is free/)
   assert.match((await c.request('acquire', { distro: 'ubuntu' }).then(r => r.text, e => e.message)), /the pool has no free linux VM|No VM is free/)
   await assert.rejects(admin.request('pool_plan', { action: 'resize', image: D, vms: 2, activate: true }), /activate is for Windows images/)
   await h.stop()

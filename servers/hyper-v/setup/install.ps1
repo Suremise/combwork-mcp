@@ -50,7 +50,7 @@ param(
   [int]$MaxLeaseMinutes = 240,
   [int]$MaxSessionMinutes = 0,
   [int]$MaxBuildMB = 2048,
-  [switch]$AllowUnpinnedIso,
+  [switch]$AllowUnpinnedIso, # MC-1572: obsolete, accepted and ignored (any image the approved plan names is used)
   [string[]]$BuildRoot = @(),
   [string]$ProjectsFile = '',
   [string]$ProductKeyFile = '',
@@ -267,7 +267,7 @@ if ($bad.Count) { throw "$install isn't admin-only after setting its ACL: $($bad
 # Nothing earlier in it is kept: every file the service runs is copied fresh below (a stray file could be loaded instead).
 Get-ChildItem -LiteralPath $install -Force | Remove-Item -Recurse -Force
 New-Item -ItemType Directory -Path (Join-Path $install 'guests') -Force | Out-Null
-foreach ($f in 'core.js', 'helper.js', 'hv.js', 'hv.ps1', 'guest-sync.ps1', 'guest-agent.ps1', 'images.js', 'iso.js', 'journal.js', 'net.js', 'paths.js', 'policy.js', 'inventory.js', 'timing.js', 'unattend.js', 'approve.ps1', 'linux-images.js', 'openpgp.js', 'qcow2.js', 'seed.js', 'ssh.js', 'sshkeys.js', 'guest.py', 'guests\linux.js') {
+foreach ($f in 'core.js', 'helper.js', 'hv.js', 'hv.ps1', 'guest-sync.ps1', 'guest-agent.ps1', 'images.js', 'iso.js', 'journal.js', 'net.js', 'paths.js', 'policy.js', 'inventory.js', 'timing.js', 'unattend.js', 'approve.ps1', 'linux-images.js', 'qcow2.js', 'seed.js', 'ssh.js', 'sshkeys.js', 'guest.py', 'guests\linux.js') {
   Copy-Item -LiteralPath (Join-Path $src "helper\$f") -Destination (Join-Path $install $f) -Force
 }
 Copy-Item -LiteralPath (Join-Path $src 'meta.json') -Destination (Join-Path $install 'meta.json') -Force
@@ -364,7 +364,6 @@ $policy = [ordered]@{
   maxMemoryMBTotal = $(if ($MaxMemoryGB) { $MaxMemoryGB * 1024 } else { [Math]::Max(4096, [Math]::Floor($ramGB / 2) * 1024) })
   maxDiskGBPerVm = $MaxDiskGBPerVm; diskFolders = $folders; maxNetwork = $netMode
   maxReservePercent = $MaxReservePercent; maxLeaseMinutes = $MaxLeaseMinutes; maxBuildMB = $MaxBuildMB
-  allowUnpinnedIso = [bool]$AllowUnpinnedIso
   buildRoots = @($buildRoots)
   linuxTransport = 'hvsocket'
 }
@@ -389,11 +388,12 @@ $bad = @(Test-ExclusiveAcl $state -Allowed $SYSTEM, $ADMINS, $runnerSid -Owners 
 foreach ($d in $folders) { $bad += @(Test-ExclusiveAcl $d -Allowed $SYSTEM, $ADMINS, $runnerSid -AllowPattern $script:HyperVGrantees) }
 if ($bad.Count) { throw "The helper's folders aren't as setup made them: $($bad -join '; ')" }
 Step "State in $state; VM disks in $($folders -join ', '); ACLs checked."
+if ($AllowUnpinnedIso) { Step "-AllowUnpinnedIso is no longer needed (MC-1572): any image the plan you approve names is used; it was ignored." }
 Step "Build folders set by an admin (beside each client's MCP roots): $(if ($buildRoots.Count) { $buildRoots -join '; ' } else { 'none' })."
 Step "Projects sharing the pool: $projectsLine."
 Step "Product key (-ProductKeyFile): $keyLine."
 Step $(if ($defaultSwitch) { "Default Switch: present. Each evaluation VM goes online through it once, when it is built, to activate Windows (about 90 days from then); runs use it only in the internet modes, when a plan the user approved allows them." } else { "Default Switch: absent. Evaluation VMs can't be activated here, so pools need a non-evaluation image (an own copy, built offline), and the internet modes can't be used." })
-Step ("Policy: up to {0} VMs, {1} cores each, {2} GB memory in all, {3} GB disks; network {4}; unpinned ISOs {5}; leases up to {6} min, work sessions up to {7} min." -f $policy.maxVms, $policy.maxCoresPerVm, ($policy.maxMemoryMBTotal / 1024), $policy.maxDiskGBPerVm, "up to $netMode (each pool's mode is chosen in the plan you approve)", $(if ($AllowUnpinnedIso) { 'allowed' } else { 'refused' }), $MaxLeaseMinutes, $(if ($MaxSessionMinutes) { $MaxSessionMinutes } else { [Math]::Max($MaxLeaseMinutes, 480) }))
+Step ("Policy: up to {0} VMs, {1} cores each, {2} GB memory in all, {3} GB disks; network {4}; images: any ISO or qcow2 file the plan you approve names; leases up to {5} min, work sessions up to {6} min." -f $policy.maxVms, $policy.maxCoresPerVm, ($policy.maxMemoryMBTotal / 1024), $policy.maxDiskGBPerVm, "up to $netMode (each pool's mode is chosen in the plan you approve)", $MaxLeaseMinutes, $(if ($MaxSessionMinutes) { $MaxSessionMinutes } else { [Math]::Max($MaxLeaseMinutes, 480) }))
 
 # 8. Start.
 if ($Mode -eq 'Service') {

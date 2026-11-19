@@ -454,8 +454,8 @@ const tools = [
         minutes: { type: 'number', description: 'Lease length, 1 to the policy\'s maximum (default 60).' },
         keepOnFailure: { type: 'boolean', description: 'If a run fails, vm_stop keeps the VM as it is for inspection until release or the deadline. Default false.' },
         wait: { type: 'boolean', description: 'Wait in line for a VM (each call waits about 20 s; repeat it within 2 minutes to keep your place). Default false.' },
-        os: { type: 'string', enum: ['windows', 'linux'], description: 'The kind of VM. Default windows (linux when distro is given). A Linux VM (Debian or Ubuntu, from the distro\'s pinned official cloud image) runs bash or sh commands in /build and writes to /out; the same tools work on both.' },
-        distro: { type: 'string', enum: ['debian', 'ubuntu'], description: 'Only a Linux VM of this distro (implies os linux). Default: any Linux image your project may use.' },
+        os: { type: 'string', enum: ['windows', 'linux'], description: 'The kind of VM. Default windows (linux when distro is given). A Linux VM (from a qcow2 cloud image the user chose: Debian and Ubuntu so far) runs bash or sh commands in /build and writes to /out; the same tools work on both.' },
+        distro: { type: 'string', description: 'Only a Linux VM of this distro, as its /etc/os-release ID names it (debian, ubuntu, ...; vm_status shows each VM\'s); implies os linux. Default: any Linux image your project may use.' },
         image: { type: 'string', description: 'Only a VM built from this image: its SHA-256, or its first 12+ hex digits (vm_status lists them). Default: any image of the OS your project may use.' },
         checkpoint: { type: 'string', description: 'Only a VM with this pool checkpoint (MC-1532: a state someone prepared and published, vm_status lists them with their owner and provenance); the lease then starts from it by default. A common name doesn\'t promise identical contents on every VM. Give os if the name is on VMs of more than one OS.' },
         vm: { type: 'string', description: 'One particular VM, by its name from vm_status: for trials and censuses on a specific VM, not for normal use (leave it out and the pool picks). Refused, saying why, when that VM isn\'t free for you; with wait: true it waits in line for that VM only.' }
@@ -595,7 +595,7 @@ const tools = [
   },
   {
     name: 'pool_plan',
-    description: 'Plan a pool change from the host\'s CPUs, memory and disks and the policy: create, resize or remove. Only when the user asks for a pool change. Changes nothing: it returns the exact plan and the one line the USER runs in an admin PowerShell to approve it; never run that line yourself. The first create also needs an image (the Windows 11 Enterprise evaluation ISO, or a non-evaluation Windows 11 ISO the user supplies), checked before anything runs it. An evaluation image is activated online once as each VM is built (the plan says so), and lasts about 90 days from then.',
+    description: 'Plan a pool change from the host\'s CPUs, memory and disks and the policy: create, resize or remove. Only when the user asks for a pool change. Changes nothing: it returns the exact plan and the one line the USER runs in an admin PowerShell to approve it; never run that line yourself. The first create also needs an image: the file the user names for these VMs (any x64 Windows ISO, or a Linux qcow2 cloud image), which the plan they approve names with its SHA-256. Never download one: ask the user which file to use. An evaluation image is activated online once as each VM is built (the plan says so), and lasts about 90 days from then.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -611,13 +611,15 @@ const tools = [
         network: { enum: ['none', 'host', 'internet', 'internet-lan'], description: 'create, resize: the pool\'s network mode, the highest a run may ask for. The user chooses it in this plan, like cores, memory and disk: describe the options to them. ' + NETWORK_DESC + ' Up to setup\'s policy (vm_status shows it). Default: none for create, the current mode for resize (a resize may change only this).' },
         activate: { type: 'boolean', description: 'A non-evaluation image: also activate Windows online once as each VM is built (the plan says so). Default false (it stays offline; its licence is shown). An evaluation image is always activated.' },
         debugKeepFailedBuild: { type: 'boolean', description: 'Debugging only, for a plan that builds Linux VMs, and only when the user asks: if a build fails, its VM is kept (on, disconnected, never leased) for an administrator to inspect in Hyper-V Manager, instead of being rolled back. The plan says so. A resize plan with no image and vms equal to the number of other VMs in the pool removes only it; any other create or resize removes it too, along with the changes it asks for; a remove plan removes the whole pool. Default: left out (rolled back).' },
-        image: { type: ['object', 'string'], description: 'A new image to check: { iso: "<path to the ISO>" } or { download: "<https URL on microsoft.com>" }, with edition: "Enterprise" | "Professional" | "Education" | "EnterpriseEval" when the ISO holds several (one edition per ISO). For Linux: { distro: "debian" | "ubuntu" } (the pinned official cloud image, downloaded and checked against the distro\'s published checksums), or { file: "<path>" } for a local copy of a pinned one. Or a verified image\'s SHA-256 (or its first 12+ hex digits): create from it, or resize only the VMs built from it (its group). Omit to use the newest verified image (and, for resize, the whole pool).' }
+        image: { type: ['object', 'string'], description: 'A new image, the local file the user named: { iso: "<path to a Windows ISO>" }, with edition: "<edition ID>" when the ISO holds several x64 editions (one edition per ISO); or { file: "<path to a Linux qcow2 cloud image>" }. The helper copies it while hashing it, reads its edition and build, and the plan names its path and SHA-256 for the user to approve; it never downloads. Or a verified image\'s SHA-256 (or its first 12+ hex digits): create from it, or resize only the VMs built from it (its group). Omit to use the newest verified image (and, for resize, the whole pool).' }
       }
     },
     run: async (args = {}) => {
       if (args.action === 'checkpoint' || args.action === 'checkpoint-remove') { await needFeature('pool-checkpoints', 'pool checkpoints'); return pass('pool_plan')({ ...args, roots: await rootList() }) }
       if (args.action === 'refresh-clean') await needFeature('refresh-clean', 'refreshing a clean checkpoint')
       await needNetworkModes(args.network, 'a pool plan')
+      // MC-1572: an older helper takes only pinned or downloaded images; the user's own file needs the new one.
+      if (args.image && typeof args.image === 'object') await needFeature('user-images', 'an image file the user names')
       // MC-1545: an older helper would ignore the flag and roll a failed build back: refused before anything is sent.
       if (args.debugKeepFailedBuild !== undefined) await needFeature('debug-keep', 'keeping a failed Linux build for debugging (debugKeepFailedBuild)')
       return pass('pool_plan')(args)
