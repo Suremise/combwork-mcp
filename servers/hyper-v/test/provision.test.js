@@ -170,6 +170,19 @@ test('a named guest setup script: shown in the plan by path, size and SHA-256; r
   assert.ok(fs.existsSync(path.join(sc.stateDir, 'scripts', `${sha}.ps1`)), 'the helper\'s copy')
 })
 
+test('MC-1588: a guest setup script over the old 1 MB reaches a Windows guest in pieces of 1 MB (as base64), no call carrying more, and runs whole', async t => {
+  const text = `write C:\\gs-big.txt ${'b'.repeat(2.5 * 1024 * 1024)}`
+  const { sc, line } = await build(t, 'gs-big', {}, { planArgs: sc => ({ guestScript: userScript(sc, text) }) })
+  assert.match(line, /create finished/, line)
+  const st = sc.stub()
+  assert.deepStrictEqual(st.stageCalls.map(c => c.part), [0, 1, 2])
+  assert.ok(st.stageCalls.every(c => c.chars <= Math.ceil(1024 * 1024 / 3) * 4 && c.as === 'admin'), 'each piece at most 1 MB as base64, as the admin')
+  assert.deepStrictEqual(st.stagedRuns, [{ n: st.stagedRuns[0].n, bytes: Buffer.byteLength(`\uFEFF${text}`), interactive: false }])
+  assert.ok(st.stagedRuns[0].n >= 800_000_000, 'the helper\'s own run number')
+  assert.strictEqual(scriptRuns(sc)[0].command, undefined, 'the start carries no command')
+  assert.strictEqual(Buffer.from(vms(sc)[0].checkpoints[0].disk['C:\\gs-big.txt'], 'base64').length, 2.5 * 1024 * 1024, 'it ran whole')
+})
+
 test('the guest setup script runs from the helper\'s copy: a later change to the user\'s file changes nothing; a changed copy refuses the plan', async t => {
   let file
   const same = await build(t, 'gs-user-changed', {}, {
@@ -200,7 +213,7 @@ test('a guest setup script that exits non-zero, or never exits in time, fails th
   }
 })
 
-test('a guest setup script is refused at plan time: a relative or missing path, the wrong kind for the guests, an empty or too-large file', async t => {
+test('a guest setup script is refused at plan time: a relative or missing path, the wrong kind for the guests, an empty file; a large one is taken (MC-1588)', async t => {
   const sc = scratch('gs-refused', { timing: 'narrow' })
   let h = await startHelper(sc)
   await h.stop()
@@ -212,8 +225,11 @@ test('a guest setup script is refused at plan time: a relative or missing path, 
   await assert.rejects(plan('guest.ps1'), /guestScript must be an absolute local path/)
   await assert.rejects(plan(path.join(sc.dir, 'nope.ps1')), /can't be read: no such file/)
   await assert.rejects(plan(userScript(sc, 'echo hi', 'guest.sh')), /guestScript must be a \.ps1, \.cmd, \.bat file for Windows guests/)
-  await assert.rejects(plan(userScript(sc, '', 'empty.ps1')), /must hold 1 byte to 1048576 bytes/)
-  await assert.rejects(plan(userScript(sc, 'x'.repeat(1024 * 1024 + 1), 'big.ps1')), /must hold 1 byte to 1048576 bytes/)
+  // MC-1588: the cap is the most Node can hold as text (formerly 1 MB, with no reason that held).
+  const { GUEST_SCRIPT_MAX } = require('../helper/core')
+  assert.strictEqual(GUEST_SCRIPT_MAX, require('buffer').constants.MAX_STRING_LENGTH - 1)
+  await assert.rejects(plan(userScript(sc, '', 'empty.ps1')), new RegExp(`must hold 1 byte to ${GUEST_SCRIPT_MAX} bytes \\(the helper reads it as text`))
+  assert.match((await plan(userScript(sc, 'x'.repeat(1024 * 1024 + 1), 'big.ps1'))).text, /- guest setup script: .*big\.ps1 \(1048577 bytes/)
   for (const ok of ['a.ps1', 'b.cmd', 'c.BAT']) assert.match((await plan(userScript(sc, 'echo hi', ok))).text, /- guest setup script: /, ok)
 })
 

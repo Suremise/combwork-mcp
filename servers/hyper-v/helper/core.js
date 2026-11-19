@@ -32,7 +32,7 @@ const { LinuxDriver, PATHS: LINUX_PATHS } = require('./guests/linux')
 
 const PLAN_ID_RE = /^p-[0-9a-f]{16}$/
 const PLAN_TTL_MS = 30 * 60_000
-const MAX_COMMAND = 8000
+// MC-1588: a vm_run command's length is the connection's commandChars setting (timing.js; formerly a fixed 8000).
 // MC-1558: the user-adjustable timings (guest ready, logon, install, provisioning, restore, checkpoints, the queue place,
 // copy) are timing.js's, per connection, lease or job: this.tm(lease).
 // MC-1556: a connected start's guest network: read back until it has held for NET_STABLE_MS (a network manager undoing
@@ -58,9 +58,28 @@ const DIAG_LOGS = ['lsm', 'security', 'winlogon', 'profile', 'shellCore', 'appRe
 const FIRST_LOGON_WORKERS = ['OneDriveSetup', 'UserOOBEBroker', 'msedgewebview2', 'CloudExperienceHostBroker', 'StartMenuExperienceHost', 'SearchHost']
 const USERINIT = 'C:\\Windows\\system32\\userinit.exe,' // Windows' own list, as the build's undo leaves it
 // MC-1577: the build adds no guest tweaks of its own (MC-1519's Defender exclusions and MC-1522's registry policy are
-// gone): a plan may name the user's own guest setup script, run in each VM it builds (runGuestScript). Its size cap: the
-// whole script travels in one guest call (a PowerShell Direct argument, or one dispatcher line).
-const GUEST_SCRIPT_MAX = 1024 * 1024
+// gone): a plan may name the user's own guest setup script, run in each VM it builds (runGuestScript).
+// MC-1588: its size cap (formerly 1 MB) is the one that breaks: the helper reads the script as text, and Node holds a
+// string of at most buffer.constants.MAX_STRING_LENGTH characters (2^29 - 24 on 64-bit, about 512 MB). A file of that
+// many bytes decodes to at most that many characters. It no longer travels in one guest call: a Windows guest gets it
+// in pieces (stageRun), a Linux guest as bytes after the request line (guests/linux.js).
+const MAX_STRING = require('buffer').constants.MAX_STRING_LENGTH
+const GUEST_SCRIPT_MAX = MAX_STRING - 1 // less one: a .ps1 gets a byte order mark in front (decodeScript)
+// MC-1588: what one PowerShell Direct call carries to or from a Windows guest, at most. PowerShell remoting refuses an
+// object over its MaximumReceivedObjectSizeMB (10 MB by default). A command or script over RUN_INLINE_CHARS goes to the
+// guest in RUN_PART_BYTES pieces, as base64 (nothing to escape, so its size is known: 4/3 of the bytes), and
+// vm_read_out reads a Windows guest's files back in calls of READ_PART_BYTES. Each stays under that limit even counted
+// at two bytes a character, and under hv.js's OUT_CAP for a reply. Whether PowerShell Direct applies the 10 MB default
+// hasn't been measured on a real VM; the pieces stay under it either way.
+const RUN_INLINE_CHARS = 256 * 1024 // a character may serialise as up to 7 (_x000D_ in PowerShell's CLIXML): under 2 MB
+const RUN_PART_BYTES = 1024 * 1024 // about 1.4 M characters of base64
+const READ_PART_BYTES = 2 * 1024 * 1024 // about 2.8 M characters of base64 in the reply
+// MC-1588: vm_read_out's maxTotalBytes, at most (formerly 64 MB; maxBytes, per file, formerly 16 MB, now has no cap of
+// its own). The files come back in one reply, held as one string on the way (the helper's reply line, the server's MCP
+// reply), and Node holds a string of at most MAX_STRING_LENGTH characters. A text file's control characters are
+// written as \u00XX in JSON, six characters a byte: so a sixth of it, less 1 MB for the rest of the reply (about 85 MB).
+const READ_TOTAL_MAX = Math.floor((MAX_STRING - 1024 * 1024) / 6)
+// (ssh.js's OUT_CAP holds a Linux guest's answer of that much, as base64.)
 const GUEST_SCRIPT_RUN_BASE = 800_000_000 // its run numbers: above any lease's, below the Linux network scripts' 900000000
 const RETRY_MS = Number(process.env.HYPERV_MCP_RETRY_MS || 5 * 60_000)
 // The build's one online step (MC-1513): its call's bound, and net-off's after a failure.
@@ -317,7 +336,63 @@ class Helper {
    * MC-1501: a guest op, by the VM's guest driver: a Windows VM's go to hv.ps1 (PowerShell Direct), a Linux VM's to its
    * dispatcher over SSH (guests/linux.js), under the same names and with the same answers.
    */
-  guestCall(vm, op, args, opts) { return this.osOf(vm) === 'linux' ? this.linux.call(vm, op, args, opts) : this.hv(op, args, opts) }
+  guestCall(vm, op, args, opts) {
+    if (this.osOf(vm) === 'linux') return this.linux.call(vm, op, args, opts)
+    if (op === 'guest-run-start' || op === 'guest-run-publish') return this.stageRun(op, args, opts)
+    if (op === 'guest-read') return this.readParts(args, opts)
+    return this.hv(op, args, opts)
+  }
+
+  /**
+   * MC-1588: a Windows run's start (or interactive publish). A command up to RUN_INLINE_CHARS goes in the call, as
+   * before; a longer one is first sent in RUN_PART_BYTES pieces of its UTF-8 (guest-run-stage, as the account the run
+   * runs as, into the folder its run file is written to), and the start then moves the staged file into place, refusing
+   * it unless it holds exactly the bytes sent. No one PowerShell Direct call carries more than a piece.
+   */
+  async stageRun(op, args, opts) {
+    if (typeof args.command !== 'string' || args.command.length <= RUN_INLINE_CHARS) return this.hv(op, args, opts)
+    const bytes = Buffer.from(args.command, 'utf8')
+    for (let part = 0, at = 0; at < bytes.length; part++, at += RUN_PART_BYTES) {
+      const piece = bytes.subarray(at, at + RUN_PART_BYTES)
+      const r = await this.hv('guest-run-stage', { vmId: args.vmId, name: args.name, folder: args.folder, cred: args.cred, runAs: args.runAs ?? null, n: args.n, part, data: piece.toString('base64') }, opts)
+      if (r?.bytes !== at + piece.length) throw new Error(`the run's command couldn't be staged in the guest (${r?.bytes} of ${at + piece.length} bytes after piece ${part + 1})`)
+    }
+    return this.hv(op, { ...args, command: undefined, staged: bytes.length }, opts)
+  }
+
+  /**
+   * MC-1588: vm_read_out's read of a Windows guest's files, in calls of at most READ_PART_BYTES, each going on from where
+   * the last stopped (a file at an offset, then the files after it), until the call's total or the files run out. The
+   * answer is one guest-read's: { files: [{ path, size, cut, data (base64) }] }.
+   */
+  async readParts(args, opts) {
+    const got = []
+    let paths = Array.isArray(args.paths) ? args.paths.slice() : []
+    let offset = 0
+    let total = 0
+    while (paths.length && total < args.maxTotalBytes) {
+      const r = await this.hv('guest-read', { ...args, paths, offset, maxTotalBytes: Math.min(READ_PART_BYTES, args.maxTotalBytes - total) }, opts)
+      const files = (Array.isArray(r.files) ? r.files : []).filter(f => f && typeof f.path === 'string' && typeof f.data === 'string')
+      let at = 0
+      let last = null
+      for (const f of files) {
+        const i = paths.indexOf(f.path, at)
+        if (i < 0) continue
+        const buf = Buffer.from(f.data, 'base64')
+        const from = i === 0 ? offset : 0
+        const prev = got[got.length - 1]
+        if (from > 0 && prev && prev.path === f.path && prev.next === from) { prev.parts.push(buf); prev.next += buf.length; prev.size = f.size; prev.cut = !!f.cut } else got.push({ path: f.path, size: f.size, cut: !!f.cut, parts: [buf], next: from + buf.length })
+        total += buf.length
+        last = { i, end: from + buf.length, want: Math.min(f.size, args.maxBytes), grew: buf.length > 0 }
+        at = i + 1
+      }
+      if (!last) break // the rest were skipped (gone, or not plain files)
+      // The last file read stopped short of what it may give (the piece ran out): go on from there, unless it gave
+      // nothing (it shrank meanwhile). Otherwise, the files after it.
+      if (last.end < last.want && last.grew) { paths = paths.slice(last.i); offset = last.end } else { paths = paths.slice(last.i + 1); offset = 0 }
+    }
+    return { files: got.map(f => ({ path: f.path, size: f.size, cut: f.cut, data: Buffer.concat(f.parts).toString('base64') })) }
+  }
   isLinux(vm) { return this.osOf(vm) === 'linux' }
   /** The guest's build and output folders, as the agent sees them. */
   paths(vm) { return this.isLinux(vm) ? LINUX_PATHS : { build: 'C:\\build', out: 'C:\\out' } }
@@ -1973,7 +2048,8 @@ class Helper {
     if (!lease.running) throw new Error('The VM is not running: call vm_start first.')
     if (!['service', 'interactive'].includes(session)) throw new Error("session must be 'service' or 'interactive'")
     if (typeof command !== 'string' || !command.trim()) throw new Error('command is required')
-    if (command.length > MAX_COMMAND) throw new Error(`command is over ${MAX_COMMAND} characters: put it in a script in the build`)
+    const maxCommand = this.tm(lease).ms.commandChars
+    if (command.length > maxCommand) throw new Error(`command is over ${maxCommand} characters (HYPERV_MCP_COMMAND_CHARS): raise that setting, or put the command in a script in the build`)
     // MC-1501: a Linux guest runs bash (its default) or sh; a Windows guest cmd (its default) or powershell.
     const linux = lease.os === 'linux'
     shell ??= linux ? 'bash' : 'cmd'
@@ -2003,7 +2079,7 @@ class Helper {
       let started = null
       if (interactive) {
         try {
-          await this.hv('guest-run-publish', args, this.forLease(lease, CALL_MS))
+          await this.guestCall(vm, 'guest-run-publish', args, this.forLease(lease, CALL_MS))
         } catch (e) {
           this.stillHeld(lease) // an ending lease restores the VM itself
           started = { lost: e.message } // unproven: restored below, never chased
@@ -2076,8 +2152,10 @@ class Helper {
   async readOut(connId, { paths, glob, maxBytes = 256 * 1024, maxTotalBytes = 1024 * 1024, vm: named } = {}) {
     const lease = this.leaseOf(connId, named)
     if (!lease.running) throw new Error('The VM is not running: files in C:\\out are read while it runs (vm_stop restores it and discards them).')
-    if (!Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > 16 * 1024 * 1024) throw new Error('maxBytes must be 1-16777216')
-    if (!Number.isInteger(maxTotalBytes) || maxTotalBytes < 1 || maxTotalBytes > 64 * 1024 * 1024) throw new Error('maxTotalBytes must be 1-67108864')
+    // MC-1588: maxBytes has no cap of its own (a file takes at most the call's total); maxTotalBytes is held to what one
+    // reply can carry (READ_TOTAL_MAX, with its reason).
+    if (!Number.isInteger(maxBytes) || maxBytes < 1) throw new Error('maxBytes must be a whole number of bytes, at least 1')
+    if (!Number.isInteger(maxTotalBytes) || maxTotalBytes < 1 || maxTotalBytes > READ_TOTAL_MAX) throw new Error(`maxTotalBytes must be 1-${READ_TOTAL_MAX}: the files come back in one reply, which Node holds as one string (at most ${MAX_STRING} characters, with a text file's byte taking up to six); read a big file in parts`)
     const vm = this.vmOf(lease)
     const want = []
     if (paths !== undefined) {
@@ -2101,8 +2179,10 @@ class Helper {
       const missing = []
       for (const p of want) { const f = byPath.get(p.toLowerCase()); if (f) chosen.push(f); else missing.push(p) }
       if (match) for (const f of files) if (match(f.path) && !chosen.includes(f)) chosen.push(f)
+      // MC-1588 round 2: the per-file allowance sent is at most the call's total (a file can't give more), so a huge
+      // maxBytes never reaches the guest side, which reads it as an Int64 (hv.ps1) or a JSON integer (guest.py).
       const r = chosen.length
-        ? await this.guestCall(vm, 'guest-read', { ...this.ident(vm), cred: creds.admin, paths: chosen.map(f => f.path), maxBytes, maxTotalBytes }, this.forLease(lease))
+        ? await this.guestCall(vm, 'guest-read', { ...this.ident(vm), cred: creds.admin, paths: chosen.map(f => f.path), maxBytes: Math.min(maxBytes, maxTotalBytes), maxTotalBytes }, this.forLease(lease))
         : { files: [] }
       let total = 0
       const got = []
@@ -3024,7 +3104,7 @@ class Helper {
     if (real.toLowerCase().startsWith(this.dir.toLowerCase() + '\\')) throw new Error('guestScript can\'t be in the helper\'s own folder')
     const st = fs.lstatSync(real)
     if (!st.isFile()) throw new Error('guestScript is not a plain file')
-    if (st.size === 0 || st.size > GUEST_SCRIPT_MAX) throw new Error(`guestScript must hold 1 byte to ${GUEST_SCRIPT_MAX} bytes (the whole script goes to the guest in one call)`)
+    if (st.size === 0 || st.size > GUEST_SCRIPT_MAX) throw new Error(`guestScript must hold 1 byte to ${GUEST_SCRIPT_MAX} bytes (the helper reads it as text, and Node holds a string of at most that many characters)`)
     const bytes = fs.readFileSync(real)
     const shell = ext === '.sh' ? 'bash' : ext === '.ps1' ? 'powershell' : 'cmd'
     decodeScript(bytes, shell) // refused here, at plan time, unless it is text
@@ -3572,4 +3652,4 @@ function describePlan(plan, digest, approve, T) {
   return lines.join('\n')
 }
 
-module.exports = { Helper, canonical, baselineProblem, expiry, licenceOf, diagSummary, diagLine, keyOf, ancestorClash, decodeScript, PLAN_ID_RE, PROTOCOL }
+module.exports = { Helper, canonical, baselineProblem, expiry, licenceOf, diagSummary, diagLine, keyOf, ancestorClash, decodeScript, PLAN_ID_RE, PROTOCOL, GUEST_SCRIPT_MAX, READ_TOTAL_MAX, RUN_INLINE_CHARS, RUN_PART_BYTES, READ_PART_BYTES }

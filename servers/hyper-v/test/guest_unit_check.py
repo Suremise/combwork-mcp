@@ -139,6 +139,24 @@ try:
         f.write('old boot')
     g.op_run_start({'n': 1, 'command': 'echo again'}, None)
     ok('stale' not in os.listdir(os.path.join(g.RUNS, '1')), 'an earlier boot\'s folder is replaced')
+    # MC-1588: no length cap of the dispatcher's own (formerly 8000 characters, 1 MB for the setup script): a long
+    # command in the line, or as commandBytes bytes of UTF-8 after it, read exactly, written whole.
+    import io  # noqa: E402
+    long_line = 'echo ' + 'l' * 20000
+    g.op_run_start({'n': 3, 'command': long_line, 'as': 'user'}, None)
+    with open(os.path.join(g.RUNS, '3', 'cmd.sh'), encoding='utf-8') as f:
+        ok(f.read() == long_line + '\n', 'a user run over 8000 characters in the line is taken')
+    body = ('echo ' + 'é' * (1536 * 1024) + '\n# end').encode('utf-8')  # 3 MB of UTF-8, over the old 1 MB
+    g.op_run_start({'n': 4, 'commandBytes': len(body), 'as': 'admin'}, io.BytesIO(body + b'not part of it'))
+    with open(os.path.join(g.RUNS, '4', 'cmd.sh'), 'rb') as f:
+        ok(f.read() == body + b'\n', 'a command sent as bytes after the line is written whole')
+    for bad, data in (({'commandBytes': 10}, b'short'), ({'commandBytes': 2}, b'\xff\xfe'), ({'commandBytes': 0}, b''),
+                      ({'commandBytes': True}, b'x'), ({'commandBytes': 1, 'command': 'x'}, b'x'), ({'commandBytes': 3}, b'a\0b')):
+        try:
+            g.op_run_start(dict(bad, n=5), io.BytesIO(data))
+            ok(False, 'refused: %r' % bad)
+        except g.Refused:
+            ok(True, '')
     # Poll reads the same files start named, capped.
     with open(os.path.join(g.RUNS, '2', 'out'), 'w') as f:
         f.write('x' * 50)

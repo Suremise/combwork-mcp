@@ -65,6 +65,15 @@ test('timing.js: defaults, no floors, ceilings only where a value breaks (a setu
   // Fractions become whole milliseconds, at least 1; outputBytes whole bytes.
   assert.strictEqual(timing.resolve({ offWaitSeconds: 0.0001, outputBytes: 100.7 }, null, {}).ms.offWaitSeconds, 1)
   assert.strictEqual(timing.resolve({ outputBytes: 100.7 }, null, {}).ms.outputBytes, 100)
+  // MC-1588: a vm_run command's length, in characters: default 8000, any number above 0, at most the helper's 4 MB
+  // request line, named with its reason; whole characters.
+  assert.strictEqual(d.values.commandChars, 8000)
+  assert.strictEqual(timing.resolve({ commandChars: 2_000_000.9 }, null, {}).ms.commandChars, 2_000_000)
+  const big = timing.resolve({ commandChars: 5 * 1024 * 1024 }, null, {})
+  assert.strictEqual(big.ms.commandChars, 4 * 1024 * 1024)
+  assert.ok(big.notes.some(n => /commandChars 5242880 characters is over the most it can be, 4194304 characters \(a vm_run reaches the helper as one request line of at most 4 MB/.test(n)), big.notes.join('; '))
+  assert.deepStrictEqual(timing.fromEnv({ HYPERV_MCP_COMMAND_CHARS: '20000' }), { commandChars: 20000 })
+  assert.match(timing.describe(timing.resolve({ commandChars: 20000 }, null, {})), /commandChars 20000 characters/)
   // A conflicting choice: a long off-wait and a short restore still fit their call.
   const c = timing.resolve({ offWaitSeconds: 600, restoreMinutes: 2 }, null, {})
   assert.deepStrictEqual(timing.derived(c.ms), { restoreCallMs: 12 * 60_000, shutdownCallMs: 6 * 60_000, makeCleanCallMs: 15 * 60_000 })

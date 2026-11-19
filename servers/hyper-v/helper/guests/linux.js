@@ -23,6 +23,9 @@ const net = require('../net')
 const LINUX_READY_BASE = Number(process.env.HYPERV_MCP_LINUX_READY_MS || 0)
 const POLL_MS = Number(process.env.HYPERV_MCP_POLL_MS || 3000)
 const ATTEMPT_MS = Number(process.env.HYPERV_MCP_LINUX_ATTEMPT_MS || 60_000) // one readiness attempt's bound (test-only override)
+// MC-1588: the longest command sent in the request line, as every dispatcher takes it (one built before MC-1588 took
+// at most this many characters); a longer one follows the line as bytes.
+const LINE_COMMAND_CHARS = 8000
 const DIAG_KEYS = ['stage', 'vmbus', 'hv_sock_driver', 'hv_sock_modinfo', 'vsock_listen', 'sshd_config_ok', 'sshd_error', 'kernel', 'n', 'result', 'code', 'status']
 const PATHS = { build: '/build', out: '/out' }
 const sleep = ms => new Promise(r => setTimeout(r, ms))
@@ -56,7 +59,18 @@ class LinuxDriver {
       }
       case 'guest-run-start': {
         if (!['bash', 'sh'].includes(a.shell)) throw new Error('a Linux guest runs bash or sh')
-        const r = await this.dispatch(vm, { op: 'run-start', n: a.n, command: a.command, shell: a.shell, as: a.runAs ? 'user' : 'admin', cwd: a.cwd }, opts)
+        const req = { op: 'run-start', n: a.n, shell: a.shell, as: a.runAs ? 'user' : 'admin', cwd: a.cwd }
+        // MC-1588: a command over LINE_COMMAND_CHARS goes as bytes after the request line (commandBytes), which a
+        // dispatcher built before MC-1588 refuses: it took at most 8000 characters in the line.
+        if (typeof a.command !== 'string' || a.command.length <= LINE_COMMAND_CHARS) {
+          const r = await this.dispatch(vm, { ...req, command: a.command }, opts)
+          return { pid: null, started: r.boot, unit: r.unit }
+        }
+        const bytes = Buffer.from(a.command, 'utf8')
+        const r = await this.dispatch(vm, { ...req, commandBytes: bytes.length }, opts, [bytes]).catch(e => {
+          if (/: a bad command$/.test(e.message) && !a.command.includes('\0')) throw new Error(`${vm.vmName}'s guest dispatcher takes a command of at most ${LINE_COMMAND_CHARS} characters (it was built before MC-1588): rebuild the VM to run longer ones, or put the command in a script in the build`)
+          throw e
+        })
         return { pid: null, started: r.boot, unit: r.unit }
       }
       case 'guest-run-poll': return this.dispatch(vm, { op: 'run-poll', n: a.n, cap: a.cap }, opts)

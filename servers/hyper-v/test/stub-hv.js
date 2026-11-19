@@ -561,10 +561,31 @@ function run(s, op, a) {
     // the poll that finishes it (its PID recorded) for ms, then writes the file: a killed poll never does.
     // state.killMismatch: the PID at the kill is no longer the run's process; state.interactiveGate: the publish waits.
     // state.startDelayMs / publishDelayMs: a slow start or publish; state.pollDelayOnceMs: the next poll hangs that long.
+    // MC-1588: a piece of a long command (guest-run-stage), kept per run number and account, as hv.ps1 keeps it in the
+    // run's folder; a start or publish with staged: <bytes> takes it whole, or refuses it as hv.ps1 does.
+    // state.stageShort: the guest reports a byte fewer than it got.
+    case 'guest-run-stage': {
+      const vm = own(s, a)
+      if (vm.state !== 'Running') throw new Error('the VM is not running')
+      const key = `${a.runAs ? 'user' : 'admin'}:${a.n}`
+      vm.stage ??= {}
+      const prev = a.part === 0 ? '' : (vm.stage[key] || '')
+      vm.stage[key] = Buffer.concat([Buffer.from(prev, 'base64'), Buffer.from(a.data, 'base64')]).toString('base64')
+      s.stageCalls = [...(s.stageCalls || []), { n: a.n, part: a.part, chars: a.data.length, as: a.runAs ? 'user' : 'admin' }]
+      return { bytes: Buffer.from(vm.stage[key], 'base64').length - (s.stageShort ? 1 : 0) }
+    }
     case 'guest-run-start':
     case 'guest-run-publish': {
       const vm = own(s, a)
       if (vm.state !== 'Running') throw new Error('the VM is not running')
+      if (a.staged) {
+        const key = `${a.runAs ? 'user' : 'admin'}:${a.n}`
+        const got = vm.stage?.[key] !== undefined ? Buffer.from(vm.stage[key], 'base64') : null
+        if (!got || got.length !== a.staged) throw new Error(`the run's command wasn't staged whole (${a.staged} bytes expected)`)
+        delete vm.stage[key]
+        a.command = got.toString('utf8')
+        s.stagedRuns = [...(s.stagedRuns || []), { n: a.n, bytes: a.staged, interactive: op === 'guest-run-publish' }]
+      }
       const interactive = op === 'guest-run-publish'
       const slow = interactive ? s.publishDelayMs : s.startDelayMs
       if (slow) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, slow)
@@ -650,19 +671,26 @@ function run(s, op, a) {
       const files = Object.entries(vm.disk).filter(([p, v]) => p.toLowerCase().startsWith('c:\\out\\') && v !== '').map(([p, v]) => ({ path: p.slice(7).replace(/\\/g, '/'), size: Buffer.from(v, 'base64').length }))
       return { files, skipped: s.outLinks || [] }
     }
+    // MC-1588: as hv.ps1's GuestRead: the first path from a.offset, maxBytes counted from each file's start. Each call is
+    // recorded in state.readCalls.
     case 'guest-read': {
       const vm = own(s, a)
+      // As hv.ps1's [long] casts: a number past Int64 can't be converted.
+      for (const k of ['maxBytes', 'maxTotalBytes', 'offset']) if (typeof a[k] === 'number' && a[k] > 9223372036854775807) throw new Error(`Cannot convert value "${a[k]}" to type "System.Int64". Error: "Value was either too large or too small for an Int64."`)
       let total = 0
       const files = []
-      for (const p of a.paths) {
+      for (const [i, p] of a.paths.entries()) {
         const v = vm.disk[`C:\\out\\${p.replace(/\//g, '\\')}`]
         if (v === undefined) continue
+        const left = a.maxTotalBytes - total
+        if (left <= 0) break
         const buf = Buffer.from(v, 'base64')
-        const take = Math.min(buf.length, a.maxBytes, a.maxTotalBytes - total)
-        if (take <= 0) break
+        const off = i === 0 ? (a.offset || 0) : 0
+        const take = Math.max(0, Math.min(Math.min(buf.length, a.maxBytes) - off, left))
         total += take
-        files.push({ path: p, size: buf.length, cut: take < buf.length, data: buf.subarray(0, take).toString('base64') })
+        files.push({ path: p, size: buf.length, offset: off, cut: off + take < buf.length, data: buf.subarray(off, off + take).toString('base64') })
       }
+      s.readCalls = [...(s.readCalls || []), { paths: a.paths.length, offset: a.offset || 0, maxBytes: a.maxBytes, maxTotalBytes: a.maxTotalBytes, bytes: total }]
       return { files }
     }
     case 'remove-vm': {
