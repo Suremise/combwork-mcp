@@ -189,6 +189,51 @@ test('a mixed pool: a Windows and a Linux lease at once, through one helper, bot
   await h.stop()
 })
 
+test('MC-1580: one session holds a Windows and a Linux VM: starts both, runs in each by vm, releases both', async () => {
+  const { sc, h, linux } = await mixedPool('lx-one-session')
+  const s = h.conn(1)
+  const W = (await s.request('acquire', { minutes: 30 })).data.vm
+  const L = (await s.request('acquire', { minutes: 30, distro: 'debian' })).data.vm
+  assert.strictEqual(L, linux.name)
+  assert.notStrictEqual(W, L)
+  assert.deepStrictEqual((await s.request('leases')).data.leases.map(l => [l.vm, l.os]).sort(), [[L, 'linux'], [W, 'windows']].sort())
+  await assert.rejects(s.request('start', {}), /This session holds 2 VMs .*: name one with vm/)
+  await s.request('start', { vm: W })
+  await s.request('start', { vm: L })
+  assert.ok(Object.values(sc.stub().vms).every(v => v.state === 'Running'), 'both running at once, in one session')
+  assert.match((await s.request('run', { vm: W, command: 'echo from-windows' })).text, /Exit code 0\.\n--- stdout ---\nfrom-windows/)
+  assert.match((await s.request('run', { vm: L, command: 'echo from-linux' })).text, /Exit code 0\.\n--- stdout ---\nfrom-linux/)
+  await assert.rejects(s.request('run', { vm: W, command: 'ls', shell: 'bash' }), /bash and sh are for Linux guests/, 'each VM keeps its own OS')
+  await s.request('release', { vm: L })
+  assert.match((await s.request('run', { command: 'echo still-windows' })).text, /still-windows/, 'the Windows lease goes on alone')
+  await s.request('release', { vm: W })
+  for (const v of Object.values(sc.stub().vms)) {
+    assert.strictEqual(v.state, 'Off')
+    assert.strictEqual(v.parent, v.checkpoints.find(c => c.name === 'clean').id, `${v.name} at its clean checkpoint`)
+  }
+  await h.stop()
+})
+
+test('MC-1580 through server.js: one session, a Windows and a Linux VM, each started with its build, run in by vm, released', async t => {
+  const { sc, h, linux } = await mixedPool('lx-one-server')
+  await h.stop()
+  const env = { ...sc.env, HYPERV_MCP_ENABLED: '1', HYPERV_MCP_MODE: 'direct', USERPROFILE: path.join(sc.dir, 'home') }
+  const s = server(env, { roots: [sc.builds] })
+  t.after(() => s.close())
+  const app = path.join(sc.builds, 'app')
+  const W = /Leased (hvmcp-[0-9a-f]+)/.exec((await s.call('vm_acquire', { minutes: 30 })).text)[1]
+  const L = /Leased (hvmcp-[0-9a-f]+)/.exec((await s.call('vm_acquire', { minutes: 30, distro: 'debian' })).text)[1]
+  assert.strictEqual(L, linux.name)
+  assert.match((await s.call('vm_start', { vm: W, build: app })).text, /build copied in/)
+  assert.match((await s.call('vm_start', { vm: L, build: app })).text, /build copied in/)
+  assert.match((await s.call('vm_run', { vm: W, command: 'echo from-windows' })).text, /from-windows/)
+  assert.match((await s.call('vm_run', { vm: L, command: 'echo from-linux' })).text, /from-linux/)
+  assert.match((await s.call('vm_run', { command: 'whoami' })).text, /name one with vm/)
+  assert.match((await s.call('vm_release', { vm: W })).text, /^Released/)
+  assert.match((await s.call('vm_release', { vm: L })).text, /^Released/)
+  assert.ok(Object.values(sc.stub().vms).every(v => v.state === 'Off'))
+})
+
 test('a Linux lease through server.js: a build copied in, bash in /build as root or hvuser, /out read back, a sync, a reset, the refusals, release', async t => {
   const { sc, h, linux } = await mixedPool('lx-server')
   await h.stop()

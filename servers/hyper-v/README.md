@@ -925,7 +925,8 @@ names it, so a newer helper keeps serving older servers:
   The server sends no `vm_acquire` at all for an `image`, or an OS other than Windows, to a helper without it.
 - feature `multi-vm` (protocol 3): several leases per connection, every lease op's `vm`, and the `leases` op. A helper
   without it would ignore a `vm` it doesn't know and act on its one VM, so the server refuses `vm` to it, sending
-  nothing (MC-1580); without `vm`, one VM per session works as before.
+  nothing (MC-1580); without `vm`, one VM per session works as before. A second `vm_acquire` is refused by that helper
+  itself ("one VM per connection", no lease changed); the server adds that it needs the newer helper.
 - feature `network-modes` (protocol 3): the network modes as strings (`none`, `host`, `internet`, `internet-lan`) in
   `vm_start`, `vm_reset` and `pool_plan`. A helper without it would read any of them, `none` included, as networking
   on, so the server refuses each with "run setup again" and sends nothing; the old booleans (`true` host, `false`

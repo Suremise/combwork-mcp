@@ -158,6 +158,8 @@ const request = m.Helper.prototype.request
 m.Helper.prototype.request = async function (connId, op, args) {
   if (op === 'version') { const r = await request.call(this, connId, op, args); return { ...r, data: { ...r.data, features: r.data.features.filter(f => f !== 'multi-vm') } } }
   if (op === 'leases') throw new Error('unknown operation leases')
+  // As a helper before multi-vm refuses a second lease (its own check, word for word).
+  if (op === 'acquire' && this.heldLeases(connId).length) throw new Error(\`This connection already has \${this.heldLeases(connId)[0].vmName}: one VM per connection.\`)
   fs.appendFileSync(${JSON.stringify(sent)}, op + ' ' + JSON.stringify(args || {}) + '\\n')
   return request.call(this, connId, op, args)
 }
@@ -172,6 +174,11 @@ m.Helper.prototype.request = async function (connId, op, args) {
     assert.match(r.text, /has no 'multi-vm' feature, which naming the VM a tool acts on \(vm\) needs: run setup again/, tool)
   }
   assert.strictEqual(fs.readFileSync(sent, 'utf8'), before, 'nothing sent for any of them')
+  // A second acquire: the older helper's own refusal, with what to do about it; still one lease.
+  const second = await s.call('vm_acquire', { minutes: 30 })
+  assert.ok(second.isError)
+  assert.match(second.text, new RegExp(`This connection already has ${A}: one VM per connection\\. More than one VM per session needs a helper with the 'multi-vm' feature: run setup again`))
+  assert.strictEqual(((await s.call('vm_status')).text.match(/\(yours\)/g) || []).length, 1)
   assert.match((await s.call('vm_start', {})).text, /Started|started/i)
   assert.match((await s.call('vm_run', { command: 'whoami' })).text, /admin/)
   assert.ok(/leased/.test((await s.call('vm_status')).text), 'the one VM still leased')

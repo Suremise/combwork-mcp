@@ -515,7 +515,13 @@ const tools = [
       // MC-1501: a Linux VM needs a helper with Linux guests (an older one only knew Linux as a journal kind).
       if (os === 'linux' || distro !== undefined) await needFeature('linux', `asking for a ${distro ?? 'Linux'} VM`)
       const args = { minutes, keepOnFailure, ...(p.features.includes('projects') ? { wait: !!wait, roots: await rootList() } : {}), ...(p.features.includes('images') ? { os, image } : {}), ...(vm !== undefined ? { vm } : {}), ...(checkpoint !== undefined ? { checkpoint } : {}), ...(distro !== undefined ? { distro } : {}) }
-      const r = await helper.request('acquire', args)
+      // MC-1580: a helper before 'multi-vm' refuses a second VM itself ("one VM per connection"), safely: no lease
+      // changes. The server only adds what to do about it, rather than track what the session holds.
+      let r
+      try { r = await helper.request('acquire', args) } catch (e) {
+        if (/one VM per connection/.test(e.message) && !p.features.includes('multi-vm')) throw new Error(`${e.message} More than one VM per session needs a helper with the 'multi-vm' feature: run setup again to update it (see the README, Setup).`)
+        throw e
+      }
       // MC-1580: a new lease starts with no earlier defaults, even on a VM this session held before.
       if (!r?.isError && typeof r?.data?.vm === 'string') sessions.delete(r.data.vm)
       return { text: text(r), isError: r?.isError }
