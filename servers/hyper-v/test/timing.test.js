@@ -353,3 +353,18 @@ test('MC-1566: the guest network waits on its read-back (a condition), bounded o
   await long.h.guestNet(NET_VM, NET_LEASE)
   assert.ok(long.now() >= 150_000 && long.now() < 240_000, `accepted when ready, within the longer ceiling (${long.now()})`)
 })
+
+test('MC-1566: the network wait is the lease\'s own value (kept from its connection), not the helper\'s defaults', async () => {
+  const late = t => t >= 150_000 ? READY : APIPA
+  // The real tm(): a lease that took 240 s from its connection waits past the default 90 s.
+  const kept = netHelper(0, late)
+  delete kept.h.tm
+  kept.h.defaultTiming = timing.resolve({}, null, {})
+  await kept.h.guestNet(NET_VM, { ...NET_LEASE, timing: timing.resolve({ networkSeconds: 240 }, null, {}) })
+  assert.ok(kept.now() >= 150_000 && kept.now() < 240_000, `the lease's 240 s (${kept.now()})`)
+  // A lease with no values of its own uses the defaults: 90 s, named.
+  const dflt = netHelper(0, late)
+  delete dflt.h.tm
+  dflt.h.defaultTiming = timing.resolve({}, null, {})
+  await assert.rejects(dflt.h.guestNet(NET_VM, NET_LEASE), /within 90 s \(HYPERV_MCP_NETWORK_SECONDS, up to 600 s/)
+})
