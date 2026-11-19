@@ -342,6 +342,10 @@ const skippedNote =list => list?.length ? `\nLinks skipped (never followed): ${l
 
 // MC-1556: the network modes, as an agent describes them to the user when a pool is planned.
 const NETWORK_DESC = 'Modes: none (disconnected); host (reaches only this PC, at a fixed address, on the ports its firewall allows, e.g. a local model server; no LAN, no internet); internet (through Windows\' Default Switch, so its traffic leaves this PC; not the LAN); internet-lan (the internet and the local network).'
+// MC-1570: a helper before the network modes reads any truthy network as on (its internal switch), 'none' included:
+// a string mode is refused unless it has the feature, so it never gets a network other than the one asked for. The
+// booleans an older client may send go through as before.
+const needNetworkModes = (network, what) => typeof network === 'string' ? needFeature('network-modes', `${what} with network '${network}'`) : undefined
 async function vmStart({ build, network = 'none', reserveCpu = 0, interactive = false, checkpoint } = {}) {
   if (interactive) await needInteractive()
   if (checkpoint !== undefined) await needFeature('pool-checkpoints', 'starting from a pool checkpoint (checkpoint)')
@@ -350,6 +354,7 @@ async function vmStart({ build, network = 'none', reserveCpu = 0, interactive = 
     if (typeof build !== 'string' || !build.trim()) throw new Error('build must be a folder path')
     staged = await stage(await buildFolder(build))
   }
+  await needNetworkModes(network, 'starting a VM')
   const r = await helper.request('start', { network, reserveCpu, ...(interactive ? { interactive } : {}), ...(checkpoint !== undefined ? { checkpoint } : {}) })
   if (!r.isError) { session.start = { network, reserveCpu, interactive: interactive || false, checkpoint }; session.build = build ?? null }
   return { text: text(r) + skippedNote(staged?.skipped), isError: r.isError }
@@ -612,6 +617,7 @@ const tools = [
     run: async (args = {}) => {
       if (args.action === 'checkpoint' || args.action === 'checkpoint-remove') { await needFeature('pool-checkpoints', 'pool checkpoints'); return pass('pool_plan')({ ...args, roots: await rootList() }) }
       if (args.action === 'refresh-clean') await needFeature('refresh-clean', 'refreshing a clean checkpoint')
+      await needNetworkModes(args.network, 'a pool plan')
       // MC-1545: an older helper would ignore the flag and roll a failed build back: refused before anything is sent.
       if (args.debugKeepFailedBuild !== undefined) await needFeature('debug-keep', 'keeping a failed Linux build for debugging (debugKeepFailedBuild)')
       return pass('pool_plan')(args)
