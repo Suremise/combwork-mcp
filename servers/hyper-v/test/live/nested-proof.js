@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
  * The nested live proof (MC-1559; MC-1560 and MC-1561 reuse it): proves the merged hyper-v code inside one
- * hand-made outer VM, hvnest-proof, with nested virtualization, so the host's installed helper and the CLI team's pool
- * are never touched. See README "Live proof in a nested VM" for the user's host and in-VM lines.
+ * hand-made outer VM, hvnest-proof, with nested virtualization, so the host's installed helper and its pool are never
+ * touched. See README "Live proof in a nested VM" for the user's host and in-VM lines.
  *
  * This file runs on the HOST, as the user (no admin). It only ever runs ssh and scp to the outer VM: it has no code path
  * that runs setup, approve.ps1, the uninstaller or any Hyper-V cmdlet on this machine.
