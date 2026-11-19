@@ -1948,7 +1948,7 @@ class Helper {
     if (!linux && !['cmd', 'powershell'].includes(shell)) throw new Error('shell must be cmd or powershell in a Windows guest (bash and sh are for Linux guests)')
     if (linux && session === 'interactive') throw new Error("Linux guests have no desktop session: session must be 'service'.")
     if (!['admin', 'user'].includes(as)) throw new Error('as must be admin or user')
-    if (!Number.isFinite(timeoutSec) || timeoutSec < 1 || timeoutSec > 3600) throw new Error('timeoutSec must be 1-3600')
+    if (!Number.isFinite(timeoutSec) || timeoutSec <= 0) throw new Error('timeoutSec must be a number of seconds above 0') // MC-1579: no ceiling (formerly 3600): a run is polled, never one long call
     if (cwd !== undefined && linux && (typeof cwd !== 'string' || !cwd.startsWith('/') || cwd.length > 1024 || /[\0-\x1f]/.test(cwd))) throw new Error('cwd must be an absolute guest folder such as /build')
     if (cwd !== undefined && !linux && (typeof cwd !== 'string' || !/^[a-zA-Z]:\\/.test(cwd) || cwd.length > 260 || /[\0-\x1f"]/.test(cwd))) throw new Error('cwd must be an absolute guest folder such as C:\\build')
     const vm = this.vmOf(lease)
@@ -3014,13 +3014,13 @@ class Helper {
     this.scriptRuns = ((this.scriptRuns || 0) % 99_999_999) + 1
     const n = GUEST_SCRIPT_RUN_BASE + this.scriptRuns
     const base = { ...this.ident(vm), cred: creds.admin, n }
-    const started = await this.guestCall(vm, 'guest-run-start', { ...base, command: decodeScript(bytes, gs.shell), shell: gs.shell, cwd: this.paths(vm).build, cap: OUTPUT_CAP, runAs: null }, { timeoutMs: CALL_MS })
+    const started = await this.guestCall(vm, 'guest-run-start', { ...base, command: decodeScript(bytes, gs.shell), shell: gs.shell, cwd: this.paths(vm).build, cap: this.tm().ms.outputBytes, runAs: null }, { timeoutMs: CALL_MS })
     const limitMs = this.tm().ms.guestScriptMinutes
     const deadline = this.now() + limitMs
     let last = null
     for (;;) {
       await sleep(Math.min(POLL_MS, 1000))
-      const r = await this.guestCall(vm, 'guest-run-poll', { ...base, cap: OUTPUT_CAP }, { timeoutMs: CALL_MS }).catch(() => null)
+      const r = await this.guestCall(vm, 'guest-run-poll', { ...base, cap: this.tm().ms.outputBytes }, { timeoutMs: CALL_MS }).catch(() => null)
       if (r) last = r
       if (r?.done) break
       if (this.now() > deadline) {

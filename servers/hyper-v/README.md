@@ -120,6 +120,7 @@ using the new server: the helper's protocol and features changed, and an older h
 - Every setting is in the shipped `combwork-mcp.example.json`'s `env` with its default, so the MCP editor shows them all
   (see "Configuration"). A setting has a default and no range of its own: a cap is left only where a larger value breaks
   something, and its reason is given.
+- `vm_run`'s `timeoutSec` loses its 3600 ceiling, and `HYPERV_MCP_GUEST_SCRIPT_MINUTES` its 1-360 range.
 - The timings lose their ranges (e.g. restore at most 30 min, logon 30): any value above 0 is used, except
   `HYPERV_MCP_COPY_IDLE_MINUTES`, still at most 9 (PowerShell Direct's call limit). New: `HYPERV_MCP_OUTPUT_BYTES`,
   `vm_run`'s output per stream (default 16384, formerly fixed), up to 1 MB.
@@ -1191,6 +1192,13 @@ only where a larger value breaks something, named with its reason.
 - **Kept, with their reasons:** `HYPERV_MCP_COPY_IDLE_MINUTES` at most 9 (PowerShell Direct's ~10-minute call);
   `HYPERV_MCP_OUTPUT_BYTES` at most 1 MB (`guest.py`); a request to the helper at most 4 MB (the service host's line
   limit).
+- **`vm_run`'s `timeoutSec`** has no ceiling (formerly 3600): a run is started in one short call and then polled, so no
+  call is held for it. `HYPERV_MCP_GUEST_SCRIPT_MINUTES` (MC-1577) has no range either (formerly 1-360), for the same
+  reason.
+- **Not yet settled (MC-1588):** a guest setup script at most 1 MB, a `vm_run` command at most 8000 characters, and
+  `vm_read_out` at most 16 MB per file and 64 MB per call. Each goes to or from the guest in one call; what that call
+  can really carry (PowerShell Direct on Windows, `guest.py` on Linux) is still to be found, and each will then be a
+  setting or keep that limit with its reason.
 
 ### Other limits
 

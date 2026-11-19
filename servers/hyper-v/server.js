@@ -536,7 +536,7 @@ const tools = [
         command: { type: 'string', description: 'A cmd command line, or a PowerShell script with shell=powershell; on Linux, a bash (or sh) script.' },
         shell: { type: 'string', enum: ['cmd', 'powershell', 'bash', 'sh'], description: 'Windows: cmd (default) or powershell. Linux: bash (default) or sh.' },
         as: { type: 'string', enum: ['admin', 'user'], description: 'admin (default; root on Linux) or user (a standard user; C:\\build, /build on Linux, is read-only for it).' },
-        timeoutSec: { type: 'number', description: '1-3600. Default 120.' },
+        timeoutSec: { type: 'number', description: 'Seconds, above 0, with no upper limit (a run is polled, never one long call). Default 120.' },
         cwd: { type: 'string', description: 'Guest working folder. Default C:\\build (/build on Linux).' },
         session: { type: 'string', enum: ['service', 'interactive'], description: 'service (default): session 0, as today. interactive (Windows only): the logged-on account\'s desktop session (as must name that account); a timeout there restores the VM.' }
       },

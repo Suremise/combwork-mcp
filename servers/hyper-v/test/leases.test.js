@@ -243,6 +243,7 @@ test('runs: as admin or user, a timeout kills inside, output capped, and the com
   assert.strictEqual(to.isError, true)
   assert.match(to.text, /Timed out after 1 s: killed inside the guest by its PID/)
   assert.match((await a.request('run', { command: 'big' })).text, /stdout \(first 16384 bytes\)/)
+  assert.match((await a.request('run', { command: 'whoami', timeoutSec: 100_000 })).text, /admin/, 'MC-1579: no ceiling on timeoutSec (formerly 3600)')
   for (const bad of [{ command: '' }, { command: 'x', shell: 'bash' }, { command: 'x', as: 'system' }, { command: 'x', timeoutSec: 0 }, { command: 'x', cwd: 'relative' }, { command: 'x'.repeat(9000) }]) {
     await assert.rejects(a.request('run', bad), Error, JSON.stringify(bad).slice(0, 60))
   }
