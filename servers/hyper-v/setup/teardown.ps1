@@ -1,20 +1,18 @@
 # Uninstall's teardown (design MC-1488/s66 + s68), dot-sourced by uninstall.ps1 after acl.ps1, and tested non-elevated by
 # test\teardown-check.ps1 with fake outside actions and a crash hook at every boundary.
 #
-# What it may delete: only storage verified, before any change, as setup's own.
-#   - A receipted install: exactly the folders with receipts (identity must match; owners and grants setup's).
-#   - A legacy install (an older setup's, no receipts): the state folder and the disk folder the admin names, each
-#     checked (owned by Administrators/SYSTEM, grants only for the expected accounts, no links, safe parents) and then
-#     confirmed by the admin typing DELETE for the printed inventory. That check proves present access control only, not
-#     history: the authority for a legacy deletion is the admin's confirmation. Old policy or journal bytes never add a
-#     target, and never become receipts.
-#   - No trust evidence: refused, nothing changed.
-# In what order: verify (no change) → record → pool (through the helper: quiesce, the approved remove plan) → stop the
-# service (it stays registered) → storage → the service, rights, group and install folder → receipts, InstallId, the
-# record. The record (HKLM\SOFTWARE\hyperv-mcp, value Teardown) is bound to its install generation (InstallId), its mode,
-# its legacy folder and its targets' identities; a rerun resumes it only with the same options, at its phase. Every action
-# checks the current state and does nothing when its work is done, so a rerun after a kill anywhere tolerates what was
-# already removed. Errors are never swallowed: the record stays at the last completed phase.
+# What it may delete: only storage verified, before any change, as setup's own: exactly the folders with receipts
+# (identity must match; owners and grants setup's). No receipts: refused, nothing changed. (MC-1583 retired the legacy
+# path for installs from before receipts: every released hyper-v, from 1.0.0 in combwork-mcp 1.3.0, wrote them; such an
+# install could only come from the unreleased builds of 13 Nov, and the README gives its manual steps.)
+# In what order: verify (no change) → the one confirmation (MC-1583: what goes, from what was just verified and the
+# helper's own remove plan; one answer) → record → pool (through the helper: quiesce, then a fresh remove plan, approved
+# only if its VMs are exactly the confirmed ones, else asked again) → stop the service (it stays registered) → storage →
+# the service, rights, group and install folder → receipts, InstallId, the record. The record (HKLM\SOFTWARE\hyperv-mcp,
+# value Teardown) is bound to its install generation (InstallId), its mode, its targets' identities and the confirmed
+# VMs; a rerun resumes it only with the same mode, at its phase. Every action checks the current state and does nothing
+# when its work is done, so a rerun after a kill anywhere tolerates what was already removed. Errors are never
+# swallowed: the record stays at the last completed phase.
 
 $script:PHASES = @('verified', 'pool-removed', 'stopped', 'storage-removed', 'components-removed')
 
@@ -50,7 +48,7 @@ function Assert-NoTeardown([Microsoft.Win32.RegistryKey]$Root, [string]$KeyPath)
   if (-not $k) { return }
   try {
     $r = $k.GetValue('Teardown')
-    if ($r) { $m = try { $r | ConvertFrom-Json } catch { $null }; throw "An uninstall is unfinished (mode $($m.mode), at $($m.phase)): finish it first, by running uninstall.ps1 again with its recorded options$(if ($m.legacyDiskFolder) { " (-LegacyDiskFolder $($m.legacyDiskFolder))" }). Nothing was changed." }
+    if ($r) { $m = try { $r | ConvertFrom-Json } catch { $null }; throw "An uninstall is unfinished (mode $($m.mode), at $($m.phase)): finish it first, by running the uninstaller again. Nothing was changed." }
   } finally { $k.Dispose() }
 }
 
@@ -76,6 +74,11 @@ function Get-Inventory([string]$Path) {
   return ('{0}: {1} file(s), {2:N1} GB' -f $Path, $files.Count, ([double]$bytes / 1GB))
 }
 
+# MC-1583: a set of VMs ({ vmId, name, folder }) as one comparable string: the same VMs in any order give the same key.
+function Get-VmSetKey($Vms) {
+  return (@($Vms | Where-Object { $_ } | ForEach-Object { "$($_.vmId)|$($_.name)|$($_.folder)".ToLowerInvariant() } | Sort-Object) -join "`n")
+}
+
 # Verifies one deletion target as it is now (its parents already pinned): not a link; owner in $RootOwners; contents
 # with only $Who (and per-VM SIDs) as owners and grantees. Returns its identity, or $null when it is missing.
 # The target's handle goes in $Pins (its own list, released just before the target is deleted).
@@ -96,20 +99,23 @@ function Test-Target([string]$Path, [string[]]$RootOwners, [string[]]$Who, [Coll
 
 function Invoke-Teardown {
   param(
-    [ValidateSet('keep', 'remove')][string]$Mode,
-    [string]$State, [string]$Install, [string]$LegacyDiskFolder,
+    # MC-1583: 'ask' (no option given): the one confirmation chooses remove or keep.
+    [ValidateSet('keep', 'remove', 'ask')][string]$Mode,
+    [string]$State, [string]$Install,
     [Microsoft.Win32.RegistryKey]$Root, [string]$KeyPath,
     [string[]]$Trusted,     # may own/write the registry key and the parents: SYSTEM, Administrators, TrustedInstaller
     [string[]]$RootOwners,  # may own a deletion target: Administrators, SYSTEM
     [string[]]$Who,         # may own or hold grants inside a target: SYSTEM, Administrators, the helper's account
-    [string]$KeyOwner,      # owner of a key created for a legacy teardown (Administrators)
-    [hashtable]$Ops,        # ServiceState, StopService, DeleteService, RemoveRights, RemoveGroup, HelperStatus, Quiesce, RemovePool, ConfirmInventory, Say
+    # ServiceState, StopService, DeleteService, RemoveRights, RemoveGroup, HelperStatus, Quiesce, Say; MC-1583:
+    # PlanRemove (the helper's remove plan: { planId, vms: { vmId, name, folder }[] }), Confirm ({ mode, vms, folders }:
+    # 'remove', 'keep' or $null), ConfirmChange (the confirmed and the live VMs: true to go on), RemovePool (a plan id:
+    # the VMs left).
+    [hashtable]$Ops,
     [scriptblock]$Crash,    # test hook: run at every boundary with its name
     [switch]$WhatIf         # MC-1557: verify only and say what would happen; nothing written, stopped or removed
   )
   $boundary = { param($n) if ($Crash) { & $Crash $n } }
   $say = { param($m) if ($Ops.Say) { & $Ops.Say $m } }
-  $legacy = [bool]$LegacyDiskFolder
   $stateFull = [IO.Path]::GetFullPath($State).TrimEnd('\')
   # Hyper-V's grantee pattern applies to disk folders only: anything but the state folder (and what it holds).
   $patternFor = { param($p) if ($p -eq $stateFull -or $p.ToLowerInvariant().StartsWith($stateFull.ToLowerInvariant() + '\')) { $null } else { $script:HyperVGrantees } }
@@ -124,8 +130,10 @@ function Invoke-Teardown {
     $installId = if ($key) { $key.GetValue('InstallId') } else { $null }
 
     if ($rec) {
-      if ($rec.mode -ne $Mode -or [string]$rec.legacyDiskFolder -ne [string]$LegacyDiskFolder) {
-        throw "An unfinished uninstall was started with other options (mode $($rec.mode)$(if ($rec.legacyDiskFolder) { ", -LegacyDiskFolder $($rec.legacyDiskFolder)" })): run it again with those. Nothing was changed."
+      # MC-1583: a resume takes the recorded mode when none was given; another mode is refused.
+      if ($Mode -eq 'ask') { $Mode = $rec.mode }
+      if ($rec.mode -ne $Mode) {
+        throw "An unfinished uninstall was started with another choice (mode $($rec.mode)): run it again with that one. Nothing was changed."
       }
       # Its InstallId is deleted only in the last phase (after components-removed): then a missing one is this teardown's own doing.
       if ($rec.installId -ne $installId -and -not ($null -eq $installId -and $rec.phase -eq 'components-removed')) { throw 'The unfinished uninstall belongs to another installation (its InstallId differs): nothing was changed.' }
@@ -136,7 +144,7 @@ function Invoke-Teardown {
       # the empty key is left.
       if ($key -and -not $installId) {
         $rk = $key.OpenSubKey('Storage'); $n = if ($rk) { $rk.ValueCount } else { 0 }; if ($rk) { $rk.Dispose() }
-        if (-not $n -and $key.ValueCount -eq 0 -and -not $legacy) {
+        if (-not $n -and $key.ValueCount -eq 0) {
           if ($WhatIf) { & $say "The empty registry key $KeyPath left by a finished uninstall would be removed."; return }
           $key.Dispose(); $key = $null
           $Root.DeleteSubKeyTree($KeyPath, $false)
@@ -148,17 +156,13 @@ function Invoke-Teardown {
       # still read and written as admin (quiesce), so it must be the verified storage too. ----
       $targets = @()
       if ($true) {
-        $paths = @()
-        if ($legacy) {
-          $paths = @($State, $LegacyDiskFolder) # its location policy (a top-level folder on a fixed drive) is uninstall.ps1's
-        } else {
-          if (-not $key) { throw 'There are no storage receipts (setup''s records of the folders it created), so nothing is known to be setup''s: no storage will be used or deleted. For an install made by an older setup, name its disk folder with -LegacyDiskFolder. Nothing was changed.' }
-          $rk = $key.OpenSubKey('Storage')
-          $receipts = @{}
-          if ($rk) { foreach ($n in $rk.GetValueNames()) { $receipts[$n] = $rk.GetValue($n) }; $rk.Dispose() }
-          if (-not $receipts.Count) { throw 'The storage receipts key holds no receipts: no storage is known to be setup''s. Nothing was changed.' }
-          $paths = @($receipts.Keys)
-        }
+        $noReceipts = 'so nothing is known to be setup''s: no storage will be used or deleted. Nothing was changed. (An install from before storage receipts, an unreleased build of 13 Nov, is removed by hand: see the README''s Uninstall.)'
+        if (-not $key) { throw "There are no storage receipts (setup's records of the folders it created), $noReceipts" }
+        $rk = $key.OpenSubKey('Storage')
+        $receipts = @{}
+        if ($rk) { foreach ($n in $rk.GetValueNames()) { $receipts[$n] = $rk.GetValue($n) }; $rk.Dispose() }
+        if (-not $receipts.Count) { throw "The storage receipts key holds no receipts, $noReceipts" }
+        $paths = @($receipts.Keys)
         # Deduplicate and drop targets nested in another (a state folder holds its approvals\).
         $full = @($paths | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') } | Sort-Object -Unique)
         $top = @($full | Where-Object { $p = $_; -not ($full | Where-Object { $_ -ne $p -and $p.ToLowerInvariant().StartsWith($_.ToLowerInvariant() + '\') }) })
@@ -166,21 +170,17 @@ function Invoke-Teardown {
           Open-TrustedAncestors $p $Trusted $pins
           $targetPins[$p] = New-Object Collections.ArrayList
           $id = Test-Target $p $RootOwners $Who $targetPins[$p] (& $patternFor $p)
-          if (-not $legacy) {
-            $want = $receipts[$p.ToLowerInvariant()]
-            if ($id -and $id -ne $want) { throw "$p isn't the folder setup created (its identity differs from its receipt): it won't be used or deleted. Nothing was changed." }
-          }
+          $want = $receipts[$p.ToLowerInvariant()]
+          if ($id -and $id -ne $want) { throw "$p isn't the folder setup created (its identity differs from its receipt): it won't be used or deleted. Nothing was changed." }
           $targets += [pscustomobject]@{ path = $p; identity = $id }
         }
         # A nested receipted target (approvals\) must match its receipt too, though it goes with its parent.
-        if (-not $legacy) {
-          foreach ($p in ($full | Where-Object { $top -notcontains $_ })) {
-            if (Test-Path -LiteralPath $p) {
-              $h = [HvMcpStorage]::Open($p)
-              $holder = $top | Where-Object { $p.ToLowerInvariant().StartsWith($_.ToLowerInvariant() + '\') } | Select-Object -First 1
-              [void]$targetPins[$holder].Add($h)
-              if ([HvMcpStorage]::Identity($h) -ne $receipts[$p.ToLowerInvariant()]) { throw "$p isn't the folder setup created (its identity differs from its receipt). Nothing was changed." }
-            }
+        foreach ($p in ($full | Where-Object { $top -notcontains $_ })) {
+          if (Test-Path -LiteralPath $p) {
+            $h = [HvMcpStorage]::Open($p)
+            $holder = $top | Where-Object { $p.ToLowerInvariant().StartsWith($_.ToLowerInvariant() + '\') } | Select-Object -First 1
+            [void]$targetPins[$holder].Add($h)
+            if ([HvMcpStorage]::Identity($h) -ne $receipts[$p.ToLowerInvariant()]) { throw "$p isn't the folder setup created (its identity differs from its receipt). Nothing was changed." }
           }
         }
         # The state folder, which quiesce reads and writes as admin, must be one of the verified targets.
@@ -190,40 +190,40 @@ function Invoke-Teardown {
         }
       }
       $helper = & $Ops.HelperStatus
-      if ($Mode -eq 'remove') {
+      if ($helper -and $helper.job) { throw "A pool job is running ($($helper.job)): wait for it, then run this again. Nothing was changed." }
+      # What would stop a remove (read-only): asked for one, it refuses now; asked to choose, the question says so.
+      $removeWhy = $null
+      if ($Mode -ne 'keep') {
         $vms = if ($helper) { [int]$helper.vms } else { $null }
-        $stateHere = Test-Path -LiteralPath $State
-        if ($null -eq $vms -and $stateHere) { throw 'The helper isn''t running, so its VMs can''t be confirmed removed: start it (Start-Service HyperVMcp) and run this again. Nothing was changed.' }
-        if ($helper -and $helper.job) { throw "A pool job is running ($($helper.job)): wait for it, then run this again. Nothing was changed." }
+        if ($null -eq $vms -and (Test-Path -LiteralPath $State)) { $removeWhy = 'The helper isn''t running, so its VMs can''t be confirmed removed: start it (Start-Service HyperVMcp) and run this again.' }
         foreach ($t in $targets) {
+          if ($removeWhy) { break }
           $pool = Join-Path $t.path 'pool'
           $left = @(if (Test-Path -LiteralPath $pool) { Get-ChildItem -LiteralPath $pool -Force })
-          if ($left.Count -and -not $vms) { throw "$pool still holds $($left.Count) item(s) ($($left[0].FullName)) while the helper reports no VMs: inspect them first. Nothing was changed." }
+          if ($left.Count -and -not $vms) { $removeWhy = "$pool still holds $($left.Count) item(s) ($($left[0].FullName)) while the helper reports no VMs: inspect them first." }
         }
-      } elseif ($helper -and $helper.job) { throw "A pool job is running ($($helper.job)): wait for it, then run this again. Nothing was changed." }
-      # A legacy transaction (deleting, or keeping, an older setup's storage) is the admin's explicit decision on the
-      # printed inventory; only then may a record and an InstallId be written for it.
+      }
+      if ($Mode -eq 'remove' -and $removeWhy) { throw "$removeWhy Nothing was changed." }
       if ($WhatIf) {
-        & $say "Verified. $(if ($Mode -eq 'remove') { "Would remove the pool$(if ($helper) { " ($($helper.vms) VM(s), through the helper's approved remove plan)" }), then these folders: $(@($targets | Where-Object { $_.identity } | ForEach-Object { $_.path }) -join ', ')" } else { "Would keep the pool and these folders: $(@($targets | Where-Object { $_.identity } | ForEach-Object { $_.path }) -join ', ')" }); then the service, its rights, the group and the install folder."
+        & $say "Verified. $(if ($Mode -ne 'keep') { "Would remove the pool$(if ($helper) { " ($($helper.vms) VM(s), through the helper's remove plan)" }), then these folders: $(@($targets | Where-Object { $_.identity } | ForEach-Object { $_.path }) -join ', ')" } else { "Would keep the pool and these folders: $(@($targets | Where-Object { $_.identity } | ForEach-Object { $_.path }) -join ', ')" }); then the service, its rights, the group and the install folder."
         return
       }
-      if ($legacy) {
-        $inv = if ($Mode -eq 'remove') { @($targets | Where-Object { $_.identity } | ForEach-Object { "DELETE $(Get-Inventory $_.path)" }) }
-          else { @(@($State, $LegacyDiskFolder) | Where-Object { Test-Path -LiteralPath $_ } | ForEach-Object { "KEEP $(Get-Inventory $_)" }) }
-        if (-not (& $Ops.ConfirmInventory $inv)) { throw 'The inventory was not confirmed: nothing was changed.' }
-      }
-      # The record, written once (its mode, options, generation and targets never change), in the protected key.
-      if (-not $key) {
-        if (-not $legacy -and $Mode -eq 'remove') { throw 'internal: no key' }
-        $rk = Open-ReceiptKey $Root "$KeyPath\Storage" $Trusted $KeyOwner; $rk.Dispose()
-        $key = $Root.OpenSubKey($KeyPath, $true)
-      }
-      if (-not $installId) {
-        if (-not $legacy) { throw 'The installation has no InstallId (it wasn''t made by this setup): for an older install, name its disk folder with -LegacyDiskFolder. Nothing was changed.' }
-        $installId = [guid]::NewGuid().ToString('n') # bootstrapped only inside the confirmed legacy transaction
-        $key.SetValue('InstallId', $installId)
-      }
-      $rec = [pscustomobject]@{ id = [guid]::NewGuid().ToString('n'); installId = $installId; mode = $Mode; legacyDiskFolder = [string]$LegacyDiskFolder; targets = $targets; phase = 'verified' }
+      # MC-1583: the one confirmation, from what was just verified: the VMs as the helper's own remove plan names them
+      # (by id, name and folder; the plan changes nothing), and each folder with what it holds. One answer: remove or
+      # keep (or, with a mode given, that one). Nothing has been written, quiesced or stopped before it.
+      $planned = @()
+      if ($Mode -ne 'keep' -and -not $removeWhy -and $helper -and [int]$helper.vms -gt 0) { $planned = @((& $Ops.PlanRemove).vms) }
+      $folders = @($targets | Where-Object { $_.identity } | ForEach-Object { Get-Inventory $_.path })
+      $choice = & $Ops.Confirm @{ mode = $Mode; vms = $planned; folders = $folders; removeWhy = $removeWhy }
+      if ($choice -ne 'remove' -and $choice -ne 'keep') { & $say 'Cancelled: nothing was changed.'; return 'cancelled' }
+      if ($Mode -ne 'ask' -and $choice -ne $Mode) { throw "internal: the answer ($choice) isn't the mode asked ($Mode)" }
+      if ($choice -eq 'remove' -and $removeWhy) { throw "$removeWhy Nothing was changed." }
+      $Mode = $choice
+      if (-not $key) { throw 'internal: no key' }
+      if (-not $installId) { throw 'The installation has no InstallId (it wasn''t made by setup): nothing was changed.' }
+      # The record, written once (its mode, generation and targets never change; the confirmed VMs only on a new answer),
+      # in the protected key.
+      $rec = [pscustomobject]@{ id = [guid]::NewGuid().ToString('n'); installId = $installId; mode = $Mode; targets = $targets; pool = @(if ($Mode -eq 'remove') { $planned }); phase = 'verified' }
       Write-Teardown $key $rec
       & $boundary 'after:record'
       & $say "Verified; the uninstall record is written ($Mode)."
@@ -252,19 +252,34 @@ function Invoke-Teardown {
       if ($s -ne 'stopped' -and $s -ne 'missing') { throw "The service is $s, not stopped: the uninstall stopped." }
     }
 
-    # ---- Phase 2: the pool, through the helper (quiesce; the approved exact-plan remove). ----
+    # ---- Phase 2: the pool, through the helper (quiesce; then the remove plan, approved only for the confirmed VMs). ----
     if ($phase -lt 1) {
       $helper = & $Ops.HelperStatus
       if ($helper) {
         & $boundary 'before:quiesce'
         & $Ops.Quiesce $(if ($Mode -eq 'remove') { 'remove-pool' } else { 'keep-pool' })
         & $boundary 'after:quiesce'
-        if ($Mode -eq 'remove' -and [int]$helper.vms -gt 0) {
-          & $boundary 'before:remove-pool'
-          $left = & $Ops.RemovePool
-          if ([int]$left -ne 0) { throw "The helper still lists $left VM(s) after the remove: see pool_status. The uninstall stopped; run it again once that is resolved." }
-          & $boundary 'after:remove-pool'
-          & $say 'The pool is removed.'
+        if ($Mode -eq 'remove') {
+          # MC-1583: a fresh remove plan (the helper's state may have moved on; a plan lasts 30 minutes), and its VMs
+          # compared with the confirmed ones, always: an empty confirmation never covers a VM made since. Any difference
+          # (one added, one replaced, the count alike or not) is asked again before anything is approved; a no stops
+          # with the record kept, so a rerun asks again.
+          $plan = if ([int]$helper.vms -gt 0) { & $Ops.PlanRemove } else { $null }
+          $live = @(if ($plan) { $plan.vms })
+          $confirmed = @(if ($rec.PSObject.Properties['pool']) { $rec.pool })
+          if ((Get-VmSetKey $live) -ne (Get-VmSetKey $confirmed)) {
+            if (-not (& $Ops.ConfirmChange $confirmed $live)) { throw 'The pool changed since you confirmed what goes: nothing more was approved or removed. Run the uninstaller again to decide on the pool as it is now.' }
+            $rec | Add-Member -NotePropertyName pool -NotePropertyValue $live -Force
+            Write-Teardown $key $rec
+            & $boundary 'after:reconfirm'
+          }
+          if ($live.Count) {
+            & $boundary 'before:remove-pool'
+            $left = & $Ops.RemovePool $plan.planId
+            if ([int]$left -ne 0) { throw "The helper still lists $left VM(s) after the remove: see pool_status. The uninstall stopped; run it again once that is resolved." }
+            & $boundary 'after:remove-pool'
+            & $say 'The pool is removed.'
+          }
         }
       } elseif ($Mode -eq 'remove' -and (Test-Path -LiteralPath $State) -and @($rec.targets | Where-Object { $_.identity }).Count) {
         throw 'The helper isn''t running, so the pool can''t be confirmed removed: start it (Start-Service HyperVMcp) and run this again.'
@@ -343,6 +358,7 @@ function Invoke-Teardown {
     $key.Dispose(); $key = $null
     if ($empty) { $Root.DeleteSubKeyTree($KeyPath, $false); & $say "Removed the registry key $KeyPath." }
     & $say "Uninstall finished ($Mode)."
+    return $Mode # MC-1583: the mode chosen (the question's answer, or the recorded one on a resume)
   } finally {
     foreach ($l in $targetPins.Values) { Close-Pins $l }
     Close-Pins $pins

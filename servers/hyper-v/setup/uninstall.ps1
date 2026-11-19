@@ -4,21 +4,23 @@
 #   cmd /c call "C:\Program Files\hyperv-mcp\uninstall.cmd"
 #   cmd /c call "<repo>\servers\hyper-v\setup\uninstall.cmd" -KeepPool
 #   cmd /c call "<repo>\servers\hyper-v\setup\uninstall.cmd" -RemovePool
-# With neither option it shows the helper's recorded inventory and asks: remove everything (the default), keep the pool,
-# or list only. -WhatIf lists what each would remove and changes nothing (no record, no approval, no service change).
-# For an install made by an older setup (no storage receipts), also name its disk folder: -LegacyDiskFolder D:\hyperv-mcp
-# (you'll be shown exactly what it will delete, and asked to type DELETE).
+# MC-1583: it verifies first, changing nothing, then shows what goes (the VMs as the helper's own remove plan names them,
+# each folder with what it holds, the service, group, install folder and Installed apps entry) and asks once: REMOVE to
+# remove everything, KEEP to keep the pool (with -RemovePool or -KeepPool, only that one). That answer is the approval of
+# the helper's remove plan, for exactly the VMs shown: if the pool changes before they go, it asks again. -WhatIf says
+# what would go and changes nothing (no record, no approval, no service change). An install from before storage receipts
+# (only the unreleased builds of 13 Nov) is refused: the README's Uninstall gives its manual steps.
 #
 #   -KeepPool   removes the service, its rights, the group and the code, and KEEPS the pool's VMs, the helper's state and
 #               the disk folders, with their storage receipts: running setup again recognises them.
-#   -RemovePool removes the pool first, through the helper's own journalled remove (you approve that plan as usual), then
-#               the storage setup created (only folders it can verify as setup's: see teardown.ps1), then everything else.
+#   -RemovePool removes the pool first, through the helper's own journalled remove, then the storage setup created (only
+#               folders it can verify as setup's: see teardown.ps1), then everything else.
 # The steps and their order, the record that lets an interrupted uninstall be finished by running it again with the same
 # options, and what may be deleted, are in teardown.ps1. The Installed apps entry, its launcher and the last phase that
 # retires the uninstaller itself are in appsentry.ps1.
-#   -Interactive the menu (the default with neither option); -Retire only the last phase (the entry's launcher runs it
-#   from uninstall.retiring\); -FromCopy internal: run from the protected temporary copy of an installed uninstaller.
-param([switch]$KeepPool, [switch]$RemovePool, [switch]$Interactive, [switch]$WhatIf, [switch]$Retire, [string]$LegacyDiskFolder, [ValidateSet('Service', 'Direct')][string]$Mode = 'Service', [string]$User = [Security.Principal.WindowsIdentity]::GetCurrent().Name, [string]$FromCopy)
+#   -Interactive the question (the default with neither option); -Retire only the last phase (the entry's launcher runs
+#   it from uninstall.retiring\); -FromCopy internal: run from the protected temporary copy of an installed uninstaller.
+param([switch]$KeepPool, [switch]$RemovePool, [switch]$Interactive, [switch]$WhatIf, [switch]$Retire, [ValidateSet('Service', 'Direct')][string]$Mode = 'Service', [string]$User = [Security.Principal.WindowsIdentity]::GetCurrent().Name, [string]$FromCopy)
 $ErrorActionPreference = 'Stop'
 # Runs under Windows PowerShell 5.1 or PowerShell 7 (MC-1575). Under 5.1 started from a PowerShell 7 window, it
 # inherits PS7's module folders and can't load its own Get-Acl: drop them (only under 5.1: they are 7's own).
@@ -29,10 +31,6 @@ function PipeOpen { return [bool]([IO.Directory]::GetFiles('\\.\pipe\') | Where-
 $me = New-Object Security.Principal.WindowsPrincipal ([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run this in an admin terminal (Run as administrator).' }
 if ($KeepPool -and $RemovePool) { throw 'Choose -KeepPool or -RemovePool, not both.' }
-if ($LegacyDiskFolder) {
-  $LegacyDiskFolder = [IO.Path]::GetFullPath($LegacyDiskFolder).TrimEnd('\')
-  if ($LegacyDiskFolder -notmatch '^[A-Za-z]:\\[^\\]+$' -or (New-Object IO.DriveInfo $LegacyDiskFolder.Substring(0, 2)).DriveType -ne 'Fixed') { throw '-LegacyDiskFolder must be a top-level folder on a local fixed drive, such as D:\hyperv-mcp.' }
-}
 . (Join-Path $PSScriptRoot 'acl.ps1')
 . (Join-Path $PSScriptRoot 'teardown.ps1')
 . (Join-Path $PSScriptRoot 'appsentry.ps1')
@@ -134,25 +132,59 @@ $ops = @{
     if ($res.isError) { throw "$($res.text) Uninstall stopped: fix or remove that VM, then run this again." }
     Step $res.text
   }
-  RemovePool = {
+  # MC-1583: the helper's remove plan (it changes nothing), and its VMs as the plan file it wrote names them.
+  PlanRemove = {
     $plan = Invoke-Helper 'pool_plan' @{ action = 'remove' }
-    Write-Host $plan.text
-    & (Join-Path $install 'approve.ps1') -Plan $plan.data.planId
-    if ($LASTEXITCODE -ne 0) { throw 'The remove plan was not approved: no VM was removed. Run this again to approve it.' }
-    $job = Invoke-Helper 'pool_remove' @{ planId = $plan.data.planId }
+    $id = [string]$plan.data.planId
+    if ($id -notmatch '^p-[0-9a-f]{16}$') { throw "The helper gave no remove plan: $($plan.text)" }
+    $p = [IO.File]::ReadAllText((Join-Path $state "plans\$id.json"), [Text.Encoding]::UTF8) | ConvertFrom-Json
+    if ($p.id -ne $id -or $p.op -ne 'remove') { throw "The helper's plan $id isn't a remove plan." }
+    [pscustomobject]@{ planId = $id; vms = @($p.remove | Where-Object { $_ } | ForEach-Object { [pscustomobject]@{ vmId = [string]$_.vmId; name = [string]$_.name; folder = [string]$_.folder } }) }
+  }
+  # MC-1583: the one question, after verification: what goes and what stays, then REMOVE or KEEP.
+  Confirm = {
+    param($info)
+    Write-Host ''
+    if ($info.mode -ne 'keep') {
+      Write-Host 'Remove everything (REMOVE):' -ForegroundColor Yellow
+      if ($info.removeWhy) { Write-Host "  not possible now: $($info.removeWhy)" }
+      else {
+        $vms = @($info.vms)
+        Write-Host "  the pool's $($vms.Count) VM(s), with their checkpoints$(if (-not $vms.Count) { ' (none)' })"
+        foreach ($v in $vms) { Write-Host "    $($v.name) (id $($v.vmId)) in $($v.folder)" }
+        foreach ($f in @($info.folders)) { Write-Host "  the folder $f" }
+        Write-Host '  setup''s host-mode switch, the service, its rights, the group, the install folder, the registry records and the Installed apps entry'
+      }
+    }
+    if ($info.mode -ne 'remove') {
+      Write-Host 'Keep the pool (KEEP):' -ForegroundColor Yellow
+      Write-Host '  keeps the VMs, their checkpoints, cached images, the disk folders and the helper''s state, with their records (setup recognises them when run again);'
+      Write-Host '  removes the service, its rights, the group, the vsock registration, setup''s host-mode switch (setup makes it again), the install folder and the Installed apps entry'
+    }
+    $ask = switch ($info.mode) { 'remove' { 'Type REMOVE to go ahead' } 'keep' { 'Type KEEP to go ahead' } default { 'Type REMOVE to remove everything, or KEEP to keep the pool' } }
+    $a = (Read-Host "$ask (anything else cancels, with nothing changed)").Trim()
+    if ($a -ceq 'REMOVE' -and $info.mode -ne 'keep') { 'remove' } elseif ($a -ceq 'KEEP' -and $info.mode -ne 'remove') { 'keep' } else { $null }
+  }
+  # MC-1583: the pool changed since the answer: the new VMs beside the confirmed ones, and the question again.
+  ConfirmChange = {
+    param($was, $now)
+    Write-Host ''
+    Write-Host 'The pool changed since you confirmed what goes:' -ForegroundColor Yellow
+    Write-Host "  you confirmed $(@($was).Count) VM(s): $((@($was) | ForEach-Object { "$($_.name) ($($_.vmId))" }) -join ', ')"
+    Write-Host "  it now has $(@($now).Count): $((@($now) | ForEach-Object { "$($_.name) ($($_.vmId)) in $($_.folder)" }) -join ', ')"
+    ((Read-Host 'Type REMOVE to remove the pool as it is now (anything else stops: nothing more is removed)').Trim() -ceq 'REMOVE')
+  }
+  # The confirmed plan approved (approve.ps1 -Confirmed: every check but the digest question, for a remove plan only),
+  # then run through the helper.
+  RemovePool = {
+    param($planId)
+    & (Join-Path $install 'approve.ps1') -Plan $planId -Confirmed
+    if ($LASTEXITCODE -ne 0) { throw 'The remove plan was not approved: no VM was removed. Run this again.' }
+    $job = Invoke-Helper 'pool_remove' @{ planId = $planId }
     Step $job.text
     do { Start-Sleep 3; $st = Invoke-Helper 'status' } while ($st.data.job)
     if ($st.data.lastJob -and -not $st.data.lastJob.ok) { throw "The remove job failed: $($st.data.lastJob.note)" }
     return [int]$st.data.vms
-  }
-  ConfirmInventory = {
-    param($lines)
-    $word = if (@($lines | Where-Object { $_ -like 'DELETE *' }).Count) { 'DELETE' } else { 'KEEP' }
-    Write-Host ''
-    Write-Host 'This uninstall will act on these folders, made by an older setup (they have no storage receipts):' -ForegroundColor Yellow
-    foreach ($l in $lines) { Write-Host "  $l" }
-    Write-Host 'Their present owners and permissions were checked; that is no proof of their history, so this is your decision.'
-    return ((Read-Host "Type $word to go ahead (anything else stops, with nothing changed)") -ceq $word)
   }
 }
 
@@ -170,7 +202,7 @@ function Show-Inventory {
   if (Test-Path -LiteralPath $inventoryFile) { Write-Host ''; Get-Content -LiteralPath $inventoryFile | ForEach-Object { Write-Host "  $_" }; Write-Host '' }
   else { Step "No recorded inventory ($inventoryFile isn't there)." }
 }
-# What keep and remove each mean, as the menu, -WhatIf and the leftover check judge them.
+# What keep and remove each mean, as -WhatIf and the leftover check judge them.
 function Show-Choices {
   Write-Host 'Remove everything (R): the pool''s VMs and their checkpoints, cached images, the disk folders, the helper''s state, setup''s host-mode switch, the service, its rights, the group, the install folder, the registry records and this Installed apps entry.'
   Write-Host 'Keep the pool (K): keeps the VMs and their checkpoints, cached images, the disk folders and the helper''s state with their records (setup recognises them when run again); removes the service, its rights, the group, the vsock registration, setup''s host-mode switch (setup makes it again), the install folder and this Installed apps entry.'
@@ -212,14 +244,10 @@ $X = @{
   EntryHere = { $e = $HKLM.OpenSubKey($script:EntryKeyPath); if ($e) { $e.Dispose(); $true } else { $false } }
   ShowInventory = { Show-Inventory }
   ShowChoices = { Show-Choices }
-  Ask = {
-    $a = Read-Host 'Remove everything (R, the default), keep the pool (K), list only (L), anything else cancels'
-    switch -Regex ($a) { '^\s*[Rr]?\s*$' { 'remove' } '^\s*[Kk]\s*$' { 'keep' } '^\s*[Ll]\s*$' { 'list' } default { $null } }
-  }
   Teardown = {
     param($m, $w)
-    Invoke-Teardown -Mode $m -State $state -Install $install -LegacyDiskFolder $LegacyDiskFolder -Root $HKLM -KeyPath $keyPath `
-      -Trusted $trustedKey -RootOwners @($SYSTEM, $ADMINS) -Who @($SYSTEM, $ADMINS, $runnerSid) -KeyOwner $ADMINS -Ops $ops -WhatIf:$w
+    Invoke-Teardown -Mode $m -State $state -Install $install -Root $HKLM -KeyPath $keyPath `
+      -Trusted $trustedKey -RootOwners @($SYSTEM, $ADMINS) -Who @($SYSTEM, $ADMINS, $runnerSid) -Ops $ops -WhatIf:$w
   }
   # MC-1556: setup's host-mode switch (its name and the Notes setup wrote, never the name alone), with this PC's address
   # on it, in both modes (setup makes it again).

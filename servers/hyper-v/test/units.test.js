@@ -520,7 +520,9 @@ for (const E of ENGINES) test(`uninstall teardown under PowerShell ${E.name} (no
   const a = JSON.parse(line.slice(7))
   assert.strictEqual(a.full, 'ok')
   assert.strictEqual(a.fullGone, true, 'storage, components, receipts, InstallId and the record all gone')
-  assert.strictEqual(a.fullOrder, 'quiesce:remove-pool,remove-pool,stop,delete-service,rights,group', 'pool, then stop, then (after storage) the components')
+  // MC-1583: the remove plan and the one question first (nothing changed before the answer), then a fresh plan after
+  // quiesce, then the pool, the stop and (after storage) the components.
+  assert.strictEqual(a.fullOrder, 'plan,confirm,quiesce:remove-pool,plan,remove-pool,stop,delete-service,rights,group', 'pool, then stop, then (after storage) the components')
   assert.strictEqual(Object.keys(a.crashes).length, 25)
   for (const [b, c] of Object.entries(a.crashes)) {
     assert.deepStrictEqual(c, { first: true, second: 'ok', gone: true, strict: '' }, `a crash at ${b}, then a rerun`)
@@ -549,14 +551,12 @@ for (const E of ENGINES) test(`uninstall teardown under PowerShell ${E.name} (no
   assert.strictEqual(a.keep, 'ok'); assert.strictEqual(a.keepStorageKept, true, 'storage kept, record retired'); assert.strictEqual(a.keepReceiptsKept, 3)
   assert.strictEqual(a.keepThenRemove, 'ok'); assert.strictEqual(a.keepThenRemoveGone, true)
   assert.match(a.keepCrash, /CRASH:after:phase:stopped/)
-  assert.match(a.mismatchMode, /other options \(mode keep\).*Nothing was changed/)
-  assert.match(a.mismatchLegacy, /other options \(mode keep\)/)
+  assert.match(a.mismatchMode, /started with another choice \(mode keep\).*Nothing was changed/)
   assert.match(a.installDuring, /An uninstall is unfinished/)
-  assert.strictEqual(a.keepFinish, 'ok'); assert.strictEqual(a.installAfter, 'allowed')
-  // Legacy: refused unless admin-owned; nothing written unless confirmed; confirmed, removed.
-  assert.match(a.legacyNotAdmin, /is owned by S-1-5-21-.*Nothing was changed/); assert.strictEqual(a.legacyNotAdminNoKey, true)
-  assert.match(a.legacyDeclined, /not confirmed: nothing was changed/); assert.strictEqual(a.legacyDeclinedUnchanged, true)
-  assert.strictEqual(a.legacyConfirmed, 'ok'); assert.match(a.legacyInventory, /^DELETE .*: \d+ file\(s\)/); assert.strictEqual(a.legacyGone, true)
+  assert.strictEqual(a.keepFinish, 'ok', 'a resume with no option takes the recorded mode'); assert.strictEqual(a.installAfter, 'allowed')
+  // MC-1583: the legacy path is retired: storage without receipts is refused untouched, pointing to the manual steps.
+  assert.match(a.legacyRefused, /There are no storage receipts .*Nothing was changed\. \(An install from before storage receipts, an unreleased build of 13 Nov, is removed by hand: see the README's Uninstall\.\)/)
+  assert.strictEqual(a.legacyUntouched, true)
   // The service started again after 'stopped' (reboot, Start-Service): stopped again before the first deletion; and after
   // 'storage-removed': stopped before it is deleted.
   assert.match(a.restartCrash, /CRASH:after:phase:stopped/); assert.strictEqual(a.restartRerun, 'ok')
@@ -564,7 +564,6 @@ for (const E of ENGINES) test(`uninstall teardown under PowerShell ${E.name} (no
   assert.match(a.restart2Crash, /CRASH:after:phase:storage-removed/); assert.strictEqual(a.restart2Rerun, 'ok')
   assert.strictEqual(a.restart2Order, 'stop,delete-service,rights,group'); assert.strictEqual(a.restart2Gone, true)
   // Keep mode verifies the storage too: refusals with no side effect at all.
-  assert.match(a.keepLegacyNotAdmin, /is owned by S-1-5-21-/); assert.strictEqual(a.keepLegacyNotAdminQuiet, true)
   assert.match(a.keepJunction, /isn't as setup and the helper leave it/); assert.strictEqual(a.keepJunctionQuiet, true)
   assert.match(a.keepMismatch, /identity differs from its receipt/); assert.strictEqual(a.keepMismatchQuiet, true)
   // A resumed run re-verifies before acting (quiesce writes into the state folder).
@@ -585,6 +584,33 @@ for (const E of ENGINES) test(`uninstall teardown under PowerShell ${E.name} (no
   assert.strictEqual(a.keepsUninstall, 'ok')
   assert.strictEqual(a.keepsUninstallLeft, 'uninstall')
   assert.strictEqual(a.keepsUninstallFile, true)
+  // MC-1583: the one confirmation, bound to the exact VMs the helper's remove plan names.
+  const B = a.bind
+  const changed = /^The pool changed since you confirmed what goes: nothing more was approved or removed\. Run the uninstaller again/
+  const untouched = { phase: 'verified', removed: 0, storage: true }
+  assert.deepStrictEqual(B.normal, { result: 'ok', shownVms: ['vm-1', 'vm-2'], shownFolders: 2, asked: 1, reasked: 0, approved: true, gone: true, order: 'plan,confirm,quiesce:remove-pool,plan,remove-pool,stop,delete-service,rights,group' }, 'one question; the plan approved with no second one')
+  assert.deepStrictEqual(B.cancel, { result: 'cancelled', record: true, calls: 'plan,confirm', service: 'running' }, 'a no: nothing written, quiesced, stopped or removed')
+  assert.deepStrictEqual(B.askKeep, { result: 'ok', kept: true, removed: 0 })
+  assert.match(B.added.result, changed); assert.deepStrictEqual(B.added.change, { was: ['vm-1', 'vm-2'], now: ['vm-1', 'vm-2', 'vm-3'] }); assert.deepStrictEqual(B.added.after, untouched, 'a VM added: nothing removed, the record kept')
+  assert.deepStrictEqual(B.addedRerun, { result: 'ok', asked: 1, reasked: 2, gone: true }, 'the rerun asks again (not the first question), and a yes removes the pool as it is')
+  assert.match(B.replaced.result, changed); assert.deepStrictEqual(B.replaced.change, { was: ['vm-1', 'vm-2'], now: ['vm-9', 'vm-2'] }); assert.deepStrictEqual(B.replaced.after, untouched, 'the same count, another VM')
+  assert.match(B.zeroToOne.result, changed); assert.strictEqual(B.zeroToOne.shownVms, 0); assert.deepStrictEqual(B.zeroToOne.change, { was: [], now: ['vm-new'] }); assert.deepStrictEqual(B.zeroToOne.after, untouched, 'an empty confirmation never covers a VM made since')
+  assert.strictEqual(B.resumeEmpty.first, 'CRASH:after:record'); assert.match(B.resumeEmpty.result, changed); assert.strictEqual(B.resumeEmpty.asked, 1); assert.deepStrictEqual(B.resumeEmpty.change, { was: [], now: ['vm-late'] }); assert.deepStrictEqual(B.resumeEmpty.after, untouched)
+  assert.deepStrictEqual(B.resumeSame, { first: 'CRASH:after:record', result: 'ok', asked: 1, reasked: 0, gone: true }, 'a resume against the same VMs asks nothing more')
+  assert.deepStrictEqual(B.zeroStill, { result: 'ok', plans: 0, reasked: 0, gone: true }, 'none confirmed and none now: no plan, no second question')
+})
+
+// MC-1583: approve.ps1 -Confirmed (the uninstaller's) only for a remove plan: any other plan still needs its digest.
+// Its checks run in order, so a test copy run from the right folder is needed to reach them; here the check itself is
+// read from the script and run against both plan kinds.
+test('approve.ps1 -Confirmed: only for a remove plan, and the digest question is skipped only then', () => {
+  const src = fs.readFileSync(path.join(__dirname, '..', 'helper', 'approve.ps1'), 'utf8')
+  assert.match(src, /^param\(\[Parameter\(Mandatory = \$true\)\]\[string\]\$Plan, \[switch\]\$Confirmed\)$/m)
+  assert.match(src, /^if \(\$Confirmed -and \$p\.op -ne 'remove'\) \{ throw "-Confirmed is only for the uninstaller's remove plan/m)
+  const gate = src.indexOf("if ($Confirmed -and $p.op -ne 'remove')")
+  assert.ok(gate > src.indexOf("if ($p.expires -le $now)") && gate < src.indexOf('Write-Host "Plan ${Plan}'), 'after every other check, before anything is shown or written')
+  assert.match(src, /^if \(-not \$Confirmed\) \{\r?\n[\s\S]*?Read-Host 'To approve exactly this plan, type the first 6 characters of its digest/m)
+  assert.ok(src.indexOf('if (-not $Confirmed) {') < src.indexOf("$dir = Join-Path $state 'approvals'"), 'the question comes before the approval is written')
 })
 
 // MC-1581: install.ps1's -DiskFolder check, run as setup runs it (the block cut from the script): a folder at any depth
