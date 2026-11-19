@@ -231,14 +231,14 @@ test('policy: problems named; disk folders strictly inside; caps', () => {
   assert.match(policy.problems({ ...p, buildRoots: 'C:\\x' }).join(), /buildRoots must be a list/)
   assert.deepStrictEqual(policy.problems({ ...p, buildRoots: Array(40).fill('C:\\x') }), [], 'MC-1579: any number of them')
   // MC-1579: no ceilings of the policy's own; Hyper-V's own maximums, each named, and lower bounds where less can't work.
-  for (const ok of [{ maxVms: 1024 }, { maxCoresPerVm: 240 }, { maxMemoryMBTotal: 4 * 1024 * 1024 }, { maxDiskGBPerVm: 65536 }, { maxLeaseMinutes: 1, maxSessionMinutes: 1 }, { maxLeaseMinutes: 60 * 24 * 90, maxSessionMinutes: 60 * 24 * 365 }, { maxLeaseMinutes: 1e9, maxSessionMinutes: 1e9 }, { maxBuildMB: 1024 * 1024 }, { maxLeaseCheckpoints: 20, maxCheckpointsPerVm: 28 }, { minFreeGBForCheckpoint: 0 }, { minFreeGBForCheckpoint: 5000 }]) {
+  // Round 2: VMs, cores, memory and disk have no ceiling here (Hyper-V's own depend on its version, and it refuses past
+  // them itself); leases and sessions none (a session ends by JavaScript's last date: sessions.test.js).
+  for (const ok of [{ maxVms: 5000 }, { maxCoresPerVm: 4096 }, { maxMemoryMBTotal: 512 * 1024 * 1024 }, { maxDiskGBPerVm: 1024 * 1024 }, { maxLeaseMinutes: 1, maxSessionMinutes: 1 }, { maxLeaseMinutes: 60 * 24 * 90, maxSessionMinutes: 60 * 24 * 365 }, { maxLeaseMinutes: 1e9 + 1, maxSessionMinutes: Number.MAX_SAFE_INTEGER }, { maxBuildMB: 1024 * 1024 }, { maxLeaseCheckpoints: 20, maxCheckpointsPerVm: 28 }, { minFreeGBForCheckpoint: 0 }, { minFreeGBForCheckpoint: 5000 }]) {
     assert.deepStrictEqual(policy.problems({ ...p, ...ok }), [], JSON.stringify(ok))
   }
-  assert.match(policy.problems({ ...p, maxVms: 1025 }).join(), /maxVms must be 1-1024 \(Hyper-V runs at most 1024 VMs on a host\)/)
-  assert.match(policy.problems({ ...p, maxCoresPerVm: 241 }).join(), /maxCoresPerVm must be 1-240 \(Hyper-V's most virtual processors/)
-  assert.match(policy.problems({ ...p, maxDiskGBPerVm: 65537 }).join(), /a VHDX holds at most 64 TB/)
-  assert.match(policy.problems({ ...p, maxLeaseMinutes: 0 }).join(), /maxLeaseMinutes must be a whole number, 1-1000000000 \(a deadline must be a date JavaScript can hold\)/)
-  assert.match(policy.problems({ ...p, maxLeaseMinutes: 60, maxSessionMinutes: 1e9 + 1 }).join(), /maxSessionMinutes must be .* at most 1000000000/)
+  assert.match(policy.problems({ ...p, maxVms: 0 }).join(), /maxVms must be a whole number, at least 1/)
+  assert.match(policy.problems({ ...p, maxLeaseMinutes: 0 }).join(), /maxLeaseMinutes must be a whole number, at least 1/)
+  assert.match(policy.problems({ ...p, maxLeaseMinutes: Number.MAX_SAFE_INTEGER + 2 }).join(), /maxLeaseMinutes must be a whole number/)
   assert.match(policy.problems({ ...p, maxCheckpointsPerVm: 49 }).join(), /maxCheckpointsPerVm must be 0-48/)
   assert.match(policy.problems({ ...p, maxLeaseCheckpoints: 25, maxCheckpointsPerVm: 24 }).join(), /together must be at most 48 \(they are 49\): Hyper-V keeps at most 50 checkpoints of a VM/)
   assert.match(policy.problems({ ...p, maxLeaseCheckpoints: 45 }).join(), /they are 49/, 'with the other\'s default')

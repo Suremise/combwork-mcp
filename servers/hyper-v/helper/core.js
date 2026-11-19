@@ -84,6 +84,9 @@ const EVAL_LAST_MS = 60 * 60_000 // an evaluation VM with less than this left is
 const CHUNK_MAX = 1024 * 1024
 const MANIFEST_BATCH = 5000 // entries per manifest_add, at most (server.js sends batches of at most 1 MB of JSON)
 const MINUTE_MS = Number(process.env.HYPERV_MCP_MINUTE_MS || 60_000) // test-only: shorter lease minutes
+// MC-1579: the last moment a JavaScript date can hold (the year 275760). Leases and sessions have no ceiling of their
+// own, so a session ends no later than this: any later end couldn't be a date (toISOString would throw).
+const DATE_MAX_MS = 8.64e15
 // vm_acquire's queue (MC-1502): one request waits at most WAIT_MS (under a client's 60 s tool timeout), and a place in
 // line is kept KEEP_MS after a wait ends without a VM, for the caller's next vm_acquire. Test-only overrides.
 const WAIT_MS = Number(process.env.HYPERV_MCP_WAIT_MS || 20_000)
@@ -658,7 +661,7 @@ class Helper {
     const now = this.now()
     // An evaluation VM's lease never runs past its recorded end: the work session is capped there too.
     const licenceEnd = evalEnd(vm)
-    const sessionEnd = Math.min(now + policyMod.sessionMinutes(this.policy) * MINUTE_MS, licenceEnd ?? Infinity)
+    const sessionEnd = Math.min(now + policyMod.sessionMinutes(this.policy) * MINUTE_MS, licenceEnd ?? Infinity, DATE_MAX_MS)
     const lease = {
       leaseId: `l-${hex(6)}`, vmId: vm.vmId, vmName: vm.vmName, connId, ownerConn: connId, pid: c.pid, ending: null, children: new Set(),
       acquiredAt: now, sessionEnd, deadline: Math.min(sessionEnd, now + Math.round(minutes * MINUTE_MS)), keepOnFailure: !!keepOnFailure,
@@ -871,7 +874,7 @@ class Helper {
     const want = now + Math.round(minutes * MINUTE_MS)
     if (want > lease.sessionEnd) {
       const vm = this.state.vms.get(lease.vmId)
-      const why = vm && evalEnd(vm) === lease.sessionEnd ? `${lease.vmName}'s Windows evaluation ends then` : `the policy's maxSessionMinutes, ${policyMod.sessionMinutes(this.policy)} min from vm_acquire`
+      const why = vm && evalEnd(vm) === lease.sessionEnd ? `${lease.vmName}'s Windows evaluation ends then` : lease.sessionEnd === DATE_MAX_MS ? 'the last date JavaScript can hold' : `the policy's maxSessionMinutes, ${policyMod.sessionMinutes(this.policy)} min from vm_acquire`
       throw new Error(`That is past this work session's end, ${new Date(lease.sessionEnd).toISOString()} (${why}): at most ${Math.floor((lease.sessionEnd - now) / MINUTE_MS)} minutes now. Nothing was changed.`)
     }
     lease.deadline = want

@@ -124,7 +124,8 @@ using the new server: the helper's protocol and features changed, and an older h
   `HYPERV_MCP_COPY_IDLE_MINUTES`, still at most 9 (PowerShell Direct's call limit). New: `HYPERV_MCP_OUTPUT_BYTES`,
   `vm_run`'s output per stream (default 16384, formerly fixed), up to 1 MB.
 - The policy loses its own ceilings: leases and work sessions longer than 24 h, any number of projects, build roots and
-  project images (formerly 16), more cores, memory and disk up to Hyper-V's own maximums. The checkpoint counts may go
+  project images (formerly 16), and VMs, cores, memory and disk without a ceiling of setup's (Hyper-V refuses past its
+  own). The checkpoint counts may go
   up to Hyper-V's 50 per VM (formerly 8 each), and setup takes them: `-MaxLeaseCheckpoints`, `-MaxCheckpointsPerVm`,
   `-MinFreeGBForCheckpoint`. Image files have no size cap (formerly 16 GB for an ISO, 4 GB for a qcow2).
 - Without the rerun, the 4.1.0 helper keeps its ranges, and ignores `HYPERV_MCP_OUTPUT_BYTES` (16 KB).
@@ -1174,13 +1175,15 @@ Nothing here is a fixed limit of the server's own (MC-1579): each is a setting w
 only where a larger value breaks something, named with its reason.
 - **In the server's `env`** (see "Configuration"): the timings, `vm_run`'s output (`HYPERV_MCP_OUTPUT_BYTES`), the
   build size this server streams and the reply wait.
-- **In setup's policy** (an admin's, see "Setup"): VMs, cores, memory and disk, up to Hyper-V's own maximums (1024 VMs
-  on a host, 240 virtual processors and 12 TB of memory for one VM, a 64 TB VHDX), and a disk of at least 64 GB
-  (Windows 11 needs it); leases and work sessions of up to 10^9 minutes (formerly at most 24 h; the end must be a date JavaScript can hold, and a deadline past Node's
-  24.8-day timer is waited for in steps); `maxBuildMB` with no upper limit; any number of projects, of folders and
+- **In setup's policy** (an admin's, see "Setup"): VMs, cores, memory and disk with no ceiling of setup's (formerly 64
+  VMs, 64 cores, 1 TB, 4 TB). Hyper-V's own maximums depend on its version ([Microsoft's table](https://learn.microsoft.com/en-us/windows-server/virtualization/hyper-v/maximum-scale-limits)
+  lists Windows Server's, not Windows 11's), so Hyper-V itself refuses a VM past them, by name, when it is created. A
+  disk is at least 64 GB (Windows 11 needs it). Leases and work sessions have no ceiling (formerly 24 h): a deadline
+  past Node's 24.8-day timer is waited for in steps, and a session ends no later than the last date JavaScript can hold
+  (the year 275760); `maxBuildMB` with no upper limit; any number of projects, of folders and
   build roots, and of images in a project (formerly 16); and the checkpoint settings, `maxLeaseCheckpoints` (default
   3) and `maxCheckpointsPerVm` (default 4), which together may be at most 48: Hyper-V keeps at most 50 checkpoints of
-  a VM, and its clean checkpoint, with a second one while it is refreshed, takes 2. `minFreeGBForCheckpoint` (default
+  a VM (on every version Microsoft lists), and its clean checkpoint, with a second one while it is refreshed, takes 2. `minFreeGBForCheckpoint` (default
   20) may be 0.
 - **Images** have no size cap (formerly 16 GB for an ISO, 4 GB for a qcow2). A Linux image's disk is held to its
   virtual size, at most `maxDiskGBPerVm` (and VHD's own 2040 GB, the format it is converted through). The build's

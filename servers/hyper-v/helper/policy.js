@@ -28,25 +28,19 @@ const DEFAULTS = {
   buildRoots: []
 }
 
-// MC-1579: the policy's numbers have no ceiling of their own: an admin's cap may go up to what Hyper-V itself allows
-// (its documented maximums), and lower bounds stay only where a smaller value can't work.
-const HV = Object.freeze({
-  vms: 1024, // running VMs on one host
-  cores: 240, // virtual processors in one generation 2 VM
-  memoryMB: 12 * 1024 * 1024, // memory in one generation 2 VM (12 TB)
-  diskGB: 64 * 1024, // one VHDX (64 TB)
-  checkpoints: 50 // checkpoints of one VM
-})
+// MC-1579: the policy's numbers have no ceiling of their own, and lower bounds stay only where a smaller value can't
+// work. VMs, cores, memory and disk have none here: their maximums depend on the host's Hyper-V version, so Hyper-V itself
+// refuses a VM beyond them, by name, when it is created. The one Hyper-V limit checked here is the checkpoints of a VM:
+// 50 on every version Microsoft lists (Windows Server 2016 to 2025), and passing it would fail a checkpoint mid-lease.
+const HV = Object.freeze({ checkpoints: 50 })
 // A VM holds its clean checkpoint, its pool checkpoints (maxCheckpointsPerVm, counting retiring ones and ones being
 // taken), the lease's own (maxLeaseCheckpoints), and for a moment during a refresh a second clean one: so the two
 // policy numbers together may be at most Hyper-V's 50 less those 2.
 const CHECKPOINTS_FREE = HV.checkpoints - 2
 const DEFAULT_LEASE_CHECKPOINTS = 3
 const DEFAULT_POOL_CHECKPOINTS = 4
+// Whole numbers stay exact up to here; a larger one would be rounded.
 const ANY = Number.MAX_SAFE_INTEGER
-// A lease or session must end on a date JavaScript can hold (its dates stop in the year 275760): 10^9 minutes, about
-// 1900 years, stays well inside that.
-const MINUTES_MAX = 1e9
 const PROJECT_RE = /^[a-z][a-z0-9-]{0,31}$/
 const OSES = ['windows', 'linux']
 /** A project's cap as { os: n }: a plain number means Windows (the only kind before images had an OS). */
@@ -64,10 +58,10 @@ function problems(p) {
   const out = []
   if (p.schema !== 1) out.push(`schema ${p.schema} is not 1`)
   if (!PREFIX_RE.test(p.prefix ?? '')) out.push('prefix must be 2-12 lower-case letters and digits, starting with a letter')
-  if (!int(p.maxVms, 1, HV.vms)) out.push(`maxVms must be 1-${HV.vms} (Hyper-V runs at most ${HV.vms} VMs on a host)`)
-  if (!int(p.maxCoresPerVm, 1, HV.cores)) out.push(`maxCoresPerVm must be 1-${HV.cores} (Hyper-V's most virtual processors for one VM)`)
+  if (!int(p.maxVms, 1, ANY)) out.push('maxVms must be a whole number, at least 1')
+  if (!int(p.maxCoresPerVm, 1, ANY)) out.push('maxCoresPerVm must be a whole number, at least 1')
   if (!int(p.maxMemoryMBTotal, 2048, ANY)) out.push('maxMemoryMBTotal must be a whole number, at least 2048')
-  if (!int(p.maxDiskGBPerVm, 64, HV.diskGB)) out.push(`maxDiskGBPerVm must be 64-${HV.diskGB} (Windows 11 needs 64 GB; a VHDX holds at most 64 TB)`)
+  if (!int(p.maxDiskGBPerVm, 64, ANY)) out.push('maxDiskGBPerVm must be a whole number, at least 64 (Windows 11 needs 64 GB)')
   if (!Array.isArray(p.diskFolders) || !p.diskFolders.length) out.push('diskFolders must name at least one folder')
   else for (const f of p.diskFolders) if (typeof f !== 'string' || !win32.isAbsolute(f) || /^\\\\/.test(f) || win32.parse(f).root === win32.normalize(f)) out.push(`disk folder "${f}" must be an absolute local folder, not a drive root`)
   // MC-1556: the highest network mode a pool may be planned with (setup's -MaxNetwork). A policy from before it has
@@ -79,10 +73,10 @@ function problems(p) {
   out.push(...timing.capsProblems(p.timingCaps)) // MC-1558: each a known key, a number within its floor and maximum
   if (!int(p.maxReservePercent, 0, 100)) out.push('maxReservePercent must be 0-100')
   // MC-1579: leases and sessions have no ceiling (formerly 24 h): the helper waits for a deadline past Node's timer
-  // limit in steps.
-  if (!int(p.maxLeaseMinutes, 1, MINUTES_MAX)) out.push(`maxLeaseMinutes must be a whole number, 1-${MINUTES_MAX} (a deadline must be a date JavaScript can hold)`)
+  // limit in steps, and ends a session no later than the last date JavaScript can hold (core.js, DATE_MAX_MS).
+  if (!int(p.maxLeaseMinutes, 1, ANY)) out.push('maxLeaseMinutes must be a whole number, at least 1')
   // A work session's cap (vm_renew), optional so a policy from before it stays usable; never below one lease.
-  if (p.maxSessionMinutes !== undefined && (!int(p.maxSessionMinutes, 1, MINUTES_MAX) || p.maxSessionMinutes < p.maxLeaseMinutes)) out.push(`maxSessionMinutes must be a whole number, at least maxLeaseMinutes and at most ${MINUTES_MAX}`)
+  if (p.maxSessionMinutes !== undefined && (!int(p.maxSessionMinutes, 1, ANY) || p.maxSessionMinutes < p.maxLeaseMinutes)) out.push('maxSessionMinutes must be a whole number, at least maxLeaseMinutes')
   if (!int(p.maxBuildMB, 1, ANY)) out.push('maxBuildMB must be a whole number, at least 1')
   // MC-1529: lease checkpoints, optional (defaults 3 and 20 GB): how many one lease may hold, and the free space the
   // VM folder's drive must keep for a take.
@@ -138,8 +132,8 @@ function projectProblems(projects) {
     }
     // maxVms: a whole number (Windows), or by OS: { "windows": 2, "linux": 1 }; 0 means the project may not use that OS.
     const v = pr.maxVms
-    if (v !== undefined && !(int(v, 0, HV.vms) || (v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length && Object.entries(v).every(([os, n]) => OSES.includes(os) && int(n, 0, HV.vms))))) {
-      out.push(`${at}: maxVms must be a whole number 0-${HV.vms}, or one per OS (${OSES.join(', ')}), such as { "windows": 2, "linux": 1 }`)
+    if (v !== undefined && !(int(v, 0, ANY) || (v && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length && Object.entries(v).every(([os, n]) => OSES.includes(os) && int(n, 0, ANY))))) {
+      out.push(`${at}: maxVms must be a whole number, at least 0, or one per OS (${OSES.join(', ')}), such as { "windows": 2, "linux": 1 }`)
     }
     if (pr.images !== undefined && (!Array.isArray(pr.images) || pr.images.some(i => typeof i !== 'string' || !/^[0-9a-f]{64}$/i.test(i)))) out.push(`${at}: images must be a list of image SHA-256s (64 hex digits)`)
     if (pr.buildRoots !== undefined) {
@@ -178,7 +172,7 @@ function checkPool(policy, vms, { network = 'none' } = {}) {
   if (mem > policy.maxMemoryMBTotal) out.push(`${mem} MB of memory in all is more than the policy's ${policy.maxMemoryMBTotal} MB`)
   for (const v of vms) {
     if (!int(v.cores, 1, policy.maxCoresPerVm)) out.push(`${v.cores} cores for one VM is outside the policy's 1-${policy.maxCoresPerVm}`)
-    if (!int(v.memoryMB, 2048, Math.min(policy.maxMemoryMBTotal, HV.memoryMB)) || v.memoryMB % 2) out.push(`${v.memoryMB} MB for one VM must be an even number of MB, at least 2048`)
+    if (!int(v.memoryMB, 2048, policy.maxMemoryMBTotal) || v.memoryMB % 2) out.push(`${v.memoryMB} MB for one VM must be an even number of MB, at least 2048`)
     if (!int(v.diskGB, 64, policy.maxDiskGBPerVm)) out.push(`a ${v.diskGB} GB disk is outside the policy's 64-${policy.maxDiskGBPerVm} GB`)
     if (!underDiskFolder(policy, v.folder)) out.push(`folder "${v.folder}" is not under one of the policy's disk folders`)
   }
