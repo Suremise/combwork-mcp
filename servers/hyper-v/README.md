@@ -761,6 +761,7 @@ each within its range and within setup's caps (below). vm_status shows the value
 | `HYPERV_MCP_PROVISION_MINUTES` | 30 | 15-120 | each account's first-logon provisioning at build |
 | `HYPERV_MCP_CLOUD_INIT_MINUTES` | 15 | 5-60 | cloud-init in a new Linux VM |
 | `HYPERV_MCP_COPY_IDLE_MINUTES` | 5 | 1-9 | a Windows build copy or vm_sync with no 32 MB part or file finished (below) |
+| `HYPERV_MCP_NETWORK_SECONDS` | 90 | 30-600 | a connected start's guest network: read back until it is right (a DHCP address, its route and DNS; or host mode's static address) and has held, then it goes on at once. This is only the ceiling (MC-1566) |
 
 - **Whose values apply.** A lease keeps the values its connection had when it was acquired: for everything done for it,
   its restore at release, disconnect or deadline included (which then runs to its own bound, but never runs guest work
@@ -1360,7 +1361,8 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   defaults for recovery, the queue place's, what server.js sends; the restore call holding the off-wait; a Windows copy
   in parts, past one call's bound, stalled, resumed and cancelled; guest-setup retried once after a timeout or a lost
   connection and never after another error, at build and at refresh; and no literal waits in the test files, which all
-  read `test\timing.json`.
+  read `test\timing.json`. MC-1566: the guest network's wait (`networkSeconds`) as a timing like the others, and on a
+  fake clock: accepted as soon as the read-back holds, given up at the lease's own ceiling with the setting named.
 - `uninstall.test.js` (MC-1557), removing everything without agents:
   - the recorded inventory: its label, each item's manual step (a quote in a path doubled), what's out of scope; the
     helper writing it at start and rewriting it after a create, resize and remove, never torn;
