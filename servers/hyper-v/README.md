@@ -257,7 +257,11 @@ approval → change**:
      4 minutes of observed quiet after it; a new completion, or a sample where App Readiness isn't done or can't be
      read, starts the quiet over. Unreadable or disabled App Readiness logs are never taken as done. If it doesn't
      finish within the account's 30 minutes, the build fails, and its reason gives App Readiness's state (tasks left,
-     a "resume at" deferral). The job's note gives each account's settled counts. This replaces MC-1527's 13-minute
+     a "resume at" deferral). That deferral isn't charged to the 30 minutes (MC-1562): right after an account's first
+     logon, Windows suspends part of its app setup for a fixed time (event 216, "will resume at", 16 minutes on 26200),
+     which took most of the budget, so the quiet after it didn't fit in a slower build. Each suspension's length, from
+     its own 216 on the guest's clock, moves the account's deadline on, by one budget at most; the job's note says how
+     long it was, and a late failure says what was credited. The job's note gives each account's settled counts. This replaces MC-1527's 13-minute
      floor: it's Windows' own marker, not a timing, though it's so far confirmed on one Windows build only. A build's
      logon attempt waits up to 15 minutes (a start's waits 10). One still waiting at 10 minutes
      gets a read-only snapshot of the guest, and a failed one a snapshot before its undo (MC-1520). The snapshot keeps
@@ -1187,7 +1191,8 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
 - `provision-readiness.test.js`, the wait for App Readiness (MC-1528) on a fake clock: no acceptance while it's
   pending, even when everything else is unchanged; the quiet counted only after it finishes, and started over by new
   work, a new completion or an unreadable sample; unknown (or a probe without it) never accepted; never finishing
-  failing late with its state; every call bounded. `provision.test.js` checks it through the stub (the post-wave counts
+  failing late with its state; every call bounded; App Readiness's own suspension (MC-1562) credited once, by one
+  budget at most, and none for a backwards, unreadable or older-probe one. `provision.test.js` checks it through the stub (the post-wave counts
   and the allowlisted state in the record; never finishing, or unreadable, rolled back with no ready record), and
   `interactive.test.js` runs hv.ps1's own App Readiness parser on synthetic events worded as Windows words them.
 - `provision-clock.test.js`, the real provisioning and logon methods on a fake clock: one provisioning deadline per

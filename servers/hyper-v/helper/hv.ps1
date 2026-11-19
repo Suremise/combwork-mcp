@@ -627,10 +627,11 @@ $ProfileCounts = {
 # tests run it. $events: AppReadiness Admin/Operational events of this boot (Id, TimeCreated, RecordId, Message), or
 # $null when a log couldn't be read (then done is $null: never evidence). Done = a 211 ("completed tasks for <SID>")
 # naming the SID, the latest 240/241 for the SID at "tasks: 0", and no 240 (a task added) for the SID after that 211.
-# Also returned for the record: the task count, 216's "will resume at" and 217's resume, as UTC times.
+# Also returned for the record: the task count, 216's "will resume at" and 217's resume, as UTC times. MC-1562: and
+# 216's own time (suspendedAt), so the helper knows the suspension's length on the guest's one clock.
 $AppReadinessState = {
   param($events, $sid)
-  if ($null -eq $events) { return @{ done = $null; tasks = $null; completedAt = $null; completionId = $null; suspendedUntil = $null; resumedAt = $null } }
+  if ($null -eq $events) { return @{ done = $null; tasks = $null; completedAt = $null; completionId = $null; suspendedAt = $null; suspendedUntil = $null; resumedAt = $null } }
   $s = [regex]::Escape($sid)
   $mine = @($events | Where-Object { [string]$_.Message -match "$s(\b|')" } | Sort-Object TimeCreated, RecordId)
   $iso = { param($t) if ($t) { $t.ToUniversalTime().ToString('o') } else { $null } }
@@ -646,7 +647,7 @@ $AppReadinessState = {
   $res = @($mine | Where-Object { $_.Id -eq 217 }) | Select-Object -Last 1
   # completionId: the 211's Admin-log record id, the completion's generation (two in the same second still differ).
   $cid = if ($done211) { [long]$done211.RecordId } else { $null }
-  @{ done = [bool]($done211 -and $tasks -eq 0 -and -not $addedAfter); tasks = $tasks; completedAt = (& $iso $done211.TimeCreated); completionId = $cid; suspendedUntil = $until; resumedAt = (& $iso $res.TimeCreated) }
+  @{ done = [bool]($done211 -and $tasks -eq 0 -and -not $addedAfter); tasks = $tasks; completedAt = (& $iso $done211.TimeCreated); completionId = $cid; suspendedAt = $(if ($until) { & $iso $susp.TimeCreated } else { $null }); suspendedUntil = $until; resumedAt = (& $iso $res.TimeCreated) }
 }
 
 # MC-1529: Hyper-V's jobs (CIM_ConcreteJob JobState) count as ended only in a documented terminal state: Completed (7),

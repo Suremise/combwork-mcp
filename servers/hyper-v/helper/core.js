@@ -2942,10 +2942,11 @@ class Helper {
     for (const which of ['admin', 'user']) {
       const name = creds[which].user
       const provisionMs = this.tm().ms.provisionMinutes
-      const deadline = this.now() + provisionMs // the account's one provisioning budget, retry included
+      let deadline = this.now() + provisionMs // the account's one provisioning budget, retry included
+      let credited = 0 // MC-1562: App Readiness suspension time credited to it, across attempts (one budget at most)
       const attempts = [] // MC-1520: each attempt's outcome, a slow one's snapshot and a failed one's diagnosis
       for (let attempt = 1; ; attempt++) {
-        if (this.now() >= deadline) throw provisionLate(name, provisionMs)
+        if (this.now() >= deadline) throw provisionLate(name, provisionMs, credited)
         step(`logging ${name} on${attempt > 1 ? ' (again)' : ''} (${name}'s budget: ${Math.max(0, Math.round((deadline - this.now()) / 60_000))} of ${Math.round(provisionMs / 60_000)} min left)`)
         // MC-1520: a read-only snapshot of the guest when the attempt is slow, and before the undo when it failed.
         const diag = async () => {
@@ -2960,7 +2961,7 @@ class Helper {
           step(`${name}'s logon is still waiting at ${Math.round(LOGON_SNAPSHOT_MS / 1000)} s: ${diagLine(slow)}`)
           this.log(`${vm.vmName}: ${name}'s build logon still waiting at ${Math.round(LOGON_SNAPSHOT_MS / 1000)} s: ${diagLine(slow)}`)
         })
-        if (o.late) throw new Error(`${provisionLate(name, provisionMs).message}${slow ? ` (at ${Math.round(LOGON_SNAPSHOT_MS / 1000)} s: ${diagLine(slow)})` : ''}`)
+        if (o.late) throw new Error(`${provisionLate(name, provisionMs, credited).message}${slow ? ` (at ${Math.round(LOGON_SNAPSHOT_MS / 1000)} s: ${diagLine(slow)})` : ''}`)
         let why = null
         const waited = Math.round(BUILD_LOGON_WAIT_MS / 1000)
         if (o.silent) why = `no logon of ${name} began within ${Math.round(FIRST_LOGON_SIGN_MS / 1000)} s of its new boot being seen`
@@ -2970,7 +2971,9 @@ class Helper {
         let quiet = null
         if (!why) {
           step(`waiting for ${name}'s first-logon work to finish`)
-          quiet = await this.waitProvisioned(vm, creds, name, o.boot, deadline)
+          quiet = await this.waitProvisioned(vm, creds, name, o.boot, deadline, provisionMs - credited)
+          credited += quiet.suspendedMs || 0
+          deadline += quiet.suspendedMs || 0
           if (quiet.lost) why = `${name}'s session was lost while its first-logon work ran`
         }
         const failed = why ? await diag() : null
@@ -2980,7 +2983,7 @@ class Helper {
           this.log(`${vm.vmName}: ${name}'s build logon attempt ${attempt} failed (${why}; ${diagLine(failed)})`)
         }
         await this.undoLogon(vm, creds)
-        if (!why) { out[name] = { logonMs: o.ms, quietMs: quiet.ms, appReadiness: quiet.appReadiness, packages: quiet.count, inventory: quiet.inventory, mappings: quiet.mappings, packagesDirs: quiet.packagesDirs, attempts }; break }
+        if (!why) { out[name] = { logonMs: o.ms, quietMs: quiet.ms, appReadiness: quiet.appReadiness, packages: quiet.count, inventory: quiet.inventory, mappings: quiet.mappings, packagesDirs: quiet.packagesDirs, quietResets: quiet.quietResets, suspendedMs: credited, attempts }; break }
         if (attempt >= 2) throw new Error(`provisioning ${name}'s profile failed twice: ${why} (${diagLine(failed)})`)
       }
     }
@@ -2994,33 +2997,53 @@ class Helper {
    * starts the quiet time over; a changed boot or the account gone is { lost }. This is observed quiescence, not proof.
    * Everything is bounded by the account's deadline: each probe's call by the time left, and nothing it returns once
    * the deadline has passed is accepted.
+   * MC-1562: Windows suspends an account's first-logon app setup for a fixed time (App Readiness's 216, "will resume at",
+   * 16 min after the first logon on 26200), and that wait isn't the account's: each suspension's length, from its own
+   * 216 on the guest's clock, moves the deadline on, never by more than one budget in all (the limit stays bounded).
    */
-  async waitProvisioned(vm, creds, account, boot, deadline) {
+  async waitProvisioned(vm, creds, account, boot, deadline, creditLeft = this.tm().ms.provisionMinutes) {
     const t0 = this.now()
+    const suspensions = new Set() // MC-1562: the suspensions credited, by 'at|until'
+    let suspendedMs = 0
     let last = null
     let readiness = null // MC-1528: App Readiness's state for the account, as last answered (for the record)
     let quietSince = null
+    const resets = new Map() // MC-1562: signal -> samples it broke the quiet in, after App Readiness finished
+    let lastReset = null
     while (this.now() < deadline) {
       const left = deadline - this.now()
       const r = await this.hv('guest-provisioned', { ...this.ident(vm), cred: creds.admin, account, quietMs: PROVISION_QUIET_MS }, { timeoutMs: Math.max(1, Math.min(120_000, left)) }).catch(() => null)
       if (this.now() >= deadline) break
-      if (r && (r.boot !== boot || r.user === false)) return { lost: true }
+      if (r && (r.boot !== boot || r.user === false)) return { lost: true, suspendedMs }
       // MC-1520: the account's AppContainer profile counts too: unknown (null) is never good, and a change is busy.
       const good = !!r && r.user === true && typeof r.inventory === 'string' && Array.isArray(r.busy) && Number.isInteger(r.mappings) && Number.isInteger(r.packagesDirs)
       // MC-1528: App Readiness's per-user queue (the AppContainer wave) must be finished: Windows' own 211 for the
       // account with no tasks left. Not done, or unknown (null), counts as busy, so the quiet backstop runs after it.
       if (r?.appReadiness) readiness = r.appReadiness
+      const susp = suspensionOf(r?.appReadiness)
+      if (susp && !suspensions.has(susp.key)) {
+        const add = Math.max(0, Math.min(susp.ms, creditLeft - suspendedMs))
+        suspensions.add(susp.key)
+        suspendedMs += add
+        deadline += add
+      }
       const ready = r?.appReadiness?.done === true
       // A new completion (a later 211: more work came and finished) also starts the quiet over.
-      const busy = !good || !ready || r.busy.length > 0 || (last && (r.lastEvent !== last.lastEvent || r.inventory !== last.inventory || r.mappings !== last.mappings || r.packagesDirs !== last.packagesDirs || r.appReadiness?.completedAt !== last.appReadiness?.completedAt || r.appReadiness?.completionId !== last.appReadiness?.completionId))
+      const why = busyReasons(r, good, ready, last)
+      const busy = why.length > 0
+      // MC-1562: which signal kept it from quiet, tallied once App Readiness had already finished at the previous good
+      // sample (before that, and at the change-over itself, being busy is expected), so a late failure, and the build's
+      // record, say what Windows was still doing.
+      const settledBefore = last?.appReadiness?.done === true
       if (good) last = r
+      if (busy && ready && settledBefore) { for (const w of why) resets.set(w, (resets.get(w) || 0) + 1); lastReset = { why, at: this.now() - t0 } }
       if (busy) quietSince = null
       else if (quietSince === null) quietSince = this.now()
-      if (!busy && this.now() - quietSince >= PROVISION_QUIET_MS) return { ms: this.now() - t0, count: r.count, inventory: r.inventory, mappings: r.mappings, packagesDirs: r.packagesDirs, appReadiness: readinessRecord(r.appReadiness) }
+      if (!busy && this.now() - quietSince >= PROVISION_QUIET_MS) return { ms: this.now() - t0, count: r.count, inventory: r.inventory, mappings: r.mappings, packagesDirs: r.packagesDirs, appReadiness: readinessRecord(r.appReadiness), quietResets: Object.fromEntries(resets), suspendedMs }
       await sleep(Math.min(PROVISION_POLL_MS, Math.max(0, deadline - this.now())))
     }
-    const e = provisionLate(account, this.tm().ms.provisionMinutes)
-    e.message += ` (${readinessLine(readiness)})`
+    const e = provisionLate(account, this.tm().ms.provisionMinutes, this.tm().ms.provisionMinutes - creditLeft + suspendedMs)
+    e.message += ` (${readinessLine(readiness)}${resets.size ? `; after it finished, the quiet was broken by ${resetsLine(resets)}, last at ${Math.round(lastReset.at / 1000)} s by ${lastReset.why.join(', ')}` : ''})`
     throw e
   }
 
@@ -3196,7 +3219,7 @@ function buildNote(profiles) {
   const notes = []
   for (const [name, p] of Object.entries(profiles || {})) {
     // The settled counts, always: what the quiet test saw when it accepted the profile.
-    if (Number.isInteger(p.mappings)) notes.push(`${name} settled with ${p.mappings} AppContainer mappings and ${p.packagesDirs} Packages folders after ${Math.round(p.quietMs / 1000)} s${p.appReadiness?.done ? ' (App Readiness finished)' : ''}`)
+    if (Number.isInteger(p.mappings)) notes.push(`${name} settled with ${p.mappings} AppContainer mappings and ${p.packagesDirs} Packages folders after ${Math.round(p.quietMs / 1000)} s${p.appReadiness?.done ? ` (App Readiness finished${p.suspendedMs > 0 ? `; Windows had suspended it for ${Math.round(p.suspendedMs / 1000)} s, not counted in the budget` : ''}${p.quietResets && Object.keys(p.quietResets).length ? `, then the quiet restarted on ${resetsLine(Object.entries(p.quietResets))}` : ''})` : ''}`)
     // MC-1524: Windows' known drop of a first logon, followed by an attempt that succeeded, is expected: said so, briefly.
     // Any other failed attempt, or a drop with no later success, stays in full.
     const ok = (p.attempts || []).some(t => !t.why)
@@ -3210,11 +3233,34 @@ function buildNote(profiles) {
   return notes.join('; ')
 }
 
-/** MC-1528: App Readiness's state, allowlisted for the record: done, the task count and three UTC times. */
+/**
+ * MC-1562: why one 'guest-provisioned' sample isn't quiet, as short signal names (none: quiet). r: the sample (null: no
+ * answer); good: every probe answered; ready: App Readiness finished; last: the previous good sample. A busy process
+ * is named (a known first-logon worker's name, else 'other'), so the record holds no arbitrary guest text.
+ */
+function busyReasons(r, good, ready, last) {
+  if (!r) return ['no answer']
+  if (!good) return ['probe incomplete']
+  const why = []
+  if (!ready) why.push('App Readiness not finished')
+  for (const n of new Set(r.busy)) why.push(`process ${/^[A-Za-z0-9._-]{1,40}$/.test(String(n)) ? n : 'other'}`)
+  if (last) {
+    if (r.lastEvent !== last.lastEvent) why.push('new AppX deployment event')
+    if (r.inventory !== last.inventory) why.push('package inventory changed')
+    if (r.mappings !== last.mappings) why.push('AppContainer mappings changed')
+    if (r.packagesDirs !== last.packagesDirs) why.push('Packages folders changed')
+    if (r.appReadiness?.completedAt !== last.appReadiness?.completedAt || r.appReadiness?.completionId !== last.appReadiness?.completionId) why.push('new App Readiness completion')
+  }
+  return why
+}
+/** MC-1562: the tally, most frequent first: "new AppX deployment event 31×, process msedgewebview2 12×". */
+const resetsLine = m => [...m].sort((a, b) => b[1] - a[1]).map(([k, n]) => `${k} ${n}×`).join(', ')
+
+/** MC-1528: App Readiness's state, allowlisted for the record: done, the task count and its UTC times (MC-1562: and the suspension's start). */
 function readinessRecord(a) {
   if (!a || typeof a !== 'object') return null
   const t = v => (typeof v === 'string' && !Number.isNaN(Date.parse(v)) ? new Date(v).toISOString() : null)
-  return { done: a.done === true ? true : a.done === false ? false : null, tasks: Number.isInteger(a.tasks) ? a.tasks : null, completedAt: t(a.completedAt), completionId: Number.isSafeInteger(a.completionId) ? a.completionId : null, suspendedUntil: t(a.suspendedUntil), resumedAt: t(a.resumedAt) }
+  return { done: a.done === true ? true : a.done === false ? false : null, tasks: Number.isInteger(a.tasks) ? a.tasks : null, completedAt: t(a.completedAt), completionId: Number.isSafeInteger(a.completionId) ? a.completionId : null, suspendedAt: t(a.suspendedAt), suspendedUntil: t(a.suspendedUntil), resumedAt: t(a.resumedAt) }
 }
 
 /** MC-1528: one line on App Readiness's state, for a late failure. */
@@ -3226,8 +3272,21 @@ function readinessLine(a) {
 }
 
 /** MC-1516: an account's provisioning budget, retry included, ran out. */
-function provisionLate(account, ms) {
-  return new Error(`${account}'s first-logon provisioning didn't settle within ${Math.round(ms / 1000)} s`)
+function provisionLate(account, ms, suspendedMs = 0) {
+  return new Error(`${account}'s first-logon provisioning didn't settle within ${Math.round(ms / 1000)} s${suspendedMs > 0 ? ` (plus ${Math.round(suspendedMs / 1000)} s while Windows had its App Readiness suspended)` : ''}`)
+}
+
+/**
+ * MC-1562: App Readiness's suspension (its 216: when, and "will resume at"), as { key, ms }, or null. Both times are the
+ * guest's, so no clock skew enters; an unreadable or backwards pair, or one over a day, is null (no credit).
+ */
+function suspensionOf(a) {
+  const at = Date.parse(a?.suspendedAt)
+  const until = Date.parse(a?.suspendedUntil)
+  if (typeof a?.suspendedAt !== 'string' || typeof a?.suspendedUntil !== 'string' || !Number.isFinite(at) || !Number.isFinite(until)) return null
+  const ms = until - at
+  if (ms <= 0 || ms > 86_400_000) return null
+  return { key: `${a.suspendedAt}|${a.suspendedUntil}`, ms }
 }
 
 /** An evaluation VM's recorded end (ms), or null: an own copy, or a VM built before licences were recorded. */
@@ -3346,7 +3405,7 @@ function describePlan(plan, digest, approve, T) {
   if (plan.image && !linux) lines.push(`- image: ${plan.image.edition}${plan.image.imageIndex > 1 ? ` (index ${plan.image.imageIndex})` : ''} build ${plan.image.build}, SHA-256 ${plan.image.sha256} (${plan.image.pinned ? 'pinned: a known Microsoft download' : plan.image.source === 'download' ? 'downloaded by the helper over HTTPS from Microsoft' : 'NOT AUTHENTICATED: a local file you chose to trust'})`)
   if (plan.add?.length && !linux) lines.push('- registry: a user\'s registry isn\'t forcibly unloaded at logoff (the DisableForceUnload policy): the suspected cause of runs losing their HKCU after the short PowerShell Direct session that started them ends (MC-1522; its real-build trial is MC-1521)')
   if (plan.add?.length && !linux) lines.push(`- Defender: the test work folders ${DEFENDER_EXCLUSIONS.join(', ')} are excluded from Defender's scanning (real-time and scheduled scans) in the guest image; Defender stays on otherwise`)
-  if (plan.add?.length && !linux) lines.push(`- provisioning: each new VM logs hvadmin and hvuser on interactively once (offline), waits for Windows' first-logon setup to finish, then turns autologon off and resets UAC and the watcher's start before its clean checkpoint; each account within ${Math.round(T.ms.provisionMinutes / 60_000)} min (a logon attempt up to ${Math.round(BUILD_LOGON_WAIT_MS / 60_000)} min once it has begun, one with no sign of a logon ${Math.round(FIRST_LOGON_SIGN_MS / 60_000)} min after its new boot is seen retried at once, then accepted once Windows' App Readiness reports the account's first-logon app setup finished and ${Math.round(PROVISION_QUIET_MS / 60_000)} min of observed quiet follow, one retry if needed)`)
+  if (plan.add?.length && !linux) lines.push(`- provisioning: each new VM logs hvadmin and hvuser on interactively once (offline), waits for Windows' first-logon setup to finish, then turns autologon off and resets UAC and the watcher's start before its clean checkpoint; each account within ${Math.round(T.ms.provisionMinutes / 60_000)} min (a logon attempt up to ${Math.round(BUILD_LOGON_WAIT_MS / 60_000)} min once it has begun, one with no sign of a logon ${Math.round(FIRST_LOGON_SIGN_MS / 60_000)} min after its new boot is seen retried at once, then accepted once Windows' App Readiness reports the account's first-logon app setup finished and ${Math.round(PROVISION_QUIET_MS / 60_000)} min of observed quiet follow, one retry if needed; the time Windows itself suspends that setup isn't counted, up to ${Math.round(T.ms.provisionMinutes / 60_000)} min more)`)
   if (plan.activation === 'online-once') lines.push('- activation: each new VM goes online once, through Windows\' Default Switch, to activate Windows; it is disconnected (verified) before its clean checkpoint, and no start ever uses that switch')
   else if (plan.add?.length && !linux) lines.push('- activation: none (each new VM stays offline; its licence is read and shown)')
   if (plan.add?.length && plan.image && !plan.image.evaluation && !linux) lines.push(`- product key: ${plan.productKey ? 'the pool\'s (set by install.ps1 -ProductKeyFile), written only into the answer file' : 'none'}`)
