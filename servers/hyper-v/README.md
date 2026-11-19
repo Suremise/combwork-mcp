@@ -1343,14 +1343,18 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
     host check fails, or the guest's network never settles (restored to clean, disconnected);
   - crashes after the ACLs, the connect and the guest's network, and a call dying between connect and start: the next
     helper restores the VM disconnected with no ACLs; leftover ACLs at a release quarantine the VM.
-- `guestnet.test.js` (MC-1563): hv.ps1's own `$GuestNet` (a Windows guest's network for a mode) run with Windows
-  PowerShell 5.1 against stub network cmdlets that return real CimInstances:
+- `guestnet.test.js` (MC-1563, MC-1565): hv.ps1's own `$GuestNet` (a Windows guest's network for a mode) run with
+  Windows PowerShell 5.1 against stub network cmdlets that return real CimInstances and keep each adapter's DHCP state,
+  addresses and default route:
   - host and internet set exactly the one adapter with the VM's MAC, also among other adapters;
   - none or two adapters with that MAC are refused with nothing changed;
-  - none resets to DHCP.
+  - internet leaves an adapter already on DHCP alone (no `Set-NetIPInterface -Dhcp`, which drops its lease, and no
+    route removed: DHCP's default route is NetMgmt too), asks for a lease (`RenewDHCPLease`) when it has no DHCP
+    address (APIPA), and puts a static adapter back on DHCP first;
+  - none puts only adapters that aren't on DHCP back on it.
 
-  Every network cmdlet name in the block is renamed to a stub before it runs, and the test refuses to run on one it
-  doesn't stub, so nothing reaches the PC's real network settings.
+  Every network and CIM cmdlet name in the block is renamed to a stub before it runs, and the test refuses to run on one
+  it doesn't stub or on a call to ipconfig or netsh, so nothing reaches the PC's real network settings.
 - `timing.test.js` (MC-1558): the timings' defaults, floors, caps and derived call bounds; an invalid `timingCaps`
   refusing the start; values per connection, kept by a lease through its cleanup after a disconnect and by a pool job,
   defaults for recovery, the queue place's, what server.js sends; the restore call holding the off-wait; a Windows copy
