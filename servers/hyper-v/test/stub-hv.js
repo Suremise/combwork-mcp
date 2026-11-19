@@ -189,9 +189,12 @@ function run(s, op, a) {
         if (!/^[0-9a-f]{64}$/.test(a.baseSha256 || '')) throw new Error('create-vm needs the approved disk\'s SHA-256')
         const got = crypto.createHash('sha256').update(fs.readFileSync(a.baseVhdx)).digest('hex')
         if (got !== a.baseSha256) throw new Error(`the disk's copy has changed since it was checked and approved (SHA-256 ${got}, not ${a.baseSha256}): refused, nothing created`)
+        // MC-1578 round 1: as hv.ps1, never more than the approved size (state.readyDiskGB: the disk's virtual size).
+        const baseGB = s.readyDiskGB ?? 40
+        if (baseGB > a.diskGB) throw new Error(`the ready-made disk is ${baseGB} GB, more than the plan's ${a.diskGB} GB: refused, nothing created`)
         fs.copyFileSync(a.baseVhdx, join(a.folder, 'disk.vhdx'))
         const g = s.readyGuest || {}
-        s.vms[id] = { id, name: a.name, location: join(a.folder, a.name), state: 'Off', checkpoints: [], parent: null, switchName: null, reserve: 0, disk: {}, cores: a.cores, memoryMB: a.memoryMB, installed: true, fromDisk: true, accounts: JSON.parse(JSON.stringify(g.accounts || { Administrator: { password: 'src-pw', admin: true, enabled: true } })), autologon: !!g.autologon, lsaSecret: !!g.lsaSecret, generalized: !!g.generalized }
+        s.vms[id] = { id, name: a.name, location: join(a.folder, a.name), state: 'Off', checkpoints: [], parent: null, switchName: null, reserve: 0, disk: {}, cores: a.cores, memoryMB: a.memoryMB, installed: true, fromDisk: true, diskGB: a.diskGB, accounts: JSON.parse(JSON.stringify(g.accounts || { Administrator: { password: 'src-pw', admin: true, enabled: true } })), autologon: !!g.autologon, lsaSecret: !!g.lsaSecret, generalized: !!g.generalized }
         return { vmId: id }
       }
       // MC-1572: hv.ps1 hashes the ISO against isoSha256 before anything is created (tested for real in units.test.js);
@@ -235,6 +238,8 @@ function run(s, op, a) {
     }
     // MC-1578: one of the user's own VMs (state.outsideVms: { id: { name, state, generation, disks: [path], checkpoints } }),
     // read only: its disk's bytes copied to a.out, as Convert-VHD flattens it.
+    // MC-1578 round 1: a ready-made disk copy's virtual size: state.readyDiskGB (40 GB by default).
+    case 'vhd-size': return { bytes: (s.readyDiskGB ?? 40) * 2 ** 30 }
     case 'image-from-vm': {
       const all = Object.entries(s.outsideVms || {})
       const hit = all.find(([id]) => id === a.vm) || all.find(([, v]) => v.name === a.vm)

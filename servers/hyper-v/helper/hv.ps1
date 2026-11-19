@@ -950,6 +950,9 @@ try {
         if ([string]$a.baseSha256 -notmatch '^[0-9a-f]{64}$') { throw 'create-vm needs the approved disk''s SHA-256' }
         $baseHash = (Get-FileHash -LiteralPath ([string]$a.baseVhdx) -Algorithm SHA256).Hash.ToLowerInvariant()
         if ($baseHash -ne [string]$a.baseSha256) { throw "the disk's copy ($([string]$a.baseVhdx)) has changed since it was checked and approved (SHA-256 $baseHash, not $([string]$a.baseSha256)): refused, nothing created" }
+        # MC-1578 round 1: never more than the approved size (the plan's diskGB is at least the disk's own size).
+        $baseSize = (Get-VHD -Path ([string]$a.baseVhdx)).Size
+        if ($baseSize -gt ([long]$a.diskGB * 1GB)) { throw "the ready-made disk is $([math]::Ceiling($baseSize / 1GB)) GB, more than the plan's $([long]$a.diskGB) GB: refused, nothing created" }
         Copy-Item -LiteralPath ([string]$a.baseVhdx) -Destination $vhd
         if ((Get-VHD -Path $vhd).Size -lt ([long]$a.diskGB * 1GB)) { Resize-VHD -Path $vhd -SizeBytes ([long]$a.diskGB * 1GB) }
         $vm = New-VM -Name ([string]$a.name) -Generation 2 -Path $folder -VHDPath $vhd -MemoryStartupBytes ([long]$a.memoryMB * 1MB)
@@ -1226,6 +1229,12 @@ try {
     'guest-provisioned' {
       $vm = Get-OwnVm $a
       Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestProvisioned -ArgumentList ([string]$a.account), ([int]$a.quietMs), $ProfileCounts.ToString(), $AppReadinessState.ToString()
+    }
+    'vhd-size' {
+      # MC-1578 round 1: a ready-made disk copy's virtual size (bytes), recorded with the image: the floor of its VMs' size.
+      $p = [string]$a.path
+      if ($p -notmatch '\.vhdx$' -or -not (Test-Path -LiteralPath $p -PathType Leaf)) { throw 'vhd-size needs a .vhdx file' }
+      @{ bytes = [long](Get-VHD -Path $p).Size }
     }
     'image-from-vm' {
       # MC-1578: one of the user's own VMs as a ready-made disk: found by id or exact name, never one of the pool's, off,

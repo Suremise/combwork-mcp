@@ -2474,6 +2474,16 @@ class Helper {
         if (!img.ready) return { text: img.text }
         plan.image = img.image
       }
+      // MC-1578 round 1: a ready-made disk's own size is a floor: each new VM's disk is at least that (it is copied, then
+      // only ever grown), so the plan and the policy are checked against the size the VMs will really have.
+      if (plan.add.length && plan.image?.ready) {
+        const need = Number(plan.image.virtualGB)
+        if (!(need > 0)) throw new Error('The ready-made disk\'s size isn\'t recorded: check the image again (pool_plan with its { vhdx | vm, admin }).')
+        if (args.diskGB !== undefined && args.diskGB < need) throw new Error(`The ready-made disk is ${need} GB: diskGB must be at least that (it is copied whole, never shrunk).`)
+        for (const x of plan.add) x.diskGB = Math.max(x.diskGB, need)
+        const bad = policyMod.checkPool(this.policy, [...others, ...keep, ...plan.add], { network })
+        if (bad.length) throw new Error(`That plan is outside the policy: ${bad.join('; ')} (the ready-made disk is ${need} GB, so each new VM's disk is at least that).`)
+      }
       if (plan.add.length) {
         // The build's one online step, bound here (MC-1513): an evaluation image always (it lasts about a day
         // unactivated); an own copy only when asked. Nothing else ever connects the Default Switch.
@@ -2597,7 +2607,8 @@ class Helper {
     p.then(img => {
       const what = describeImage(img)
       if (img.existing) { this.lastImage = `ready: ${what}`; return }
-      this.journal.append({ t: 'image', ...img })
+      const { updated, ...rec } = img // MC-1578 round 1: another admin for the same bytes: the newest record wins
+      this.journal.append({ t: 'image', ...rec })
       this.lastImage = `ready: ${what}`
     }, e => { this.lastImage = `REFUSED: ${e.message}` }).finally(() => { this.imageJob = null })
     return { ready: false, text: ready ? 'Copying the disk into the helper\'s folder now, while hashing it (for a VM: its disk flattened into a copy; the VM itself is only read). This takes a few minutes for a large disk: call pool_status, then pool_plan again with no image to use it.' : linux ? 'Checking the Linux image now (copied into the helper\'s folder while hashed, then converted to the base VHDX with nothing installed on the host). This takes a few minutes: call pool_status, then pool_plan again with no image to use it.' : 'Checking the image now (copied into the helper\'s folder while hashed, then its editions and build read before anything runs). This takes a few minutes for a 7 GB ISO: call pool_status, then pool_plan again with no image to use it.' }
@@ -3045,7 +3056,7 @@ class Helper {
     }
     step('reading its Windows licence (offline)')
     const lic = await this.hv('guest-licence', { ...this.ident(vm), cred: creds.admin }, { timeoutMs: 120_000 })
-    const licence = licenceOf(lic, images.isEvalEdition(g.editionId), this.now())
+    const licence = licenceOf(lic, images.isEvalEdition(g.editionId), this.now(), 0) // read as it is: no fresh-build minimum
     step('setting autologon and UAC back to Windows\' own (verified)')
     await this.undoLogon(vm, creds)
     step('shutting down and taking the clean checkpoint')
@@ -3581,7 +3592,9 @@ function expiry(vm, now) {
  * Only an absent or unreadable date is ignored (hv.ps1 sends none for Windows' 1601 sentinel): a real end date that
  * has passed fails the build, never giving way to the grace figure. An own copy is recorded as it is (no expiry).
  */
-function licenceOf(r, evaluation, now) {
+// minDays: the fresh ISO build's minimum (EVAL_MIN_DAYS); MC-1578's ready-made disk passes 0: an evaluation part way
+// through its period is taken as it is, its end recorded for the usual warnings (one already over is still refused).
+function licenceOf(r, evaluation, now, minDays = EVAL_MIN_DAYS) {
   if (!r || typeof r !== 'object') throw new Error('the guest reported no licence')
   const status = Number(r.status)
   if (!evaluation) return { kind: 'own', activated: status === 1, status }
@@ -3592,7 +3605,7 @@ function licenceOf(r, evaluation, now) {
   const end = Math.min(...ends)
   if (end <= now) throw new Error(`the evaluation's end date, ${new Date(end).toISOString()}, has already passed`)
   const days = Math.floor((end - now) / DAY_MS)
-  if (days < EVAL_MIN_DAYS) throw new Error(`the evaluation activated with only ${days} day(s) left (at least ${EVAL_MIN_DAYS} needed)`)
+  if (days < minDays) throw new Error(`the evaluation activated with only ${days} day(s) left (at least ${minDays} needed)`)
   return { kind: 'evaluation', expiresAt: new Date(end).toISOString() }
 }
 
@@ -3646,11 +3659,11 @@ const isEval = img => img.evaluation ?? images.isEvalEdition(img.edition)
 const pick = img => img.os === 'linux'
   ? { sha256: img.sha256, size: img.size, imageIndex: 1, evaluation: false, source: img.source, path: img.path ?? null, os: 'linux', distro: img.distro ?? null, release: img.release ?? null, serial: img.serial ?? null, name: img.name ?? null } // MC-1501
   : img.ready // MC-1578: a ready-made Windows disk (its edition and build are read from the guest at build)
-    ? { sha256: img.sha256, size: img.size, imageIndex: 1, evaluation: false, source: img.source, path: img.path ?? null, vmName: img.vmName ?? null, vmId: img.vmId ?? null, os: 'windows', ready: true, admin: img.admin }
+    ? { sha256: img.sha256, size: img.size, imageIndex: 1, evaluation: false, source: img.source, path: img.path ?? null, vmName: img.vmName ?? null, vmId: img.vmId ?? null, os: 'windows', ready: true, admin: img.admin, virtualGB: img.virtualGB ?? null }
     : { sha256: img.sha256, size: img.size, edition: img.edition, build: img.build, imageIndex: img.imageIndex ?? 1, evaluation: isEval(img), source: img.source, path: img.path ?? null, signature: img.signature ?? null, os: img.os || 'windows' }
 /** An image in a line: a Linux one, a ready-made Windows disk (MC-1578), or a Windows ISO's edition and build. */
 const describeImage = img => img.os === 'linux' ? linuxImages.describe(img)
-  : img.ready ? `ready-made Windows disk ${img.source === 'vm' ? `from the VM ${img.vmName} (${img.vmId})` : `from ${img.path}`}, admin account ${img.admin} (${img.sha256.slice(0, 12)}…)`
+  : img.ready ? `ready-made Windows disk ${img.source === 'vm' ? `from the VM ${img.vmName} (${img.vmId})` : `from ${img.path}`}, ${img.virtualGB ? `${img.virtualGB} GB, ` : ''}admin account ${img.admin} (${img.sha256.slice(0, 12)}…)`
     : `${img.edition} ${img.build} (${img.sha256.slice(0, 12)}…${img.path ? `, from ${img.path}` : ''})`
 /** MC-1572: where an image came from, for the plan: the user's file, or an earlier check's record. */
 const imageFrom = img => img.path ? `from ${img.path}, copied into the helper's folder; the build uses that copy, checked against this SHA-256 first` : 'checked earlier (the helper\'s copy, checked against this SHA-256 before the build uses it)'
@@ -3676,7 +3689,7 @@ function describePlan(plan, digest, approve, T) {
   if (plan.debugKeepFailedBuild) lines.push('- DEBUG (MC-1545): if a Linux build fails, its VM is kept, turned on, network disconnected, never leased, for an administrator to inspect in Hyper-V Manager (its console, its COM1 diagnostics, a host-side HvMcpVsock retry; no login or other access to the guest is added; its seed, with its host key, stays with it); a resize plan with no image and vms equal to the number of other VMs in the pool removes only it; any other create or resize removes it too, along with the changes it asks for; a remove plan removes the whole pool')
   const ready = !!plan.image?.ready // MC-1578
   if (ready) lines.push(`- image: ready-made Windows disk ${plan.image.source === 'vm' ? `from your VM ${plan.image.vmName} (id ${plan.image.vmId}; its disk flattened into a copy; the VM itself is only read, never changed)` : `from ${plan.image.path}`}, SHA-256 ${plan.image.sha256}, copied into the helper's folder; the build uses that copy, checked against this SHA-256 first`)
-  if (ready && plan.add?.length) lines.push(`- ready-made build: each new VM is a copy of that disk (grown to its disk size if larger), started offline. The disk's admin account ${plan.image.admin} is used once, to make the helper's own accounts hvadmin (an administrator) and hvuser (a standard user; accounts by those names in the copy are reset to that); its password is the one you type when you approve, kept only until this plan's builds end. Then the guest setup, autologon and UAC set back to Windows' own (verified), and the clean checkpoint. No unattended install, no activation, and no first-logon wait: an interactive start's first logon does Windows' first-logon work then`)
+  if (ready && plan.add?.length) lines.push(`- ready-made build: each new VM is a copy of that disk (${plan.image.virtualGB} GB; grown to the plan's disk size, never shrunk), started offline. The disk's admin account ${plan.image.admin} is used once, to make the helper's own accounts hvadmin (an administrator) and hvuser (a standard user; accounts by those names in the copy are reset to that); its password is the one you type when you approve, kept only until this plan's builds end. Then the guest setup, autologon and UAC set back to Windows' own (verified), and the clean checkpoint. No unattended install, no activation, and no first-logon wait: an interactive start's first logon does Windows' first-logon work then`)
   if (plan.image && !linux && !ready) lines.push(`- image: ${plan.image.edition}${plan.image.imageIndex > 1 ? ` (index ${plan.image.imageIndex})` : ''} build ${plan.image.build}, SHA-256 ${plan.image.sha256}, ${imageFrom(plan.image)}${plan.image.signature ? `; setup files: ${plan.image.signature.microsoft ? 'signed by Microsoft' : `not signed by Microsoft (${plan.image.signature.note}): information only`}` : ''}`)
   // MC-1577: the user's guest setup script, or none: the build adds no guest changes of its own.
   if (plan.add?.length) {

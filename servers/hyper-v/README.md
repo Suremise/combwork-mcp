@@ -453,7 +453,15 @@ pool_plan({ ..., image: { vm: "win11-dev", admin: "Administrator" } })
 - **The password:** approve.cmd asks you for `admin`'s password. It's never asked of or passed by an agent, and never
   on a command line. It's kept in the helper's secrets folder (SYSTEM, Administrators and the helper only), bound to
   that approval, and deleted when the plan's builds end, when the approval expires unused, or when the helper next
-  starts. Another plan for the same disk (a resize) asks again.
+  starts. Another plan for the same disk (a resize) asks again. To use another administrator in the same disk (or to
+  correct a mistyped name), plan with `{ vhdx | vm, admin: "<the other>" }` again: later plans use that name, and
+  plans already made keep theirs.
+- **Its size:** the disk's own size (recorded with the image, shown in the plan) is the floor. Each VM's disk is
+  at least that, grown to the plan's `diskGB` if that's larger, and never shrunk. A smaller `diskGB` is refused, and the
+  policy's `maxDiskGBPerVm` is checked against the size the VMs will have. A disk bigger than the plan's size is
+  refused at create.
+- **Its licence:** read as it is. An evaluation part way through its period is fine, and its end is recorded for the
+  usual expiry warnings. One already over is refused. The fresh ISO build's 85-day minimum doesn't apply.
 - **Each VM's build, offline:**
   1. A copy of the disk, grown to the plan's size, with Secure Boot and a vTPM.
   2. `admin` is used once, to make the helper's own accounts: `hvadmin` (an administrator) and `hvuser` (a standard

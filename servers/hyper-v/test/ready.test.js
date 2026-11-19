@@ -108,7 +108,7 @@ test('the disk\'s admin may itself be named hvuser: its copy is made the helper\
   // Planned again with the admin hvuser (the image is the same disk, recorded with Administrator: refused), so a fresh disk.
   const file2 = path.join(sc.dir, 'user', 'win2.vhdx'); fs.writeFileSync(file2, 'another ready-made disk')
   await admin.request('pool_plan', { action: 'create', vms: 1, cores: 2, memoryGB: 4, image: { vhdx: file2, admin: 'hvuser' } })
-  await waitFor(async () => /Image: ready: ready-made Windows disk from .*win2\.vhdx, admin account hvuser/.test(await statusText(admin)), T.waitForMs, 'the second image')
+  await waitFor(async () => /Image: ready: ready-made Windows disk from .*win2\.vhdx, 40 GB, admin account hvuser/.test(await statusText(admin)), T.waitForMs, 'the second image')
   const { line } = await planAndBuild(sc, admin, { approveIt: (sc, id) => approveReady(sc, id, { password: 'src-pw' }) })
   assert.match(line, /create finished/, line)
   const cp = vms(sc)[0].checkpoints[0]
@@ -215,7 +215,7 @@ test('one of the user\'s own VMs: its disk read into a copy, the VM itself uncha
   const diskHash = () => crypto.createHash('sha256').update(fs.readFileSync(srcDisk)).digest('hex')
   const before = diskHash()
   const { sc, admin } = await withReadyImage(t, 'ready-vm', { stub: { outsideVms }, image: { vm: 'mywin', admin: 'Administrator' } })
-  assert.match(await statusText(admin), /Image: ready: ready-made Windows disk from the VM mywin \(vm-own-1\), admin account Administrator/)
+  assert.match(await statusText(admin), /Image: ready: ready-made Windows disk from the VM mywin \(vm-own-1\), 40 GB, admin account Administrator/)
   const { plan, line } = await planAndBuild(sc, admin)
   assert.match(plan.text, /- image: ready-made Windows disk from your VM mywin \(id vm-own-1; its disk flattened into a copy; the VM itself is only read, never changed\), SHA-256 [0-9a-f]{64}/)
   assert.match(line, /create finished/, line)
@@ -232,4 +232,64 @@ test('one of the user\'s own VMs: its disk read into a copy, the VM itself uncha
   const poolVm = vms(sc)[0]
   await admin.request('pool_plan', { action: 'resize', vms: 2, cores: 2, memoryGB: 4, image: { vm: poolVm.id, admin: 'Administrator' } }).catch(() => {})
   await waitFor(async () => /is one of the pool's own VMs: name a VM of your own/.test(await statusText(admin)), T.waitForMs, 'a pool VM refused')
+})
+
+// MC-1578 round 1 (MR1's findings).
+test('round 1: the disk\'s own size is the floor: recorded, in the plan, each VM grown to at least it; too big for the policy, or a smaller diskGB, refused; a base grown after approval refused at create', async t => {
+  const { sc, admin } = await withReadyImage(t, 'ready-size', { stub: { readyDiskGB: 100 } })
+  assert.match(await statusText(admin), /Image: ready: ready-made Windows disk from .*win\.vhdx, 100 GB, admin account Administrator/)
+  await assert.rejects(admin.request('pool_plan', { action: 'create', vms: 1, cores: 2, memoryGB: 4, diskGB: 64 }), /The ready-made disk is 100 GB: diskGB must be at least that/)
+  const { plan, line } = await planAndBuild(sc, admin)
+  assert.match(plan.text, /each new VM is a copy of that disk \(100 GB; grown to the plan's disk size, never shrunk\)/)
+  assert.match(line, /create finished/, line)
+  assert.strictEqual(vms(sc)[0].diskGB, 100, 'the plan\'s size is the disk\'s, not the 64 GB default')
+  // A base bigger than the policy allows (maxDiskGBPerVm 128): refused at the plan.
+  const big = await withReadyImage(t, 'ready-size-big', { stub: { readyDiskGB: 512 } })
+  await assert.rejects(big.admin.request('pool_plan', { action: 'create', vms: 1, cores: 2, memoryGB: 4 }), /outside the policy: .*a 512 GB disk is outside the policy's 64-128 GB.*the ready-made disk is 512 GB/)
+  // Approved at 100 GB; the copy's size then reported larger: create refuses, nothing created.
+  const late = await withReadyImage(t, 'ready-size-late', { stub: { readyDiskGB: 64 } })
+  const p = await late.admin.request('pool_plan', { action: 'create', vms: 1, cores: 2, memoryGB: 4 })
+  approveReady(late.sc, p.data.planId)
+  late.sc.patchStub(s => { s.readyDiskGB = 512 })
+  await late.admin.request('pool_create', { planId: p.data.planId })
+  await waitFor(async () => /Last pool job: create (finished|FAILED)/.test(await statusText(late.admin)), T.waitForMs, 'the build')
+  assert.match(await jobLine(late.admin), /the ready-made disk is 512 GB, more than the plan's 64 GB: refused, nothing created/)
+  assert.deepStrictEqual(vms(late.sc), [])
+})
+
+test('round 1: an evaluation part way through its period is taken as it is (no fresh-build minimum), its end recorded; one already over is refused', async t => {
+  const end = new Date(Date.now() + 45 * 86_400_000).toISOString()
+  const { sc, admin } = await withReadyImage(t, 'ready-eval', { stub: { guestEdition: 'EnterpriseEval', licence: { status: 1, graceMinutes: 45 * 24 * 60, evalEnd: end } } })
+  const { line } = await planAndBuild(sc, admin)
+  assert.match(line, /create finished/, line)
+  const ready = sc.journal().find(r => r.t === 'ready')
+  assert.strictEqual(ready.licence.kind, 'evaluation')
+  assert.ok(Math.abs(Date.parse(ready.licence.expiresAt) - Date.parse(end)) < 86_400_000, ready.licence.expiresAt)
+  assert.ok(!sc.stub().calls.some(c => c.op === 'guest-activate'), 'nothing activated')
+  const over = await withReadyImage(t, 'ready-eval-over', { stub: { guestEdition: 'EnterpriseEval', licence: { status: 1, graceMinutes: 0, evalEnd: new Date(Date.now() - 86_400_000).toISOString() } } })
+  const r = await planAndBuild(over.sc, over.admin)
+  assert.match(r.line, /the evaluation's end date, .*, has already passed/, r.line)
+})
+
+test('round 1: the same disk with another admin (a typo corrected, another administrator): recorded anew for later plans, an older plan keeps its own', async t => {
+  const readyGuest = { accounts: { Administrator: { password: PASSWORD, admin: true, enabled: true }, Other: { password: 'other-pw', admin: true, enabled: true } } }
+  const { sc, admin, file } = await withReadyImage(t, 'ready-admin', { stub: { readyGuest }, image: undefined })
+  const p1 = await admin.request('pool_plan', { action: 'create', vms: 1, cores: 2, memoryGB: 4 })
+  await admin.request('pool_plan', { action: 'create', vms: 1, cores: 2, memoryGB: 4, image: { vhdx: file, admin: 'Other' } })
+  await waitFor(async () => /Image: ready: ready-made Windows disk from .*win\.vhdx, 40 GB, admin account Other/.test(await statusText(admin)), T.waitForMs, 'the same disk with Other')
+  const plan1 = JSON.parse(fs.readFileSync(path.join(sc.stateDir, 'plans', `${p1.data.planId}.json`), 'utf8'))
+  assert.strictEqual(plan1.image.admin, 'Administrator', 'the older plan keeps its own')
+  approveReady(sc, p1.data.planId)
+  await admin.request('pool_create', { planId: p1.data.planId })
+  await waitFor(async () => /Last pool job: create (finished|FAILED)/.test(await statusText(admin)), T.waitForMs, 'the first build')
+  assert.match(await jobLine(admin), /create finished/)
+  const sha = plan1.image.sha256
+  const p2 = await admin.request('pool_plan', { action: 'resize', vms: 2, image: sha })
+  assert.match(p2.text, /admin account Other is used once/, p2.text)
+  approveReady(sc, p2.data.planId, { password: 'other-pw' })
+  await admin.request('pool_resize', { planId: p2.data.planId })
+  await waitFor(async () => /Last pool job: resize (finished|FAILED)/.test(await statusText(admin)), T.waitForMs, 'the grow')
+  assert.match(await jobLine(admin), /resize finished/)
+  assert.deepStrictEqual(sc.stub().calls.filter(c => c.op === 'guest-accounts').map(c => c.as), ['Administrator', 'Other'])
+  assert.deepStrictEqual(secrets(sc), [])
 })

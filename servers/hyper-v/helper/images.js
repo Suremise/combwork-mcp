@@ -154,15 +154,28 @@ async function prepareReady({ want, dir, hv, known, ownDirs = [], poolVmIds = []
     if (known?.has(lower) && fs.existsSync(known.get(lower).file)) {
       const rec = known.get(lower)
       if (!rec.ready) throw new Error('this disk is already a verified image of another kind: use it by its SHA-256')
-      if (rec.admin !== want.admin) throw new Error(`this disk is recorded with its admin account ${rec.admin}: name that one, or use another disk`)
-      return { ...rec, existing: true }
+      // MC-1578 round 1: the admin is the plan's way in, not the disk's identity: another name (a typo corrected, another
+      // administrator) is recorded anew for later plans; plans already made keep theirs. A record from before its size
+      // was kept gets it now.
+      const virtualGB = rec.virtualGB || await virtualSizeGB(hv, rec.file)
+      if (rec.admin === want.admin && rec.virtualGB) return { ...rec, existing: true }
+      return { ...rec, admin: want.admin, virtualGB, updated: true }
     }
+    const virtualGB = await virtualSizeGB(hv, tmp)
     const file = join(dir, `${lower}.vhdx`)
     fs.renameSync(tmp, file)
-    return { sha256: lower, size, file, ...source, os: 'windows', ready: true, admin: want.admin, imageIndex: 1, evaluation: false }
+    return { sha256: lower, size, file, ...source, os: 'windows', ready: true, admin: want.admin, virtualGB, imageIndex: 1, evaluation: false }
   } finally {
     fs.rmSync(tmp, { force: true })
   }
+}
+
+/** MC-1578 round 1: a VHDX's virtual size in whole GB (rounded up), from Get-VHD: every VM's disk is at least this. */
+async function virtualSizeGB(hv, file) {
+  const r = await hv('vhd-size', { path: file })
+  const bytes = Number(r?.bytes)
+  if (!(bytes > 0)) throw new Error('the disk\'s size couldn\'t be read')
+  return Math.ceil(bytes / 2 ** 30)
 }
 
 /** SHA-256 (lower-case hex) of a file, streaming: the build's recheck of the copy against the approved hash. */
