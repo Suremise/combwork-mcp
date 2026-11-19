@@ -336,9 +336,9 @@ function Invoke-Retire([string]$ProgramFiles, [string[]]$Trusted, [string[]]$Roo
 
 # The uninstaller's top level (uninstall.ps1 wires the real actions in $X; test\appsentry-check.ps1 fakes them), so its
 # decisions are tested as they run. $P: KeepPool, RemovePool, WhatIf, Retire. $X: Say, ServiceHere, StateHere, KeyHere,
-# KeptMark, InstallHere, EntryHere, ShowInventory, ShowChoices, Ask ('remove' | 'keep' | 'list' | $null), Teardown
-# (mode, whatIf), HostSwitches (count), RemoveHostSwitches, Leftovers (mode: the list), WriteKept, Retire. Returns the
-# exit code.
+# KeptMark, InstallHere, EntryHere, ShowInventory and ShowChoices (-WhatIf's), Teardown (mode: 'remove', 'keep' or
+# 'ask'; whatIf; returns the mode chosen or 'cancelled'), HostSwitches (count), RemoveHostSwitches, Leftovers (mode: the
+# list), WriteKept, Retire. Returns the exit code.
 # -WhatIf changes nothing on every path, -Retire included. Whatever a run was interrupted after (the teardown, the
 # switch's removal), a rerun ends the same way: setup's host-mode switch removed, then the live leftover check for the
 # mode, and only when it passes the kept-pool mark (keep) and the retire phase, which retires the recovery route last.
@@ -372,19 +372,23 @@ function Invoke-UninstallFlow([hashtable]$P, [hashtable]$X, [scriptblock]$Crash)
   }
   $whatIf = [bool]$P.WhatIf
   $choice = if ($P.RemovePool) { 'remove' } elseif ($P.KeepPool) { 'keep' } else { $null }
-  if (-not $choice) {
-    [void](& $X.ShowInventory); [void](& $X.ShowChoices)
-    if ($whatIf) { $choice = 'remove' }
-    else {
-      $a = & $X.Ask
-      if ($a -eq 'list') { $whatIf = $true; $choice = 'remove' } elseif ($a -eq 'remove' -or $a -eq 'keep') { $choice = $a } else { [void](& $X.Say 'Cancelled: nothing was changed.'); return 1 }
-    }
-  } elseif ($whatIf) { [void](& $X.ShowInventory) }
-  if ($choice -eq 'remove' -and $kept -and -not (& $X.ServiceHere)) {
-    throw 'An earlier uninstall kept the pool and removed the helper, which removes it: run setup again (from the repo) to restore the helper, then uninstall. Nothing was changed.'
+  if ($kept -and -not (& $X.ServiceHere)) {
+    if ($choice -eq 'remove') { throw 'An earlier uninstall kept the pool and removed the helper, which removes it: run setup again (from the repo) to restore the helper, then uninstall. Nothing was changed.' }
+    if (-not $choice) { $choice = 'keep' } # the only choice left: the pool can't be removed without its helper
   }
-  [void](& $X.Teardown $choice $whatIf)
-  if ($whatIf) { [void](& $X.Say 'Nothing was changed (-WhatIf).'); return 0 }
+  if ($whatIf) {
+    [void](& $X.ShowInventory)
+    if (-not $choice) { [void](& $X.ShowChoices); $choice = 'remove' }
+    [void](& $X.Teardown $choice $true)
+    [void](& $X.Say 'Nothing was changed (-WhatIf).')
+    return 0
+  }
+  # MC-1583: the teardown asks the one question (after verifying, before changing anything): with no option, it chooses
+  # remove or keep; with one, it confirms it. Its answer comes back as the mode, or 'cancelled'.
+  $res = @(& $X.Teardown $(if ($choice) { $choice } else { 'ask' }) $false)
+  $res = if ($res.Count) { $res[-1] } else { $null }
+  if ($res -eq 'cancelled') { return 1 }
+  $mode = if ($res -eq 'remove' -or $res -eq 'keep') { $res } elseif ($choice) { $choice } else { 'remove' }
   & $boundary 'after:teardown'
-  return (& $finish $choice)
+  return (& $finish $mode)
 }

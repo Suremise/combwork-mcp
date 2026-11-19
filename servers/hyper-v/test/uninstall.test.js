@@ -152,9 +152,12 @@ for (const E of psEngines()) test(`the Installed apps entry, run for real under 
   const done = { switch: false, install: false, entry: false }
   assert.deepStrictEqual(F.remove, { result: 0, calls: 'teardown:remove,switch,check:remove,retire', ...done, kept: false })
   assert.deepStrictEqual(F.keep, { result: 0, calls: 'teardown:keep,switch,check:keep,kept,retire', ...done, kept: true }, 'the mark after the check, before the retire')
-  assert.deepStrictEqual(F.menuRemove, { result: 0, calls: 'inventory,choices,ask,teardown:remove,switch,check:remove,retire', ...done, kept: false })
-  assert.deepStrictEqual([F.menuCancel.result, F.menuCancel.calls, F.menuCancel.install], [1, 'inventory,choices,ask', true])
-  assert.deepStrictEqual([F.menuList.result, F.menuList.calls], [0, 'inventory,choices,ask,teardown:remove:whatif'])
+  // MC-1583: with no option, the teardown asks the one question (after verifying) and its answer is the mode.
+  assert.deepStrictEqual(F.menuRemove, { result: 0, calls: 'teardown:ask,switch,check:remove,retire', ...done, kept: false })
+  assert.deepStrictEqual(F.menuKeep, { result: 0, calls: 'teardown:ask,switch,check:keep,kept,retire', ...done, kept: true })
+  assert.deepStrictEqual([F.menuCancel.result, F.menuCancel.calls, F.menuCancel.install, F.menuCancel.switch], [1, 'teardown:ask', true, true], 'a cancel changes nothing after it')
+  assert.deepStrictEqual([F.optionCancel.result, F.optionCancel.calls], [1, 'teardown:remove'])
+  assert.deepStrictEqual(F.keptOnly, { result: 0, calls: 'teardown:keep,switch,check:keep,retire', ...done, kept: true })
   // Round 1: interrupted after the teardown (the service, state and records gone), before or after the switch, or
   // before the retire: the rerun from the entry removes the switch if it's there, checks, and only then retires.
   for (const [at, calls] of Object.entries({ 'after:teardown': 'switch,check:remove,retire', 'before:switch': 'switch,check:remove,retire', 'after:switch': 'check:remove,retire', 'before:retire': 'check:remove,retire' })) {

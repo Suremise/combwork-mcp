@@ -22,7 +22,11 @@ function New-Fixture([int]$vms = 2) {
   $f = [pscustomobject]@{
     base = $b; state = (Join-Path $b 'state'); disk = (Join-Path $b 'disk'); install = (Join-Path $b 'install')
     keyPath = "Software\hyperv-mcp-test-$([guid]::NewGuid().ToString('n'))"
-    sys = @{ service = 'running'; rights = $true; group = $true; helper = $true; vms = $vms; job = $null; approve = $true; removeLeft = 0; deleteFail = $false; confirm = $true; strict = @(); calls = New-Object Collections.ArrayList }
+    sys = @{ service = 'running'; rights = $true; group = $true; helper = $true; vms = $vms; job = $null; approve = $true; removeLeft = 0; deleteFail = $false; strict = @(); calls = New-Object Collections.ArrayList
+      # MC-1583: the helper's VMs as its remove plan names them; the one question's answer ($null: the mode asked, or
+      # remove when asked to choose) and a hook run while it is open; the answer when asked again after a change.
+      vmList = @(for ($i = 1; $i -le $vms; $i++) { [pscustomobject]@{ vmId = "vm-$i"; name = "hvmcp-$i"; folder = (Join-Path $b "disk\pool\i-$i") } })
+      answer = $null; onConfirm = $null; onQuiesce = $null; changeAnswer = $true; shown = @(); changes = @(); plans = 0; approved = $null }
   }
   $pins = New-Object Collections.ArrayList
   $rk = Open-ReceiptKey $HKCU "$($f.keyPath)\Storage" $trusted $me
@@ -57,31 +61,48 @@ function New-Ops($f) {
     RemoveRights = { $s.rights = $false; [void]$s.calls.Add('rights') }.GetNewClosure()
     RemoveGroup = { $s.group = $false; [void]$s.calls.Add('group') }.GetNewClosure()
     HelperStatus = { if ($s.helper) { [pscustomobject]@{ vms = $s.vms; job = $s.job } } else { $null } }.GetNewClosure()
-    Quiesce = { param($purpose) if (-not $s.helper) { & $strict 'quiesce without a helper' }; [void]$s.calls.Add("quiesce:$purpose") }.GetNewClosure()
+    # $s.onQuiesce (MC-1583 round 1): the pool changing between the status read before quiesce and quiesce itself.
+    Quiesce = { param($purpose) if (-not $s.helper) { & $strict 'quiesce without a helper' }; if ($s.onQuiesce) { & $s.onQuiesce; $s.onQuiesce = $null }; [void]$s.calls.Add("quiesce:$purpose") }.GetNewClosure()
+    PlanRemove = {
+      if (-not $s.helper) { & $strict 'plan without a helper' }
+      $s.plans++
+      [void]$s.calls.Add('plan')
+      [pscustomobject]@{ planId = ('p-{0:x16}' -f $s.plans); vms = @($s.vmList) }
+    }.GetNewClosure()
+    Confirm = {
+      param($info)
+      $s.shown += , $info
+      [void]$s.calls.Add('confirm')
+      if ($s.onConfirm) { & $s.onConfirm }
+      if ($s.answer) { $s.answer } elseif ($info.mode -eq 'ask') { 'remove' } else { $info.mode }
+    }.GetNewClosure()
+    ConfirmChange = { param($was, $now) $s.changes += , [pscustomobject]@{ was = @($was | ForEach-Object { $_.vmId }); now = @($now | ForEach-Object { $_.vmId }) }; [void]$s.calls.Add('reconfirm'); $s.changeAnswer }.GetNewClosure()
     RemovePool = {
+      param($planId)
       if (-not $s.helper) { & $strict 'remove without a helper' }
       if (-not $s.approve) { throw 'The remove plan was not approved (fake).' }
-      if (-not $s.removeLeft) { Get-ChildItem -LiteralPath (Join-Path $f.disk 'pool') -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force }
+      $s.approved = $planId
+      if (-not $s.removeLeft) { Get-ChildItem -LiteralPath (Join-Path $f.disk 'pool') -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force; $s.vmList = @() }
       $s.vms = $s.removeLeft
       [void]$s.calls.Add('remove-pool')
       return $s.removeLeft
     }.GetNewClosure()
-    ConfirmInventory = { param($lines) $s.inventory = $lines; return $s.confirm }.GetNewClosure()
   }
 }
 
-function Run($f, [string]$mode = 'remove', [string]$crashAt, [string]$legacy, [string[]]$rootOwners = $who) {
+function Run($f, [string]$mode = 'remove', [string]$crashAt, [string[]]$rootOwners = $who) {
   $script:crashAt = $crashAt
   $crash = {
     param($b)
     if ($script:hookAt -and $b -eq $script:hookAt) { $script:hookAt = $null; & $script:hookDo }
     if ($script:crashAt -and $b -eq $script:crashAt) { $script:crashAt = $null; throw "CRASH:$b" }
   }
-  Invoke-Teardown -Mode $mode -State $f.state -Install $f.install -LegacyDiskFolder $legacy -Root $HKCU -KeyPath $f.keyPath `
-    -Trusted $trusted -RootOwners $rootOwners -Who $who -KeyOwner $me -Ops (New-Ops $f) -Crash $crash
+  Invoke-Teardown -Mode $mode -State $f.state -Install $f.install -Root $HKCU -KeyPath $f.keyPath `
+    -Trusted $trusted -RootOwners $rootOwners -Who $who -Ops (New-Ops $f) -Crash $crash
 }
-function Try-Run($f, [string]$mode = 'remove', [string]$crashAt, [string]$legacy, [string[]]$rootOwners = $who) {
-  try { Run $f $mode $crashAt $legacy $rootOwners; return 'ok' } catch { return $_.Exception.Message }
+# 'ok', 'cancelled' (MC-1583: the question's answer was no), or the error.
+function Try-Run($f, [string]$mode = 'remove', [string]$crashAt, [string[]]$rootOwners = $who) {
+  try { $res = @(Run $f $mode $crashAt $rootOwners); if ($res.Count -and $res[-1] -eq 'cancelled') { return 'cancelled' }; return 'ok' } catch { return $_.Exception.Message }
 }
 function Gone($f) { -not (Test-Path $f.state) -and -not (Test-Path $f.disk) -and -not (Test-Path $f.install) -and -not $HKCU.OpenSubKey($f.keyPath) -and $f.sys.service -eq 'missing' -and -not $f.sys.rights -and -not $f.sys.group -and -not $f.sys.strict.Count }
 function Phase($f) { $k = $HKCU.OpenSubKey($f.keyPath); if (-not $k) { return $null }; try { $v = $k.GetValue('Teardown'); if ($v) { ($v | ConvertFrom-Json).phase } } finally { $k.Dispose() } }
@@ -175,31 +196,20 @@ $r.keepThenRemove = Try-Run $f; $r.keepThenRemoveGone = Gone $f
 $f = New-Fixture
 $r.keepCrash = Try-Run $f 'keep' 'after:phase:stopped'
 $r.mismatchMode = Try-Run $f 'remove'
-$r.mismatchLegacy = Try-Run $f 'keep' $null ($f.disk)
 try { Assert-NoTeardown $HKCU $f.keyPath; $r.installDuring = 'allowed' } catch { $r.installDuring = $_.Exception.Message }
-$r.keepFinish = Try-Run $f 'keep'
+$r.keepFinish = Try-Run $f 'ask' # MC-1583: a resume with no option takes the recorded mode
 try { Assert-NoTeardown $HKCU $f.keyPath; $r.installAfter = 'allowed' } catch { $r.installAfter = $_.Exception.Message }
 
-# 8. Legacy: no receipts. Not admin-owned → refused; confirmed → removed (InstallId bootstrapped, then gone); not confirmed → nothing changed.
-function New-Legacy {
-  $script:n++
-  $b = Join-Path $Dir "legacy$($script:n)"
-  $f = [pscustomobject]@{ base = $b; state = (Join-Path $b 'state'); disk = (Join-Path $b 'disk'); install = (Join-Path $b 'install'); keyPath = "Software\hyperv-mcp-test-$([guid]::NewGuid().ToString('n'))"; sys = (New-Fixture 0).sys }
-  foreach ($p in $f.state, $f.disk) { Set-ExclusiveAcl $p @("$SYSTEM=FullControl", "$me=FullControl") }
-  Set-Content (Join-Path $f.state 'journal.jsonl') '{"t":"epoch"}'
-  New-Item -ItemType Directory -Force $f.install | Out-Null
-  return $f
-}
-$f = New-Legacy
-$r.legacyNotAdmin = Try-Run $f 'remove' $null $f.disk @($SYSTEM, $ADMINS)
-$r.legacyNotAdminNoKey = -not $HKCU.OpenSubKey($f.keyPath)
-$f = New-Legacy; $f.sys.confirm = $false
-$r.legacyDeclined = Try-Run $f 'remove' $null $f.disk
-$r.legacyDeclinedUnchanged = (Test-Path $f.state) -and -not $HKCU.OpenSubKey($f.keyPath)
-$f = New-Legacy
-$r.legacyConfirmed = Try-Run $f 'remove' $null $f.disk
-$r.legacyInventory = $f.sys.inventory -join ' | '
-$r.legacyGone = Gone $f
+# 8. MC-1583: the legacy path (installs from before receipts) is retired: storage without receipts is refused, untouched,
+# whatever its owner or permissions, and the message points to the manual steps.
+$script:n++
+$lb = Join-Path $Dir "legacy$($script:n)"
+$f = [pscustomobject]@{ base = $lb; state = (Join-Path $lb 'state'); disk = (Join-Path $lb 'disk'); install = (Join-Path $lb 'install'); keyPath = "Software\hyperv-mcp-test-$([guid]::NewGuid().ToString('n'))"; sys = (New-Fixture 0).sys }
+foreach ($p in $f.state, $f.disk) { Set-ExclusiveAcl $p @("$SYSTEM=FullControl", "$me=FullControl") }
+Set-Content (Join-Path $f.state 'journal.jsonl') '{"t":"epoch"}'
+New-Item -ItemType Directory -Force $f.install | Out-Null
+$r.legacyRefused = Try-Run $f 'remove'
+$r.legacyUntouched = (Test-Path (Join-Path $f.state 'journal.jsonl')) -and (Test-Path $f.disk) -and -not $HKCU.OpenSubKey($f.keyPath) -and -not @($f.sys.calls | Where-Object { $_ -ne 'state' }).Count
 
 # 9. The service started again after 'stopped' (a reboot, or Start-Service), then a rerun: it is stopped again before
 # the first deletion. And after 'storage-removed': stopped before it is deleted.
@@ -223,9 +233,6 @@ $r.restart2Gone = Gone $f
 # 10. Keep mode verifies the storage too, and acts on nothing it refuses: an untrusted legacy owner, a junction in the
 # state folder, a receipt mismatch. No side-effect callback runs.
 $sideEffects = { param($f) @($f.sys.calls | Where-Object { $_ -ne 'state' }).Count }
-$f = New-Legacy
-$r.keepLegacyNotAdmin = Try-Run $f 'keep' $null $f.disk @($SYSTEM, $ADMINS)
-$r.keepLegacyNotAdminQuiet = (& $sideEffects $f) -eq 0 -and -not $HKCU.OpenSubKey($f.keyPath)
 $f = New-Fixture
 $jt = Join-Path $f.base 'jt'; New-Item -ItemType Directory -Force $jt | Out-Null
 & cmd.exe /c mklink /J (Join-Path $f.state 'approvals\escape') $jt | Out-Null
@@ -243,6 +250,7 @@ $f = New-Fixture
 $r.resumeCrash = Try-Run $f 'keep' 'after:record'
 $jt2 = Join-Path $f.base 'jt2'; New-Item -ItemType Directory -Force $jt2 | Out-Null
 & cmd.exe /c mklink /J (Join-Path $f.state 'approvals\escape') $jt2 | Out-Null
+[void]$f.sys.calls.Clear() # the first run's question (MC-1583) came before its crash: only the resume's calls count
 $r.resumeTampered = Try-Run $f 'keep'
 $r.resumeTamperedQuiet = (& $sideEffects $f) -eq 0 -and (Phase $f) -eq 'verified'
 
@@ -271,8 +279,8 @@ foreach ($m in @('remove', 'keep')) {
   $ops = New-Ops $f
   $said = New-Object Collections.ArrayList
   $ops.Say = { param($x) [void]$said.Add($x) }.GetNewClosure()
-  foreach ($w in @('StopService', 'DeleteService', 'RemoveRights', 'RemoveGroup', 'Quiesce', 'RemovePool', 'ConfirmInventory')) { $nm = $w; $ops[$w] = { throw "WHATIF CALLED $nm" }.GetNewClosure() }
-  $res = try { Invoke-Teardown -Mode $m -State $f.state -Install $f.install -Root $HKCU -KeyPath $f.keyPath -Trusted $trusted -RootOwners $who -Who $who -KeyOwner $me -Ops $ops -WhatIf; 'ok' } catch { $_.Exception.Message }
+  foreach ($w in @('StopService', 'DeleteService', 'RemoveRights', 'RemoveGroup', 'Quiesce', 'RemovePool', 'PlanRemove', 'Confirm', 'ConfirmChange')) { $nm = $w; $ops[$w] = { throw "WHATIF CALLED $nm" }.GetNewClosure() }
+  $res = try { Invoke-Teardown -Mode $m -State $f.state -Install $f.install -Root $HKCU -KeyPath $f.keyPath -Trusted $trusted -RootOwners $who -Who $who -Ops $ops -WhatIf; 'ok' } catch { $_.Exception.Message }
   $after = Get-Snapshot $f
   $diff = @(Compare-Object ($before -split ';') ($after -split ';') | ForEach-Object { "$($_.SideIndicator)$($_.InputObject)" }) -join ' '
   $whatIf[$m] = [ordered]@{ result = $res; unchanged = ($after -eq $before); diff = $diff; record = $null -eq (Phase $f); calls = (($f.sys.calls | Sort-Object -Unique) -join ','); said = ($said -join ' | ') }
@@ -287,5 +295,67 @@ New-Item -ItemType Directory -Force (Join-Path $f.install 'guests') | Out-Null; 
 $r.keepsUninstall = Try-Run $f
 $r.keepsUninstallLeft = @(Get-ChildItem -LiteralPath $f.install -Force | ForEach-Object { $_.Name }) -join ','
 $r.keepsUninstallFile = Test-Path (Join-Path $f.install 'uninstall\uninstall.ps1')
+
+# 15. MC-1583: the one confirmation, bound to the exact VMs.
+$bind = [ordered]@{}
+$state1 = { param($f) [ordered]@{ phase = (Phase $f); removed = (@($f.sys.calls | Where-Object { $_ -eq 'remove-pool' }).Count); storage = (Test-Path $f.state) -and (Test-Path $f.disk) } }
+# The normal path: the VMs shown are the plan's; one question; the plan approved with no second one; all gone.
+$f = New-Fixture
+$res = Try-Run $f 'ask'
+$bind.normal = [ordered]@{ result = $res; shownVms = @($f.sys.shown[0].vms | ForEach-Object { $_.vmId }); shownFolders = @($f.sys.shown[0].folders).Count; asked = (@($f.sys.calls | Where-Object { $_ -eq 'confirm' }).Count); reasked = @($f.sys.changes).Count; approved = [bool]$f.sys.approved; gone = (Gone $f); order = (@($f.sys.calls | Where-Object { $_ -ne 'state' }) -join ',') }
+# A cancel: nothing written, quiesced, stopped or removed.
+$f = New-Fixture; $f.sys.answer = 'no'
+$bind.cancel = [ordered]@{ result = (Try-Run $f 'ask'); record = $null -eq (Phase $f); calls = (@($f.sys.calls | Where-Object { $_ -ne 'state' }) -join ','); service = $f.sys.service }
+# Asked to choose, keep: the pool kept.
+$f = New-Fixture; $f.sys.answer = 'keep'
+$bind.askKeep = [ordered]@{ result = (Try-Run $f 'ask'); kept = (Test-Path (Join-Path $f.disk 'pool\i-1')); removed = @($f.sys.calls | Where-Object { $_ -eq 'remove-pool' }).Count }
+# A VM added while the question is open: asked again (2 → 3); a no stops with nothing removed and the record kept; a
+# rerun asks again, and a yes removes the pool as it is now.
+$f = New-Fixture
+$f.sys.onConfirm = { $f.sys.vmList += [pscustomobject]@{ vmId = 'vm-3'; name = 'hvmcp-3'; folder = (Join-Path $f.disk 'pool\i-3') }; $f.sys.vms = 3 }.GetNewClosure()
+$f.sys.changeAnswer = $false
+$bind.added = [ordered]@{ result = (Try-Run $f 'ask'); change = $f.sys.changes[0]; after = (& $state1 $f) }
+$f.sys.changeAnswer = $true; $f.sys.onConfirm = $null
+$bind.addedRerun = [ordered]@{ result = (Try-Run $f 'ask'); asked = (@($f.sys.calls | Where-Object { $_ -eq 'confirm' }).Count); reasked = @($f.sys.changes).Count; gone = (Gone $f) }
+# The same count, another VM (vm-1 replaced by vm-9): asked again; a no removes nothing.
+$f = New-Fixture
+$f.sys.onConfirm = { $f.sys.vmList = @([pscustomobject]@{ vmId = 'vm-9'; name = 'hvmcp-9'; folder = (Join-Path $f.disk 'pool\i-9') }) + @($f.sys.vmList | Where-Object { $_.vmId -ne 'vm-1' }) }.GetNewClosure()
+$f.sys.changeAnswer = $false
+$bind.replaced = [ordered]@{ result = (Try-Run $f 'ask'); change = $f.sys.changes[0]; after = (& $state1 $f) }
+# None confirmed, then a VM made before the answer: an empty confirmation never covers it: asked again; a no deletes no
+# storage.
+$f = New-Fixture 0
+$f.sys.onConfirm = { $f.sys.vmList = @([pscustomobject]@{ vmId = 'vm-new'; name = 'hvmcp-new'; folder = (Join-Path $f.disk 'pool\i-new') }); $f.sys.vms = 1 }.GetNewClosure()
+$f.sys.changeAnswer = $false
+$bind.zeroToOne = [ordered]@{ result = (Try-Run $f 'ask'); shownVms = @($f.sys.shown[0].vms).Count; change = $f.sys.changes[0]; after = (& $state1 $f) }
+# A resume with an empty recorded set and a live VM: asked again before anything is approved.
+$f = New-Fixture 0
+$first = Try-Run $f 'remove' 'after:record'
+$f.sys.vmList = @([pscustomobject]@{ vmId = 'vm-late'; name = 'hvmcp-late'; folder = (Join-Path $f.disk 'pool\i-late') }); $f.sys.vms = 1
+$f.sys.changeAnswer = $false
+$bind.resumeEmpty = [ordered]@{ first = $first; result = (Try-Run $f 'remove'); asked = (@($f.sys.calls | Where-Object { $_ -eq 'confirm' }).Count); change = $f.sys.changes[0]; after = (& $state1 $f) }
+# A resume against the same set: no second question.
+$f = New-Fixture
+$first = Try-Run $f 'remove' 'after:record'
+$bind.resumeSame = [ordered]@{ first = $first; result = (Try-Run $f 'remove'); asked = (@($f.sys.calls | Where-Object { $_ -eq 'confirm' }).Count); reasked = @($f.sys.changes).Count; gone = (Gone $f) }
+# Round 1: a VM made after phase 2's first status read, just before quiesce locks the pool (an empty pool confirmed):
+# the count is read again after quiesce, so it is seen and asked about. A no keeps the record at 'verified' with all
+# storage; a yes removes it through its own fresh remove plan.
+$newVm = { param($f) $f.sys.vmList = @([pscustomobject]@{ vmId = 'vm-q'; name = 'hvmcp-q'; folder = (Join-Path $f.disk 'pool\i-q') }); $f.sys.vms = 1 }
+$f = New-Fixture 0
+$f.sys.onQuiesce = { & $newVm $f }.GetNewClosure(); $f.sys.changeAnswer = $false
+$bind.atQuiesceNo = [ordered]@{ result = (Try-Run $f 'ask'); change = $f.sys.changes[0]; after = (& $state1 $f) }
+$f = New-Fixture 0
+$f.sys.onQuiesce = { & $newVm $f }.GetNewClosure()
+$bind.atQuiesceYes = [ordered]@{ result = (Try-Run $f 'ask'); change = $f.sys.changes[0]; plans = $f.sys.plans; approved = $f.sys.approved; removed = (@($f.sys.calls | Where-Object { $_ -eq 'remove-pool' }).Count); gone = (Gone $f) }
+# The same on a resume of an empty record: a VM made just before the resumed run's quiesce.
+$f = New-Fixture 0
+$first = Try-Run $f 'remove' 'after:record'
+$f.sys.onQuiesce = { & $newVm $f }.GetNewClosure(); $f.sys.changeAnswer = $false
+$bind.atQuiesceResume = [ordered]@{ first = $first; result = (Try-Run $f 'remove'); change = $f.sys.changes[0]; after = (& $state1 $f) }
+# None confirmed and still none: no plan, no second question.
+$f = New-Fixture 0
+$bind.zeroStill = [ordered]@{ result = (Try-Run $f 'ask'); plans = $f.sys.plans; reasked = @($f.sys.changes).Count; gone = (Gone $f) }
+$r.bind = $bind
 
 [Console]::Out.WriteLine('RESULT:' + (ConvertTo-Json $r -Compress -Depth 6))

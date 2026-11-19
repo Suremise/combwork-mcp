@@ -8,7 +8,9 @@
 # state's epoch and a random nonce. The helper accepts it once, before it expires, for that exact plan only.
 #
 # It runs only from %ProgramFiles%\hyperv-mcp (admin-only writable), dot-sources nothing and uses only in-box cmdlets.
-param([Parameter(Mandatory = $true)][string]$Plan)
+# -Confirmed (MC-1583): the uninstaller's, for its own remove plan only, after the admin typed REMOVE for exactly that
+# plan's VMs: every check below, but no digest question. Like the rest of this script it runs elevated only.
+param([Parameter(Mandatory = $true)][string]$Plan, [switch]$Confirmed)
 $ErrorActionPreference = 'Stop'
 # Runs under Windows PowerShell 5.1 or PowerShell 7 (MC-1575). Under 5.1 started from a PowerShell 7 window, it
 # inherits PS7's module folders and can't load its own Get-Acl: drop them (only under 5.1: they are 7's own).
@@ -33,13 +35,14 @@ $now = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 if ($p.id -ne $Plan) { throw 'The plan file names another plan: refusing.' }
 if ($p.epoch -ne $epoch) { throw 'The plan is from an earlier pool state: ask for a new one.' }
 if ($p.expires -le $now) { throw 'The plan has expired: ask for a new one.' }
+if ($Confirmed -and $p.op -ne 'remove') { throw "-Confirmed is only for the uninstaller's remove plan: plan $Plan is a $($p.op) plan, and needs its digest." }
 
 Write-Host ''
 Write-Host "Plan ${Plan}: $($p.op) the hyper-v pool" -ForegroundColor Cyan
 foreach ($a in @($p.add)) { if ($a) { Write-Host ("  create {0}: {1} cores, {2} MB memory, {3} GB disk, in {4}" -f $a.name, $a.cores, $a.memoryMB, $a.diskGB, $a.folder) } }
 foreach ($r in @($p.remove)) { if ($r) { Write-Host ("  remove {0} and its folder {1}" -f $r.name, $r.folder) } }
 # MC-1531: a refresh plan.
-foreach ($r in @($p.refresh)) { if ($r) { Write-Host ("  refresh the clean checkpoint of {0}: rerun the build's guest steps offline (registry policy and Defender; the accounts' profiles kept as built, not logged on: profile-setup fixes need a rebuild), take a new clean checkpoint, remove the old one (pool checkpoints kept; nothing goes online; its evaluation end unchanged)" -f $r.name) } }
+foreach ($r in @($p.refresh)) { if ($r) { Write-Host ("  refresh the clean checkpoint of {0}: rerun the build's guest setup offline (its folders; not the guest setup script; the accounts' profiles kept as built, not logged on: profile-setup fixes need a rebuild), take a new clean checkpoint, remove the old one (pool checkpoints kept; nothing goes online; its evaluation end unchanged)" -f $r.name) } }
 # MC-1532: a pool-checkpoint plan.
 if ($p.op -eq 'checkpoint') {
   foreach ($v in @($p.vms)) {
@@ -56,13 +59,15 @@ if ($p.image) {
   Write-Host ("  image: {0}, SHA-256 {1} ({2})" -f $what, $p.image.sha256, $from)
   if ($p.image.signature) { Write-Host ("  setup files: {0}" -f $(if ($p.image.signature.microsoft) { 'signed by Microsoft' } else { "not signed by Microsoft ($($p.image.signature.note)): information only" })) }
 }
-Write-Host ''
-Write-Host 'The full plan, as the helper recorded it:' -ForegroundColor DarkGray
-Write-Host ($p | ConvertTo-Json -Depth 6) -ForegroundColor DarkGray
-Write-Host ''
-Write-Host "Digest: $digest"
-$typed = Read-Host 'To approve exactly this plan, type the first 6 characters of its digest (anything else cancels)'
-if ($typed.Trim().ToLowerInvariant() -ne $digest.Substring(0, 6)) { Write-Host 'Not approved.' -ForegroundColor Yellow; exit 1 }
+if (-not $Confirmed) {
+  Write-Host ''
+  Write-Host 'The full plan, as the helper recorded it:' -ForegroundColor DarkGray
+  Write-Host ($p | ConvertTo-Json -Depth 6) -ForegroundColor DarkGray
+  Write-Host ''
+  Write-Host "Digest: $digest"
+  $typed = Read-Host 'To approve exactly this plan, type the first 6 characters of its digest (anything else cancels)'
+  if ($typed.Trim().ToLowerInvariant() -ne $digest.Substring(0, 6)) { Write-Host 'Not approved.' -ForegroundColor Yellow; exit 1 }
+}
 
 $dir = Join-Path $state 'approvals'
 if (-not (Test-Path -LiteralPath $dir -PathType Container)) { throw "$dir is missing: run setup again." }

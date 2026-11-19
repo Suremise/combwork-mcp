@@ -1119,18 +1119,24 @@ You don't need an agent, or this repo, to put the PC back (MC-1557). Setup insta
 it works out what to remove when it runs, from the helper's own records: the pool, VMs, checkpoints, images, switch,
 service and folders as they are then, whoever made them. Nobody has to keep a script up to date.
 
-- **Settings > Apps > Installed apps > "Hyper-V MCP helper and test VMs" > Uninstall.** It asks for admin rights, shows
-  what is installed, and asks: remove everything (the default), keep the pool and remove only the helper, or list only.
+- **Settings > Apps > Installed apps > "Hyper-V MCP helper and test VMs" > Uninstall.** It asks for admin rights,
+  checks what is installed (changing nothing), then shows one screen of what goes and asks once: type `REMOVE` to
+  remove everything, or `KEEP` to keep the pool and remove only the helper. Anything else cancels, with nothing
+  changed (MC-1583).
 - Or, in an admin terminal (cmd or PowerShell; one line), the installed copy:
   ```
   cmd /c call "C:\Program Files\hyperv-mcp\uninstall.cmd"
   ```
-  Add `-RemovePool` or `-KeepPool` to skip the question, or `-WhatIf` to see what each would remove, changing nothing
-  (no record, no approval, no service change).
+  Add `-RemovePool` or `-KeepPool` to choose up front (it still shows what goes, and asks you to type that word), or
+  `-WhatIf` to see what each would remove, changing nothing (no record, no approval, no service change).
+- **The one answer is the approval.** The VMs on that screen are the ones the helper's own remove plan names, by id,
+  name and folder. Typing `REMOVE` approves that plan for exactly those VMs: there is no second approval step. If the
+  pool changes before they go (a VM added or replaced, even one appearing in a pool that had none), nothing is
+  removed: the new list is shown beside the one you confirmed, and you're asked again. A resumed uninstall checks the
+  same way.
 - **What is installed, in plain text:** `C:\ProgramData\hyperv-mcp\inventory.txt`, the helper's recorded inventory,
   rewritten after every change it makes. Each item has the command to remove it by hand, for when the uninstaller
-  can't run. The uninstaller shows it first, and checks every item live before deleting anything; it never runs the
-  file's text.
+  can't run. The uninstaller checks every item live before deleting anything; it never runs the file's text.
 - **Interrupted?** Run the Installed apps entry again: it finishes what's left, down to its own files and itself.
 
 Remove everything takes the pool's VMs and their checkpoints, the cached images, the disk folders, the helper's state,
@@ -1153,30 +1159,34 @@ An installed copy runs itself from a protected temporary copy (only SYSTEM and A
 folder. If a run is interrupted (its window closed), the next uninstall or setup removes that run's copy, only when it
 is exactly such a copy (`C:\Windows\Temp\hvmcp-uninstall-<32 hex>`, no links, owned by Administrators, only SYSTEM and
 Administrators granted, only the uninstaller's files) and no uninstall still runs from it; nothing else there is touched.
-With neither option it asks (see above). Choose one:
+With neither option it asks (see above), once. The two choices:
 - `-KeepPool` removes the service, its rights, the group and the code, and **keeps** the VMs, the helper's state (the
   journal, policy and guest credentials), the disk folders and their storage receipts. Running setup again recognises
   them by their receipts.
-- `-RemovePool` removes the pool first, through the helper's own journalled remove (you approve that plan as usual).
-  Then it removes the storage, then everything else.
+- `-RemovePool` removes the pool first, through the helper's own journalled remove (its plan approved by your one
+  answer, for exactly the VMs shown). Then it removes the storage, then everything else.
 
-**What it may delete:** only storage it verifies, before any change, as setup's own:
-- for an install made by this setup, exactly the folders that have storage receipts. Each folder's identity must
-  match its receipt, and its owners and permissions must be setup's;
-- for an install made by an older setup (no receipts), only the state folder and the disk folder you name with
-  `-LegacyDiskFolder D:\hyperv-mcp`. Each is checked (owned by Administrators or SYSTEM, permissions only for the
-  expected accounts, no links, safe parents). Then you're shown exactly what will be deleted, and asked to type
-  DELETE. Their present permissions prove nothing about their history, so your confirmation is the authority;
-- without that evidence, nothing is deleted. `policy.json` is never a source of what to delete.
+**What it may delete:** only storage it verifies, before any change, as setup's own: exactly the folders that have
+storage receipts. Each folder's identity must match its receipt, and its owners and permissions must be setup's.
+Without receipts, nothing is deleted, and `policy.json` is never a source of what to delete.
+
+**An install from before storage receipts** (MC-1583 retired the uninstaller's path for one). Every released hyper-v,
+from 1.0.0 in combwork-mcp 1.3.0, writes receipts. Such an install could only come from the unreleased builds of
+13 Nov. The uninstaller refuses one, changing nothing. Remove it by hand, in an admin PowerShell, following its
+`C:\ProgramData\hyperv-mcp\inventory.txt` if there is one: the VMs (`Stop-VM`, `Remove-VM`), the service
+(`sc.exe delete HyperVMcp`), the group (`Remove-LocalGroup 'Hyper-V MCP Users'`), `HKLM\SOFTWARE\hyperv-mcp`, the
+install and state folders, and the disk folder you gave setup.
 
 Nothing is ever deleted through a link. `-KeepPool` verifies the storage the same way, though it deletes nothing:
 quiesce reads and writes the helper's state as admin, so anything it would refuse to delete, it also refuses to use.
 
 **In what order:**
-1. Verify everything, changing nothing, and write a record.
+1. Verify everything, changing nothing. Then the one question, with the VMs as the helper's remove plan names them.
+   Then write a record, holding your answer and those VMs.
 2. Quiesce the helper and remove the pool: no new leases, every lease ended, every VM restored. The quiesce's own
    admin-written approval names its purpose: with `-KeepPool` no pool change is allowed after it; with `-RemovePool`
-   only this uninstall's own approved remove.
+   only this uninstall's own approved remove. A fresh remove plan is approved (`approve.ps1 -Confirmed`, for a remove
+   plan only) only if its VMs are exactly the confirmed ones; otherwise you're asked again first.
 3. Stop the service. It stays registered, and the code stays.
 4. Delete the storage. A leftover in `pool\` stops here, with the service only stopped.
 5. Remove the service, its rights, the group and the code.
@@ -1316,7 +1326,12 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
       rerun;
     - KeepPool, then reinstall, then RemovePool; a resume with other options refused; setup refused during a
       teardown;
-    - legacy storage refused unless admin-owned, unchanged unless confirmed, removed when confirmed;
+    - storage without receipts (an install from before them) refused untouched, pointing to the manual steps;
+    - MC-1583's one confirmation: the VMs shown are the remove plan's; one question, and the plan approved with no
+      second one; a cancel writing, quiescing, stopping and removing nothing; keep chosen at the question; a VM added,
+      one replaced (same count), or one appearing in a pool confirmed empty, each asked again with nothing removed on a
+      no and the record kept, and a yes going on; a resume against a changed set (an empty one included) asked again,
+      and against the same set not; none confirmed and none now, no plan;
   - `approve.ps1` refusing to run outside the install folder;
   - setup and `uninstall.ps1` running under 5.1 and under 7 on to their own checks, changing nothing; the module-path
     fix applied under 5.1 only;

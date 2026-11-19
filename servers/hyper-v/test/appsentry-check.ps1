@@ -212,8 +212,16 @@ function New-X($s, [switch]$ReadOnly) {
     ServiceHere = { $s.service }.GetNewClosure(); StateHere = { $s.state }.GetNewClosure(); KeyHere = { $s.key }.GetNewClosure()
     KeptMark = { $s.kept }.GetNewClosure(); InstallHere = { $s.install }.GetNewClosure(); EntryHere = { $s.entry }.GetNewClosure()
     ShowInventory = { [void]$s.calls.Add('inventory') }.GetNewClosure(); ShowChoices = { [void]$s.calls.Add('choices') }.GetNewClosure()
-    Ask = { [void]$s.calls.Add('ask'); $s.ask }.GetNewClosure()
-    Teardown = { param($m, $w) [void]$s.calls.Add("teardown:$m$(if ($w) { ':whatif' })"); if (-not $w) { & $mut 'teardown'; $s.service = $false; if ($m -eq 'remove') { $s.state = $false; $s.key = $false } } }.GetNewClosure()
+    # MC-1583: the teardown asks the one question ($s.ask: 'remove', 'keep' or 'cancelled') and returns the mode chosen.
+    Teardown = {
+      param($m, $w)
+      [void]$s.calls.Add("teardown:$m$(if ($w) { ':whatif' })")
+      if ($w) { return }
+      if ($s.ask -eq 'cancelled') { return 'cancelled' }
+      $mode = if ($m -eq 'ask') { $s.ask } else { $m }
+      & $mut 'teardown'; $s.service = $false; if ($mode -eq 'remove') { $s.state = $false; $s.key = $false }
+      return $mode
+    }.GetNewClosure()
     HostSwitches = { if ($s.switch) { 1 } else { 0 } }.GetNewClosure()
     RemoveHostSwitches = { & $mut 'switch'; [void]$s.calls.Add('switch'); $s.switch = $false }.GetNewClosure()
     Leftovers = { param($m) [void]$s.calls.Add("check:$m"); $l = @(); if ($s.switch) { $l += 'switch' }; if ($s.service) { $l += 'service' }; if ($m -eq 'remove' -and ($s.state -or $s.key)) { $l += 'state' }; if ($s.leftover) { $l += $s.leftover }; $l }.GetNewClosure()
@@ -230,8 +238,11 @@ $flow = [ordered]@{}
 $flow.remove = Get-Flow (New-World) @{ RemovePool = $true }
 $flow.keep = Get-Flow (New-World) @{ KeepPool = $true }
 $flow.menuRemove = Get-Flow (New-World) @{}
-$flow.menuCancel = Get-Flow (New-World @{ ask = $null }) @{}
-$flow.menuList = Get-Flow (New-World @{ ask = 'list' }) @{} -ReadOnly
+$flow.menuKeep = Get-Flow (New-World @{ ask = 'keep' }) @{}
+$flow.menuCancel = Get-Flow (New-World @{ ask = 'cancelled' }) @{}
+$flow.optionCancel = Get-Flow (New-World @{ ask = 'cancelled' }) @{ RemovePool = $true }
+# A kept pool whose helper is gone: keep is the only choice, so the teardown is asked to keep, not to choose.
+$flow.keptOnly = Get-Flow (New-World @{ service = $false; kept = $true; ask = 'keep' }) @{}
 foreach ($at in @('after:teardown', 'before:switch', 'after:switch', 'before:retire')) {
   $s = New-World
   $first = Get-Flow $s @{ RemovePool = $true } $at
