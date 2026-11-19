@@ -30,7 +30,8 @@ function wsb(args, timeoutMs = 120_000) {
   const t0 = Date.now()
   const { file, pre } = command()
   return new Promise(resolve => {
-    execFile(file, [...pre, ...args, '--raw'], { cwd: LAUNCH_DIR, timeout: Math.min(timeoutMs, TIMER_MAX_MS), windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+    // Whole milliseconds, at least 1 and at most a timer's longest wait: execFile refuses a fractional timeout.
+    execFile(file, [...pre, ...args, '--raw'], { cwd: LAUNCH_DIR, timeout: Math.max(1, Math.min(Math.round(timeoutMs), TIMER_MAX_MS)), windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
       let json = null
       try { json = stdout.trim() ? JSON.parse(stdout) : null } catch { /* not JSON */ }
       const timedOut = !!err?.killed

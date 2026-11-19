@@ -56,7 +56,8 @@ async function ollama(path, payload, timeoutMs = TIMEOUT_MS) {
       method: payload === undefined ? 'GET' : 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: payload === undefined ? undefined : JSON.stringify(payload),
-      signal: AbortSignal.timeout(Math.min(timeoutMs, TIMER_MAX_MS))
+      // Whole milliseconds, at least 1 and at most a timer's longest wait: AbortSignal.timeout takes no fraction.
+      signal: AbortSignal.timeout(Math.max(1, Math.min(Math.round(timeoutMs), TIMER_MAX_MS)))
     })
   } catch (e) {
     throw new Error(`Could not reach Ollama at ${OLLAMA_HOST} (${e.cause?.message ?? e.message}). Is it running?`)

@@ -512,3 +512,22 @@ test('the ready wait is a setting: a Sandbox that never runs a command is given 
   assert.ok(Date.now() - t0 < 20_000, 'well short of the old fixed 60 s')
   await srv.close()
 })
+
+test('a fractional timeoutSec is honoured: execFile gets whole milliseconds', async () => {
+  const s = scratch('srv-frac-timeout')
+  const { srv } = await started(s)
+  const r = await srv.call('sandbox_run', { command: 'hang', timeoutSec: 1.0005 })
+  assert.ok(r.isError && /TIMED OUT after 1\.0005 s: killed PID 4242 inside/.test(r.text), r.text)
+  await srv.call('sandbox_stop')
+  await srv.close()
+})
+
+test('screenshot.ps1 scales a wide desktop down to a 1-pixel width without a zero height', { skip: process.platform !== 'win32' && 'needs Windows PowerShell' }, () => {
+  const { execFileSync } = require('child_process')
+  const dir = scratch('shot-size').dir
+  for (const [desktop, width, want] of [['2560x1080', 1, '1x1'], ['3840x1080', 2, '2x1'], ['1920x1080', 1280, '1280x720'], ['800x600', 1280, '800x600']]) {
+    const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, '..', 'inside', 'screenshot.ps1'), '-Path', path.join(dir, `${desktop}-${width}.jpg`), '-MaxWidth', String(width), '-Desktop', desktop], { encoding: 'utf8', windowsHide: true })
+    assert.strictEqual(out.trim(), `${desktop} -> ${want}`)
+    assert.ok(fs.statSync(path.join(dir, `${desktop}-${width}.jpg`)).size > 0)
+  }
+})

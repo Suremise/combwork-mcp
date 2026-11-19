@@ -89,7 +89,8 @@ async function etapi(method, path, { body, as = 'json', timeoutMs = TIMEOUT_MS }
       method,
       headers,
       body: body === undefined ? undefined : typeof body === 'string' ? body : JSON.stringify(body),
-      signal: AbortSignal.timeout(timeoutMs)
+      // Whole milliseconds, at least 1 and at most a timer's longest wait: AbortSignal.timeout takes no fraction.
+      signal: AbortSignal.timeout(Math.max(1, Math.min(Math.round(timeoutMs), TIMER_MAX_MS)))
     })
   } catch (e) {
     throw new TriliumError(`Could not reach Trilium at ${BASE} (${e.cause?.message ?? e.message}). Is it running, and is TRILIUM_URL right?`)

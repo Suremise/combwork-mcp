@@ -233,6 +233,16 @@ test('the size limits are settings: OLLAMA_MAX_FILE_MB raised reads a big file, 
   await srv.close()
 })
 
+test('a fractional OLLAMA_TIMEOUT_SECONDS works: the timeout is whole milliseconds', async () => {
+  const s = scratch('frac-timeout')
+  for (const t of ['1.001', '2.0005']) {
+    const srv = server({ ...s.env, OLLAMA_TIMEOUT_SECONDS: t }, { roots: [s.a] })
+    const r = await ask(srv, ['README.md'])
+    assert.ok(!r.isError && r.text.includes('A-README'), `${t}: ${r.text}`)
+    await srv.close()
+  }
+})
+
 test('folders are read to any depth', async () => {
   const s = scratch('deep')
   const deep = path.join(s.a, ...Array.from({ length: 15 }, (_, i) => `d${i}`))

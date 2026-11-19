@@ -340,6 +340,16 @@ test('the limits are settings, with no ceiling of their own: lowered or raised, 
   await srv.close()
 })
 
+test('a fractional TRILIUM_TIMEOUT_SECONDS works: the timeout is whole milliseconds', async () => {
+  for (const t of ['1.001', '2.0005']) {
+    const srv = start({ TRILIUM_TIMEOUT_SECONDS: t })
+    assert.match((await srv.ready).result.instructions, /Connected to Trilium/, t)
+    const r = await srv.call('trilium_read_note', { note: 'builds' })
+    assert.ok(!r.isError && r.text.startsWith('# Builds (builds)'), `${t}: ${r.text}`)
+    await srv.close()
+  }
+})
+
 test('a protected note: read says plainly that ETAPI can\'t read it, and append refuses; neither asks for its content', async () => {
   const srv = start()
   let r = await srv.call('trilium_read_note', { note: 'secret' })
