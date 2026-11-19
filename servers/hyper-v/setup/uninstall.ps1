@@ -55,6 +55,11 @@ $SYSTEM = 'S-1-5-18'; $ADMINS = 'S-1-5-32-544'
 # MC-1557: an installed uninstaller (under the install folder) runs from a protected temporary copy, so it can remove
 # its own folder and nothing holds it open: the same arguments, then the copy is removed.
 $here = [IO.Path]::GetFullPath($PSScriptRoot).TrimEnd('\')
+# MC-1567: an interrupted run's copy (its window closed before its finally) is removed by the next run, only when it is
+# exactly such a copy and no uninstall is still running from it (appsentry.ps1, Remove-StaleProtectedCopies).
+if (-not $FromCopy -and -not $WhatIf) {
+  foreach ($l in @(Remove-StaleProtectedCopies (Join-Path $env:SystemRoot 'Temp') -Owners @($ADMINS) -Grants @($SYSTEM, $ADMINS))) { Step "An earlier run's temporary copy: $l." }
+}
 if (-not $FromCopy -and $here.ToLowerInvariant().StartsWith($install.ToLowerInvariant() + '\')) {
   $tmp = New-ProtectedCopy (Join-Path $env:SystemRoot 'Temp') @($script:RetiringSet | ForEach-Object { Join-Path $here $_ }) -Owners @($ADMINS) -Grants @($SYSTEM, $ADMINS) -SetOwner
   $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Join-Path $tmp 'uninstall.ps1'))

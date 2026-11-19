@@ -165,4 +165,30 @@ test('the Installed apps entry, run for real (5.1, non-elevated, scratch Program
   assert.deepStrictEqual([F.nothing.result, F.nothing.calls], [0, ''])
   // The protected temporary copy.
   assert.deepStrictEqual(a.copy, { files: ['acl.ps1', 'appsentry.ps1', 'Storage.cs', 'teardown.ps1', 'uninstall.ps1'], problems: [], protected: true })
+  // MC-1567: an interrupted run's copies are removed by a later run; the current run's copy, one still in use, anything
+  // not exactly such a copy (an extra file, a subfolder, a looser ACL, another owner, a file, a link) and anything else
+  // under the parent are left. The link's target is untouched.
+  const st = a.stale
+  // Round 1: a process query that fails, or a list without this process, establishes nothing: every copy left, none
+  // removed (the stale ones included), each saying why.
+  const cands = ['afile', 'extra', 'inuse', 'link', 'loose', 'stale', 'stale2', 'subfolder']
+  assert.deepStrictEqual(st.fail, cands.map(k => `left ${k} whether an uninstall still runs from it is unknown: the process list couldn't be read: Access denied (injected)`))
+  assert.deepStrictEqual(st.part, cands.map(k => `left ${k} whether an uninstall still runs from it is unknown: the process list was incomplete`))
+  assert.deepStrictEqual(st.afterFail, { stale: true, stale2: true })
+  const want = [
+    /^left afile it is not a folder$/,
+    /^left extra it holds notes\.txt, which the uninstaller doesn't copy there$/,
+    /^left inuse an uninstall is still running from it$/,
+    /^left link it is a link$/,
+    /^left loose .*hvmcp-uninstall-[0-9a-f]{32}: .* has /,
+    /^left subfolder it holds sub, which the uninstaller doesn't copy there$/,
+    /^removed stale$/,
+    /^removed stale2$/
+  ]
+  assert.strictEqual(st.lines.length, want.length, st.lines.join('\n'))
+  want.forEach((re, i) => assert.match(st.lines[i], re))
+  for (const k of ['extra', 'loose', 'stale', 'stale2', 'subfolder']) assert.ok(st.owner.some(l => l.startsWith(`left ${k} it is owned by `)), `${k}: another owner is left (${st.owner.join('; ')})`)
+  assert.ok(!st.owner.some(l => /^removed|current|othername|unrelated|linktarget/.test(l)), st.owner.join('; '))
+  assert.deepStrictEqual(st.exists, { stale: false, stale2: false, current: true, inuse: true, extra: true, subfolder: true, loose: true, othername: true, afile: true, unrelated: true, linktarget: true, link: true })
+  assert.deepStrictEqual(st.linkTargetFiles, ['acl.ps1', 'appsentry.ps1', 'Storage.cs', 'teardown.ps1', 'uninstall.ps1'])
 })

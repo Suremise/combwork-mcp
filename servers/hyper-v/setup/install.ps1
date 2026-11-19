@@ -91,6 +91,8 @@ if ($kpKey) {
     Step 'The pool an earlier uninstall kept is taken over again.'
   }
 }
+# MC-1567: an interrupted uninstall's protected temporary copy, only when it is exactly one (appsentry.ps1).
+foreach ($l in @(Remove-StaleProtectedCopies (Join-Path $env:SystemRoot 'Temp') -Owners @('S-1-5-32-544') -Grants @('S-1-5-18', 'S-1-5-32-544'))) { Step "An earlier uninstall's temporary copy: $l." }
 $src = Split-Path -Parent $PSScriptRoot   # servers\hyper-v
 # Locations from Windows' known-folder API, not from environment variables.
 $install = Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'hyperv-mcp'
