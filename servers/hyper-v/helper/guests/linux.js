@@ -60,6 +60,8 @@ class LinuxDriver {
         return { pid: null, started: r.boot, unit: r.unit }
       }
       case 'guest-run-poll': return this.dispatch(vm, { op: 'run-poll', n: a.n, cap: a.cap }, opts)
+      // MC-1577: a build-time run's files live under /hvmcp/runs, which the build's finish clears before the checkpoint.
+      case 'guest-run-clear': return { cleared: 'at finish' }
       case 'guest-run-kill': return this.dispatch(vm, { op: 'run-kill', n: a.n, boot: a.started }, opts)
       case 'guest-list': return this.dispatch(vm, { op: 'list' }, opts)
       case 'guest-read': return this.dispatch(vm, { op: 'read', paths: a.paths, maxBytes: a.maxBytes, maxTotalBytes: a.maxTotalBytes }, opts)
@@ -204,6 +206,12 @@ class LinuxDriver {
     step('checking the guest')
     const bad = verifyProblem(g, { keys, transport, img })
     if (bad.length) throw new Error(`the guest's checks failed: ${bad.join('; ')}`)
+    // MC-1577: the plan's guest setup script (the user's own), as root, offline, before cloud-init is turned off.
+    let guestScript = null
+    if (plan.guestScript) {
+      step(`running the guest setup script ${plan.guestScript.name} (offline)`)
+      guestScript = await h.runGuestScript(vm, plan.guestScript)
+    }
     step('turning cloud-init off, then shutting down')
     const fin = await this.dispatch(vm, { op: 'finish' })
     // MC-1551: cloud-init's cached seed (a second copy of the host key's private half) must be gone before the clean
@@ -216,7 +224,7 @@ class LinuxDriver {
     fs.rmSync(seedIso, { force: true })
     return {
       vm,
-      record: { licence: { kind: 'linux' }, guest: { id: g.id, versionId: g.versionId, serial: g.serial, kernel: g.kernel }, diag: facts, transport }
+      record: { licence: { kind: 'linux' }, guest: { id: g.id, versionId: g.versionId, serial: g.serial, kernel: g.kernel }, diag: facts, transport, guestScript }
     }
   }
 

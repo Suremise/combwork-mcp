@@ -18,8 +18,8 @@ never branches on the OS itself, except to refuse something a driver says it doe
 |---|---|---|
 | `diskFrom(image, plan)` | empty VHDX + the ISO + answer-file ISO | copies the image's verified base VHDX, `Resize-VHD` to the plan's size, plus a NoCloud seed ISO (§3) |
 | `firmware` | Gen 2, Secure Boot `MicrosoftWindows` | Gen 2, Secure Boot `MicrosoftUEFICertificateAuthority` (Debian and Ubuntu boot through Microsoft's signed shim) |
-| `install(vm)` | unattended setup, guest setup, licence, profiles, Defender | first boot from the seed, cloud-init finishes, then the guest steps (§3) |
-| `guestSteps(vm)` (build and refresh-clean) | guest setup, registry policy, Defender | reinstall and verify the fixed guest scripts, units and sshd config (§3) |
+| `install(vm)` | unattended setup, guest setup, licence, profiles, the plan's guest setup script | first boot from the seed, cloud-init finishes, then the guest steps (§3) |
+| `guestSteps(vm)` (build and refresh-clean) | guest setup | reinstall and verify the fixed guest scripts, units and sshd config (§3) |
 | `ready(vm)` | heartbeat, then PowerShell Direct | heartbeat (hv_utils), then an SSH `ready` |
 | `runStart / runPoll / runKill` | `guest-run-*` over PowerShell Direct | SSH to the guest dispatcher (§4) |
 | `copyIn / syncIn` | `Copy-Item -ToSession` + guest-sync.ps1 | a stream into the guest dispatcher's `sync` (§5) |

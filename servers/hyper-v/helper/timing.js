@@ -27,7 +27,9 @@ const KEYS = {
   copyIdleMinutes: { env: 'HYPERV_MCP_COPY_IDLE_MINUTES', unit: MIN, def: 5, floor: 1, max: 9, test: 'HYPERV_MCP_COPY_IDLE_MS', what: 'a Windows build copy or vm_sync with no 32 MB part or file finished' },
   // MC-1566: a connected start's guest network read back until it is right and has held (a condition); this is only
   // its ceiling, formerly a fixed 90 s.
-  networkSeconds: { env: 'HYPERV_MCP_NETWORK_SECONDS', unit: SEC, def: 90, floor: 30, max: 600, test: 'HYPERV_MCP_NET_WAIT_MS', what: "a connected start's guest network being ready and steady (a DHCP address, or host mode's static one)" }
+  networkSeconds: { env: 'HYPERV_MCP_NETWORK_SECONDS', unit: SEC, def: 90, floor: 30, max: 600, test: 'HYPERV_MCP_NET_WAIT_MS', what: "a connected start's guest network being ready and steady (a DHCP address, or host mode's static one)" },
+  // MC-1577: the user's guest setup script at build.
+  guestScriptMinutes: { env: 'HYPERV_MCP_GUEST_SCRIPT_MINUTES', unit: MIN, def: 30, floor: 1, max: 360, test: 'HYPERV_MCP_GUEST_SCRIPT_MS', what: 'the guest setup script a plan names, in each VM it builds' }
 }
 const unitName = k => KEYS[k].unit === MIN ? 'min' : 's'
 

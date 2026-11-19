@@ -479,17 +479,23 @@ $GuestSetup = {
   & icacls.exe C:\out /grant "${userName}:(OI)(CI)M" | Out-Null
   Remove-Item 'C:\Windows\Panther\unattend*.xml', 'C:\Windows\Panther\Unattend\*.xml' -Force -ErrorAction SilentlyContinue
   $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
-  # MC-1522: a session-0 run outlives the PowerShell Direct session that started it (MC-1510). The evidence suggests,
-  # but doesn't yet prove (MC-1521's trial does), that without this policy the User Profile Service force-unloads the
-  # account's registry when that session ends, under the still-running run ("registry key marked for deletion",
-  # 0x800703FA, seen in a run; .NET's LoadFile failing with E_UNEXPECTED). Read back for the check.
-  New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Force | Out-Null
-  Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name DisableForceUnload -Value 1 -Type DWord
-  $dfu = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -ErrorAction SilentlyContinue).DisableForceUnload
+  # MC-1577: no registry policy or other tweak of the build's own (MC-1522's DisableForceUnload is gone): a user who
+  # wants one puts it in their guest setup script.
   # MC-1558: read back what it made (it may run twice: everything above is idempotent).
   $folders = (Test-Path -LiteralPath 'C:\out' -PathType Container) -and (Test-Path -LiteralPath 'C:\build' -PathType Container) -and (Test-Path -LiteralPath 'C:\hvmcp' -PathType Container)
   $buildProtected = [bool](Get-Acl -LiteralPath 'C:\build').AreAccessRulesProtected
-  @{ editionId = $cv.EditionID; build = $cv.CurrentBuild; ubr = $cv.UBR; disableForceUnload = $(if ($null -eq $dfu) { $null } else { [int]$dfu }); folders = $folders; buildProtected = $buildProtected }
+  @{ editionId = $cv.EditionID; build = $cv.CurrentBuild; ubr = $cv.UBR; folders = $folders; buildProtected = $buildProtected }
+}
+
+# MC-1577: a finished build-time run's files (the guest setup script's), cleared before the clean checkpoint: its
+# script and wrapper in C:\hvmcp, its output and exit files in C:\out. Only that run's fixed names.
+$GuestRunClear = {
+  param($n)
+  $n = [int]$n
+  foreach ($f in "C:\hvmcp\run-$n.ps1", "C:\hvmcp\run-$n.cmd", "C:\hvmcp\wrap-$n.cmd", "C:\out\.run-$n.stdout.txt", "C:\out\.run-$n.stderr.txt", "C:\out\.run-$n.exit", "C:\out\.run-$n.exit.tmp") {
+    Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
+  }
+  @{ cleared = $true }
 }
 
 # The guest's LSA secret helper (MC-1503): Store sets the autologon password; Remove (MC-1516) deletes it again. Passed
@@ -721,19 +727,6 @@ $GuestProvisioned = {
   } catch { $ar = $null }
   if ($null -eq $ar) { $ar = & ([scriptblock]::Create($readinessText)) $null '' }
   @{ boot = $boot; user = ($procs.Count -gt 0); lastEvent = $last; count = $pk.Count; inventory = $inventory; busy = $busy; mappings = $counts.mappings; packagesDirs = $counts.packagesDirs; appReadiness = $ar }
-}
-
-# MC-1519 (the user's decision): the test work folders excluded from Defender's scanning (an ExclusionPath: real-time
-# and scheduled scans), in the guest image only. The user's chosen mitigation for an intermittent load failure of a
-# just-written large exe; Defender's part in it is suspected, not established. Defender stays on otherwise. It reads
-# back the exclusions and Defender's state for the helper to check.
-$GuestDefender = {
-  param($paths)
-  $ErrorActionPreference = 'Stop'
-  Add-MpPreference -ExclusionPath ([string[]]$paths)
-  $p = Get-MpPreference
-  $s = Get-MpComputerStatus
-  @{ exclusions = @($p.ExclusionPath | Where-Object { $_ }); realTime = [bool]$s.RealTimeProtectionEnabled; service = [bool]$s.AMServiceEnabled; tamper = [bool]$s.IsTamperProtected }
 }
 
 # MC-1520: events shaped to allowlisted fields only, pure so the tests run it: the last $cap of them, oldest first, as
@@ -1182,9 +1175,9 @@ try {
       $vm = Get-OwnVm $a
       Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestProvisioned -ArgumentList ([string]$a.account), ([int]$a.quietMs), $ProfileCounts.ToString(), $AppReadinessState.ToString()
     }
-    'guest-defender' {
+    'guest-run-clear' {
       $vm = Get-OwnVm $a
-      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestDefender -ArgumentList (,[string[]]@($a.paths))
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestRunClear -ArgumentList ([int]$a.n)
     }
     'guest-licence' {
       $vm = Get-OwnVm $a

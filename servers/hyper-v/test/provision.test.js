@@ -11,7 +11,8 @@ const status = async c => (await c.request('status')).text
 
 /** A one-VM create with the stub set as given; resolves the plan and the job's line. */
 // Builds whose provisioning waits run out on purpose: timing.json's narrow values (MC-1558).
-async function build(t, name, stub = {}) {
+// planArgs(sc): more pool_plan arguments (MC-1577: guestScript); beforeApply(sc, plan): between the plan and its apply.
+async function build(t, name, stub = {}, { planArgs = () => ({}), beforeApply = () => {} } = {}) {
   const sc = scratch(name, { stub, timing: 'narrow' })
   let h = await startHelper(sc)
   await h.stop()
@@ -19,8 +20,9 @@ async function build(t, name, stub = {}) {
   h = await startHelper(sc)
   t.after(() => h.stop())
   const admin = h.conn(1)
-  const plan = await admin.request('pool_plan', { action: 'create', vms: 1, cores: 2, memoryGB: 4 })
+  const plan = await admin.request('pool_plan', { action: 'create', vms: 1, cores: 2, memoryGB: 4, ...planArgs(sc) })
   approve(sc, plan.data.planId)
+  await beforeApply(sc, plan)
   await admin.request('pool_create', { planId: plan.data.planId })
   await waitFor(async () => /Last pool job: create (finished|FAILED)/.test(await status(admin)), T.waitForMs, 'the pool job')
   const line = (await status(admin)).split('\n').find(l => l.startsWith('Last pool job'))
@@ -128,42 +130,91 @@ test('an undo that doesn\'t verify fails the build: a leftover explicit ACE on C
   assert.deepStrictEqual(vms(lua.sc), [])
 })
 
-// MC-1519 (the user's decision): the test work folders excluded from Defender's scanning (real-time and scheduled), in
-// the image.
-const EXCLUDED = String.raw`C:\build|C:\out|C:\trial-session|C:\hvmcp`.split('|')
+// MC-1577: no guest tweaks of the build's own (MC-1519's Defender exclusions, MC-1522's registry policy); the user's
+// own guest setup script, named in the plan, instead.
+const path = require('path')
+const fs = require('fs')
+const crypto = require('crypto')
+/** The user's script file (the stub runs its text as a command: "write <path> <text>", "exit <n>", "sleep"). */
+const userScript = (sc, text, name = 'guest.ps1') => { const f = path.join(sc.dir, 'user', name); fs.mkdirSync(path.dirname(f), { recursive: true }); fs.writeFileSync(f, text); return f }
+const scriptRuns = sc => sc.stub().calls.filter(c => c.op === 'guest-run-start')
 
-test('Defender (MC-1519): the build excludes exactly the test folders, after the profiles and before the checkpoint, read back with real-time on', async t => {
-  const { sc, plan, line } = await build(t, 'def-ok')
+test('a plain build adds no guest tweaks: no Defender step, no registry policy, no script; the plan says so', async t => {
+  const { sc, plan, line } = await build(t, 'gs-plain')
   assert.match(line, /create finished/)
-  assert.ok(plan.text.includes(String.raw`- Defender: the test work folders C:\build, C:\out, C:\trial-session, C:\hvmcp are excluded from Defender's scanning (real-time and scheduled scans) in the guest image; Defender stays on otherwise`), plan.text)
+  assert.match(plan.text, /- guest setup script: none \(nothing is added to the guest beyond the build's own accounts and folders\)/)
+  assert.doesNotMatch(plan.text, /Defender|DisableForceUnload|trial-session/)
   const ops = sc.stub().calls.map(c => c.op)
-  assert.ok(ops.lastIndexOf('guest-logon-undo') < ops.indexOf('guest-defender') && ops.indexOf('guest-defender') < ops.indexOf('make-clean'), 'after the profiles, before the checkpoint')
-  assert.deepStrictEqual(vms(sc)[0].exclusions, EXCLUDED)
-  assert.deepStrictEqual(sc.journal().find(r => r.t === 'ready').defender, { exclusions: EXCLUDED, realTime: true })
+  for (const op of ['guest-defender', 'guest-run-start', 'guest-run-clear']) assert.ok(!ops.includes(op), `no ${op}`)
+  assert.strictEqual(sc.journal().find(r => r.t === 'ready').guestScript, null)
+  assert.ok(!Object.keys(vms(sc)[0].checkpoints[0].disk).some(p => /trial-session/i.test(p)))
 })
 
-test('Defender (MC-1519): a read-back missing a folder, with another exclusion, or with real-time protection off fails the build', async t => {
-  const missing = await build(t, 'def-missing', { defenderOverride: { exclusions: String.raw`C:\build|C:\out|C:\hvmcp`.split('|') } })
-  assert.ok(missing.line.includes(String.raw`Defender's settings didn't verify: its exclusions are c:\build, c:\hvmcp, c:\out, not exactly`), missing.line)
-  const extra = await build(t, 'def-extra', { defenderOverride: { exclusions: [...EXCLUDED, String.raw`C:\Users`] } })
-  assert.ok(extra.line.includes(String.raw`c:\users`) && extra.line.includes('not exactly'), extra.line)
-  const off = await build(t, 'def-off', { defenderOverride: { realTime: false } })
-  assert.match(off.line, /didn't verify: real-time protection is off/)
-  assert.deepStrictEqual(vms(off.sc), [])
+test('a named guest setup script: shown in the plan by path, size and SHA-256; run once as the admin after the build\'s steps, its run cleared, before the checkpoint', async t => {
+  const text = 'write C:\\gs-ran.txt from the user script'
+  let file
+  const { sc, plan, line } = await build(t, 'gs-ok', {}, { planArgs: sc => ({ guestScript: (file = userScript(sc, text)) }) })
+  assert.match(line, /create finished/, line)
+  const sha = crypto.createHash('sha256').update(text).digest('hex')
+  assert.ok(plan.text.includes(`- guest setup script: ${file} (${text.length} bytes, SHA-256 ${sha}), run once in each new VM as its admin, offline, before its clean checkpoint; a non-zero exit fails that VM's build`), plan.text)
+  const runs = scriptRuns(sc)
+  assert.strictEqual(runs.length, 1)
+  assert.strictEqual(runs[0].command, text, 'the script\'s own text')
+  const ops = sc.stub().calls.map(c => c.op)
+  const at = ops.indexOf('guest-run-start')
+  assert.ok(ops.lastIndexOf('guest-logon-undo') < at && at < ops.indexOf('guest-run-clear') && ops.indexOf('guest-run-clear') < ops.indexOf('make-clean'), 'after the profiles, cleared, then the checkpoint')
+  const vm = vms(sc)[0]
+  assert.ok(vm.checkpoints[0].disk['C:\\gs-ran.txt'], 'what it did is in the clean checkpoint')
+  assert.ok(sc.stub().cleared.every(n => n >= 800_000_000), 'its run number is the helper\'s own')
+  assert.deepStrictEqual(sc.journal().find(r => r.t === 'ready').guestScript, { sha256: sha, name: 'guest.ps1' })
+  assert.ok(fs.existsSync(path.join(sc.stateDir, 'scripts', `${sha}.ps1`)), 'the helper\'s copy')
 })
 
-test('Defender (MC-1519): the antivirus service off, or the query failing, fails the build before any checkpoint or ready record, and rolls back', async t => {
-  for (const [name, stub, why] of [
-    ['def-service', { defenderOverride: { service: false } }, /Defender's settings didn't verify: the antivirus service is off/],
-    ['def-query', { fail: { 'guest-defender': 1 } }, /injected failure of guest-defender/]
+test('the guest setup script runs from the helper\'s copy: a later change to the user\'s file changes nothing; a changed copy refuses the plan', async t => {
+  let file
+  const same = await build(t, 'gs-user-changed', {}, {
+    planArgs: sc => ({ guestScript: (file = userScript(sc, 'write C:\\approved.txt yes')) }),
+    beforeApply: () => fs.writeFileSync(file, 'write C:\\swapped.txt no')
+  })
+  assert.match(same.line, /create finished/)
+  assert.strictEqual(scriptRuns(same.sc)[0].command, 'write C:\\approved.txt yes', 'the approved bytes ran')
+  let tsc
+  await assert.rejects(build(t, 'gs-copy-changed', {}, {
+    planArgs: sc => ({ guestScript: userScript(sc, 'write C:\\approved.txt yes') }),
+    beforeApply: sc => { tsc = sc; const d = path.join(sc.stateDir, 'scripts'); for (const f of fs.readdirSync(d)) fs.writeFileSync(path.join(d, f), 'exit 0') }
+  }), /Plan p-[0-9a-f]{16}'s guest setup script \(its helper copy\) is missing or changed: make a new plan\./)
+  assert.ok(!tsc.stub().calls.some(c => c.op === 'create-vm' || c.op === 'guest-run-start'), 'nothing was created or run')
+})
+
+test('a guest setup script that exits non-zero, or never exits in time, fails the build with its output, before any checkpoint, and rolls back', async t => {
+  for (const [name, text, why] of [
+    ['gs-exit', 'exit 3', /FAILED: .*the guest setup script guest\.ps1 exited 3/],
+    ['gs-slow', 'sleep', /FAILED: .*the guest setup script guest\.ps1 didn't finish within 0 min \(the guestScriptMinutes timing\)\. Its output ends:/]
   ]) {
-    const { sc, line } = await build(t, name, stub)
-    assert.match(line, why)
+    const { sc, line } = await build(t, name, { runJobs: true }, { planArgs: sc => ({ guestScript: userScript(sc, text) }) })
+    assert.match(line, why, `${name}: ${line}`)
     assert.ok(!sc.stub().calls.some(c => c.op === 'make-clean'), `${name}: never reached the checkpoint`)
     assert.ok(!sc.journal().some(r => r.t === 'ready'), `${name}: no ready record`)
     assert.ok(sc.journal().some(r => r.t === 'rolledBack'), `${name}: rolled back`)
-    assert.deepStrictEqual(vms(sc), [])
+    if (name === 'gs-slow') assert.ok(sc.stub().kills?.length, 'the run was killed')
   }
+})
+
+test('a guest setup script is refused at plan time: a relative or missing path, the wrong kind for the guests, an empty or too-large file', async t => {
+  const sc = scratch('gs-refused', { timing: 'narrow' })
+  let h = await startHelper(sc)
+  await h.stop()
+  seedImage(sc)
+  h = await startHelper(sc)
+  t.after(() => h.stop())
+  const admin = h.conn(1)
+  const plan = guestScript => admin.request('pool_plan', { action: 'create', vms: 1, cores: 2, memoryGB: 4, guestScript })
+  await assert.rejects(plan('guest.ps1'), /guestScript must be an absolute local path/)
+  await assert.rejects(plan(path.join(sc.dir, 'nope.ps1')), /can't be read: no such file/)
+  await assert.rejects(plan(userScript(sc, 'echo hi', 'guest.sh')), /guestScript must be a \.ps1, \.cmd, \.bat file for Windows guests/)
+  await assert.rejects(plan(userScript(sc, '', 'empty.ps1')), /must hold 1 byte to 1048576 bytes/)
+  await assert.rejects(plan(userScript(sc, 'x'.repeat(1024 * 1024 + 1), 'big.ps1')), /must hold 1 byte to 1048576 bytes/)
+  for (const ok of ['a.ps1', 'b.cmd', 'c.BAT']) assert.match((await plan(userScript(sc, 'echo hi', ok))).text, /- guest setup script: /, ok)
 })
 
 // MC-1520: a failed build logon is diagnosed before its undo, and the attempt recorded where anyone can see it.
@@ -209,11 +260,8 @@ test('an unknown AppContainer count (MC-1520) is never quiet: it starts the wind
 })
 
 // MC-1522: the guest image doesn't forcibly unload a user's registry at logoff; guest-setup reads it back.
-test('the registry policy (MC-1522): named in the plan, read back from guest-setup; a build without it fails and rolls back', async t => {
-  const ok = await build(t, 'dfu-ok')
+test('no registry policy of the build\'s own (MC-1577 removed MC-1522\'s): a guest-setup read-back without one builds', async t => {
+  const ok = await build(t, 'dfu-none', { setupOverride: { disableForceUnload: null } })
   assert.match(ok.line, /create finished/)
-  assert.match(ok.plan.text, /- registry: a user's registry isn't forcibly unloaded at logoff \(the DisableForceUnload policy\)/)
-  const missing = await build(t, 'dfu-missing', { setupOverride: { disableForceUnload: null } })
-  assert.match(missing.line, /the guest's sanity check failed: the guest's DisableForceUnload policy reads nothing, not 1/)
-  assert.deepStrictEqual(vms(missing.sc), [])
+  assert.doesNotMatch(ok.plan.text, /- registry:/)
 })
