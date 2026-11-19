@@ -7,6 +7,22 @@
   "env": {
     "WSB_MCP_ENABLED": "1",
     "WSB_ROOTS_FROM_CWD": "1",
-    "WSB_TOOL_DIRS": "node=C:\\Program Files\\nodejs"
+    "WSB_ALLOWED_ROOTS": "",
+    "WSB_TOOL_DIRS": "node=C:\\Program Files\\nodejs",
+    "WSB_SANDBOX_ROOT": "",
+    "WSB_START_WAIT_MS": "180000",
+    "WSB_READY_WAIT_MS": "60000",
+    "WSB_SESSION_WAIT_MS": "90000",
+    "WSB_MAX_MINUTES": "240",
+    "WSB_OUTPUT_BYTES": "16384",
+    "WSB_COLLECT_MAX_BYTES": "8388608",
+    "WSB_COLLECT_MAX_TOTAL_BYTES": "16777216",
+    "WSB_LIST_MAX_FILES": "1000",
+    "WSB_LIST_MAX_ENTRIES": "10000",
+    "WSB_LIST_MAX_DEPTH": "16",
+    "WSB_STOP_ATTEMPTS": "3",
+    "WSB_STOP_RETRY_MS": "3000",
+    "WSB_WATCHDOG_CHECK_MS": "2000",
+    "WSB_WATCHDOG_ROUNDS": "20"
   }
 }

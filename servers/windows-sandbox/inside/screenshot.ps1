@@ -1,17 +1,26 @@
 # Runs inside the Sandbox in the user session (wsb exec -r ExistingLogin): saves the whole desktop as a JPEG, scaled
 # down to at most MaxWidth pixels wide (a full PNG is ~5 MB). Prints the captured and saved sizes. As System, or once
 # the connect window is closed, the desktop comes back blank.
-param([Parameter(Mandatory = $true)][string]$Path, [int]$MaxWidth = 1280)
+# -Desktop WxH (tests only): a blank image of that size stands in for the desktop, so the scaling and saving run
+# without a screen.
+param([Parameter(Mandatory = $true)][string]$Path, [int]$MaxWidth = 1280, [ValidatePattern('^\d+x\d+$')][string]$Desktop)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
-$b = [System.Windows.Forms.SystemInformation]::VirtualScreen
-$bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
-$g = [System.Drawing.Graphics]::FromImage($bmp)
-$g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
-$g.Dispose()
+if ($Desktop) {
+  $wh = $Desktop -split 'x'
+  $b = New-Object System.Drawing.Rectangle 0, 0, ([int]$wh[0]), ([int]$wh[1])
+  $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+} else {
+  $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+  $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $g.CopyFromScreen($b.Left, $b.Top, 0, 0, $bmp.Size)
+  $g.Dispose()
+}
 $w = [Math]::Min($MaxWidth, $b.Width)
-$h = [int]($b.Height * $w / $b.Width)
+# At least one pixel high: a small MaxWidth on a wide desktop would round the height to 0, which Bitmap refuses.
+$h = [Math]::Max(1, [int]($b.Height * $w / $b.Width))
 $small = New-Object System.Drawing.Bitmap $w, $h
 $g = [System.Drawing.Graphics]::FromImage($small)
 $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic

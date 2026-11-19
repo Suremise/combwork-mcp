@@ -22,25 +22,42 @@ const VERSION = (() => {
     return typeof v === 'string' && v.trim() ? v : 'unknown'
   } catch { return 'unknown' }
 })()
+/**
+ * A number setting from the environment: `def` when it is unset, empty or not a number, or below `min` (only where a
+ * smaller value can't work). `max` is only ever a value that breaks something; each use says what.
+ */
+function numberSetting(name, def, { min = 0, max = Infinity } = {}) {
+  const raw = String(process.env[name] ?? '').trim()
+  const n = raw === '' ? NaN : Number(raw)
+  return Number.isFinite(n) && n >= min ? Math.min(n, max) : def
+}
+// Node's timers can't wait longer than this (about 24.8 days): a longer timeout would fire at once.
+const TIMER_MAX_MS = 2 ** 31 - 1
+
 // Use the IP, not localhost: localhost resolution adds a ~2s Windows IPv6-fallback delay per call.
 const OLLAMA_HOST = (process.env.OLLAMA_HOST || 'http://127.0.0.1:11434').replace(/\/$/, '')
-const DEFAULT_MODEL = process.env.OLLAMA_DEFAULT_MODEL || ''
-// Larger contexts need more GPU memory; inputs beyond this are split into batches.
-const MAX_CTX = Math.max(8192, parseInt(process.env.OLLAMA_MAX_CTX, 10) || 65536) // not a number: the default
-const MAX_FILE_BYTES = 2 * 1024 * 1024
-const MAX_TOTAL_CHARS = 3_000_000
+const DEFAULT_MODEL = String(process.env.OLLAMA_DEFAULT_MODEL || '').trim()
+// Larger contexts need more GPU memory; inputs beyond this are split into batches. At least 8192: 4096 tokens of each
+// window are kept for the answer, and the rest has to hold the prompt and some of the files.
+const MAX_CTX = Math.floor(numberSetting('OLLAMA_MAX_CTX', 65536, { min: 8192 }))
+// Files over this are skipped, and reading stops once this many characters are in (both listed in the reply).
+const MAX_FILE_BYTES = numberSetting('OLLAMA_MAX_FILE_MB', 2, { min: 0 }) * 1024 * 1024
+const MAX_TOTAL_CHARS = numberSetting('OLLAMA_MAX_INPUT_CHARS', 3_000_000, { min: 1 })
+// How long one answer may take before the call gives up.
+const TIMEOUT_MS = numberSetting('OLLAMA_TIMEOUT_SECONDS', 600, { min: 1 }) * 1000
 const SKIP_DIRS = new Set(['node_modules', 'dist', 'out', 'build', '.next', '.venv', 'venv', '__pycache__', 'target', 'bin', 'obj'])
 // Rough chars-per-token for code and prose; used only to size the context window.
 const CHARS_PER_TOKEN = 3.2
 
-async function ollama(path, payload, timeoutMs = 600_000) {
+async function ollama(path, payload, timeoutMs = TIMEOUT_MS) {
   let res
   try {
     res = await fetch(OLLAMA_HOST + path, {
       method: payload === undefined ? 'GET' : 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: payload === undefined ? undefined : JSON.stringify(payload),
-      signal: AbortSignal.timeout(timeoutMs)
+      // Whole milliseconds, at least 1 and at most a timer's longest wait: AbortSignal.timeout takes no fraction.
+      signal: AbortSignal.timeout(Math.max(1, Math.min(Math.round(timeoutMs), TIMER_MAX_MS)))
     })
   } catch (e) {
     throw new Error(`Could not reach Ollama at ${OLLAMA_HOST} (${e.cause?.message ?? e.message}). Is it running?`)
@@ -57,6 +74,7 @@ async function ollama(path, payload, timeoutMs = 600_000) {
   return data ?? {}
 }
 
+// Listing models is quick when Ollama is up; 5 s is a ceiling for one that hangs, so a session's start isn't held.
 async function models() {
   return (await ollama('/api/tags', undefined, 5_000)).models ?? []
 }
@@ -129,7 +147,7 @@ async function collect(paths, allowed) {
     const s = await stat(real).catch(() => null)
     if (!s) return skipped.push(`${given} (not found)`)
     if (s.isDirectory()) {
-      if (depth > 12) return
+      // No depth limit: a folder already read (by its real path) is never read again, so links can't loop.
       for (const e of (await readdir(real)).sort()) {
         if (SKIP_DIRS.has(e) || e.startsWith('.')) continue
         await add(join(real, e), `${shown(real)}/${e}`, depth + 1)

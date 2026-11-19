@@ -50,7 +50,8 @@ started by the client inherits the client's environment, user variables included
 [top-level README](../../README.md#install) shows the same kind of entry for each client's config format.
 
 **In Combwork:** pack it (`node scripts\pack.mjs trilium` at the repo root) and add `dist\trilium.zip` with **Add MCP
-Server from File** in the MCP view. Its definition, [`combwork-mcp.example.json`](combwork-mcp.example.json), is added turned off: set `TRILIUM_URL` to
+Server from File** in the MCP view. Its definition, [`combwork-mcp.example.json`](combwork-mcp.example.json), lists every
+setting with its default, so each one shows in Combwork's MCP editor. It is added turned off: set `TRILIUM_URL` to
 your Trilium, keep the token as the `${TRILIUM_ETAPI_TOKEN}` reference (Combwork warns about a literal secret in a
 definition), then turn it on.
 
@@ -64,21 +65,24 @@ exactly one note (an exact title first, else one that differs only in case). An 
 Reading:
 - `trilium_index(note?, depth?, limit?)`: a compact tree of titles and ids, from the top of the tree by default, 2
   levels deep by default. A note whose children are beyond the depth shows `+N`. Trilium's own system notes (ids that
-  start with `_`, such as `_hidden`) are left out. Cut at 200 lines by default, with a note saying so.
+  start with `_`, such as `_hidden`) are left out. Cut at 200 lines by default, with a note saying so. At most
+  `TRILIUM_INDEX_MAX_DEPTH` levels (6) and `TRILIUM_INDEX_MAX_LINES` lines (1000) a call.
 - `trilium_search(query, limit?, detail?)`: Trilium's search syntax (words, `#label`, `#label=value`, `note.title *= "x"`…). One line per note: title, id, where it is (its parents'
-  titles) and labels. `detail` adds when it last changed. 20 results by default, at most 100.
+  titles) and labels. `detail` adds when it last changed. 20 results by default, at most `TRILIUM_SEARCH_MAX` (100).
 - `trilium_read_note(note, section?, offset?, maxChars?, detail?)`: the note as readable text (headings `#`, lists,
-  to-dos `[x]`, links `[text](href)`, code blocks and tables kept), with its parents, labels and up to 20 children.
-  - A note over 4,000 characters with headings comes back as its **outline** (each heading with its number and size)
+  to-dos `[x]`, links `[text](href)`, code blocks and tables kept), with its parents, labels and up to
+  `TRILIUM_CHILDREN_SHOWN` children (20).
+  - A note over `TRILIUM_OUTLINE_OVER` characters (4,000) with headings comes back as its **outline** (each heading with its number and size)
     and its first 600 characters. `section` (a heading, part of one, or its number) reads that part with its
     subheadings.
   - The outline keeps within `maxChars` too: a note with more headings than fit says which it shows, and
     `outlineFrom` (a heading number) shows the next ones.
-  - `offset` (0 for the start) reads in order, skipping the outline. Content is cut at 8,000 characters by default
-    (`maxChars`, at most 200,000), with a line saying where and which offset reads on.
+  - `offset` (0 for the start) reads in order, skipping the outline. Content is cut at `TRILIUM_MAX_CHARS` (8,000)
+    characters by default (`maxChars`, at most `TRILIUM_READ_MAX_CHARS`, 200,000), with a line saying where and which
+    offset reads on.
   - `detail` adds the note's type, MIME type and its created and changed dates.
 - `trilium_list_children(note?, limit?)`: a note's children (the top of the tree by default): title, id, the type when
-  it isn't text, and `+N` children.
+  it isn't text, and `+N` children. 100 by default, at most `TRILIUM_CHILDREN_MAX` (500).
 
 Writing (left out with `TRILIUM_READ_ONLY=1`):
 - `trilium_create_note(parent, title, content?, format?, code?, labels?)`: a text note under `parent`.
@@ -117,13 +121,30 @@ reply's size on the fixture (`npm test` prints them), so a change that makes rep
 
 ## Configuration (`env`)
 
+Every setting is in [`combwork-mcp.example.json`](combwork-mcp.example.json) with its default. A number setting left
+empty, or set to something that isn't a number or below its least value, uses its default. The limits keep replies
+lean by default; none has an upper limit of its own, so raise any of them as far as you like.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `TRILIUM_URL` | none | Your Trilium's address, e.g. `http://localhost:8080` or `https://notes.example.com`. The server adds `/etapi` (one given with `/etapi` works too). |
 | `TRILIUM_ETAPI_TOKEN` | none | The ETAPI token: a reference to a user environment variable (see Setup), never a literal. |
-| `TRILIUM_READ_ONLY` | off | `1`: only the reading tools are listed, and the writing ones are refused. |
-| `TRILIUM_MAX_CHARS` | `8000` | How much of a note's content a read returns by default (at least 1000). |
+| `TRILIUM_READ_ONLY` | `0`: off | `1`: only the reading tools are listed, and the writing ones are refused. |
+| `TRILIUM_MAX_CHARS` | `8000` | How much of a note's content (or outline) a read returns when the call doesn't say. At least 1. |
+| `TRILIUM_READ_MAX_CHARS` | `200000` | The most a read returns when the call asks for more (`maxChars`). At least 1. |
+| `TRILIUM_OUTLINE_OVER` | `4000` | A note longer than this, with headings, is read as its outline first. `0`: always the outline when it has headings. |
+| `TRILIUM_CHILDREN_SHOWN` | `20` | How many children `trilium_read_note` names; the rest are counted. |
+| `TRILIUM_INDEX_MAX_DEPTH` | `6` | The deepest `trilium_index` goes (`depth`). At least 1. |
+| `TRILIUM_INDEX_MAX_LINES` | `1000` | The most lines `trilium_index` returns (`limit`). At least 1. |
+| `TRILIUM_SEARCH_MAX` | `100` | The most notes `trilium_search` returns (`limit`). At least 1. |
+| `TRILIUM_CHILDREN_MAX` | `500` | The most children `trilium_list_children` returns (`limit`). At least 1. |
 | `TRILIUM_CACHE_SECONDS` | `60` | How long fetched notes are kept between calls at most (see Limits); `0` keeps none. |
+| `TRILIUM_TIMEOUT_SECONDS` | `30` | How long one ETAPI request may take. **Ceiling:** about 24.8 days (2147483 s), the longest a Node timer can wait; a larger value counts as that. |
+
+Fixed, not settings: at start-up the server asks Trilium its version for at most 3 s (or `TRILIUM_TIMEOUT_SECONDS`, if
+shorter), so a Trilium that doesn't answer can't hold up the session's start; its tools still try on each call. Titles,
+label values and lists of names inside a reply line are shortened (with `…` or `+N more`), so one long title can't swell
+a reply; the note itself is always readable in full.
 
 ## Safety notes
 

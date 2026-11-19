@@ -151,13 +151,16 @@ function fakeTrilium() {
   }
 }
 
+/** The limit settings, left empty (their defaults) unless a test sets one. */
+const SETTINGS = ['TRILIUM_READ_MAX_CHARS', 'TRILIUM_OUTLINE_OVER', 'TRILIUM_CHILDREN_SHOWN', 'TRILIUM_INDEX_MAX_LINES', 'TRILIUM_INDEX_MAX_DEPTH', 'TRILIUM_SEARCH_MAX', 'TRILIUM_CHILDREN_MAX', 'TRILIUM_TIMEOUT_SECONDS']
+
 /** Servers still running: a test that fails before closing its server leaves it here for afterEach to stop. */
 const running = new Set()
 
 /** Starts server.js as a client would (initialize), then calls tools. */
 function server(env) {
   const child = spawn(process.execPath, [SERVER], {
-    env: { ...process.env, TRILIUM_URL: '', TRILIUM_ETAPI_TOKEN: '', TRILIUM_READ_ONLY: '', TRILIUM_MAX_CHARS: '', TRILIUM_CACHE_SECONDS: '', ...env },
+    env: { ...process.env, TRILIUM_URL: '', TRILIUM_ETAPI_TOKEN: '', TRILIUM_READ_ONLY: '', TRILIUM_MAX_CHARS: '', TRILIUM_CACHE_SECONDS: '', ...Object.fromEntries(SETTINGS.map(n => [n, ''])), ...env },
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true
   })
@@ -314,6 +317,37 @@ test('read: long content is cut with a note saying where, and offset reads on', 
   r = await srv.call('trilium_read_note', { note: 'long', maxChars: 50000 })
   assert.ok(!r.text.includes('[Characters'), 'the whole of it fits')
   await srv.close()
+})
+
+test('the limits are settings, with no ceiling of their own: lowered or raised, each call and description follows', async () => {
+  let srv = start({ TRILIUM_READ_MAX_CHARS: '2000', TRILIUM_INDEX_MAX_DEPTH: '1', TRILIUM_SEARCH_MAX: '2', TRILIUM_CHILDREN_SHOWN: '1', TRILIUM_MAX_CHARS: '500' })
+  let r = await srv.call('trilium_read_note', { note: 'long', maxChars: 50000 })
+  assert.ok(r.text.endsWith('[Characters 0–2000 of 30000. Pass offset 2000 to read on.]'), r.text.slice(-200))
+  r = await srv.call('trilium_read_note', { note: 'long' })
+  assert.ok(r.text.endsWith('[Characters 0–500 of 30000. Pass offset 500 to read on.]'), 'TRILIUM_MAX_CHARS below the old 1000 floor counts')
+  r = await srv.call('trilium_index', { depth: 3 })
+  assert.ok(r.text.startsWith('The top of the tree, 1 level:\nGaming (gaming) +3\n'), r.text)
+  await srv.call('trilium_search', { query: '#todo', limit: 50 })
+  assert.strictEqual(fake.requests.find(q => q.path === '/etapi/notes' && q.query.startsWith('?search=%23todo')).query, '?search=%23todo&limit=2')
+  r = await srv.call('trilium_read_note', { note: 'gaming' })
+  assert.match(r.text, /^Children \(3\): PoE \(poe\), \+2 more \(trilium_list_children\)$/m)
+  await srv.close()
+  srv = start({ TRILIUM_SEARCH_MAX: '5000', TRILIUM_READ_MAX_CHARS: 'lots' })
+  await srv.call('trilium_search', { query: 'poe', limit: 3000 })
+  assert.ok(fake.requests.some(q => q.query === '?search=poe&limit=3000'), 'above the old 100')
+  r = await srv.call('trilium_read_note', { note: 'long', maxChars: 50000 })
+  assert.ok(!r.text.includes('[Characters'), 'not a number: the default, 200000')
+  await srv.close()
+})
+
+test('a fractional TRILIUM_TIMEOUT_SECONDS works: the timeout is whole milliseconds', async () => {
+  for (const t of ['1.001', '2.0005']) {
+    const srv = start({ TRILIUM_TIMEOUT_SECONDS: t })
+    assert.match((await srv.ready).result.instructions, /Connected to Trilium/, t)
+    const r = await srv.call('trilium_read_note', { note: 'builds' })
+    assert.ok(!r.isError && r.text.startsWith('# Builds (builds)'), `${t}: ${r.text}`)
+    await srv.close()
+  }
 })
 
 test('a protected note: read says plainly that ETAPI can\'t read it, and append refuses; neither asks for its content', async () => {

@@ -19,21 +19,40 @@ const VERSION = (() => {
     return typeof v === 'string' && v.trim() ? v : 'unknown'
   } catch { return 'unknown' }
 })()
+/**
+ * A number setting from the environment: `def` when it is unset, empty or not a number, or below `min` (only where a
+ * smaller value can't work). None has an upper limit.
+ */
+function numberSetting(name, def, { min = 0 } = {}) {
+  const raw = String(process.env[name] ?? '').trim()
+  const n = raw === '' ? NaN : Number(raw)
+  return Number.isFinite(n) && n >= min ? n : def
+}
+const whole = (name, def, min = 1) => Math.floor(numberSetting(name, def, { min }))
+// Node's timers can't wait longer than this (about 24.8 days): a longer timeout would fire at once.
+const TIMER_MAX_MS = 2 ** 31 - 1
+
 const BASE = String(process.env.TRILIUM_URL || '').trim().replace(/\/+$/, '').replace(/\/etapi$/i, '')
 const TOKEN = String(process.env.TRILIUM_ETAPI_TOKEN || '').trim()
 const READ_ONLY = /^(1|true|yes)$/i.test(String(process.env.TRILIUM_READ_ONLY || '').trim())
-// Replies are kept lean (the server's selling point): a note's content is cut at this many characters unless the call
-// asks for more (up to MAX_CHARS_LIMIT), and a note longer than OUTLINE_OVER with headings comes back as its outline.
-const MAX_CHARS = Math.max(1000, parseInt(process.env.TRILIUM_MAX_CHARS, 10) || 8_000) // not a number: the default
-const MAX_CHARS_LIMIT = 200_000
-const OUTLINE_OVER = 4_000
+// Replies are kept lean (the server's selling point): a note's content is cut at MAX_CHARS characters unless the call
+// asks for more (up to READ_MAX_CHARS), and a note longer than OUTLINE_OVER with headings comes back as its outline.
+// Every limit is a setting (README, Configuration); the per-call ones bound what a call may ask for.
+const MAX_CHARS = whole('TRILIUM_MAX_CHARS', 8_000)
+const READ_MAX_CHARS = whole('TRILIUM_READ_MAX_CHARS', 200_000)
+const OUTLINE_OVER = whole('TRILIUM_OUTLINE_OVER', 4_000, 0)
 const START_CHARS = 600
-const MAX_CHILDREN_SHOWN = 20
+const CHILDREN_SHOWN = whole('TRILIUM_CHILDREN_SHOWN', 20, 0)
 const INDEX_LINES = 200
+const INDEX_MAX_LINES = whole('TRILIUM_INDEX_MAX_LINES', 1000)
+const INDEX_MAX_DEPTH = whole('TRILIUM_INDEX_MAX_DEPTH', 6)
+const SEARCH_MAX = whole('TRILIUM_SEARCH_MAX', 100)
+const CHILDREN_MAX = whole('TRILIUM_CHILDREN_MAX', 500)
 const LABEL_NAME = /^[\p{L}\p{N}_:]+$/u
 // Fetched notes are kept between calls for at most this long (0: never kept); see notesCache.
-const CACHE_SECONDS = parseInt(process.env.TRILIUM_CACHE_SECONDS, 10)
-const CACHE_MS = (Number.isNaN(CACHE_SECONDS) ? 60 : Math.max(0, CACHE_SECONDS)) * 1000
+const CACHE_MS = numberSetting('TRILIUM_CACHE_SECONDS', 60, { min: 0 }) * 1000
+// How long one ETAPI call may take.
+const TIMEOUT_MS = Math.min(TIMER_MAX_MS, numberSetting('TRILIUM_TIMEOUT_SECONDS', 30, { min: 0.001 }) * 1000)
 
 /** The text with the token replaced, so nothing the server writes can carry it. */
 function scrub(s) {
@@ -58,7 +77,7 @@ class TriliumError extends Error {
 }
 
 /** One ETAPI call. `body`: an object is sent as JSON, a string as text/plain. `as`: 'json' (default) or 'text'. */
-async function etapi(method, path, { body, as = 'json', timeoutMs = 30_000 } = {}) {
+async function etapi(method, path, { body, as = 'json', timeoutMs = TIMEOUT_MS } = {}) {
   const problem = configProblem()
   if (problem) throw new TriliumError(problem)
   const headers = { Authorization: TOKEN }
@@ -70,7 +89,8 @@ async function etapi(method, path, { body, as = 'json', timeoutMs = 30_000 } = {
       method,
       headers,
       body: body === undefined ? undefined : typeof body === 'string' ? body : JSON.stringify(body),
-      signal: AbortSignal.timeout(timeoutMs)
+      // Whole milliseconds, at least 1 and at most a timer's longest wait: AbortSignal.timeout takes no fraction.
+      signal: AbortSignal.timeout(Math.max(1, Math.min(Math.round(timeoutMs), TIMER_MAX_MS)))
     })
   } catch (e) {
     throw new TriliumError(`Could not reach Trilium at ${BASE} (${e.cause?.message ?? e.message}). Is it running, and is TRILIUM_URL right?`)
@@ -150,8 +170,10 @@ async function notesCache() {
 /** The titles from the top of the tree down to the note's parent, through each first parent ("Gaming/PoE"). */
 async function parentPath(note, cache) {
   const titles = []
-  let id = note.parentNoteIds?.[0]
-  for (let depth = 0; id && id !== 'root' && depth < 30; depth++) {
+  const seen = new Set()
+  // No depth limit: a note met twice ends the walk, so a loop can't run on.
+  for (let id = note.parentNoteIds?.[0]; id && id !== 'root' && !seen.has(id);) {
+    seen.add(id)
     const p = await cache.get(id).catch(() => null)
     if (!p) break
     titles.unshift(p.title)
@@ -364,7 +386,7 @@ function findSection(heads, section) {
  * then the note's start (on the first page only). A cut outline says which headings it shows and how to see the rest.
  */
 function outlinePage(text, heads, from, maxChars) {
-  const size = Math.min(MAX_CHARS_LIMIT, Math.max(1, Math.floor(Number(maxChars)) || MAX_CHARS))
+  const size = Math.min(READ_MAX_CHARS, Math.max(1, Math.floor(Number(maxChars)) || MAX_CHARS))
   const first = Math.min(heads.length, Math.max(1, Math.floor(Number(from)) || 1))
   const startLen = first === 1 ? Math.min(START_CHARS, Math.floor(size / 4)) : 0
   const min = Math.min(...heads.map(h => h.level))
@@ -387,7 +409,7 @@ function outlinePage(text, heads, from, maxChars) {
 /** Up to maxChars of text from offset, with a line saying where it was cut and how to read on. */
 function page(text, offset, maxChars, also = '') {
   const start = Math.max(0, Math.floor(Number(offset)) || 0)
-  const size = Math.min(MAX_CHARS_LIMIT, Math.max(1, Math.floor(Number(maxChars)) || MAX_CHARS))
+  const size = Math.min(READ_MAX_CHARS, Math.max(1, Math.floor(Number(maxChars)) || MAX_CHARS))
   if (start >= text.length) return `(${text.length} characters: nothing from ${start}.)`
   const part = text.slice(start, start + size)
   const end = start + part.length
@@ -462,15 +484,15 @@ const tools = [
       type: 'object',
       properties: {
         note: noteRef('note to start from (default: the top of the tree)'),
-        depth: { type: 'number', description: 'How many levels down (default 2, at most 6).' },
-        limit: { type: 'number', description: `At most this many lines (default ${INDEX_LINES}, at most 1000).` }
+        depth: { type: 'number', description: `How many levels down (default ${Math.min(2, INDEX_MAX_DEPTH)}, at most ${INDEX_MAX_DEPTH}).` },
+        limit: { type: 'number', description: `At most this many lines (default ${Math.min(INDEX_LINES, INDEX_MAX_LINES)}, at most ${INDEX_MAX_LINES}).` }
       }
     },
     run: async ({ note: ref = 'root', depth = 2, limit = INDEX_LINES }) => {
       const cache = await notesCache()
       const top = await resolveNote(ref, cache)
-      const levels = Math.min(6, Math.max(1, Math.floor(Number(depth)) || 2))
-      const max = Math.min(1000, Math.max(1, Math.floor(Number(limit)) || INDEX_LINES))
+      const levels = Math.min(INDEX_MAX_DEPTH, Math.max(1, Math.floor(Number(depth)) || 2))
+      const max = Math.min(INDEX_MAX_LINES, Math.max(1, Math.floor(Number(limit)) || INDEX_LINES))
       const lines = []
       let cut = false
       const walk = async (ids, level) => {
@@ -495,14 +517,14 @@ const tools = [
       type: 'object',
       properties: {
         query: { type: 'string', description: 'Trilium search, e.g. `ollama`, `#todo`, `note.title *= "release"`.' },
-        limit: { type: 'number', description: 'At most this many notes (default 20, at most 100).' },
+        limit: { type: 'number', description: `At most this many notes (default ${Math.min(20, SEARCH_MAX)}, at most ${SEARCH_MAX}).` },
         detail: { type: 'boolean', description: 'Also say when each note last changed.' }
       },
       required: ['query']
     },
     run: async ({ query, limit = 20, detail = false }) => {
       if (typeof query !== 'string' || !query.trim()) throw new TriliumError('query is the search text.')
-      const n = Math.min(100, Math.max(1, Math.floor(Number(limit)) || 20))
+      const n = Math.min(SEARCH_MAX, Math.max(1, Math.floor(Number(limit)) || 20))
       const data = await etapi('GET', `/notes?search=${enc(query)}&limit=${n}`)
       const results = (data?.results ?? []).slice(0, n)
       if (!results.length) return `No notes match ${JSON.stringify(query)}.`
@@ -526,7 +548,7 @@ const tools = [
         section: { type: 'string', description: 'A heading from the outline, or its number: reads that part (with its subheadings).' },
         offset: { type: 'number', description: 'Read the content (or the section) in order from this character, skipping the outline; 0 for the start.' },
         outlineFrom: { type: 'number', description: 'Show the outline from this heading number on, when it was cut.' },
-        maxChars: { type: 'number', description: `At most this many characters of content, or of outline (default ${MAX_CHARS}, at most ${MAX_CHARS_LIMIT}).` },
+        maxChars: { type: 'number', description: `At most this many characters of content, or of outline (default ${Math.min(MAX_CHARS, READ_MAX_CHARS)}, at most ${READ_MAX_CHARS}).` },
         detail: { type: 'boolean', description: 'Also give the note\'s type, MIME type and when it was created and changed.' }
       },
       required: ['note']
@@ -536,7 +558,7 @@ const tools = [
       const note = await resolveNote(ref, cache)
       const parents = await cache.many(note.parentNoteIds ?? []).catch(() => [])
       const childIds = note.childNoteIds ?? []
-      const children = await cache.many(childIds.slice(0, MAX_CHILDREN_SHOWN))
+      const children = await cache.many(childIds.slice(0, CHILDREN_SHOWN))
       const labels = labelsOf(note)
       const head = [
         `# ${named(note)}${note.type !== 'text' ? ` · ${note.type}` : ''}`,
@@ -568,7 +590,7 @@ const tools = [
       type: 'object',
       properties: {
         note: noteRef('note whose children to list (default: the top of the tree, "root")'),
-        limit: { type: 'number', description: 'At most this many children (default 100, at most 500).' }
+        limit: { type: 'number', description: `At most this many children (default ${Math.min(100, CHILDREN_MAX)}, at most ${CHILDREN_MAX}).` }
       }
     },
     run: async ({ note: ref = 'root', limit = 100 }) => {
@@ -577,7 +599,7 @@ const tools = [
       const ids = visible(note.childNoteIds)
       const where = note.noteId === 'root' ? 'The top of the tree' : named(note)
       if (!ids.length) return `${where} has no children.`
-      const n = Math.min(500, Math.max(1, Math.floor(Number(limit)) || 100))
+      const n = Math.min(CHILDREN_MAX, Math.max(1, Math.floor(Number(limit)) || 100))
       const children = await cache.many(ids.slice(0, n))
       const rows = children.map(c => {
         const count = c.childNoteIds?.length ?? 0
@@ -696,7 +718,8 @@ async function instructions() {
   if (problem) return `This Trilium server isn't set up yet, so don't use its tools: ${problem}`
   const mode = READ_ONLY ? '\nIt is read-only (TRILIUM_READ_ONLY): only searching and reading are available.' : ''
   try {
-    const info = await etapi('GET', '/app-info', { timeoutMs: 3_000 })
+    // At start-up only: a ceiling for a Trilium that doesn't answer, so the session's start isn't held.
+    const info = await etapi('GET', '/app-info', { timeoutMs: Math.min(3_000, TIMEOUT_MS) })
     return `${GUIDANCE}${mode}\n\nConnected to Trilium ${info?.appVersion ?? ''} at ${BASE}.`
   } catch (e) {
     return `Trilium can't be used right now: ${e.message} Don't use these tools unless the user says it is fixed.`

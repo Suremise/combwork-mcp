@@ -35,7 +35,9 @@ function scratch(name, fail = {}) {
       WSB_TOOL_DIRS: `node=${path.join(dir, 'tools/node')}`,
       WSB_STOP_RETRY_MS: '10',
       WSB_WATCHDOG_CHECK_MS: '100',
-      WSB_SESSION_WAIT_MS: '3000'
+      WSB_SESSION_WAIT_MS: '3000',
+      // The other settings at their defaults, whatever the environment running the tests says.
+      ...Object.fromEntries(['WSB_START_WAIT_MS', 'WSB_READY_WAIT_MS', 'WSB_MAX_MINUTES', 'WSB_OUTPUT_BYTES', 'WSB_COLLECT_MAX_BYTES', 'WSB_COLLECT_MAX_TOTAL_BYTES', 'WSB_LIST_MAX_FILES', 'WSB_LIST_MAX_ENTRIES', 'WSB_LIST_MAX_DEPTH', 'WSB_STOP_ATTEMPTS', 'WSB_WATCHDOG_ROUNDS'].map(n => [n, '']))
     },
     read: () => JSON.parse(fs.readFileSync(state, 'utf8')),
     patch: fn => { const s = JSON.parse(fs.readFileSync(state, 'utf8')); fn(s); fs.writeFileSync(state, JSON.stringify(s)) }

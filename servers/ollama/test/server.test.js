@@ -67,6 +67,10 @@ function scratch(name) {
     OLLAMA_DEFAULT_MODEL: '',
     OLLAMA_ALLOWED_ROOTS: '',
     OLLAMA_ROOTS_FROM_CWD: '',
+    OLLAMA_MAX_FILE_MB: '',
+    OLLAMA_MAX_INPUT_CHARS: '',
+    OLLAMA_MAX_CTX: '',
+    OLLAMA_TIMEOUT_SECONDS: '',
     USERPROFILE: path.join(dir, 'home'),
     HOME: path.join(dir, 'home'),
     APPDATA: path.join(dir, 'home', 'AppData', 'Roaming'),
@@ -206,6 +210,46 @@ test('reading is unchanged inside the roots: dot-folders, node_modules, binaries
   assert.ok(!r.text.includes('logo.png'), 'binaries met in a folder walk are skipped silently')
   r = await ask(srv, ['logo.png', 'missing.txt'])
   assert.match(r.text, /No readable text files found\. Skipped: logo\.png \(binary\), missing\.txt \(not found\)/)
+  await srv.close()
+})
+
+test('the size limits are settings: OLLAMA_MAX_FILE_MB raised reads a big file, OLLAMA_MAX_INPUT_CHARS lowered stops early', async () => {
+  const s = scratch('settings')
+  let srv = server({ ...s.env, OLLAMA_MAX_FILE_MB: '3' }, { roots: [s.a] })
+  let r = await ask(srv, ['big.log'])
+  assert.ok(!r.text.includes('too large') && r.text.includes('xxxx'), r.text.slice(-300))
+  await srv.close()
+  srv = server({ ...s.env, OLLAMA_MAX_FILE_MB: '0.5' }, { roots: [s.a] })
+  r = await ask(srv, ['big.log'])
+  assert.match(r.text, /big\.log \(too large, 2\.0 MB\)/)
+  await srv.close()
+  srv = server({ ...s.env, OLLAMA_MAX_INPUT_CHARS: '5' }, { roots: [s.a] })
+  r = await ask(srv, ['README.md', 'src/util.js'])
+  assert.ok(r.text.includes('A-README') && !r.text.includes('A-UTIL'), r.text)
+  assert.match(r.text, /src\/util\.js \(input limit reached\)/)
+  await srv.close()
+  srv = server({ ...s.env, OLLAMA_MAX_FILE_MB: 'lots' }, { roots: [s.a] })
+  assert.match((await ask(srv, ['big.log'])).text, /too large, 2\.0 MB/, 'not a number: the default')
+  await srv.close()
+})
+
+test('a fractional OLLAMA_TIMEOUT_SECONDS works: the timeout is whole milliseconds', async () => {
+  const s = scratch('frac-timeout')
+  for (const t of ['1.001', '2.0005']) {
+    const srv = server({ ...s.env, OLLAMA_TIMEOUT_SECONDS: t }, { roots: [s.a] })
+    const r = await ask(srv, ['README.md'])
+    assert.ok(!r.isError && r.text.includes('A-README'), `${t}: ${r.text}`)
+    await srv.close()
+  }
+})
+
+test('folders are read to any depth', async () => {
+  const s = scratch('deep')
+  const deep = path.join(s.a, ...Array.from({ length: 15 }, (_, i) => `d${i}`))
+  fs.mkdirSync(deep, { recursive: true })
+  fs.writeFileSync(path.join(deep, 'bottom.txt'), 'A-BOTTOM')
+  const srv = server(s.env, { roots: [s.a] })
+  assert.ok((await ask(srv, ['d0'])).text.includes('A-BOTTOM'))
   await srv.close()
 })
 
