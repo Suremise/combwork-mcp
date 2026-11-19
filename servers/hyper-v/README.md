@@ -1537,9 +1537,10 @@ Results go to `results.md` and `results.json` beside the log.
   ```
 - **H9b** removes the VM by id, only if its name, folder and disks are where H1 put them. `New-VM -Path C:\hvnest-proof`
   puts the VM's own files in a subfolder named after it, so its `Path` and `ConfigurationLocation` are
-  `C:\hvnest-proof\hvnest-proof`; its disk stays `C:\hvnest-proof\hvnest-proof.vhdx`, as H1 named it:
+  `C:\hvnest-proof\hvnest-proof` (the check also accepts `C:\hvnest-proof` itself, as the run on 19 Nov did); its disk
+  stays `C:\hvnest-proof\hvnest-proof.vhdx`, as H1 named it:
   ```
-  $ErrorActionPreference='Stop'; $id=(Select-String -LiteralPath C:\hvnest-proof\identity.txt -Pattern '^vmId=').Line.Substring(5); $vm=Get-VM -Id $id; if ($vm.Name -ne 'hvnest-proof' -or $vm.Path.TrimEnd('\') -ne 'C:\hvnest-proof\hvnest-proof' -or $vm.ConfigurationLocation.TrimEnd('\') -ne 'C:\hvnest-proof\hvnest-proof' -or @(Get-VMHardDiskDrive -VM $vm | ? { $_.Path -notlike 'C:\hvnest-proof\*' }).Count) { throw 'identity or location mismatch: nothing removed' }; Stop-VM -VM $vm -TurnOff -Force; Remove-VM -VM $vm -Force
+  $ErrorActionPreference='Stop'; $id=(Select-String -LiteralPath C:\hvnest-proof\identity.txt -Pattern '^vmId=').Line.Substring(5); $vm=Get-VM -Id $id; $ok='C:\hvnest-proof','C:\hvnest-proof\hvnest-proof'; if ($vm.Name -ne 'hvnest-proof' -or $vm.Path.TrimEnd('\') -notin $ok -or $vm.ConfigurationLocation.TrimEnd('\') -notin $ok -or @(Get-VMHardDiskDrive -VM $vm | ? { $_.Path -notlike 'C:\hvnest-proof\*' }).Count) { throw 'identity or location mismatch: nothing removed' }; Stop-VM -VM $vm -TurnOff -Force; Remove-VM -VM $vm -Force
   ```
 - **H9c** deletes the fixed folder, once the listing was read and the VM is gone:
   ```
