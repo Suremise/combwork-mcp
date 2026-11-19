@@ -96,7 +96,7 @@ try {
   # when the admin would agree to a removal.
   $r.writeWithYes = & { try { Use-StorageFolder $disk $grants $me $receipts -Allowed $trusted -Owners $trusted -AllowPattern $script:HyperVGrantees -Pins $pins -Confirm { $true } } catch { $_.Exception.Message } }
 
-  # MC-1581 (Darren's decision B): a disk folder (-WriteRepair) after Explorer's "Continue", which gives the user Full
+  # MC-1581 (the user's decision): a disk folder (-WriteRepair) after Explorer's "Continue", which gives the user Full
   # Control of it and everything in it (KB 950934): shown as able to write, removed only on a yes, Hyper-V's own grants
   # kept, then trusted again.
   $dx = Join-Path $base 'disk-explored'

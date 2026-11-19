@@ -400,7 +400,7 @@ for (const E of ENGINES) test(`setup storage and ACLs under PowerShell ${E.name}
   // MC-1581: an extra account's read-only grant (Explorer's "Continue") is shown, and removed only if the admin agrees;
   // write access by another account, or a changed identity, is still refused.
   assert.match(a.writeWithYes, /contents aren't as setup and the helper leave them.*S-1-5-32-545|BUILTIN.Users/, 'without -WriteRepair (the state folder), a Users write grant is refused even with a yes')
-  // Darren's decision B: a disk folder after Explorer's Continue (Full Control): offered for removal, with its warning.
+  // MC-1581 (the user's decision): a disk folder after Explorer's Continue (Full Control): offered for removal, with its warning.
   assert.match(a.diskWriterNoQuestion, /has its receipt, but BUILTIN.Users have access to it, and the grant wasn't removed\. Nothing was changed/)
   assert.match(a.diskWriterNo, /have access to it, and the grant wasn't removed/)
   assert.deepStrictEqual(a.diskWriterShown, [{ sid: 'S-1-5-32-545', write: true }], 'shown as able to write')

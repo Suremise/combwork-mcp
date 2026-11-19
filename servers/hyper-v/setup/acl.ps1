@@ -71,7 +71,7 @@ function Set-ExclusiveAcl([string]$Path, [string[]]$Grants, [switch]$SetOwner, [
 # Problems: every Allow grant on $Path or anything under it whose SID isn't in $Allowed (or, for $Writers, any write
 # right held by a SID not in $Writers), and every owner not in $Owners. Empty when the folder is as setup made it.
 # MC-1581: grants to SIDs not in $Allowed that Get-ExtraGrants lists instead, for the caller to show and remove:
-# -IgnoreReadOnly, those holding no write right; -IgnoreForeign, all of them (a disk folder's, Darren's decision B:
+# -IgnoreReadOnly, those holding no write right; -IgnoreForeign, all of them (a disk folder's, the user's decision on MC-1581:
 # Explorer's "Continue" grants the user Full Control, KB 950934).
 $script:WriteMask = 0x2 -bor 0x4 -bor 0x40 -bor 0x10000 -bor 0x40000 -bor 0x80000 -bor 0x10000000 -bor 0x40000000
 function Test-ExclusiveAcl([string]$Path, [string[]]$Allowed, [string[]]$Writers = $Allowed, [string[]]$Owners, [string]$AllowPattern, [switch]$IgnoreReadOnly, [switch]$IgnoreForeign) {
@@ -239,7 +239,7 @@ function Open-ReceiptKey([Microsoft.Win32.RegistryKey]$Root, [string]$SubKey, [s
 # otherwise. Its ancestors must already be checked and pinned (Open-TrustedAncestors). $Grants: 'SID=Rights' for a new
 # folder (inherited by everything in it), owned by $OwnerSid. $BeforeCreate: a test hook, run after setup found the path
 # missing and before it creates it (the boundary where someone else could create it first). MC-1581: $Confirm, the
-# admin's question before an extra account's grant is removed; -WriteRepair (disk folders only, Darren's decision B):
+# admin's question before an extra account's grant is removed; -WriteRepair (disk folders only, the user's decision on MC-1581):
 # a grant that can write is offered for removal too, with its warning, instead of refused.
 function Use-StorageFolder {
   param([string]$Path, [string[]]$Grants, [string]$OwnerSid, [Microsoft.Win32.RegistryKey]$Receipts,
