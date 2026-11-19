@@ -370,7 +370,7 @@ So the driver is "Debian family with systemd and cloud-init". A new release of D
   - existing suites run once per OS where the behaviour is shared (leases, sessions, checkpoints, pool checkpoints,
     recovery).
 
-## 11. The real trial (only with the Assistant's go: the CLI team holds both Windows VMs)
+## 11. The real trial (only with the Assistant's go: it shares the pool's Windows VMs with whoever leases them)
 
 Trial steps:
 1. **Prerequisites:** setup rerun; pins filled from downloads the Assistant allows; one approved plan adding **one
@@ -381,8 +381,8 @@ Trial steps:
    trial **stops**, and the diagnosis goes to the user through the Assistant, who decides whether to move to B (a setup
    rerun with `-LinuxTransport InternalSwitch` and rebuilt Linux VMs). Then a forced-command check: an SSH session
    asking for a shell, or for a command other than the dispatcher's, gets only the dispatcher's refusal.
-3. **Build and test, side by side:** two sessions in one project, one leasing Debian and one leasing the Windows VM the
-   CLI team frees (or a timed window). Then:
+3. **Build and test, side by side:** two sessions in one project, one leasing Debian and one leasing a Windows VM when
+   one is free in the pool (or in a timed window). Then:
    - the same small Node project built on the host, its tests run in both guests at once, with a pinned Node linux-x64
      tarball carried in the build (guests are offline; tools come in the build);
    - `vm_sync` of one edit, then a rerun;
@@ -397,7 +397,8 @@ Trial steps:
    - no key anywhere an agent can read (replies, logs, `%ProgramData%` as the user);
    - the host's build unchanged after root writes `/build`;
    - the helper and host each killed mid-run and recovered.
-5. Ubuntu repeats steps 3 and 4 (shorter). Then release everything and confirm the CLI team's VMs were never touched.
+5. Ubuntu repeats steps 3 and 4 (shorter). Then release everything and confirm that VMs leased by other sessions
+   were never touched.
 
 ## The user's decisions (16 Nov)
 
