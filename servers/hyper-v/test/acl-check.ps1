@@ -92,6 +92,80 @@ try {
   $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier $USERS), 'Modify', 'Allow')))
   Set-Acl -LiteralPath $vhdx -AclObject $acl
   $r.hyperVPlusUsers = & { try { Use-StorageFolder $disk $grants $me $receipts -Allowed $trusted -Owners $trusted -AllowPattern $script:HyperVGrantees -Pins $pins } catch { $_.Exception.Message } }
+  # MC-1581: without -WriteRepair (the state folder's case), write access by another account is still refused, even
+  # when the admin would agree to a removal.
+  $r.writeWithYes = & { try { Use-StorageFolder $disk $grants $me $receipts -Allowed $trusted -Owners $trusted -AllowPattern $script:HyperVGrantees -Pins $pins -Confirm { $true } } catch { $_.Exception.Message } }
+
+  # MC-1581 (the user's decision): a disk folder (-WriteRepair) after Explorer's "Continue", which gives the user Full
+  # Control of it and everything in it (KB 950934): shown as able to write, removed only on a yes, Hyper-V's own grants
+  # kept, then trusted again.
+  $dx = Join-Path $base 'disk-explored'
+  [void](Use-StorageFolder $dx $grants $me $receipts -Allowed $trusted -Owners $trusted -AllowPattern $script:HyperVGrantees -Pins $pins)
+  $dvhd = Join-Path $dx 'pool\disk.vhdx'
+  New-Item -ItemType Directory -Force (Split-Path $dvhd) | Out-Null; Set-Content $dvhd 'v'
+  & icacls.exe $dvhd /grant '*S-1-5-83-0:(F)' /Q | Out-Null
+  & icacls.exe $dx /grant "*${USERS}:(OI)(CI)F" /Q | Out-Null
+  $useDisk = { param($c) Use-StorageFolder $dx $grants $me $receipts -Allowed $trusted -Owners $trusted -AllowPattern $script:HyperVGrantees -Pins $pins -WriteRepair -Confirm $c }
+  $r.diskWriterNoQuestion = & { try { & $useDisk $null } catch { $_.Exception.Message } }
+  $script:shownW = $null
+  $r.diskWriterNo = & { try { & $useDisk { param($p, $x) $script:shownW = $x; $false } } catch { $_.Exception.Message } }
+  $r.diskWriterShown = @($script:shownW | ForEach-Object { [ordered]@{ sid = $_.sid; write = $_.write } })
+  $r.diskWriterKeptOnNo = Has $dvhd $USERS
+  $r.diskWriterYes = & { try { & $useDisk { $true } } catch { $_.Exception.Message } }
+  $r.diskWriterGone = -not ((Has $dx $USERS) -or (Has $dvhd $USERS))
+  $r.diskHyperVKept = Has $dvhd 'S-1-5-83-0'
+  $r.diskWriterAfter = & { try { & $useDisk $null } catch { $_.Exception.Message } }
+
+  # MC-1581 round 1: while the question is open, the account being removed (it can still write) plants a file and a
+  # folder symbolic link to targets outside, each carrying its own Users grant. The removal must change neither
+  # target; setup's strict check after it finds the links and refuses the folder.
+  $outside = Join-Path $base 'outside'
+  New-Item -ItemType Directory -Force (Join-Path $outside 'dir') | Out-Null
+  Set-Content (Join-Path $outside 'marker.txt') 'outside data'
+  & icacls.exe (Join-Path $outside 'marker.txt') /grant "*${USERS}:(RX)" /Q | Out-Null
+  & icacls.exe (Join-Path $outside 'dir') /grant "*${USERS}:(OI)(CI)RX" /Q | Out-Null
+  $outsideAcl = { @((Join-Path $outside 'marker.txt'), (Join-Path $outside 'dir')) | ForEach-Object { (Get-Acl -LiteralPath $_).GetSecurityDescriptorSddlForm('Access') } }
+  $before = & $outsideAcl
+  & icacls.exe $dx /grant "*${USERS}:(OI)(CI)F" /Q | Out-Null
+  $plant = {
+    param($p, $x)
+    # mklink, as an unprivileged program would (Windows PowerShell 5.1's New-Item asks for admin even in Developer Mode).
+    $f = & cmd.exe /d /c mklink (Join-Path $dx 'pool\planted.txt') (Join-Path $outside 'marker.txt') 2>&1
+    $g = & cmd.exe /d /c mklink /D (Join-Path $dx 'pool\planted-dir') (Join-Path $outside 'dir') 2>&1
+    $script:linksMade = if ((Test-Path -LiteralPath (Join-Path $dx 'pool\planted.txt')) -and (Test-Path -LiteralPath (Join-Path $dx 'pool\planted-dir'))) { $true } else { "no: $f $g" }
+    $true
+  }
+  $script:linksMade = $null
+  $r.plantedResult = & { try { & $useDisk $plant } catch { $_.Exception.Message } }
+  $r.linksMade = $script:linksMade
+  $r.outsideUnchanged = ((& $outsideAcl) -join '|') -eq ($before -join '|')
+  $r.outsideData = (Get-Content -LiteralPath (Join-Path $outside 'marker.txt') -Raw).Trim()
+
+  # MC-1581: an extra account's read-only grant (as Explorer's "Continue" adds: inherited by everything in it) on a
+  # folder whose identity matches its receipt: shown, and removed only when the admin agrees; then trusted again.
+  $exp = Join-Path $base 'explored'
+  [void](& $use $exp $null)
+  New-Item -ItemType Directory -Force (Join-Path $exp 'pool') | Out-Null
+  Set-Content (Join-Path $exp 'pool\disk.vhdx') 'v'
+  & icacls.exe $exp /grant "*${USERS}:(OI)(CI)RX" /Q | Out-Null
+  $r.readerBefore = (Has $exp $USERS) -and (Has (Join-Path $exp 'pool\disk.vhdx') $USERS)
+  $r.readerNoQuestion = & { try { Use-StorageFolder $exp $grants $me $receipts -Allowed $trusted -Owners $trusted -Pins $pins } catch { $_.Exception.Message } }
+  $script:shown = $null
+  $r.readerNo = & { try { Use-StorageFolder $exp $grants $me $receipts -Allowed $trusted -Owners $trusted -Pins $pins -Confirm { param($p, $rd) $script:shown = $rd; $false } } catch { $_.Exception.Message } }
+  $r.readerKeptOnNo = Has $exp $USERS
+  $r.readerShown = @($script:shown | ForEach-Object { [ordered]@{ sid = $_.sid; rights = ($_.rights -join ','); where = $_.where } })
+  $r.readerYes = & { try { Use-StorageFolder $exp $grants $me $receipts -Allowed $trusted -Owners $trusted -Pins $pins -Confirm { $true } } catch { $_.Exception.Message } }
+  $r.readerGone = -not ((Has $exp $USERS) -or (Has (Join-Path $exp 'pool') $USERS) -or (Has (Join-Path $exp 'pool\disk.vhdx') $USERS))
+  $r.readerAfter = & $use $exp $null
+  $r.readerDataKept = (Get-Content -LiteralPath (Join-Path $exp 'pool\disk.vhdx') -Raw).Trim() -eq 'v'
+
+  # MC-1581: uninstall's teardown lets a read-only grant through (a reader can't have changed anything), not a write one.
+  . (Join-Path $PSScriptRoot '..\setup\teardown.ps1')
+  & icacls.exe $exp /grant "*${USERS}:(OI)(CI)RX" /Q | Out-Null
+  $tp = New-Object Collections.ArrayList
+  try { $r.teardownReader = [bool](Test-Target $exp $trusted $trusted $tp $null) } catch { $r.teardownReader = $_.Exception.Message } finally { Close-Pins $tp }
+  & icacls.exe $exp /grant "*${USERS}:(W)" /Q | Out-Null
+  try { $r.teardownWriter = [bool](Test-Target $exp $trusted $trusted $tp $null) } catch { $r.teardownWriter = $_.Exception.Message } finally { Close-Pins $tp }
 
   # The injected boundary: after setup found the path missing, someone creates it first and plants a forged journal.
   $race = Join-Path $base 'race'

@@ -208,8 +208,10 @@ The helper trusts what is in its state folder (the journal, plans, approvals, gu
 - **Supported locations.**
   - The state folder is `%ProgramData%\hyperv-mcp`, and the code goes in `%ProgramFiles%\hyperv-mcp`. Both are found
     through Windows' known-folder API, not environment variables.
-  - A disk folder must be a **top-level folder on a local fixed drive**, such as `D:\hyperv-mcp`. Anything deeper is
-    refused.
+  - A disk folder may be **any folder on a local fixed drive** (not a drive root), such as `D:\hyperv-mcp` or
+    `D:\VMs\hyperv-mcp` (MC-1581). Its parents must pass the check below. On a fresh drive, a folder you make under the
+    drive root usually lets Authenticated Users modify it (Windows' default), which fails that check: put the disk
+    folder at the top level, or tighten that parent's permissions first.
 - **Parents are checked, never changed.** Before anything else, setup checks every folder above each of these, from
   the drive root down:
   - no link or junction;
@@ -226,16 +228,28 @@ The helper trusts what is in its state folder (the journal, plans, approvals, gu
   - its receipt matches its identity;
   - it and everything in it still have only the expected owners and permissions.
 
-  Setup never repairs or re-permissions an existing folder. A folder without a receipt is refused untouched: one made
-  by someone else, by an older setup, or whose creation was interrupted. So is one whose identity differs (deleted and
-  made again). To use that location, remove the folder (and any pool in it, first), then run setup again.
+  A folder without a receipt is refused untouched: one made by someone else, by an older setup, or whose creation was
+  interrupted. So is one whose identity differs (deleted and made again), or with another owner. To use that
+  location, remove the folder (and any pool in it, first), then run setup again.
+- **An extra account's access can be removed (MC-1581).** When a folder matches its receipt but another account was
+  given access to it, setup lists each account, its rights and where, and removes that access only if you type
+  `REMOVE`, then checks the folder again:
+  - **read-only access**, on any storage folder: nobody could have changed anything with it;
+  - **access that can write**, on a **disk folder** only, with a warning: while it was there, programs running as that
+    account (agents included) could have changed what's in it. The helper hashes each image again before every
+    build, and a VM's disks are the agents' own to change anyway. If you think something was tampered with, answer no,
+    remove the pool and the folder, and run setup again;
+  - the **state folder** with another account able to write is still refused: a forged approval or journal there
+    would matter. Remove the pool and the state folder, then run setup again.
+
+  Uninstall lets read-only access through, and refuses access that can write (run setup first to remove it).
 - **Files setup writes** (`policy.json`) are created with their final permissions under a temporary name, then renamed
   into place.
 - `uninstall.ps1 -KeepPool` keeps the folders and their receipts. `-RemovePool` removes both.
 - **Don't open these folders in Explorer.** Its "You don't currently have permission to access this folder" prompt,
-  if you click Continue, grants your account access to the folder and everything in it. Then agents running as you
-  could write there, and setup and uninstall will refuse to trust the folder. To look inside, use an admin
-  PowerShell (`Get-ChildItem D:\hyperv-mcp -Recurse`).
+  if you click Continue, gives your account Full Control of the folder and everything in it (Microsoft's KB 950934).
+  Then agents running as you could write there. Setup then offers to remove that access from a disk folder (above),
+  but refuses the state folder. To look inside, use an admin PowerShell (`Get-ChildItem D:\hyperv-mcp -Recurse`).
 
 **In Combwork:** pack it (`node scripts\pack.mjs hyper-v` at the repo root) and add `dist\hyper-v.zip` with **Add MCP
 Server from File** in the MCP view. Its definition goes in as `combwork-mcp.example.json`
@@ -1257,6 +1271,11 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
     - a parent granting Users DeleteChild refused, and a junction parent refused;
     - a pinned parent that can't be renamed while setup holds it;
     - a receipts key that Users can write, refused;
+    - MC-1581: another account's read-only grant shown, kept on a no, removed on a yes from the folder and everything
+      in it (contents untouched), then trusted; on a disk folder, Explorer's Full Control grant shown as able to write,
+      removed on a yes with Hyper-V's own grants kept; the same write grant refused without the disk folder's repair
+      (the state folder's case), even with a yes; uninstall passing a read-only grant and refusing a write one; the
+      `-DiskFolder` check taking deeper folders and refusing a drive root;
     - a file written with its own ACL, not the old file's;
     - for the install folder: earlier grants removed, VM grants kept, links refused before any change;
   - uninstall's teardown (`setup\teardown.ps1`), non-elevated with strict fakes for its outside actions
