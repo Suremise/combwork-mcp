@@ -125,10 +125,25 @@ $GuestNet = {
       New-NetIPAddress -InterfaceIndex $i -IPAddress $address -PrefixLength 24 | Out-Null
       Set-DnsClientServerAddress -InterfaceIndex $i -ResetServerAddresses
     } else {
+      # MC-1565: back to DHCP only an interface that isn't on it (host mode's static address). On one already on DHCP,
+      # Set-NetIPInterface -Dhcp Enabled drops its lease (APIPA, with no new request for minutes), and its DHCP default
+      # route is Protocol NetMgmt too, so neither is touched there: found live, it cost every Windows internet start.
       Get-NetIPAddress -InterfaceIndex $i -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.PrefixOrigin -eq 'Manual' } | Remove-NetIPAddress -Confirm:$false
-      Get-NetRoute -InterfaceIndex $i -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object { $_.Protocol -eq 'NetMgmt' } | Remove-NetRoute -Confirm:$false
-      Set-NetIPInterface -InterfaceIndex $i -AddressFamily IPv4 -Dhcp Enabled -RouterDiscovery Enabled
+      if ((Get-NetIPInterface -InterfaceIndex $i -AddressFamily IPv4).Dhcp -ne 'Enabled') {
+        Get-NetRoute -InterfaceIndex $i -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Where-Object { $_.Protocol -eq 'NetMgmt' } | Remove-NetRoute -Confirm:$false
+        Set-NetIPInterface -InterfaceIndex $i -AddressFamily IPv4 -Dhcp Enabled -RouterDiscovery ControlledByDHCP
+      }
       Set-DnsClientServerAddress -InterfaceIndex $i -ResetServerAddresses
+    }
+  }
+  if ($mode -eq 'internet') {
+    # MC-1565: no DHCP address on the adapter yet (none, or APIPA after unanswered requests): a lease asked for now,
+    # rather than at Windows' own next try, minutes later. The helper's read-back still decides whether it is ready.
+    $i = $nics[0].ifIndex
+    if (-not @(Get-NetIPAddress -InterfaceIndex $i -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object { $_.PrefixOrigin -eq 'Dhcp' }).Count) {
+      $c = Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration -Filter "InterfaceIndex=$i"
+      if (-not $c) { throw "no adapter configuration for interface $i in the guest" }
+      return @{ set = $true; renewed = [int](Invoke-CimMethod -InputObject $c -MethodName RenewDHCPLease).ReturnValue }
     }
   }
   if ($mode -eq 'none') {
