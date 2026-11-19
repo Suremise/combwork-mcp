@@ -10,7 +10,7 @@ const { Helper } = require('../helper/core')
 
 const vm = { vmId: 'v', vmName: 'hvmcp-test', folder: 'X:\\pool\\i-0' }
 const creds = { admin: { user: 'hvadmin', password: 'a' }, user: { user: 'hvuser', password: 'u' } }
-const DONE = { done: true, tasks: 0, completedAt: '2026-11-16T02:01:55.000Z', completionId: 101, suspendedUntil: null, resumedAt: '2026-11-16T02:00:55.600Z' }
+const DONE = { done: true, tasks: 0, completedAt: '2026-11-16T02:01:55.000Z', completionId: 101, suspendedAt: null, suspendedUntil: null, resumedAt: '2026-11-16T02:00:55.600Z' }
 const PENDING = { done: false, tasks: 39, completedAt: null, completionId: null, suspendedUntil: '2026-11-16T02:00:55.499Z', resumedAt: null }
 
 /** A helper on the fake clock. readiness(account, logonNo, sinceReady): App Readiness's state on that probe. */
@@ -135,4 +135,35 @@ test('MC-1562: a settled account records what restarted its quiet after App Read
   assert.deepStrictEqual(out.hvuser.quietResets, { 'process other': 1 })
   const quiet = fake(() => DONE)
   assert.deepStrictEqual((await quiet.h.provisionProfiles(vm, creds, () => {})).hvadmin.quietResets, {})
+})
+
+// MC-1562, found live: Windows suspends an account's first-logon app setup for 16 min (App Readiness's 216 "will resume
+// at"), so its own scheduled wait took most of the budget, and the quiet after it didn't fit. On the fake clock: a
+// suspension of 150 (its 216 at …00.000, resuming at …00.150) in a budget of 200, finishing at 250.
+const SUSPENDED = { ...PENDING, suspendedAt: '2026-11-16T02:00:00.000Z', suspendedUntil: '2026-11-16T02:00:00.150Z' }
+
+test("MC-1562: App Readiness's own suspension isn't charged to the account's budget: a build that finishes after it settles", async () => {
+  const f = fake((acc, n, since) => since >= 250 ? { ...DONE, suspendedAt: SUSPENDED.suspendedAt, suspendedUntil: SUSPENDED.suspendedUntil } : SUSPENDED)
+  const out = await f.h.provisionProfiles(vm, creds, () => {})
+  for (const who of ['hvadmin', 'hvuser']) {
+    assert.ok(out[who].quietMs >= 250 + 20, `${who}: settled after it finished (${out[who].quietMs})`)
+    assert.strictEqual(out[who].suspendedMs, 150, `${who}: the suspension credited once, though every sample reports it`)
+    assert.strictEqual(out[who].appReadiness.suspendedAt, SUSPENDED.suspendedAt)
+  }
+  bounded(f.calls, 'hvadmin', 200 + 150)
+  // Without the 216's own time (an older probe), nothing is credited: the same build fails at the budget.
+  const old = fake((acc, n, since) => since >= 250 ? DONE : PENDING)
+  await assert.rejects(old.h.provisionProfiles(vm, creds, () => {}), /didn't settle within 0 s \(App Readiness: not finished/)
+})
+
+test('MC-1562: the credit is one budget at most, a backwards or unreadable suspension earns none, and a late failure says what was credited', async () => {
+  const long = { ...PENDING, suspendedAt: '2026-11-16T02:00:00.000Z', suspendedUntil: '2026-11-16T03:00:00.000Z' }
+  const f = fake(() => long)
+  await assert.rejects(f.h.provisionProfiles(vm, creds, () => {}), /didn't settle within 0 s \(plus 0 s while Windows had its App Readiness suspended\) \(App Readiness: not finished, 39 tasks left, suspended until 2026-11-16T03:00:00\.000Z\)/)
+  bounded(f.calls, 'hvadmin', 200 + 200)
+  for (const bad of [{ suspendedAt: '2026-11-16T02:00:01.000Z', suspendedUntil: '2026-11-16T02:00:00.000Z' }, { suspendedAt: 'soon', suspendedUntil: '2026-11-16T02:00:00.150Z' }, { suspendedAt: 7, suspendedUntil: '2026-11-16T02:00:00.150Z' }]) {
+    const g = fake(() => ({ ...PENDING, ...bad }))
+    await assert.rejects(g.h.provisionProfiles(vm, creds, () => {}), e => { assert.doesNotMatch(e.message, /plus \d+ s/); return true })
+    bounded(g.calls, 'hvadmin', 200)
+  }
 })

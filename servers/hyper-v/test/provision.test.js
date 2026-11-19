@@ -106,7 +106,7 @@ test('the build waits for App Readiness to finish each account (MC-1528): the ch
   for (const who of ['hvadmin', 'hvuser']) {
     assert.strictEqual(ready.profiles[who].mappings, 99, `${who}: the post-wave count`)
     assert.strictEqual(ready.profiles[who].packagesDirs, 64)
-    assert.deepStrictEqual(ready.profiles[who].appReadiness, { done: true, tasks: 0, completedAt: '2026-11-16T02:01:55.000Z', completionId: 7, suspendedUntil: '2026-11-16T02:00:55.499Z', resumedAt: '2026-11-16T02:00:55.600Z' }, 'allowlisted: no other field')
+    assert.deepStrictEqual(ready.profiles[who].appReadiness, { done: true, tasks: 0, completedAt: '2026-11-16T02:01:55.000Z', completionId: 7, suspendedAt: null, suspendedUntil: '2026-11-16T02:00:55.499Z', resumedAt: '2026-11-16T02:00:55.600Z' }, 'allowlisted: no other field (no suspendedAt from this probe)')
   }
   assert.match(line, /hvadmin settled with 99 AppContainer mappings and 64 Packages folders after \d+ s \(App Readiness finished\)/)
 })
@@ -194,7 +194,7 @@ test('a failed build logon whose diagnosis fails (MC-1520): recorded as unavaila
 test('quiet waits for the account\'s AppContainer counts to stop changing (MC-1520); they\'re recorded; the plan names the budget', async t => {
   const { sc, plan, line } = await build(t, 'prov-counts', { profileGrow: 4 })
   assert.match(line, /create finished/)
-  assert.match(plan.text, /each account within \d+ min \(a logon attempt up to \d+ min once it has begun, one with no sign of a logon \d+ min after its new boot is seen retried at once, then accepted once Windows' App Readiness reports the account's first-logon app setup finished and \d+ min of observed quiet follow, one retry if needed\)/)
+  assert.match(plan.text, /each account within \d+ min \(a logon attempt up to \d+ min once it has begun, one with no sign of a logon \d+ min after its new boot is seen retried at once, then accepted once Windows' App Readiness reports the account's first-logon app setup finished and \d+ min of observed quiet follow, one retry if needed; the time Windows itself suspends that setup isn't counted, up to \d+ min more\)/)
   for (const who of ['hvadmin', 'hvuser']) assert.ok(vms(sc)[0].provisioned.filter(a => a === who).length >= 6, `${who}: 4 changing samples, then quiet`)
   const p = sc.journal().find(r => r.t === 'ready').profiles
   assert.deepStrictEqual([p.hvadmin.mappings, p.hvadmin.packagesDirs, p.hvuser.mappings, p.hvuser.packagesDirs], [64, 29, 64, 29])
