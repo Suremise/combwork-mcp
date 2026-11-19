@@ -127,6 +127,15 @@ using the new server: the helper's protocol and features changed, and an older h
    ```
    cmd /c call "C:\path\to\combwork-mcp\servers\hyper-v\setup\install.cmd" -DiskFolder D:\hyperv-mcp
    ```
+   `install.cmd` runs setup under Windows PowerShell where it is installed, otherwise PowerShell 7. The service then
+   runs its Hyper-V script (`hv.ps1`) under the same PowerShell. **To use PowerShell 7 where both are installed**, run
+   setup with PowerShell 7 itself instead (one line, again the same in any admin terminal):
+   ```
+   cmd /c call "C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\combwork-mcp\servers\hyper-v\setup\install.ps1" -DiskFolder D:\hyperv-mcp
+   ```
+   Setup records the PowerShell it runs in only when that is one Windows has registered (a normal PowerShell 7 install
+   is). Otherwise it records the one `install.cmd` would choose. Its "Service host compiled" step names the one it
+   recorded. To switch back, run setup again with the `install.cmd` line.
    It reports each step and can be run again (to update the helper or change the policy). It installs:
    - the helper's code, `approve.cmd` and `approve.ps1`, and the service host (compiled there by the in-box .NET
      Framework compiler) in `%ProgramFiles%\hyperv-mcp`;
