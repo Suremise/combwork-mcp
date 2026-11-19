@@ -2,7 +2,10 @@
 # install.ps1 and uninstall.ps1 after acl.ps1 and teardown.ps1; tested non-elevated by test\appsentry-check.ps1.
 #
 # The entry (HKLM\...\Uninstall\HyperVMcp) runs a fixed launcher, never a path from the registry:
-#   powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand <the launcher>
+#   "<engine>" -NoProfile -ExecutionPolicy Bypass -EncodedCommand <the launcher>
+# <engine> (MC-1575): Windows PowerShell 5.1's powershell.exe where it is installed, else PowerShell 7's pwsh.exe, each
+# the one setup ran in when that is registered in HKLM (Get-SetupEngine). The launcher elevates and runs the uninstaller
+# with that same engine, the one it is running in.
 # The launcher takes its paths from Windows' known folders and fixed names, elevates itself, then, in this order:
 #   a. hyperv-mcp\uninstall\uninstall.ps1 exists: runs it (-Interactive). The normal route; it resumes any unfinished
 #      uninstall.
@@ -46,6 +49,8 @@ $c = @{
 $over = '__OVERRIDES__'
 if ($over) { foreach ($p in ($over | ConvertFrom-Json).PSObject.Properties) { $c[$p.Name] = $p.Value } }
 $finishOnly = $args.Count -gt 0 -and $args[0] -eq 'finish'
+# The engine this launcher runs in (the entry's own, from HKLM), for elevating and for the uninstaller (MC-1575).
+$ps = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
 $expected = if ($finishOnly) { [string]$args[1] } else { $null }
 if (-not $finishOnly) {
   $cl = [Environment]::GetCommandLineArgs()
@@ -63,15 +68,14 @@ function Stop-Launcher([string]$m) {
 }
 $admin = (New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $finishOnly -and $c.elevate -and -not $admin) {
-  if (-not $expected) { Stop-Launcher 'Run this from Installed apps, or in an admin PowerShell.' }
-  Start-Process -FilePath powershell.exe -Verb RunAs -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $expected)
+  if (-not $expected) { Stop-Launcher 'Run this from Installed apps, or in an admin terminal.' }
+  Start-Process -FilePath $ps -Verb RunAs -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $expected)
   exit 0
 }
 $inst = Join-Path $c.pf 'hyperv-mcp'
 $ret = Join-Path $inst 'uninstall.retiring'
 $set = @('uninstall.ps1', 'teardown.ps1', 'acl.ps1', 'appsentry.ps1', 'Storage.cs')
 $root = if ($c.regRoot -eq 'CurrentUser') { [Microsoft.Win32.Registry]::CurrentUser } else { [Microsoft.Win32.Registry]::LocalMachine }
-$ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 # Trust, for anything the launcher runs or deletes (MC-1557 round 1): it exists, isn't a link (reparse point), its owner
 # is trusted, and no one else may write to, delete or re-permission it (inherit-only entries, which apply only to new
 # children, aside).
@@ -105,12 +109,12 @@ if (-not $finishOnly) {
   $un = Join-Path $inst 'uninstall'
   if (Test-Path -LiteralPath $un) {
     $w = Get-SetProblem $un
-    if ($w) { Stop-Launcher "Nothing was run or removed: $w. Run the uninstaller from the repo (servers\hyper-v\setup\uninstall.ps1, in an admin Windows PowerShell)." }
+    if ($w) { Stop-Launcher "Nothing was run or removed: $w. Run the uninstaller from the repo (servers\hyper-v\setup\uninstall.ps1, in an admin terminal)." }
     & $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $un 'uninstall.ps1') -Interactive; Close-Launcher $LASTEXITCODE
   }
   if ((Test-Path -LiteralPath $ret) -and @($set | Where-Object { Test-Path -LiteralPath (Join-Path $ret $_) }).Count -eq $set.Count) {
     $w = Get-SetProblem $ret
-    if ($w) { Stop-Launcher "Nothing was run or removed: $w. Run the uninstaller from the repo (servers\hyper-v\setup\uninstall.ps1, in an admin Windows PowerShell)." }
+    if ($w) { Stop-Launcher "Nothing was run or removed: $w. Run the uninstaller from the repo (servers\hyper-v\setup\uninstall.ps1, in an admin terminal)." }
     & $ps -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ret 'uninstall.ps1') -Retire; Close-Launcher $LASTEXITCODE
   }
 }
@@ -128,7 +132,7 @@ if ($sk) {
     }
   } finally { $sk.Dispose() }
 }
-$manual = "Run the uninstaller from the repo (servers\hyper-v\setup\uninstall.ps1, in an admin Windows PowerShell), or follow the manual steps in $(Join-Path $c.state 'inventory.txt') if it is still there."
+$manual = "Run the uninstaller from the repo (servers\hyper-v\setup\uninstall.ps1, in an admin terminal), or follow the manual steps in $(Join-Path $c.state 'inventory.txt') if it is still there."
 # c: the uninstaller's own leftovers, only in exactly the shape it leaves them.
 if (Test-Path -LiteralPath $inst) {
   $why = $null
@@ -180,10 +184,49 @@ Close-Launcher 0
 '@.Replace('__OVERRIDES__', $over)
 }
 
-# The UninstallString for a launcher text.
-function Get-LauncherCommand([string]$Text) {
+# MC-1575: the PowerShells registered in HKLM (admin-only), never found from PATH or the environment: Windows PowerShell
+# 5.1's powershell.exe first, then each PowerShell 7's pwsh.exe, each only if the file is there. $Root, $Key51 and $Key7
+# (tests only) name other keys.
+function Get-PsEngines([Microsoft.Win32.RegistryKey]$Root = [Microsoft.Win32.Registry]::LocalMachine,
+  [string]$Key51 = 'SOFTWARE\Microsoft\PowerShell\3\PowerShellEngine', [string]$Key7 = 'SOFTWARE\Microsoft\PowerShellCore\InstalledVersions') {
+  $out = @()
+  $k = $Root.OpenSubKey($Key51)
+  if ($k) {
+    try { $b = [string]$k.GetValue('ApplicationBase') } finally { $k.Dispose() }
+    if ($b) { $exe = Join-Path $b 'powershell.exe'; if (Test-Path -LiteralPath $exe -PathType Leaf) { $out += $exe } }
+  }
+  $k = $Root.OpenSubKey($Key7)
+  if ($k) {
+    try {
+      foreach ($n in $k.GetSubKeyNames()) {
+        $v = $k.OpenSubKey($n); if (-not $v) { continue }
+        try { $b = [string]$v.GetValue('InstallLocation') } finally { $v.Dispose() }
+        if ($b) { $exe = Join-Path $b 'pwsh.exe'; if (Test-Path -LiteralPath $exe -PathType Leaf) { $out += $exe } }
+      }
+    } finally { $k.Dispose() }
+  }
+  return , $out
+}
+
+# The PowerShell to run elevated scripts with, as the .cmd launchers choose it: Windows PowerShell 5.1 where it is
+# installed, else the last PowerShell 7 registered.
+function Get-PsEngine([string[]]$Engines = (Get-PsEngines)) {
+  if (-not $Engines.Count) { throw 'Neither Windows PowerShell nor PowerShell 7 is installed.' }
+  if ($Engines[0] -match '\\powershell\.exe$') { return $Engines[0] }
+  return $Engines[-1]
+}
+
+# Setup's: the PowerShell it runs in ($Current), when that is one registered in HKLM (so a copy anywhere else, such as one
+# a user could replace, is never recorded for the service or the Installed apps entry); else Get-PsEngine's.
+function Get-SetupEngine([string]$Current = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName, [string[]]$Engines = (Get-PsEngines)) {
+  foreach ($e in $Engines) { if ([IO.Path]::GetFullPath($e) -ieq [IO.Path]::GetFullPath($Current)) { return $e } }
+  return (Get-PsEngine $Engines)
+}
+
+# The UninstallString for a launcher text, run by $Engine (default: Get-PsEngine's).
+function Get-LauncherCommand([string]$Text, [string]$Engine = (Get-PsEngine)) {
   $b64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Text))
-  return [pscustomobject]@{ b64 = $b64; command = "powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand $b64" }
+  return [pscustomobject]@{ b64 = $b64; command = "`"$Engine`" -NoProfile -ExecutionPolicy Bypass -EncodedCommand $b64" }
 }
 
 # Writes (or refreshes) the Installed apps entry. $Root/$Path: HKLM and $script:EntryKeyPath for setup; a test key in tests.

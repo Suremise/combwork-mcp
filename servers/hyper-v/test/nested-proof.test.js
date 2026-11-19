@@ -294,9 +294,21 @@ test('every PowerShell script the driver sends parses (Windows PowerShell 5.1\'s
     preflight: P.SCRIPTS.preflight, deployPrepare: P.SCRIPTS.deployPrepare,
     deployUnpack: P.SCRIPTS.deployUnpack('0123456789abcdef0123456789abcdef01234567', 'a'.repeat(64), REPO_DIR),
     setup: P.SCRIPTS.setup(REPO_DIR, 'InternetLan'),
+    setup7: P.SCRIPTS.setup(REPO_DIR, 'Host', '7'),
     uploadCheck: P.SCRIPTS.uploadCheck('Win11_Eval.iso', 'b'.repeat(64)),
-    installNode: P.SCRIPTS.installNode('node-v22.11.0-x64.msi')
+    installNode: P.SCRIPTS.installNode('node-v22.11.0-x64.msi'),
+    installPwsh: P.SCRIPTS.installPwsh('PowerShell-7.6.10-win-x64.msi')
   }
+  // MC-1575: setup by the user's own line (install.cmd) by default, or under the registered PowerShell 7; approvals by
+  // the user's approve.cmd line.
+  assert.match(scripts.setup, /^cmd \/c call "C:\\hvnest-proof\\repo-0123456789ab\\servers\\hyper-v\\setup\\install\.cmd" -DiskFolder C:\\hyperv-mcp-disks -User "hvnest-proof\\proofuser" -MaxNetwork InternetLan /)
+  assert.match(scripts.setup7, /PowerShellCore\\InstalledVersions[\s\S]*& \$pwsh -NoProfile -ExecutionPolicy Bypass -File 'C:\\hvnest-proof\\repo-0123456789ab\\servers\\hyper-v\\setup\\install\.ps1' -DiskFolder/)
+  for (const s of [scripts.setup, scripts.setup7]) assert.match(s, /"engine: " \+ \[string\]\(Get-Content -LiteralPath 'C:\\Program Files\\hyperv-mcp\\host\.config'/)
+  assert.throws(() => P.SCRIPTS.setup(REPO_DIR, 'Host', '5'), /bad setup/)
+  assert.throws(() => P.SCRIPTS.installPwsh('PowerShell-7.6.10-win-x64.msi"; evil'), /bad PowerShell msi/)
+  assert.match(scripts.installPwsh, /O=Microsoft Corporation/)
+  assert.strictEqual(P.approveLine('p-0123456789abcdef'), 'cmd /c call "C:\\Program Files\\hyperv-mcp\\approve.cmd" -Plan p-0123456789abcdef')
+  assert.throws(() => P.approveLine('p-01 & evil'), /approve <p-/)
   assert.throws(() => P.SCRIPTS.uploadCheck("x'.iso", 'b'.repeat(64)), /bad upload/)
   assert.throws(() => P.SCRIPTS.installNode('evil.msi'), /bad node msi/)
   assert.throws(() => P.SCRIPTS.setup("C:\\x'; rm", 'InternetLan'), /bad setup/)

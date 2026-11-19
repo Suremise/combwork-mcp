@@ -137,6 +137,9 @@ class Supervisor {
     };
     psi.EnvironmentVariables["HYPERV_MCP_STATE_DIR"] = cfg["stateDir"];
     psi.EnvironmentVariables["HYPERV_MCP_INSTALL_DIR"] = AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\');
+    // MC-1575: the PowerShell setup ran in (one registered in HKLM), for hv.ps1. An older setup's host.config has none:
+    // the helper then finds one itself, the same way.
+    if (cfg.ContainsKey("powershell")) psi.EnvironmentVariables["HYPERV_MCP_POWERSHELL"] = cfg["powershell"];
     helper = Process.Start(psi);
     if (!Native.AssignProcessToJobObject(job, helper.Handle)) { Log("can't assign the helper to its job: " + Marshal.GetLastWin32Error()); KillHelper("no job"); return; }
     helperIn = new StreamWriter(helper.StandardInput.BaseStream, new UTF8Encoding(false)) { AutoFlush = true, NewLine = "\n" };

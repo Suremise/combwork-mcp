@@ -26,7 +26,7 @@ Each server's README covers its setup, tools, configuration, safety notes and li
 - **`windows-sandbox`:** Windows 11 **Pro, Enterprise or Education, 24H2 or later**, with virtualisation turned on in
   the firmware and the **Windows Sandbox** optional feature installed. (Windows Home has no Windows Sandbox.)
 - **`hyper-v`:** Windows 11 **Pro, Enterprise or Education** with **Hyper-V** turned on, Node installed for all users,
-  its helper service set up once in an admin PowerShell, and a Windows 11 Enterprise evaluation ISO for the pool (see
+  its helper service set up once in an admin terminal, and a Windows 11 Enterprise evaluation ISO for the pool (see
   [its README](servers/hyper-v/#setup)). For [Linux guests](servers/hyper-v/#linux-guests) (Debian 13, Ubuntu 26.04,
   from pinned official cloud images the helper downloads and verifies), also Windows' **OpenSSH Client**
   (Settings, System, Optional features).

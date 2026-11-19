@@ -82,7 +82,7 @@ and test accounts.
 
 ## Setup
 
-**Upgrading from an earlier release:** run setup again (step 2, the same line) in an admin Windows PowerShell before
+**Upgrading from an earlier release:** run setup again (step 2, the same line) in an admin terminal before
 using the new server: the helper's protocol and features changed, and an older helper refuses each newer feature with
 "run setup again". The pool's VMs and images are kept; pass the same options you used before (`-DiskFolder`,
 `-BuildRoot` and the rest), since a rerun replaces them.
@@ -116,17 +116,20 @@ using the new server: the helper's protocol and features changed, and an older h
   again" (it would refuse files it doesn't know). Images and VMs you already have are kept and stay usable.
 - `vm_acquire`'s `distro` takes any `/etc/os-release` ID (`debian`, `ubuntu`, `fedora`...).
 
+**From 4.0.0 to 4.1.0 (any terminal, MC-1575): rerun setup to get the new lines.**
+- Setup, approvals and the uninstaller each take one line that works the same in any admin terminal (cmd, Windows
+  Terminal, Windows PowerShell or PowerShell 7), and they run under PowerShell 7 on a Windows without Windows PowerShell.
+- Until the rerun, the 4.0.0 helper still gives the old `powershell -File ... approve.ps1` line, which still works.
+
 1. Turn on Hyper-V (see Requirements), and check `Get-Service vmms` says Running.
-2. In an **admin PowerShell**, run setup once (one line). Name a folder for the VMs' disks on a drive with room:
+2. In an **admin terminal** (cmd, Windows Terminal, Windows PowerShell or PowerShell 7), run setup once (one line,
+   the same in each). Name a folder for the VMs' disks on a drive with room:
    ```
-   powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\combwork-mcp\servers\hyper-v\setup\install.ps1" -DiskFolder D:\hyperv-mcp
+   cmd /c call "C:\path\to\combwork-mcp\servers\hyper-v\setup\install.cmd" -DiskFolder D:\hyperv-mcp
    ```
-   Run it with **Windows PowerShell 5.1** (`powershell`, as above), never PowerShell 7 (`pwsh`): setup's storage and ACL
-   routines need .NET Framework. Started from PowerShell 7, setup (and `uninstall.ps1` and `approve.ps1`) stops before
-   checking or changing anything, and prints the 5.1 line to run instead: run it with the same arguments.
    It reports each step and can be run again (to update the helper or change the policy). It installs:
-   - the helper's code, `approve.ps1` and the service host (compiled there by the in-box .NET Framework compiler) in
-     `%ProgramFiles%\hyperv-mcp`;
+   - the helper's code, `approve.cmd` and `approve.ps1`, and the service host (compiled there by the in-box .NET
+     Framework compiler) in `%ProgramFiles%\hyperv-mcp`;
    - the service `HyperVMcp` on its virtual account `NT SERVICE\HyperVMcp`, which it adds to Hyper-V Administrators.
      The service is restarted after a failure (3 times a day, then left stopped);
    - the local group **Hyper-V MCP Users**, with you in it (`-User` to name someone else). Its members may open the
@@ -207,7 +210,7 @@ The helper trusts what is in its state folder (the journal, plans, approvals, gu
 
 **In Combwork:** pack it (`node scripts\pack.mjs hyper-v` at the repo root) and add `dist\hyper-v.zip` with **Add MCP
 Server from File** in the MCP view. Its definition goes in as `combwork-mcp.example.json`
-([this one](combwork-mcp.example.json)). Run setup from the unpacked folder's `setup\install.ps1`, then turn the server
+([this one](combwork-mcp.example.json)). Run setup from the unpacked folder's `setup\install.cmd`, then turn the server
 on, and only in a dedicated testing project (see "Who gets it").
 
 ### Direct mode (no service): weaker, read this first
@@ -229,11 +232,12 @@ approval → change**:
    keeps, and the pool's network mode (none unless you choose another; the agent describes the options, see "Network
    modes"). The plan changes nothing. The first plan also checks the image, which takes a few minutes (see "The
    image"); the agent then plans again.
-2. **Approve.** The plan's reply holds one line for **you** to run in an **admin PowerShell** (one UAC prompt):
+2. **Approve.** The plan's reply holds one line for **you** to run in an **admin terminal** (cmd or PowerShell, the
+   same line in each):
    ```
-   powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\hyperv-mcp\approve.ps1" -Plan p-0123456789abcdef
+   cmd /c call "C:\Program Files\hyperv-mcp\approve.cmd" -Plan p-0123456789abcdef
    ```
-   Check that the path is `C:\Program Files\hyperv-mcp\approve.ps1` before you run it.
+   Check that the path is `C:\Program Files\hyperv-mcp\approve.cmd` before you run it.
    - It shows the plan from the helper's own record, never from the agent's text.
    - It asks for the first 6 characters of the plan's digest. That only confirms the plan on screen is the one you
      approve: it's not a password.
@@ -671,7 +675,7 @@ client's settings (Claude Code's `additionalDirectories`, Codex's `HYPERV_MCP_AL
 folders at setup:
 
 ```
-powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\combwork-mcp\servers\hyper-v\setup\install.ps1" -DiskFolder D:\hyperv-mcp -BuildRoot "C:\Users\you\AppData\Local\app-builds"
+cmd /c call "C:\path\to\combwork-mcp\servers\hyper-v\setup\install.cmd" -DiskFolder D:\hyperv-mcp -BuildRoot "C:\Users\you\AppData\Local\app-builds"
 ```
 
 - A build may then come from your MCP roots **or** from inside one of these folders, for every client, with no client
@@ -690,10 +694,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\combwork-mcp\ser
 ### Sharing the pool between projects
 
 With nothing set up, every project shares one pool, first come first served. An admin can name the projects that use it,
-so none of them takes every VM, in a JSON file given to setup (one line, in an admin Windows PowerShell):
+so none of them takes every VM, in a JSON file given to setup (one line, in an admin terminal):
 
 ```
-powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\combwork-mcp\servers\hyper-v\setup\install.ps1" -DiskFolder D:\hyperv-mcp -ProjectsFile D:\hyperv-projects.json
+cmd /c call "C:\path\to\combwork-mcp\servers\hyper-v\setup\install.cmd" -DiskFolder D:\hyperv-mcp -ProjectsFile D:\hyperv-projects.json
 ```
 
 ```json
@@ -867,6 +871,20 @@ that they own them. The service account can only read there.
 - checks the plan id is an opaque `p-` and 16 hex digits before touching a file;
 - reads only the helper's own record.
 
+**The one-line launchers (MC-1575).** Setup, approvals and the uninstaller are each one line,
+`cmd /c call "<launcher>.cmd" <arguments>`, and the same line works in cmd, Windows Terminal, Windows PowerShell and
+PowerShell 7. (`call` keeps every quoted path's quotes, which `cmd /c` alone strips once a second argument is quoted.)
+- The launcher runs its `.ps1` under Windows PowerShell 5.1 where it is installed, otherwise PowerShell 7. It finds
+  each one from its HKLM registration, and `reg.exe` and `cmd.exe` by their full paths under `%SystemRoot%`. It never
+  looks in PATH or the current folder, which a non-elevated program could plant things in. With neither installed, it
+  says so and runs nothing. The scripts themselves run the same under either engine.
+- The service runs `hv.ps1` with the PowerShell setup ran in, recorded in `host.config` only if it is one registered in
+  HKLM (otherwise HKLM's default, as above). The Installed apps entry names the same engine by its full path.
+- Paths are read first by the shell the line is typed in and then by cmd, so keep `%`, `^`, `&`, `!` and `$` out of
+  the folder and file names you pass. A `%` or `^` that is still there when the launcher runs is refused before
+  anything runs. What the typing shell has already changed (a `%NAME%` or `$name` it expanded) can't be seen, so
+  avoid those characters rather than rely on the refusal.
+
 Even a forged approval can only do what the policy allows.
 
 **The journal and recovery.** `%ProgramData%\hyperv-mcp\journal.jsonl` is append-only, and each record is flushed
@@ -1000,9 +1018,9 @@ service and folders as they are then, whoever made them. Nobody has to keep a sc
 
 - **Settings > Apps > Installed apps > "Hyper-V MCP helper and test VMs" > Uninstall.** It asks for admin rights, shows
   what is installed, and asks: remove everything (the default), keep the pool and remove only the helper, or list only.
-- Or, in an admin PowerShell (one line), the installed copy:
+- Or, in an admin terminal (cmd or PowerShell; one line), the installed copy:
   ```
-  powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\hyperv-mcp\uninstall\uninstall.ps1"
+  cmd /c call "C:\Program Files\hyperv-mcp\uninstall.cmd"
   ```
   Add `-RemovePool` or `-KeepPool` to skip the question, or `-WhatIf` to see what each would remove, changing nothing
   (no record, no approval, no service change).
@@ -1023,10 +1041,10 @@ undo those as you were told when they were made. Its last line reminds you.
 
 ## Uninstall
 
-From Installed apps, or in an admin PowerShell (one line), with the installed copy or the repo's:
+From Installed apps, or in an admin terminal (one line), with the installed copy or the repo's:
 ```
-powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\hyperv-mcp\uninstall\uninstall.ps1" -KeepPool
-powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\combwork-mcp\servers\hyper-v\setup\uninstall.ps1" -KeepPool
+cmd /c call "C:\Program Files\hyperv-mcp\uninstall.cmd" -KeepPool
+cmd /c call "C:\path\to\combwork-mcp\servers\hyper-v\setup\uninstall.cmd" -KeepPool
 ```
 An installed copy runs itself from a protected temporary copy (only SYSTEM and Administrators), so it can remove its own
 folder. If a run is interrupted (its window closed), the next uninstall or setup removes that run's copy, only when it
@@ -1134,7 +1152,7 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   - the policy, the journal (a torn last line cut off, then reopen → append → reopen keeping every record),
     canonical plans, the answer file's escaping, the evaluation-expiry warning;
   - setup's storage and ACL routines themselves, non-elevated on temp folders and a test registry key
-    (`test\acl-check.ps1`):
+    (`test\acl-check.ps1`), under Windows PowerShell 5.1 and PowerShell 7 each (MC-1575):
     - a folder created with its final security and its receipt, then trusted unchanged on the next run;
     - the injected boundary: a folder created, with a forged journal, between "missing" and the create, refused and
       left untouched, with no receipt minted;
@@ -1146,7 +1164,7 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
     - a file written with its own ACL, not the old file's;
     - for the install folder: earlier grants removed, VM grants kept, links refused before any change;
   - uninstall's teardown (`setup\teardown.ps1`), non-elevated with strict fakes for its outside actions
-    (`test\teardown-check.ps1`), including `-WhatIf` changing nothing (no outside action, no record, files and key as
+    (`test\teardown-check.ps1`), under 5.1 and 7 each, including `-WhatIf` changing nothing (no outside action, no record, files and key as
     they were) and the install folder's `uninstall\` kept for the last phase:
     - a crash at each of 25 points (before and after every action and every record write), then a rerun to
       completion, without asking any action to redo what was undone;
@@ -1160,10 +1178,22 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
       teardown;
     - legacy storage refused unless admin-owned, unchanged unless confirmed, removed when confirmed;
   - `approve.ps1` refusing to run outside the install folder;
-  - setup, `uninstall.ps1` and `approve.ps1` under PowerShell 7 (where `pwsh` is installed) refused before anything
-    else, saying to run them under 5.1 with the same arguments, and setup under 5.1 going on past that check;
-  - setup's helper file list holding every helper file (and the zip the whole helper folder), and its
-    `-MaxSessionMinutes` check agreeing with the helper's.
+  - setup and `uninstall.ps1` running under 5.1 and under 7 on to their own checks, changing nothing; the module-path
+    fix applied under 5.1 only;
+  - setup's helper file list holding every helper file (and the zip the whole helper folder), and its `-BuildRoot`
+    and `-MaxSessionMinutes` checks agreeing with the helper's, under 5.1 and 7.
+- `launchers.test.js` (MC-1575): `install.cmd`, `uninstall.cmd` and `approve.cmd`, each run for real by its one line
+  typed in cmd, Windows PowerShell 5.1 and PowerShell 7, beside a stub script:
+  - spaced paths for every path option, arriving exactly; exit codes 0 and 7 reaching each caller;
+  - Windows PowerShell 5.1 where it is registered; a copy whose 5.1 key is renamed running PowerShell 7 (the fallback,
+    exercised on this PC); with neither, nothing run and the reason given;
+  - fake `powershell`, `pwsh`, `reg`, `findstr` and `where` in PATH and the current folder, never run;
+  - a `%` or `^` still in an argument refused before anything runs; a `%NAME%` that cmd has already expanded arriving
+    expanded (the documented limit, not claimed as caught);
+  - the installed `uninstall.cmd` running `uninstall\uninstall.ps1` and ending cleanly when the uninstall removes it;
+    typed directly in a cmd session or called from a batch file, the caller goes on, with the exit code;
+  - the three launchers one text, apart from the script each runs;
+  - `hv.js`'s engine choice from `reg.exe` output, and `hv.ps1` run under each engine through `HYPERV_MCP_POWERSHELL`.
 - `leases.test.js`:
   - leases across connections; a connection closing, the deadline, keep and `keepOnFailure`;
   - the restore before every start;
@@ -1253,7 +1283,7 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   wait never given a VM and its place expiring, a repeat call keeping its place, a disconnect leaving it, a resize
   serving the next waiter, and a newer call superseding an older one (in-process); a lease keeping its project; which
   project a session is in; through `server.js`, a project's own build folder refused to others, and a newer helper
-  still serving this server; setup's projects check under Windows PowerShell 5.1, before any change (caps per OS
+  still serving this server; setup's projects check under Windows PowerShell 5.1 and PowerShell 7, before any change (caps per OS
   formatted, never cast; `reserveVms` refused); the policy's rules for projects.
 - `images.test.js`, a pool from more than one image (a stub "linux" kind, made only in the journal): groups by image
   (a resize adding to or taking from one image's VMs only); `vm_acquire` by OS and image, one VM per session; VMs made
@@ -1360,7 +1390,9 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   - pool checkpoints and refresh-clean on Linux, and the feature gate;
   - a host-mode run, its address set by the helper's own script, and a checkpoint restart after the pool's mode was
     lowered, which goes on with network `none`.
-- `linux-ps.test.js`: hv.ps1's Linux actions run for real under Windows PowerShell 5.1, with the Hyper-V cmdlets
+- `linux-ps.test.js`: hv.ps1's Linux actions run for real under Windows PowerShell 5.1 and PowerShell 7 each (the
+  service runs hv.ps1 under the one setup ran in; `restorewait.test.js`'s `$RestoreTo` and `checkpoints.test.js`'s
+  `$JobsIdle`, its other host-side blocks, run under each too), with the Hyper-V cmdlets
   mocked:
   - `com-attach` and `com-detach` (the exact `\\.\pipe\<name>` path, read back) and `vhd-convert`'s path checks;
   - `com-read` on a real named pipe: a quiet spell longer than its wait, a line split across writes, the pipe coming
@@ -1402,7 +1434,8 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   - the recorded inventory: its label, each item's manual step (a quote in a path doubled), what's out of scope; the
     helper writing it at start and rewriting it after a create, resize and remove, never torn;
   - setup copying the uninstaller's files and writing the entry, and clearing a kept-pool mark;
-  - the Installed apps entry, run for real under Windows PowerShell 5.1 as Windows runs an UninstallString, with a
+  - the Installed apps entry, run for real under Windows PowerShell 5.1 and PowerShell 7 each (the entry names its
+    engine by full path, found from HKLM; fake registrations test the choice) as Windows runs an UninstallString, with a
     scratch Program Files and HKCU keys (`test\appsentry-check.ps1`): the uninstaller launched while its files are
     whole; every partial set of its last files, an empty `uninstall.retiring\` and an empty install folder finished by
     the launcher alone; the entry removed when nothing is left, or on a verified kept-pool mark; refusals (an extra
@@ -1462,7 +1495,7 @@ VM.
 **Pool VMs can't be used.** The tools can't expose virtualization extensions on them, and a lease restores them to
 clean. A separate VM also has its own lifetime and leaves the pool alone.
 
-**Who runs what.** The user runs every host line in an admin Windows PowerShell 5.1, and every in-VM line in the VM's
+**Who runs what.** The user runs every host line in an admin PowerShell (Windows PowerShell or PowerShell 7), and every in-VM line in the VM's
 console. The driver runs on the host as the user, with no admin rights. It only uses `ssh` and `scp` to the VM, and
 never acts on this PC's Hyper-V.
 
@@ -1522,8 +1555,12 @@ $ErrorActionPreference='Stop'; if ($env:COMPUTERNAME -ne 'HVNEST-PROOF') { throw
 - `install-node <node-vX.Y.Z-x64.msi>` (downloaded from nodejs.org on the host; installed only if Authenticode-valid
   and signed by the OpenJS Foundation) and `upload <the Windows ISO>`, each checked by SHA-256;
 - `deploy` (a `git archive` of a commit, checked by SHA-256);
-- `setup --max-network InternetLan`;
-- `call pool_plan ...` with `approve <plan>`, which types the digest approve.ps1 shows; then `call pool_create ...`
+- `setup --max-network InternetLan`, by the user's own line (`install.cmd`). For the PowerShell 7 proof (MC-1575):
+  `install-pwsh <PowerShell-X.Y.Z-win-x64.msi>` (from Microsoft's GitHub releases; installed only if Authenticode-valid
+  and signed by Microsoft), then `setup --max-network InternetLan --engine 7`, after which the service runs `hv.ps1`
+  under PowerShell 7 (the setup output's `engine:` line says which);
+- `call pool_plan ...` with `approve <plan>`, which types the digest approve.ps1 shows (through the user's
+  `approve.cmd` line); then `call pool_create ...`
   for one Windows VM and one Debian VM, at pool network `internet-lan`. If approve.ps1 can't read the digest over SSH,
   or the user prefers it, the user runs the approve line in the VM's console instead;
 - `matrix`;
@@ -1593,9 +1630,10 @@ Then delete `%USERPROFILE%\.ssh\hvnest-proof\`. No host firewall rule, switch or
     transport), `guest.py` (the guest's dispatcher), and `host\HvMcpVsock.cs` (the Hyper-V socket bridge, compiled by setup);
   - `hv.js` and `hv.ps1` (the only way it acts on Hyper-V), `guest-sync.ps1` (the guest side of `vm_sync`) and
     `guest-agent.ps1` (the interactive session's watcher), each run in the guest by `hv.ps1`;
-  - `approve.ps1`;
+  - `approve.ps1`, and `approve.cmd`, its one-line launcher for any terminal (MC-1575);
   - `host\HvMcpHost.cs` (the service host's source).
-- `setup\install.ps1`, `setup\uninstall.ps1`: the only elevated steps besides approvals. `setup\teardown.ps1` is
+- `setup\install.ps1`, `setup\uninstall.ps1`: the only elevated steps besides approvals, each run by its launcher
+  (`install.cmd`, `uninstall.cmd`; setup installs `uninstall.cmd` beside `approve.cmd`). `setup\teardown.ps1` is
   uninstall's teardown, and `setup\appsentry.ps1` the Installed apps entry, its launcher and the last phase (MC-1557);
   setup copies `uninstall.ps1`, `teardown.ps1`, `acl.ps1`, `appsentry.ps1` and `Storage.cs` into
   `%ProgramFiles%\hyperv-mcp\uninstall`. `helper\inventory.js` renders the helper's recorded inventory. `helper\timing.js` holds the timings' keys, defaults, ranges and caps (MC-1558). `setup\acl.ps1` holds

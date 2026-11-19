@@ -16,6 +16,7 @@ $SYSTEM = 'S-1-5-18'; $ADMINS = 'S-1-5-32-544'
 $HKCU = [Microsoft.Win32.Registry]::CurrentUser
 $r = [ordered]@{}
 $script:n = 0
+$script:Engine = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
 $set = $script:RetiringSet
 
 # A fresh case: its own Program Files root, state folder and keys; the launcher's overrides for them.
@@ -26,7 +27,8 @@ function New-Case([hashtable]$Extra = @{}) {
   $base = "Software\hvmcp-apps-test-$([guid]::NewGuid().ToString('n'))"
   $o = @{ pf = (Join-Path $b 'pf'); state = (Join-Path $b 'state'); regRoot = 'CurrentUser'; stateKey = "$base\state"; entryKey = "$base\entry"; service = "hvmcp-no-such-service-$($script:n)"; trusted = @($me, $SYSTEM, $ADMINS); elevate = $false; pause = $false }
   foreach ($k in $Extra.Keys) { $o[$k] = $Extra[$k] }
-  $cmd = Get-LauncherCommand (Get-LauncherText $o)
+  # MC-1575: run by the engine this check runs in, as setup records its own (so each engine's run tests its own entry).
+  $cmd = Get-LauncherCommand (Get-LauncherText $o) $script:Engine
   Set-AppsEntry $HKCU $o.entryKey $cmd.command '9.9.9' (Join-Path $o.pf 'hyperv-mcp')
   return [pscustomobject]@{ base = $b; o = $o; cmd = $cmd; inst = (Join-Path $o.pf 'hyperv-mcp'); rec = (Join-Path $b 'launched.txt'); keyBase = $base }
 }
@@ -43,7 +45,9 @@ function Add-Files($c, [string]$where, [string[]]$names) {
 # Runs a command line as Windows starts an UninstallString: one CreateProcess with the whole line (not cmd.exe, whose
 # 8191-character limit an encoded launcher exceeds; CreateProcess allows 32767).
 function Invoke-Line([string]$u) {
-  $exe, $rest = $u.Split(' ', 2)
+  # The program is the first word, or (MC-1575: the entry names its engine's full path) a quoted first part.
+  if ($u.StartsWith('"')) { $q = $u.IndexOf('"', 1); $exe = $u.Substring(1, $q - 1); $rest = $u.Substring($q + 1).TrimStart() }
+  else { $exe, $rest = $u.Split(' ', 2) }
   $si = New-Object Diagnostics.ProcessStartInfo $exe, $rest
   $si.UseShellExecute = $false; $si.RedirectStandardOutput = $true; $si.RedirectStandardError = $true; $si.WorkingDirectory = $Dir
   $p = [Diagnostics.Process]::Start($si)
@@ -65,8 +69,36 @@ $pc = Get-LauncherCommand $prod
 $r.prodParses = -not $errs
 $r.prodNoOverrides = $prod.Contains("`$over = ''")
 $r.prodRoundTrip = ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($pc.b64)) -eq $prod)
-$r.prodCommand = $pc.command.StartsWith('powershell.exe -NoProfile -ExecutionPolicy Bypass -EncodedCommand ')
+$r.prodCommand = $pc.command -ceq "`"$(Get-PsEngine)`" -NoProfile -ExecutionPolicy Bypass -EncodedCommand $($pc.b64)"
 $r.prodLength = $pc.command.Length
+$r.engine = $PSVersionTable.PSEdition
+
+# MC-1575: the engine, from HKLM-style keys (fakes here, under HKCU): 5.1 first, else the last PowerShell 7; a file
+# missing is skipped; setup's own engine only when it is one registered.
+$eb = Join-Path $Dir 'engines'
+foreach ($d in 'ps51', 'ps7a', 'ps7b') { New-Item -ItemType Directory -Force (Join-Path $eb $d) | Out-Null }
+foreach ($f in 'ps51\powershell.exe', 'ps7a\pwsh.exe', 'ps7b\pwsh.exe') { Set-Content -LiteralPath (Join-Path $eb $f) -Value 'fake' }
+$ek = "Software\hvmcp-engine-test-$([guid]::NewGuid().ToString('n'))"
+$k = $HKCU.CreateSubKey("$ek\51"); $k.SetValue('ApplicationBase', (Join-Path $eb 'ps51')); $k.Dispose()
+$k = $HKCU.CreateSubKey("$ek\gone51"); $k.SetValue('ApplicationBase', (Join-Path $eb 'nowhere')); $k.Dispose()
+$k = $HKCU.CreateSubKey("$ek\7\a"); $k.SetValue('InstallLocation', (Join-Path $eb 'ps7a') + '\'); $k.Dispose()
+$k = $HKCU.CreateSubKey("$ek\7\b"); $k.SetValue('InstallLocation', (Join-Path $eb 'ps7b')); $k.Dispose()
+try {
+  $all = Get-PsEngines $HKCU "$ek\51" "$ek\7"
+  $no51 = Get-PsEngines $HKCU "$ek\none" "$ek\7"
+  $gone = Get-PsEngines $HKCU "$ek\gone51" "$ek\7"
+  $none = Get-PsEngines $HKCU "$ek\none" "$ek\none7"
+  $r.engines = [ordered]@{
+    all = @($all | ForEach-Object { $_.Substring($eb.Length + 1) })
+    pick = (Get-PsEngine $all).Substring($eb.Length + 1)
+    pickNo51 = (Get-PsEngine $no51).Substring($eb.Length + 1)
+    pickGone51 = (Get-PsEngine $gone).Substring($eb.Length + 1)
+    none = $(try { Get-PsEngine $none; 'picked' } catch { $_.Exception.Message })
+    setupRegistered = (Get-SetupEngine (Join-Path $eb 'ps7a\pwsh.exe') $all).Substring($eb.Length + 1)
+    setupElsewhere = (Get-SetupEngine 'C:\Users\Public\pwsh.exe' $all).Substring($eb.Length + 1)
+    live = [bool](Get-PsEngines | Where-Object { $_ -ieq [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName })
+  }
+} finally { $HKCU.DeleteSubKeyTree($ek, $false) }
 
 # The entry's values.
 $c = New-Case

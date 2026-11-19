@@ -10,9 +10,8 @@ const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
 const { spawnSync } = require('child_process')
-const { T, scratch, withPool } = require('./helpers')
+const { T, scratch, withPool, psEngines } = require('./helpers')
 const { server } = require('../client')
-const { ps51Env } = require('../helper/hv')
 const { Helper } = require('../helper/core')
 
 const HV_PS = fs.readFileSync(path.join(__dirname, '..', 'helper', 'hv.ps1'), 'utf8')
@@ -38,10 +37,15 @@ $io = @{
 $r = & $RestoreTo 'target' $io${offMs ? ` ${offMs}` : ''}
 'OUT:' + (ConvertTo-Json -InputObject @{ r = $r; calls = @($script:calls); sleeps = @($script:sleeps); clock = $script:clock } -Compress -Depth 4)
 `)
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: ps51Env(), timeout: T.spawnMs })
-  const line = r.stdout.split(/\r?\n/).find(l => l.startsWith('OUT:'))
-  assert.ok(line, r.stdout + r.stderr)
-  return JSON.parse(line.slice(4))
+  // MC-1575: under every PowerShell installed (the helper runs hv.ps1 under the one setup ran in): the same result each.
+  const results = psEngines().map(E => {
+    const r = spawnSync(E.exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: E.env, timeout: T.spawnMs })
+    const line = r.stdout.split(/\r?\n/).find(l => l.startsWith('OUT:'))
+    assert.ok(line, `PowerShell ${E.name}: ${r.stdout}${r.stderr}`)
+    return JSON.parse(line.slice(4))
+  })
+  for (const x of results.slice(1)) assert.deepStrictEqual(x, results[0], 'the same under each PowerShell')
+  return results[0]
 }
 
 const skip = process.platform !== 'win32' || !BLOCK

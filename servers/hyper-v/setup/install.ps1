@@ -1,8 +1,10 @@
-# Sets up the hyper-v MCP server's helper. Run once, in an admin PowerShell (one line):
-#   powershell -NoProfile -ExecutionPolicy Bypass -File "<repo>\servers\hyper-v\setup\install.ps1" -DiskFolder D:\hyperv-mcp
+# Sets up the hyper-v MCP server's helper. Run once, as one line in an admin terminal (cmd, Windows Terminal, Windows
+# PowerShell or PowerShell 7: the same line in each, MC-1575):
+#   cmd /c call "<repo>\servers\hyper-v\setup\install.cmd" -DiskFolder D:\hyperv-mcp
+# install.cmd runs this script under Windows PowerShell 5.1 where it is installed, otherwise PowerShell 7.
 #
 # Service mode (the default) installs:
-#   - %ProgramFiles%\hyperv-mcp: the helper's code, approve.ps1, and HvMcpHost.exe (compiled here by the in-box csc.exe);
+#   - %ProgramFiles%\hyperv-mcp: the helper's code, approve.ps1 and approve.cmd, and HvMcpHost.exe (compiled here by the in-box csc.exe);
 #   - the service HyperVMcp, on its virtual account NT SERVICE\HyperVMcp, the only account it adds to Hyper-V
 #     Administrators, restarted by the Service Control Manager after a failure (3 times a day, then left stopped);
 #   - the local group "Hyper-V MCP Users", with -User in it: members may open the helper's pipe;
@@ -56,29 +58,24 @@ param(
   [string]$ProductKeyFile = '',
   [string]$LinuxTransport = 'HvSocket'
 )
-# Windows PowerShell 5.1 only (MC-1506), refused before any check or change:
-# setup's storage and ACL routines use .NET Framework calls that PowerShell 7
-# doesn't have.
-# Run from PowerShell 7, an earlier setup stopped the service, then failed part-way. The refusal says how to run it
-# under 5.1, with the arguments used (they aren't rebuilt here: -File can't carry every type).
-if ($PSVersionTable.PSEdition -ne 'Desktop') {
-  [Console]::Error.WriteLine("This needs Windows PowerShell 5.1, not PowerShell $($PSVersionTable.PSVersion): nothing was checked or changed. Run it again in an admin Windows PowerShell, as one line, with the same arguments you used:`n  powershell -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" <the same arguments>")
-  exit 1
-}
 $ErrorActionPreference = 'Stop'
-# Started from a PowerShell 7 window, this 5.1 inherits PS7's module folders and can't load its own Get-Acl: drop them.
-$env:PSModulePath = (($env:PSModulePath -split ';') | Where-Object { $_ -and $_ -notmatch '(?<!Windows)PowerShell\\(\d[^\\]*\\)?Modules\\?$' }) -join ';'
+# Runs under Windows PowerShell 5.1 or PowerShell 7 (MC-1575). Under 5.1 started from a PowerShell 7 window, it
+# inherits PS7's module folders and can't load its own Get-Acl: drop them (only under 5.1: they are 7's own).
+if ($PSVersionTable.PSEdition -eq 'Desktop') { $env:PSModulePath = (($env:PSModulePath -split ';') | Where-Object { $_ -and $_ -notmatch '(?<!Windows)PowerShell\\(\d[^\\]*\\)?Modules\\?$' }) -join ';' }
 $ProgressPreference = 'SilentlyContinue'
 function Step($m) { Write-Host "- $m" }
 # Whether the helper's pipe exists, by listing the pipes (opening one would count as a client).
 function PipeOpen { return [bool]([IO.Directory]::GetFiles('\\.\pipe\') | Where-Object { $_ -ieq '\\.\pipe\hyperv-mcp' }) }
 
 $me = New-Object Security.Principal.WindowsPrincipal ([Security.Principal.WindowsIdentity]::GetCurrent())
-if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run this in an admin PowerShell (Run as administrator).' }
+if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run this in an admin terminal (Run as administrator).' }
 
 . (Join-Path $PSScriptRoot 'acl.ps1')     # trusted storage (Use-StorageFolder, receipts, ancestors) and ACL checks
 . (Join-Path $PSScriptRoot 'teardown.ps1') # Assert-NoTeardown
 . (Join-Path $PSScriptRoot 'appsentry.ps1') # MC-1557: the Installed apps entry and its launcher
+# MC-1575: the PowerShell this runs in, when it is one registered in HKLM (else that registration's default): the service
+# runs hv.ps1 with it, and the Installed apps entry the uninstaller.
+$engine = Get-SetupEngine
 # No install while an uninstall is unfinished (no helper may start during one).
 Assert-NoTeardown ([Microsoft.Win32.Registry]::LocalMachine) 'SOFTWARE\hyperv-mcp'
 # MC-1557: a finished keep-pool uninstall's record (KeptPool) ends here: this setup restores the helper for that pool.
@@ -104,7 +101,7 @@ $HVADMINS = 'S-1-5-32-578'
 
 # 1. Hyper-V
 if (-not (Get-Command Get-VM -ErrorAction SilentlyContinue) -or -not (Get-Service vmms -ErrorAction SilentlyContinue)) {
-  throw "Hyper-V or its PowerShell module isn't installed. Turn it on (in an admin PowerShell: Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All), restart, then run this again."
+  throw "Hyper-V or its PowerShell module isn't installed. Turn it on (in an admin PowerShell window: Enable-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V-All), restart, then run this again."
 }
 if ((Get-Service vmms).Status -ne 'Running') { throw 'The Hyper-V Virtual Machine Management service (vmms) is not running: start it, or restart the PC, then run this again.' }
 Step 'Hyper-V is on.'
@@ -267,7 +264,7 @@ if ($bad.Count) { throw "$install isn't admin-only after setting its ACL: $($bad
 # Nothing earlier in it is kept: every file the service runs is copied fresh below (a stray file could be loaded instead).
 Get-ChildItem -LiteralPath $install -Force | Remove-Item -Recurse -Force
 New-Item -ItemType Directory -Path (Join-Path $install 'guests') -Force | Out-Null
-foreach ($f in 'core.js', 'helper.js', 'hv.js', 'hv.ps1', 'guest-sync.ps1', 'guest-agent.ps1', 'images.js', 'iso.js', 'journal.js', 'net.js', 'paths.js', 'policy.js', 'inventory.js', 'timing.js', 'unattend.js', 'approve.ps1', 'linux-images.js', 'qcow2.js', 'seed.js', 'ssh.js', 'sshkeys.js', 'guest.py', 'guests\linux.js') {
+foreach ($f in 'core.js', 'helper.js', 'hv.js', 'hv.ps1', 'guest-sync.ps1', 'guest-agent.ps1', 'images.js', 'iso.js', 'journal.js', 'net.js', 'paths.js', 'policy.js', 'inventory.js', 'timing.js', 'unattend.js', 'approve.ps1', 'approve.cmd', 'linux-images.js', 'qcow2.js', 'seed.js', 'ssh.js', 'sshkeys.js', 'guest.py', 'guests\linux.js') {
   Copy-Item -LiteralPath (Join-Path $src "helper\$f") -Destination (Join-Path $install $f) -Force
 }
 Copy-Item -LiteralPath (Join-Path $src 'meta.json') -Destination (Join-Path $install 'meta.json') -Force
@@ -277,8 +274,10 @@ Step "Helper code copied to $install (only Administrators and SYSTEM can write t
 # reads what to remove from the helper's records when it runs.
 New-Item -ItemType Directory -Path (Join-Path $install 'uninstall') -Force | Out-Null
 foreach ($f in $script:RetiringSet) { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $f) -Destination (Join-Path $install "uninstall\$f") -Force }
+# MC-1575: its launcher for any terminal (cmd /c call "...\uninstall.cmd"), which runs uninstall\uninstall.ps1.
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'uninstall.cmd') -Destination (Join-Path $install 'uninstall.cmd') -Force
 $appsVersion = (Get-Content -LiteralPath (Join-Path $src 'meta.json') -Raw | ConvertFrom-Json).version
-Set-AppsEntry ([Microsoft.Win32.Registry]::LocalMachine) $script:EntryKeyPath (Get-LauncherCommand (Get-LauncherText)).command $appsVersion $install
+Set-AppsEntry ([Microsoft.Win32.Registry]::LocalMachine) $script:EntryKeyPath (Get-LauncherCommand (Get-LauncherText) $engine).command $appsVersion $install
 Step "Uninstaller copied to $install\uninstall; Installed apps lists 'Hyper-V MCP helper and test VMs' (its Uninstall removes everything, or keeps the pool)."
 
 # MC-1501: Linux guests. The helper reaches a Linux guest by SSH (Windows' in-box OpenSSH Client) over a Hyper-V
@@ -303,8 +302,8 @@ if ($Mode -eq 'Service') {
   $out = & $csc -nologo -target:exe -optimize "-out:$exe" -reference:System.ServiceProcess.dll -reference:System.Core.dll (Join-Path $src 'helper\host\HvMcpHost.cs') 2>&1
   if ($LASTEXITCODE -ne 0) { throw "Compiling the service host failed:`n$($out -join "`n")" }
   Set-Content -LiteralPath (Join-Path $install 'host.config') -Encoding ASCII -Value @(
-    "node=$node", "helper=$(Join-Path $install 'helper.js')", "stateDir=$state", 'pipe=hyperv-mcp', "usersSid=$usersSid")
-  Step 'Service host compiled.'
+    "node=$node", "helper=$(Join-Path $install 'helper.js')", "stateDir=$state", 'pipe=hyperv-mcp', "usersSid=$usersSid", "powershell=$engine")
+  Step "Service host compiled; the helper runs Hyper-V operations with $engine."
   if (-not $existing) {
     & sc.exe create $svc binPath= "`"$exe`"" obj= $svcAccount start= auto DisplayName= 'Hyper-V MCP helper' | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "sc.exe create failed ($LASTEXITCODE)." }

@@ -2,6 +2,10 @@
 # mixed endings and a server's zip (scripts/pack.mjs) holds the same bytes as the repo. npm test checks for mixed files.
 # PowerShell 5.1 and 7 both run LF scripts, and the .ps1 files have always shipped as LF, so they need no exception.
 * text=auto eol=lf
+# Batch files (hyper-v's launchers, MC-1575) are stored CRLF, as is, and never converted: cmd.exe misreads labels and
+# goto in an LF batch file. So the repo, every working tree and a server's zip hold the same CRLF bytes.
+*.cmd -text
+*.bat -text
 
 # Binaries: never converted or diffed as text.
 *.png binary

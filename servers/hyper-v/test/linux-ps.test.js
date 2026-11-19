@@ -1,4 +1,4 @@
-// hv.ps1's Linux actions (MC-1501), run for real under Windows PowerShell 5.1: the whole script, dot-sourced after
+// hv.ps1's Linux actions (MC-1501), run for real under Windows PowerShell 5.1 and PowerShell 7 (MC-1575): the whole script, dot-sourced after
 // mocks of the Hyper-V cmdlets they call (functions win over cmdlets), with { op, args } on stdin as the helper sends it.
 // No Hyper-V call is made. com-read reads a real named pipe served by this test: lines across a quiet spell longer
 // than its 5 s wait, a line split across writes, the pipe closing and coming back (a guest restart), 64 KB without a
@@ -9,8 +9,10 @@ const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
 const { spawnSync } = require('child_process')
-const { ps51Env } = require('../helper/hv')
-const { T, scratch } = require('./helpers')
+const { T, scratch, psEngines } = require('./helpers')
+// MC-1575: hv.ps1 runs under the PowerShell setup ran in, 5.1 or 7: every case here runs under each one installed.
+const ENGINES = psEngines()
+let ENGINE = ENGINES[0]
 
 const HV = path.join(__dirname, '..', 'helper', 'hv.ps1')
 const skip = process.platform !== 'win32'
@@ -28,13 +30,16 @@ function hv(name, op, args, prelude = '', timeout = 60_000) {
   const sc = scratch(`lxps-${name}`)
   const file = path.join(sc.dir, 'case.ps1')
   fs.writeFileSync(file, `${MOCKS}\n${prelude}\n. '${HV.replace(/'/g, "''")}'\n'CALLS:' + (ConvertTo-Json -InputObject @($global:calls) -Compress)\n`)
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { input: JSON.stringify({ op, args }), encoding: 'utf8', env: ps51Env(), timeout })
+  const r = spawnSync(ENGINE.exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { input: JSON.stringify({ op, args }), encoding: 'utf8', env: ENGINE.env, timeout })
   const out = r.stdout.split(/\r?\n/)
   const ans = out.find(l => l.startsWith('HVJSON:'))
   const calls = out.find(l => l.startsWith('CALLS:'))
   assert.ok(ans, r.stdout + r.stderr)
   return { answer: JSON.parse(ans.slice(7)), calls: calls ? JSON.parse(calls.slice(6)) : [] }
 }
+
+for (const E of ENGINES) test.describe(`hv.ps1's Linux actions under PowerShell ${E.name}`, () => {
+test.before(() => { ENGINE = E })
 
 test('com-attach sets COM1 to \\\\.\\pipe\\<name> exactly, and com-detach unsets it, read back; a bad name is refused before any call', { skip }, () => {
   const pipe = 'hvmcp-diag-0123456789abcdef'
@@ -133,6 +138,7 @@ test('MC-1545 com-read through the wait: the seed\'s last stage doesn\'t end it,
   for (const bad of [path.join(sc.dir, 'elsewhere', `${pipe}.stop`), path.join(sc.dir, 'runs', 'hvmcp-diag-0000000000000000.stop')]) {
     assert.deepStrictEqual(hv('read-badstop', 'com-read', { pipe, ms: 100, through: true, stopFile: bad }).answer, { error: 'bad stop file' })
   }
+})
 })
 
 test('MC-1545 HvMcpVsock.exe, compiled by the in-box compiler as setup does: its usage, and an AF_HYPERV connect that fails says so at once (exit 255)', { skip }, () => {

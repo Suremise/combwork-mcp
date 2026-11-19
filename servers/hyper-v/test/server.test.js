@@ -88,7 +88,7 @@ test('pool tools: a plan names the approve line; without the user\'s approval no
   const s = server({ ...sc.env, HYPERV_MCP_ENABLED: '1', HYPERV_MCP_MODE: 'direct' })
   t.after(() => s.close())
   const p = await s.call('pool_plan', { vms: 1, cores: 2, memoryGB: 4 })
-  assert.match(p.text, /approve\.ps1" -Plan (p-[0-9a-f]{16})/)
+  assert.match(p.text, /cmd \/c call "[^"]*\\approve\.cmd" -Plan (p-[0-9a-f]{16})/)
   const id = /-Plan (p-[0-9a-f]{16})/.exec(p.text)[1]
   const c = await s.call('pool_create', { planId: id })
   assert.strictEqual(c.isError, true)

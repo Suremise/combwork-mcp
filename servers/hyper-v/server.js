@@ -595,7 +595,7 @@ const tools = [
   },
   {
     name: 'pool_plan',
-    description: 'Plan a pool change from the host\'s CPUs, memory and disks and the policy: create, resize or remove. Only when the user asks for a pool change. Changes nothing: it returns the exact plan and the one line the USER runs in an admin PowerShell to approve it; never run that line yourself. The first create also needs an image: the file the user names for these VMs (any x64 Windows ISO, or a Linux qcow2 cloud image), which the plan they approve names with its SHA-256. Never download one: ask the user which file to use. An evaluation image is activated online once as each VM is built (the plan says so), and lasts about 90 days from then.',
+    description: 'Plan a pool change from the host\'s CPUs, memory and disks and the policy: create, resize or remove. Only when the user asks for a pool change. Changes nothing: it returns the exact plan and the one line the USER runs in an admin terminal (cmd or PowerShell) to approve it; never run that line yourself. The first create also needs an image: the file the user names for these VMs (any x64 Windows ISO, or a Linux qcow2 cloud image), which the plan they approve names with its SHA-256. Never download one: ask the user which file to use. An evaluation image is activated online once as each VM is built (the plan says so), and lasts about 90 days from then.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -639,7 +639,7 @@ const tools = [
   },
   ...['create', 'resize', 'remove'].map(op => ({
     name: `pool_${op}`,
-    description: `Carry out an approved ${op} plan. Refused unless the user approved that exact plan in an admin PowerShell (approve.ps1), it hasn't expired, and it is within the policy. Runs in the background: follow it with pool_status.`,
+    description: `Carry out an approved ${op} plan. Refused unless the user approved that exact plan in an admin terminal (approve.cmd), it hasn't expired, and it is within the policy. Runs in the background: follow it with pool_status.`,
     inputSchema: { type: 'object', properties: { planId: { type: 'string' } }, required: ['planId'] },
     run: pass(`pool_${op}`)
   })),
@@ -658,7 +658,7 @@ const INSTRUCTIONS = [
   'Network is none unless you ask, and never above the mode the user approved for the pool (vm_status): host (this PC only, on the ports its firewall allows), internet, or internet and LAN. Don\'t put real sign-ins, tokens or real CLIs in a VM.',
   'A slow vm_start, vm_reset, vm_restore, vm_checkpoint, vm_run or vm_sync replies within about 45 s: if it says "still in progress", call vm_wait (again and again) until it gives the result. Never end your turn while one is in progress: nothing wakes you when it finishes.',
   'Write anything you want back to C:\\out inside, and read it with vm_read_out before vm_stop.',
-  'pool_plan, pool_create, pool_resize and pool_remove change the pool: use them only when the user asks. The user approves each plan in an admin PowerShell; never run the approve line yourself.'
+  'pool_plan, pool_create, pool_resize and pool_remove change the pool: use them only when the user asks. The user approves each plan in an admin terminal (cmd or PowerShell); never run the approve line yourself.'
 ].join('\n')
 
 // ---------- JSON-RPC ----------

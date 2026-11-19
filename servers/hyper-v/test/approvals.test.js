@@ -22,10 +22,12 @@ test('a plan changes nothing and names the elevated approve line; unapproved, it
   const { sc, h, admin } = await fresh('unapproved')
   t.after(() => h.stop())
   const p = await plan(admin)
-  assert.match(p.text, /Plan p-[0-9a-f]{16} \(create\)[\s\S]*approve\.ps1" -Plan p-[0-9a-f]{16}[\s\S]*never|Don't approve it for the user/)
-  assert.match(p.text, /powershell -NoProfile -ExecutionPolicy Bypass -File "C:\\Program Files\\hyperv-mcp\\approve\.ps1"/)
+  assert.match(p.text, /Plan p-[0-9a-f]{16} \(create\)[\s\S]*approve\.cmd" -Plan p-[0-9a-f]{16}[\s\S]*never|Don't approve it for the user/)
+  // MC-1575: one line for any terminal (cmd, Windows PowerShell or PowerShell 7), with no shell caveat.
+  assert.match(p.text, /as one line in an admin terminal \(cmd or PowerShell\):\r?\ncmd \/c call "C:\\Program Files\\hyperv-mcp\\approve\.cmd" -Plan p-[0-9a-f]{16}/)
+  assert.doesNotMatch(p.text, /powershell -NoProfile|Windows PowerShell|5\.1|pwsh/)
   assert.deepStrictEqual(Object.keys(sc.stub().vms), [])
-  await assert.rejects(admin.request('pool_create', { planId: p.data.planId }), /is not approved\. The user approves it in an admin PowerShell/)
+  await assert.rejects(admin.request('pool_create', { planId: p.data.planId }), /is not approved\. The user approves it in an admin terminal \(cmd or PowerShell\) with:\ncmd \/c call "C:\\Program Files\\hyperv-mcp\\approve\.cmd" -Plan p-/)
   assert.deepStrictEqual(Object.keys(sc.stub().vms), [])
 })
 

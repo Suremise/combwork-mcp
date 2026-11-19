@@ -206,4 +206,22 @@ async function withPool(sc, n = 2, planArgs = {}) {
   return { h, admin }
 }
 
-module.exports = { T, timingEnv, HOST_NETWORK, scratch, startHelper, approve, seedImage, waitFor, withPool, STUB, SSH_STUB, HELPER, SERVER, BASE }
+/**
+ * MC-1575: the PowerShells installed here, each as { name ('5.1' or '7'), exe, env (its child's environment) }, found as
+ * the helper finds them (HKLM). Setup, uninstall, approve and hv.ps1 run under both: a test that runs one for real runs
+ * it under each. Empty off Windows.
+ */
+function psEngines() {
+  if (process.platform !== 'win32') return []
+  const hv = require('../helper/hv')
+  const out = []
+  const exists = f => fs.existsSync(f)
+  for (const b of hv.regValues('HKLM\\SOFTWARE\\Microsoft\\PowerShell\\3\\PowerShellEngine', 'ApplicationBase', false)) {
+    const exe = path.join(b, 'powershell.exe'); if (exists(exe)) { out.push({ name: '5.1', exe, env: hv.ps51Env() }); break }
+  }
+  const sevens = hv.regValues('HKLM\\SOFTWARE\\Microsoft\\PowerShellCore\\InstalledVersions', 'InstallLocation', true).map(b => path.join(b, 'pwsh.exe')).filter(exists)
+  if (sevens.length) out.push({ name: '7', exe: sevens[sevens.length - 1], env: { ...process.env } })
+  return out
+}
+
+module.exports = { T, timingEnv, HOST_NETWORK, scratch, startHelper, approve, seedImage, waitFor, withPool, psEngines, STUB, SSH_STUB, HELPER, SERVER, BASE }

@@ -411,7 +411,6 @@ test('a baseline with leftover ACLs is quarantined, not leased', async t => {
 // or clashing subnet before setup changes anything (MC-1556 round 1: the path to net.js was broken).
 test('setup: the host-subnet check loads helper/net.js and refuses a bad or clashing subnet, before anything changes', { skip: process.platform !== 'win32' }, () => {
   const { spawnSync } = require('child_process')
-  const { ps51Env } = require('../helper/hv')
   const src = fs.readFileSync(path.join(__dirname, '..', 'setup', 'install.ps1'), 'utf8')
   const block = /^if \(\$wantHost\) \{\r?\n  \$nodeNet = [\s\S]*?\r?\n\}\r?\n/m.exec(src)
   assert.ok(block, 'the host-subnet block in install.ps1')
@@ -428,16 +427,19 @@ test('setup: the host-subnet check loads helper/net.js and refuses a bad or clas
     block[0],
     "'checked'"
   ].join('\n'))
-  const run = (subnet, clash = '') => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, '-src', path.join(__dirname, '..'), '-subnet', subnet, '-clash', clash], { encoding: 'utf8', env: ps51Env(), timeout: T.spawnMs })
-  const good = run('10.137.42.0/24')
-  assert.strictEqual(good.status, 0, good.stdout + good.stderr)
-  assert.match(good.stdout, /checked/)
-  const clash = run('10.137.42.0/24', '10.137.9.9')
-  assert.notStrictEqual(clash.status, 0)
-  assert.match(clash.stdout + clash.stderr, /Host mode can't use 10\.137\.42\.0\/24: VPN has 10\.137\.9\.9\/16, which overlaps the host subnet/)
-  const bad = run('10.137.42.1/24')
-  assert.notStrictEqual(bad.status, 0)
-  assert.match(bad.stdout + bad.stderr, /the host subnet must be a \/24 written as a\.b\.c\.0\/24/)
+  // MC-1575: setup runs under Windows PowerShell 5.1 or PowerShell 7: under each one installed.
+  for (const E of require('./helpers').psEngines()) {
+    const run = (subnet, clash = '') => spawnSync(E.exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, '-src', path.join(__dirname, '..'), '-subnet', subnet, '-clash', clash], { encoding: 'utf8', env: E.env, timeout: T.spawnMs })
+    const good = run('10.137.42.0/24')
+    assert.strictEqual(good.status, 0, `PowerShell ${E.name}: ${good.stdout}${good.stderr}`)
+    assert.match(good.stdout, /checked/)
+    const clash = run('10.137.42.0/24', '10.137.9.9')
+    assert.notStrictEqual(clash.status, 0)
+    assert.match(clash.stdout + clash.stderr, /Host mode can't use 10\.137\.42\.0\/24: VPN has 10\.137\.9\.9\/16, which overlaps the host subnet/)
+    const bad = run('10.137.42.1/24')
+    assert.notStrictEqual(bad.status, 0)
+    assert.match(bad.stdout + bad.stderr, /the host subnet must be a \/24 written as a\.b\.c\.0\/24/)
+  }
 })
 
 test('server.js (MC-1570): a helper without the network-modes feature is never sent a string network: vm_start, vm_reset and pool_plan refuse each mode, none included, with "run setup again"; the old booleans go through as before', async t => {
