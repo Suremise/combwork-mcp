@@ -20,7 +20,7 @@ export const SERVERS = {
   ollama: [['server.js'], ['roots.js'], ['meta.json'], ['README.md'], ['combwork-mcp.example.json', 'combwork-mcp.json']],
   // It goes in as the example, to be checked before it is turned on: it maps folders into the Sandbox (WSB_TOOL_DIRS).
   'windows-sandbox': [
-    ['server.js'], ['wsb.js'], ['confine.js'], ['watchdog.js'], ['roots.js'], ['client.js'], ['inside'],
+    ['server.js'], ['wsb.js'], ['confine.js'], ['watchdog.js'], ['settings.js'], ['roots.js'], ['client.js'], ['inside'],
     ['meta.json'], ['README.md'], ['combwork-mcp.example.json']
   ],
   // It goes in as the example, to be checked before it is turned on: TRILIUM_URL is the user's own Trilium.

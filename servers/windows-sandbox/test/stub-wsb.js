@@ -12,6 +12,7 @@
  *   start: true        start fails
  *   others: [ids]      Sandboxes not started here, always listed
  *   session: n         exec as ExistingLogin fails until n such calls were made
+ *   ready: true        exec as System fails (0x80070422) every time: a Sandbox that never comes ready
  *   guest: [{ match, exit, stdout, stderr }]   a guest command matching the regex `match` (the first that does) gets
  *                      that exit code and output instead of being simulated below
  * Guest commands given to the run wrapper (base64 in -B64) are simulated:
@@ -80,6 +81,7 @@ const r = withState(s => {
     const id = opt('--id')
     if (!s.sandboxes.includes(id)) return { code: 1, stderr: 'not found' }
     const line = opt('-c')
+    if (s.fail.ready && opt('-r') === 'System') return { code: 1, stderr: 'not ready (0x80070422)' }
     if (opt('-r') === 'ExistingLogin' && count('session') <= (s.fail.session || 0)) return { code: 2147943712, stderr: 'A specified logon session does not exist. (0x80070520)' }
     const host = p => path.join(s.out[id], p.replace(/^C:\\out\\?/i, ''))
     const kill = /^taskkill\.exe \/PID (\d+) \/T \/F$/.exec(line)

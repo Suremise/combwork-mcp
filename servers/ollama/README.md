@@ -38,9 +38,10 @@ unset, the server uses the first model Ollama lists, and agents can always pass 
 pulled, the server's instructions say so, so agents pass `model` instead.
 
 **In Combwork:** pack it (`node scripts\pack.mjs ollama` at the repo root) and add `dist\ollama.zip` with **Add MCP Server
-from File** in the MCP view. Its definition, `combwork-mcp.json`, works unchanged for a local Ollama. It sets
-`OLLAMA_ROOTS_FROM_CWD=1`, because Combwork starts each agent in its project folder or worktree, and leaves the model
-unset: add `OLLAMA_DEFAULT_MODEL` to pick one.
+from File** in the MCP view. Its definition, `combwork-mcp.json`, works unchanged for a local Ollama. It lists every
+setting with its default, so each one shows in Combwork's MCP editor. It sets `OLLAMA_ROOTS_FROM_CWD=1`, because
+Combwork starts each agent in its project folder or worktree, and leaves `OLLAMA_DEFAULT_MODEL` empty: set it to pick a
+model.
 
 [`combwork-mcp.example.json`](combwork-mcp.example.json) is that definition: the same entry in Combwork's format, where
 `${CW_MCP_DIR}` is the folder Combwork keeps its MCP servers in. (The zip holds it as `combwork-mcp.json`.)
@@ -115,13 +116,24 @@ And they list the installed models and the default, or say that Ollama isn't run
 
 ## Configuration (`env`)
 
+Every setting is in [`combwork-mcp.example.json`](combwork-mcp.example.json) with its default. A number setting left
+empty, or set to something that isn't a number, uses its default. None has an upper limit unless a value above it
+breaks something, and then the reason is given.
+
 | Variable | Default | Meaning |
 |---|---|---|
 | `OLLAMA_HOST` | `http://127.0.0.1:11434` | Where Ollama listens. On Windows, use the IP, not `localhost`: `localhost` adds a ~2 s IPv6-fallback delay per call. |
-| `OLLAMA_DEFAULT_MODEL` | first local model | The model used when the agent doesn't name one. Pick one from `list_local_models`. Switching models costs a load of up to a minute, so stick to one. |
-| `OLLAMA_MAX_CTX` | `65536` | The largest context window requested (at least 8192; a value that isn't a number means the default). The server sizes `num_ctx` to each input (Ollama silently truncates input beyond it); larger values need more GPU memory. |
-| `OLLAMA_ROOTS_FROM_CWD` | off | `1`: for a client that sends no MCP roots, the folder it started the server in is the root (never a drive root). |
-| `OLLAMA_ALLOWED_ROOTS` | none | `;`-separated folders. With MCP roots it **narrows** them; without, it is the list of folders files may come from. |
+| `OLLAMA_DEFAULT_MODEL` | empty: the first local model | The model used when the agent doesn't name one. Pick one from `list_local_models`. Switching models costs a load of up to a minute, so stick to one. |
+| `OLLAMA_MAX_CTX` | `65536` | The largest context window requested, in tokens. The server sizes `num_ctx` to each input (Ollama silently truncates input beyond it), and splits inputs beyond this into batches. Larger values need more GPU memory. **At least 8192:** 4096 tokens of every window are kept for the answer, so a smaller window leaves too little for the files; a smaller value uses the default. |
+| `OLLAMA_MAX_FILE_MB` | `2` | Files larger than this many MB (decimals allowed) are skipped and listed in the reply. |
+| `OLLAMA_MAX_INPUT_CHARS` | `3000000` | Reading stops once one call has this many characters of files; the rest are listed in the reply as skipped. Batches take longer the more you allow. |
+| `OLLAMA_TIMEOUT_SECONDS` | `600` | How long one answer from the model may take. **Ceiling:** about 24.8 days (2147483 s), the longest a Node timer can wait; a larger value counts as that. |
+| `OLLAMA_ROOTS_FROM_CWD` | `1` in the example, off if unset | `1`: for a client that sends no MCP roots, the folder it started the server in is the root (never a drive root). |
+| `OLLAMA_ALLOWED_ROOTS` | empty: none | `;`-separated folders. With MCP roots it **narrows** them; without, it is the list of folders files may come from. |
+
+Fixed, not settings: asking Ollama for its models (at start-up and in `list_local_models`) waits at most 5 s, so a
+session's start isn't held by an Ollama that doesn't answer; and the client's answer to `roots/list` waits at most 5 s
+(see "Multiple projects").
 
 ## Safety notes
 
@@ -133,9 +145,10 @@ And they list the installed models and the default, or say that Ollama isn't run
 
 ## Limits
 
-- Files over 2 MB, and anything past 3 million characters in one call, are skipped and listed in the reply. Binary
-  files are skipped too; they're listed only when named directly.
-- One request may run for up to 10 minutes before it times out.
+- Files over `OLLAMA_MAX_FILE_MB` (2 MB), and anything past `OLLAMA_MAX_INPUT_CHARS` (3 million characters) in one
+  call, are skipped and listed in the reply. Binary files are skipped too; they're listed only when named directly.
+- Folders are read to any depth; a folder reached twice (through a link) is read once.
+- One request may run for `OLLAMA_TIMEOUT_SECONDS` (10 minutes) before it times out.
 - Local models are slower than cloud ones and can be wrong: check what they cite before acting on it.
 - Speed depends on your GPU and model. As a rough guide, one machine running `qwen3.6:35b-a3b` produces ~45 tokens/s,
   and reads ~180k tokens of source (3 batches) in about two minutes. A repeat question over the same files is much

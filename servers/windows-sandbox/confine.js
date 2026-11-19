@@ -21,9 +21,8 @@
 const fs = require('fs')
 const { join, sep } = require('path')
 
-const LIST_MAX_FILES = 1000
-const LIST_MAX_ENTRIES = 10_000
-const LIST_MAX_DEPTH = 16
+// Settings (README, Configuration): how much of the out folder a listing looks at.
+const { LIST_MAX_FILES, LIST_MAX_ENTRIES, LIST_MAX_DEPTH } = require('./settings')
 // libuv's UV_FS_O_EXLOCK (Windows): open with share mode 0. Node doesn't export it; libuv honours it.
 const EXLOCK = 0x10000000
 const PIN_NAME = '.wsb-mcp-pin'
@@ -32,7 +31,8 @@ const DEVICE_RE = /^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³]|conin\$|conou
 /** Splits a guest-relative path or glob into segments, or throws why it is refused. Touches no disk. */
 function segments(p, { glob = false } = {}) {
   if (typeof p !== 'string' || !p.trim()) throw new Error('empty path')
-  if (p.length > 400) throw new Error('path too long')
+  // Windows' own limit on a path; the out folder's own path comes on top of it.
+  if (p.length > 32767) throw new Error('path too long (Windows allows 32767 characters)')
   if (/[\0-\x1f]/.test(p)) throw new Error('control characters in path')
   if (/^[\\/]/.test(p)) throw new Error('absolute, UNC or device path (paths are relative to the out folder)')
   if (/^[a-zA-Z]:/.test(p)) throw new Error('drive path (paths are relative to the out folder)')

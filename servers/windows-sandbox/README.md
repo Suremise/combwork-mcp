@@ -82,13 +82,13 @@ The [top-level README](../../README.md#install) shows the same entry for each cl
 **In Combwork:** pack it (`node scripts\pack.mjs windows-sandbox` at the repo root) and add `dist\windows-sandbox.zip`
 with **Add MCP Server from File** in the MCP view. Its definition goes in as `combwork-mcp.example.json`: check `env`
 (`WSB_TOOL_DIRS` names Node's usual folder), then turn it on, and only in a dedicated project (see "Who gets it"). It
-sets `WSB_ROOTS_FROM_CWD=1`, because Combwork starts each agent in its project folder or worktree: Claude Code agents send
+lists every setting with its default, so each one shows in Combwork's MCP editor. It sets `WSB_ROOTS_FROM_CWD=1`, because Combwork starts each agent in its project folder or worktree: Claude Code agents send
 that folder as their root, and Codex and Copilot agents start the server there.
 
 [`combwork-mcp.example.json`](combwork-mcp.example.json) is that definition: the same entry in Combwork's format, where
 `${CW_MCP_DIR}` is the folder Combwork keeps its MCP servers in.
 
-**What the server needs to run:** `server.js`, `wsb.js`, `confine.js`, `watchdog.js`, `roots.js`, `inside\run.ps1`
+**What the server needs to run:** `server.js`, `wsb.js`, `confine.js`, `watchdog.js`, `settings.js`, `roots.js`, `inside\run.ps1`
 and `inside\screenshot.ps1`. `roots.js` is a copy of the repo's [`shared/roots.js`](../../shared/roots.js). `client.js` is a small stdio client for scripts and the tests. Everything else in this
 folder is tests and probes.
 
@@ -120,10 +120,10 @@ One installed server serves every project: the build folder must be inside the p
 
 | Tool | What it does |
 |---|---|
-| `sandbox_start({ build?, network=false, session=true, closeWindow=false, tools?, maxMinutes=30, smartAppControl='keep' })` | Starts one Sandbox. Maps `build` read-only at `C:\build`, each tool folder read-only at `C:\tools\<name>` (default: all configured), the server's `inside\` scripts read-only at `C:\wsb-mcp`, and one fresh writable folder at `C:\out`. With `session`, opens the Sandbox window **minimised** and waits up to 90 s for the user session (commands as the user and desktop screenshots need it). `closeWindow` closes the window once the session is up: desktop shots are then blank, window shots from a script inside still work. `smartAppControl: 'off'` turns Smart App Control off inside this Sandbox (see "Smart App Control in the Sandbox"). Refuses if `wsb list` fails, if any Sandbox is running, or if a folder isn't allowed. Replies with the id, timings, mappings, network state, Smart App Control (when asked off) and deadline. |
-| `sandbox_run({ command, shell='cmd'\|'powershell', as='user'\|'system', timeoutSec=120, cwd? })` | Runs a command through `inside\run.ps1`, which records its PID and redirects stdout and stderr into `C:\out\.run-<n>.stdout.txt` / `.stderr.txt` (`.pid`, `.exit`, and `.error.txt` if the wrapper itself fails). Replies with the exit code, stdout and stderr (16 KB each, read capped, saying when cut). **On a timeout it kills the command inside by that PID** (`taskkill /T /F`): killing `wsb exec` alone would leave it running, and a command waiting on a dialog blocks forever. If the PID file is missing or not a valid number, it says "no PID" and `sandbox_stop` is the fallback. |
-| `sandbox_screenshot({ maxWidth=1280 })` | A desktop screenshot as the user (CopyFromScreen, scaled down, JPEG) saved as `C:\out\.shot-<n>.jpg` and returned as an image. Errors without a user session or after `closeWindow`, because the shot would be blank. |
-| `sandbox_collect({ paths?, glob?, maxBytes=256 KB, maxTotalBytes=1 MB, base64=false })` | Files from the run's out folder only. **While the Sandbox runs, only files directly in `C:\out`; files in its folders after `sandbox_stop`** (see "Reading back"). `paths` are relative to out; `glob` is matched against a listing of out (`*`, `?` within a folder, `**` across). With neither, lists the files (and, while running, the folders to collect after stop). Text comes back as text, PNG/JPEG as images, other binaries with `base64`. |
+| `sandbox_start({ build?, network=false, session=true, closeWindow=false, tools?, maxMinutes=30, smartAppControl='keep' })` | Starts one Sandbox. Maps `build` read-only at `C:\build`, each tool folder read-only at `C:\tools\<name>` (default: all configured), the server's `inside\` scripts read-only at `C:\wsb-mcp`, and one fresh writable folder at `C:\out`. With `session`, opens the Sandbox window **minimised** and waits until the user session is up (at most `WSB_SESSION_WAIT_MS`, 90 s) (commands as the user and desktop screenshots need it). `closeWindow` closes the window once the session is up: desktop shots are then blank, window shots from a script inside still work. `smartAppControl: 'off'` turns Smart App Control off inside this Sandbox (see "Smart App Control in the Sandbox"). `maxMinutes` is at most `WSB_MAX_MINUTES` (240). Refuses if `wsb list` fails, if any Sandbox is running, or if a folder isn't allowed. Replies with the id, timings, mappings, network state, Smart App Control (when asked off) and deadline. |
+| `sandbox_run({ command, shell='cmd'\|'powershell', as='user'\|'system', timeoutSec=120, cwd? })` | Runs a command through `inside\run.ps1`, which records its PID and redirects stdout and stderr into `C:\out\.run-<n>.stdout.txt` / `.stderr.txt` (`.pid`, `.exit`, and `.error.txt` if the wrapper itself fails). Replies with the exit code, stdout and stderr (`WSB_OUTPUT_BYTES` each, 16 KB, read capped, saying when cut). `timeoutSec` has no setting to cap it, only Node's timer limit (see "Fixed limits"): the Sandbox's deadline still stops everything. **A cmd command is at most 8127 characters** (cmd.exe's own command line holds 8191, and the wrapper takes the rest); a PowerShell one goes into a script file, so it is limited only by the one Windows command line `wsb exec` passes it on (32767 characters, holding it in base64: about 24,000 characters of plain text). Longer: put it in a script in the build folder. **On a timeout it kills the command inside by that PID** (`taskkill /T /F`): killing `wsb exec` alone would leave it running, and a command waiting on a dialog blocks forever. If the PID file is missing or not a valid number, it says "no PID" and `sandbox_stop` is the fallback. |
+| `sandbox_screenshot({ maxWidth=1280 })` | A desktop screenshot as the user (CopyFromScreen, scaled down to `maxWidth` pixels, never up, JPEG) saved as `C:\out\.shot-<n>.jpg` and returned as an image. Errors without a user session or after `closeWindow`, because the shot would be blank. |
+| `sandbox_collect({ paths?, glob?, maxBytes=256 KB, maxTotalBytes=1 MB, base64=false })` | Files from the run's out folder only. `maxBytes` is at most `WSB_COLLECT_MAX_BYTES` (8 MB) and `maxTotalBytes` at most `WSB_COLLECT_MAX_TOTAL_BYTES` (16 MB); any number of `paths`. **While the Sandbox runs, only files directly in `C:\out`; files in its folders after `sandbox_stop`** (see "Reading back"). `paths` are relative to out; `glob` is matched against a listing of out (`*`, `?` within a folder, `**` across). With neither, lists the files (and, while running, the folders to collect after stop). Text comes back as text, PNG/JPEG as images, other binaries with `base64`. |
 | `sandbox_stop()` | Stops and discards it. Says "Stopped" only once `wsb list` confirms it's gone; otherwise reports **CLEANUP FAILED** with the id kept. |
 | `sandbox_status()` | What's running, for how long, the deadline, the watchdog, any unconfirmed stop, `wsb list`, and what the start-up check found. Works with the server turned off. |
 
@@ -156,16 +156,47 @@ Errors name the cause:
 
 ## Configuration (`env`)
 
-| Variable | Meaning |
-|---|---|
-| `WSB_MCP_ENABLED` | Must be `1`, or every tool refuses (status still answers). A **kill switch**, so a copied config doesn't silently turn it on; it is **not** caller authentication (see "Who gets it"). |
-| `WSB_ALLOWED_ROOTS` | Optional. `;`-separated folders. With MCP roots it **narrows** them (a build must be under both); without, it is the list of folders builds may come from. See "Multiple projects". |
-| `WSB_ROOTS_FROM_CWD` | Optional. `1`: for a client that sends no MCP roots, the folder it started the server in is the root (never a drive root). |
-| `WSB_TOOL_DIRS` | `;`-separated `name=folder` pairs mapped read-only at `C:\tools\<name>`, e.g. `node=C:\Program Files\nodejs`. All optional: add what your tests need inside. |
-| `WSB_SANDBOX_ROOT` | Optional. Where per-run folders go (default `%LOCALAPPDATA%\windows-sandbox-mcp`): `<run>\out` (the writable folder), `config.xml`, `state.json`, `watchdog.json`/`.log`. Also `session-times.jsonl` (connect → user session times). The repo's tests, smoke run and probes put their scratch under `%LOCALAPPDATA%\combwork-mcp-tests`. |
-| `WSB_SESSION_WAIT_MS` | Optional. How long `sandbox_start` waits for the user session (default 90000). |
+Every setting is in [`combwork-mcp.example.json`](combwork-mcp.example.json) with its default. A number setting left
+empty, or set to something that isn't a number or is below its least value, uses its default. None has an upper limit
+of its own; where a larger value would break something, the reason is given.
 
-Test-only: `WSB_STUB` (a Node script run instead of `wsb.exe`), `WSB_STOP_RETRY_MS`, `WSB_WATCHDOG_CHECK_MS`.
+| Variable | Default | Meaning |
+|---|---|---|
+| `WSB_MCP_ENABLED` | `1` in the example; off if unset | Must be `1`, or every tool refuses (status still answers). A **kill switch**, so a copied config doesn't silently turn it on; it is **not** caller authentication (see "Who gets it"). |
+| `WSB_ROOTS_FROM_CWD` | `1` in the example; off if unset | `1`: for a client that sends no MCP roots, the folder it started the server in is the root (never a drive root). |
+| `WSB_ALLOWED_ROOTS` | empty: none | `;`-separated folders. With MCP roots it **narrows** them (a build must be under both); without, it is the list of folders builds may come from. See "Multiple projects". |
+| `WSB_TOOL_DIRS` | `node=C:\Program Files\nodejs` in the example | `;`-separated `name=folder` pairs mapped read-only at `C:\tools\<name>`. All optional: add what your tests need inside. |
+| `WSB_SANDBOX_ROOT` | empty: `%LOCALAPPDATA%\windows-sandbox-mcp` | Where per-run folders go: `<run>\out` (the writable folder), `config.xml`, `state.json`, `watchdog.json`/`.log`. Also `session-times.jsonl` (connect → user session times). The repo's tests, smoke run and probes put their scratch under `%LOCALAPPDATA%\combwork-mcp-tests`. |
+| `WSB_START_WAIT_MS` | `180000` | How long `wsb start` may take to say the Sandbox started. |
+| `WSB_READY_WAIT_MS` | `60000` | After the start, the server checks every 250 ms whether the Sandbox runs a command, and goes on as soon as it does. This is how long it keeps checking before it stops the Sandbox and says so. |
+| `WSB_SESSION_WAIT_MS` | `90000` | The same for the user session after connecting (checked every second; it has taken 3–46 s). If it isn't up by then, the start still succeeds and says so. |
+| `WSB_MAX_MINUTES` | `240` | The longest lifetime `sandbox_start` may ask for (`maxMinutes`, default 30). Any length works: past the 24.8 days one Node timer can wait, the deadline is reached in steps. |
+| `WSB_OUTPUT_BYTES` | `16384` | How much of each of stdout and stderr `sandbox_run` returns; the whole streams stay in `C:\out` for `sandbox_collect`. |
+| `WSB_COLLECT_MAX_BYTES` | `8388608` | The most `sandbox_collect` may ask for per file (`maxBytes`, default 256 KB), and the largest screenshot returned. |
+| `WSB_COLLECT_MAX_TOTAL_BYTES` | `16777216` | The most `sandbox_collect` may ask for per call (`maxTotalBytes`, default 1 MB). A reply goes back as one message, which can't be over about 512 MB (V8's longest string, with images and base64 a third larger): a larger one comes back as an error saying so. |
+| `WSB_LIST_MAX_FILES` | `1000` | The most files a listing of the out folder (`sandbox_collect` with no `paths`, or a `glob`) returns. |
+| `WSB_LIST_MAX_ENTRIES` | `10000` | The most folder entries a listing looks at, and the most looked at when finding one name in a folder. |
+| `WSB_LIST_MAX_DEPTH` | `16` | How many folders deep a listing goes after the Sandbox stopped (while it runs, only the top). A tree thousands of folders deep can exhaust the listing's call stack: it then fails with an error. |
+| `WSB_STOP_ATTEMPTS` | `3` | How many `wsb stop` tries one stop makes, each confirmed by `wsb list`. |
+| `WSB_STOP_RETRY_MS` | `3000` | The pause between those tries. |
+| `WSB_WATCHDOG_CHECK_MS` | `2000` | How often the watchdog checks that the server is alive and the deadline. Its stop rounds are 15 times this apart. |
+| `WSB_WATCHDOG_ROUNDS` | `20` | How many rounds of stops the watchdog makes before it gives up (the next server start then tries again). |
+
+**Fixed limits, with their reasons:**
+- A cmd command is at most 8127 characters, and any command must fit, in base64 with the wrapper, in one Windows
+  command line of 32767 characters (see `sandbox_run`). These are Windows' own limits.
+- `timeoutSec` is at most 2147478 s (about 24.8 days): the longest a Node timer can wait, less the 5 s the host adds.
+- A path given to `sandbox_collect` is at most 32767 characters, Windows' longest path.
+- `maxWidth` is a whole number from 1 up to 2147483647, the largest PowerShell `[int]`, which the screenshot script
+  takes it as.
+- Each single check inside a wait has its own ceiling, so one hung call can't hold the wait past it: a `wsb exec`
+  check during the ready and session waits takes at most 30 s (or what's left of the wait); `wsb list` 60 s; `wsb stop`
+  120 s; a screenshot 60 s; minimising or closing the window 30 s; the Smart App Control commands 60 s each; killing a
+  timed-out command 30 s; the client's answer to `roots/list` 5 s. Replacing `state.json` or `watchdog.json` retries
+  for about 2 s while another process has it open.
+
+Test-only, never in the example: `WSB_STUB` and `WSB_STUB_STATE` (a Node script run instead of `wsb.exe`), and the
+smoke run's `SMOKE_*` and the probes' `PROBE_*`.
 
 ## Security model
 
@@ -223,11 +254,11 @@ below don't rely on that; the smoke test checks it so a Windows change is notice
 **Always stop, failing closed.**
 - `wsb list` counts only with exit 0 and valid JSON holding an array of string Ids; anything else is "unknown", never
   "none". Start refuses when it's unknown or anything is running (one Sandbox at a time).
-- A stop is retried 3 times, a few seconds apart. It counts only once `list` confirms the id is gone (`stop` exiting
+- A stop is tried `WSB_STOP_ATTEMPTS` times (3), `WSB_STOP_RETRY_MS` apart (3 s). It counts only once `list` confirms the id is gone (`stop` exiting
   0 isn't enough). Otherwise:
   - the reply is **CLEANUP FAILED**, and the id is kept;
   - `sandbox_run` and `sandbox_start` refuse until a later `sandbox_stop` confirms it.
-- Each Sandbox has a deadline (`maxMinutes`, default 30, at most 240). The server stops it when stdin closes or on a
+- Each Sandbox has a deadline (`maxMinutes`, default 30, at most `WSB_MAX_MINUTES`, 240). The server stops it when stdin closes or on a
   signal (exit code 1 if that stop isn't confirmed).
 - A **detached watchdog** (`watchdog.js <runDir>`) starts right after `wsb start`, with a pipe from the server. It
   stops the Sandbox, with the same confirm-and-retry rule, when:
@@ -235,7 +266,7 @@ below don't rely on that; the smoke test checks it so a Windows change is notice
   - the server's PID dies (killed hard, so no exit handler ran);
   - or the deadline passes.
 
-  It keeps trying in bounded rounds and records the outcome in `watchdog.json`.
+  It keeps trying in `WSB_WATCHDOG_ROUNDS` rounds (20) and records the outcome in `watchdog.json`.
 - `state.json` keeps the id until a stop is confirmed. A restarted server stops any Sandbox an earlier run of it left
   unconfirmed (whose server is no longer running), and never touches one it didn't start.
 - `state.json` and `watchdog.json` are each replaced whole: a temp file, then a rename. Windows refuses that rename while
@@ -249,9 +280,10 @@ below don't rely on that; the smoke test checks it so a Windows change is notice
   another agent's), `sandbox_start` refuses; wait and try again, rather than stopping it.
 - Inside there is PowerShell 5.1, Edge and `curl.exe`, but **no Node, Git or Notepad**: map Node as a tool folder.
   PowerShell's `Out-File` writes UTF-16 unless given `-Encoding utf8`.
-- A cold start takes tens of seconds, plus up to 90 s for the user session.
-- Output and collected files are capped (16 KB per stream for `sandbox_run`; 256 KB per file and 1 MB per call by
-  default for `sandbox_collect`). Write big results to a file in `C:\out` and collect it after `sandbox_stop`.
+- A cold start takes tens of seconds, plus the time the user session takes (3–46 s seen; at most `WSB_SESSION_WAIT_MS`).
+- Output and collected files are capped by default (16 KB per stream for `sandbox_run`; 256 KB per file and 1 MB per
+  call for `sandbox_collect`); the settings above raise them. Write big results to a file in `C:\out` and collect it
+  after `sandbox_stop`.
 - While the Sandbox runs, only files directly in `C:\out` can be read back; files in its folders are read after
   `sandbox_stop`.
 - If the client kills the server's whole process tree or job, the watchdog may go with it; the state file and the

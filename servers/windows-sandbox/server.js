@@ -14,6 +14,7 @@ const { join } = require('path')
 const { LAUNCH_DIR, ID_RE, wsb, list, stopConfirmed, configXml, hostProblem, hint, connect, windowOp, SAC_QUERY, SAC_OFF, sacState, replaceFile } = require('./wsb')
 const { segments, outRoot, readLive, pinRoot, readFile, listOut, globMatcher, parsePid, inside } = require('./confine')
 const { realDir, profileRefusal, rootsClient, allowedRoots } = require('./roots')
+const S = require('./settings')
 
 // The version is the catalogue's: meta.json, beside this file in the repo and in its zip. No second copy here.
 const VERSION = (() => {
@@ -26,10 +27,14 @@ const ENABLED = process.env.WSB_MCP_ENABLED === '1'
 const DEFAULT_ROOT = join(process.env.LOCALAPPDATA || os.tmpdir(), 'windows-sandbox-mcp')
 const ROOT = process.env.WSB_SANDBOX_ROOT || DEFAULT_ROOT
 const INSIDE = join(__dirname, 'inside')
-const SESSION_WAIT_MS = Number(process.env.WSB_SESSION_WAIT_MS || 90_000)
-const READY_WAIT_MS = 60_000
-const OUTPUT_CAP = 16 * 1024
-const MAX_COMMAND = 8000
+// The waits and limits are settings (settings.js; README, Configuration). These two are Windows' own limits:
+// a process's command line holds at most 32767 characters, and wsb exec's -c line (the wrapper with the command in
+// base64) must fit in one with room for wsb.exe's path and its own arguments; and cmd.exe takes at most 8191 characters
+// on its command line, of which the wrapper's `"...\cmd.exe" /d /s /c "..."` takes up to 64.
+const CMDLINE_MAX = 32767 - 512
+const CMD_MAX = 8191 - 64
+// A command's timeout, in seconds, must fit in a Node timer with the 5 s the host adds.
+const TIMEOUT_SEC_MAX = Math.floor(S.TIMER_MAX_MS / 1000) - 5
 const KB = n => `${(n / 1024).toFixed(n < 10240 ? 1 : 0)} KB`
 const secs = ms => `${(ms / 1000).toFixed(1)} s`
 
@@ -42,10 +47,11 @@ const roots = rootsClient(m => process.stdout.write(JSON.stringify(m) + '\n'))
 
 // ---------- helpers ----------
 
+/** Checks fn until it holds or timeoutMs has passed: ms taken, or null. fn gets the time left, to bound its own wait. */
 const until = async (fn, timeoutMs, everyMs = 1000) => {
   const t0 = Date.now()
   while (Date.now() - t0 < timeoutMs) {
-    if (await fn()) return Date.now() - t0
+    if (await fn(timeoutMs - (Date.now() - t0))) return Date.now() - t0
     await new Promise(r => setTimeout(r, everyMs))
   }
   return null
@@ -208,9 +214,16 @@ function startWatchdog(r) {
 
 function armDeadline(r) {
   clearTimeout(r.timer)
-  r.timer = setTimeout(() => void stopRun('deadline'), Math.min(2 ** 31 - 1, Math.max(0, r.deadline - Date.now())))
+  // A Node timer waits at most TIMER_MAX_MS (about 24.8 days): a later deadline is reached in steps.
+  r.timer = setTimeout(() => {
+    if (run !== r) return
+    if (Date.now() >= r.deadline) void stopRun('deadline')
+    else armDeadline(r)
+  }, Math.min(S.TIMER_MAX_MS, Math.max(0, r.deadline - Date.now())))
   r.timer.unref?.()
 }
+/** A probe's own timeout: at most its usual ceiling, and never much past what its wait has left. */
+const probeMs = (left, ceiling = 30_000) => Math.max(1000, Math.min(ceiling, left))
 
 /** At start-up: stops any Sandbox a previous run of this server started and didn't confirm stopped. */
 async function recover() {
@@ -256,12 +269,12 @@ async function smartAppControlOff(r) {
   return 'Smart App Control turned OFF in this Sandbox by option (VerifiedAndReputablePolicyState 0, read back), so unsigned installers can run. The host is not changed.'
 }
 
-async function start({ build, network = false, session = true, closeWindow = false, tools, maxMinutes = 30, smartAppControl = 'keep' }) {
+async function start({ build, network = false, session = true, closeWindow = false, tools, maxMinutes = Math.min(30, S.MAX_MINUTES), smartAppControl = 'keep' }) {
   if (run) throw new Error(run.unconfirmed ? `Sandbox ${run.id}'s stop is unconfirmed: call sandbox_stop before starting another.` : `Sandbox ${run.id} is already running: call sandbox_stop first (one at a time).`)
   const problem = hostProblem()
   if (problem) throw new Error(problem)
   if (typeof network !== 'boolean' || typeof session !== 'boolean' || typeof closeWindow !== 'boolean') throw new Error('network, session and closeWindow are true or false.')
-  if (!Number.isFinite(maxMinutes) || maxMinutes < 1 || maxMinutes > 240) throw new Error('maxMinutes is 1 to 240.')
+  if (typeof maxMinutes !== 'number' || !(maxMinutes > 0) || maxMinutes > S.MAX_MINUTES) throw new Error(`maxMinutes is more than 0 and at most ${S.MAX_MINUTES} (WSB_MAX_MINUTES).`)
   if (!['keep', 'off'].includes(smartAppControl)) throw new Error("smartAppControl is 'keep' (default) or 'off'.")
 
   const config = configProblems()
@@ -296,7 +309,7 @@ async function start({ build, network = false, session = true, closeWindow = fal
   fs.writeFileSync(join(runDir, 'config.xml'), xml)
 
   const t0 = Date.now()
-  const r = await wsb(['start', '-c', xml], 180_000)
+  const r = await wsb(['start', '-c', xml], S.START_WAIT_MS)
   const id = r.json?.Id
   if (r.code !== 0 || typeof id !== 'string' || !ID_RE.test(id)) {
     fs.closeSync(pinFd)
@@ -312,10 +325,11 @@ async function start({ build, network = false, session = true, closeWindow = fal
   armDeadline(run)
   const timings = { startMs: r.ms }
 
-  const ready = await until(async () => { const e = await exec(id, 'cmd.exe /c ver', 'system', 30_000); return e.code === 0 && e.json?.ExitCode === 0 }, READY_WAIT_MS, 250)
+  // Ready when it runs a command: checked until it does, for at most WSB_READY_WAIT_MS.
+  const ready = await until(async left => { const e = await exec(id, 'cmd.exe /c ver', 'system', probeMs(left)); return e.code === 0 && e.json?.ExitCode === 0 }, S.READY_WAIT_MS, 250)
   if (ready === null) {
     const res = await stopRun('not ready')
-    throw new Error(`Sandbox ${id} didn't run commands within ${READY_WAIT_MS / 1000} s. ${res.ok ? 'Stopped it (confirmed).' : describeStop(id, res)}`)
+    throw new Error(`Sandbox ${id} didn't run commands within ${S.READY_WAIT_MS / 1000} s (WSB_READY_WAIT_MS). ${res.ok ? 'Stopped it (confirmed).' : describeStop(id, res)}`)
   }
   timings.readyMs = Date.now() - t0
   const sacLine = smartAppControl === 'off' ? await smartAppControlOff(run) : null
@@ -325,10 +339,10 @@ async function start({ build, network = false, session = true, closeWindow = fal
     const tc = Date.now()
     run.connect = connect(id)
     const min = await windowOp(id, 'minimise')
-    const ms = await until(async () => (await exec(id, 'cmd.exe /c ver', 'user', 30_000)).json?.ExitCode === 0, SESSION_WAIT_MS)
+    const ms = await until(async left => (await exec(id, 'cmd.exe /c ver', 'user', probeMs(left))).json?.ExitCode === 0, S.SESSION_WAIT_MS)
     try { fs.appendFileSync(join(ROOT, 'session-times.jsonl'), JSON.stringify({ at: new Date().toISOString(), id, connectToReadyMs: ms, ok: ms !== null }) + '\n') } catch { /* timing log only */ }
     if (ms === null) {
-      sessionLine = `User session NOT ready ${SESSION_WAIT_MS / 1000} s after connect: user commands and screenshots will fail until it is (it has taken 3–46 s). sandbox_stop if it doesn't come.`
+      sessionLine = `User session NOT ready ${S.SESSION_WAIT_MS / 1000} s after connect (WSB_SESSION_WAIT_MS): user commands and screenshots will fail until it is (it has taken 3–46 s). sandbox_stop if it doesn't come.`
     } else {
       run.session = { wanted: true, ready: true, ms }
       timings.sessionMs = ms
@@ -354,10 +368,10 @@ async function start({ build, network = false, session = true, closeWindow = fal
 async function runCommand({ command, shell = 'cmd', as = 'user', timeoutSec = 120, cwd }) {
   const r = needRun()
   if (typeof command !== 'string' || !command.trim()) throw new Error('command is required.')
-  if (command.length > MAX_COMMAND) throw new Error(`command is longer than ${MAX_COMMAND} characters: put it in a script in the build folder.`)
   if (!['cmd', 'powershell'].includes(shell)) throw new Error('shell is cmd or powershell.')
+  if (shell === 'cmd' && command.length > CMD_MAX) throw new Error(`command is ${command.length} characters, and cmd.exe takes at most ${CMD_MAX} here (Windows limits its command line to 8191): use shell=powershell, or put it in a script in the build folder.`)
   if (!['user', 'system'].includes(as)) throw new Error('as is user or system.')
-  if (!Number.isFinite(timeoutSec) || timeoutSec < 1 || timeoutSec > 3600) throw new Error('timeoutSec is 1 to 3600.')
+  if (typeof timeoutSec !== 'number' || !(timeoutSec > 0) || timeoutSec > TIMEOUT_SEC_MAX) throw new Error(`timeoutSec is more than 0 and at most ${TIMEOUT_SEC_MAX} (about 24.8 days, the longest a Node timer waits).`)
   if (cwd !== undefined && (typeof cwd !== 'string' || !/^[A-Za-z]:\\[^"\r\n]*$/.test(cwd))) throw new Error('cwd is a folder inside the Sandbox, like C:\\build.')
   if (as === 'user' && !(await sessionReady(r))) throw new Error(r.session.wanted ? 'The user session isn\'t ready yet: try again shortly, or run as system.' : 'Started without a user session (session=false): run as system.')
 
@@ -368,6 +382,10 @@ async function runCommand({ command, shell = 'cmd', as = 'user', timeoutSec = 12
   const n = ++r.runs
   const name = `.run-${n}`
   const cmdline = ps('run.ps1', `-Name ${name} -Shell ${shell} -B64 ${Buffer.from(command, 'utf8').toString('base64')} -Cwd "${cwdArg}"`)
+  if (cmdline.length > CMDLINE_MAX) {
+    r.runs--
+    throw new Error('command is too long for one Windows command line (32767 characters, with the wrapper and the command in base64, which adds a third): put it in a script in the build folder.')
+  }
   const t0 = Date.now()
   const e = await exec(r.id, cmdline, as, timeoutSec * 1000 + 5000)
   const ms = Date.now() - t0
@@ -394,7 +412,7 @@ async function runCommand({ command, shell = 'cmd', as = 'user', timeoutSec = 12
     lines.push(`exit ${e.json.ExitCode} (${secs(ms)})`)
   }
   for (const stream of ['stdout', 'stderr']) {
-    const f = readLive(outReal, `${name}.${stream}.txt`, OUTPUT_CAP)
+    const f = readLive(outReal, `${name}.${stream}.txt`, S.OUTPUT_BYTES)
     if (f.error) { if (f.error !== 'not found') lines.push(`[${stream}: ${f.error}]`); continue }
     if (!f.size) continue
     lines.push(`--- ${stream} ---`, decode(f.buf).replace(/\s+$/, ''))
@@ -405,16 +423,17 @@ async function runCommand({ command, shell = 'cmd', as = 'user', timeoutSec = 12
 
 async function screenshot({ maxWidth = 1280 }) {
   const r = needRun()
-  if (!Number.isInteger(maxWidth) || maxWidth < 320 || maxWidth > 3840) throw new Error('maxWidth is 320 to 3840.')
+  // At most PowerShell's [int], which screenshot.ps1 takes it as; it never scales up past the desktop's own width.
+  if (!Number.isInteger(maxWidth) || maxWidth < 1 || maxWidth > 2 ** 31 - 1) throw new Error('maxWidth is a whole number of pixels, at least 1.')
   if (!(await sessionReady(r))) throw new Error('No user session, so no desktop to capture: start with session=true.')
   if (r.windowClosed) throw new Error('The connect window was closed (closeWindow), so a desktop shot would be blank. Take window shots from a script inside, or start again without closeWindow.')
   const n = ++r.shots
   const rel = `.shot-${n}.jpg`
   const e = await exec(r.id, ps('screenshot.ps1', `-Path C:\\out\\${rel} -MaxWidth ${maxWidth}`), 'user', 60_000)
   if (e.code !== 0 || e.json?.ExitCode !== 0) throw new Error(`Screenshot failed (${e.timedOut ? 'timed out' : `exit ${e.json?.ExitCode ?? e.code}`}): ${(e.stderr || 'no output').slice(0, 300)}${hint(e.stderr)}`)
-  const f = readLive(outRoot(r.outDir), rel, 8 * 1024 * 1024)
+  const f = readLive(outRoot(r.outDir), rel, S.COLLECT_MAX_BYTES)
   if (f.error) throw new Error(`Screenshot not readable: ${f.error}`)
-  if (f.truncated) return { text: `Desktop screenshot too large to return (${KB(f.size)}): ${join(r.outDir, rel)}` }
+  if (f.truncated) return { text: `Desktop screenshot too large to return (${KB(f.size)}, over WSB_COLLECT_MAX_BYTES): ${join(r.outDir, rel)}` }
   return {
     content: [
       { type: 'text', text: `Desktop screenshot ${rel} (${KB(f.size)}): ${join(r.outDir, rel)}` },
@@ -426,12 +445,12 @@ async function screenshot({ maxWidth = 1280 }) {
 const imageType = buf =>
   buf[0] === 0x89 && buf[1] === 0x50 ? 'image/png' : buf[0] === 0xff && buf[1] === 0xd8 ? 'image/jpeg' : null
 
-async function collect({ paths, glob, maxBytes = 256 * 1024, maxTotalBytes = 1024 * 1024, base64 = false }) {
+async function collect({ paths, glob, maxBytes = Math.min(256 * 1024, S.COLLECT_MAX_BYTES), maxTotalBytes = Math.min(1024 * 1024, S.COLLECT_MAX_TOTAL_BYTES), base64 = false }) {
   const target = run || last
   if (!target) throw new Error('No Sandbox run to collect from: call sandbox_start first.')
-  if (!Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > 8 * 1024 * 1024) throw new Error('maxBytes is 1 to 8388608.')
-  if (!Number.isInteger(maxTotalBytes) || maxTotalBytes < 1 || maxTotalBytes > 16 * 1024 * 1024) throw new Error('maxTotalBytes is 1 to 16777216.')
-  if (paths !== undefined && (!Array.isArray(paths) || paths.some(p => typeof p !== 'string') || paths.length > 200)) throw new Error('paths is a list of up to 200 paths.')
+  if (!Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > S.COLLECT_MAX_BYTES) throw new Error(`maxBytes is 1 to ${S.COLLECT_MAX_BYTES} (WSB_COLLECT_MAX_BYTES).`)
+  if (!Number.isInteger(maxTotalBytes) || maxTotalBytes < 1 || maxTotalBytes > S.COLLECT_MAX_TOTAL_BYTES) throw new Error(`maxTotalBytes is 1 to ${S.COLLECT_MAX_TOTAL_BYTES} (WSB_COLLECT_MAX_TOTAL_BYTES).`)
+  if (paths !== undefined && (!Array.isArray(paths) || paths.some(p => typeof p !== 'string'))) throw new Error('paths is a list of paths.')
   if (glob !== undefined && typeof glob !== 'string') throw new Error('glob is a pattern like "logs/**/*.txt".')
 
   // Every path and the glob are checked before the out folder is touched at all.
@@ -473,7 +492,7 @@ async function collect({ paths, glob, maxBytes = 256 * 1024, maxTotalBytes = 102
     if (live && l.folders.length && (match.deep || match.depth > 1)) lines.push(`(${l.folders.length} folder${l.folders.length === 1 ? '' : 's'} not searched: ${AFTER_STOP})`)
     if (!hits.length) lines.push(`No files match ${JSON.stringify(glob)}.`)
   }
-  selected = [...new Set(selected)].slice(0, 200)
+  selected = [...new Set(selected)]
 
   let total = 0
   for (const p of selected) {
@@ -535,7 +554,7 @@ const tools = [
     name: 'sandbox_start',
     description:
       'Start a fresh Windows Sandbox (one at a time) to test a build on a clean Windows. The build folder is mapped read-only at C:\\build, tool folders (e.g. node, playwright, fake-clis) read-only at C:\\tools\\<name>, and one fresh writable folder at C:\\out. Network is off unless asked. ' +
-      'With session (default) it opens the Sandbox window minimised on the host and waits up to 90 s for the user session, which commands as the user and screenshots need. Refuses if any Sandbox is running or that can\'t be told. Stops by itself after maxMinutes.',
+      `With session (default) it opens the Sandbox window minimised on the host and waits up to ${S.SESSION_WAIT_MS / 1000} s for the user session, which commands as the user and screenshots need. Refuses if any Sandbox is running or that can't be told. Stops by itself after maxMinutes.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -544,7 +563,7 @@ const tools = [
         session: { type: 'boolean', description: 'Open the user session (minimised window). Default true; false allows only commands as system.' },
         closeWindow: { type: 'boolean', description: 'Close the Sandbox window once the session is ready. Desktop screenshots are then blank; window shots from a script inside still work. Default false.' },
         tools: { type: 'array', items: { type: 'string' }, description: 'Tool folders to map (names from WSB_TOOL_DIRS). Default: all configured.' },
-        maxMinutes: { type: 'number', description: 'Lifetime before it is stopped automatically, 1–240. Default 30.' },
+        maxMinutes: { type: 'number', description: `Lifetime before it is stopped automatically, at most ${S.MAX_MINUTES}. Default ${Math.min(30, S.MAX_MINUTES)}.` },
         smartAppControl: { type: 'string', enum: ['keep', 'off'], description: "'off' turns Smart App Control off inside this Sandbox only (never on the host), so unsigned installers can run; the reply says whether it is off. Default 'keep': left as Windows set it." }
       }
     },
@@ -554,14 +573,14 @@ const tools = [
   {
     name: 'sandbox_run',
     description:
-      'Run a command in the Sandbox and get its exit code, stdout and stderr (16 KB each; says when cut). It runs through a wrapper that records its PID: on a timeout the command is killed inside the Sandbox. Commands that wait on a dialog hang until the timeout.',
+      `Run a command in the Sandbox and get its exit code, stdout and stderr (${KB(S.OUTPUT_BYTES)} each; says when cut). It runs through a wrapper that records its PID: on a timeout the command is killed inside the Sandbox. Commands that wait on a dialog hang until the timeout.`,
     inputSchema: {
       type: 'object',
       properties: {
-        command: { type: 'string', description: 'The command line, e.g. "C:\\build\\Setup.exe /S" or a PowerShell script with shell=powershell.' },
+        command: { type: 'string', description: `The command line, e.g. "C:\\build\\Setup.exe /S" (at most ${CMD_MAX} characters with cmd, Windows' limit), or a PowerShell script with shell=powershell (longer: about 24,000 characters of plain text).` },
         shell: { type: 'string', enum: ['cmd', 'powershell'], description: 'Default cmd.' },
         as: { type: 'string', enum: ['user', 'system'], description: 'user (default: the Sandbox user, with a desktop) or system (no desktop, works without a session).' },
-        timeoutSec: { type: 'number', description: '1–3600. Default 120.' },
+        timeoutSec: { type: 'number', description: 'Seconds. Default 120. The Sandbox\'s own deadline (maxMinutes) still stops it.' },
         cwd: { type: 'string', description: 'Working folder inside the Sandbox. Default C:\\build if a build is mapped, else C:\\.' }
       },
       required: ['command']
@@ -572,7 +591,7 @@ const tools = [
   {
     name: 'sandbox_screenshot',
     description: 'A screenshot of the Sandbox desktop (as the user, scaled down, JPEG), returned as an image and saved in the out folder. Needs the user session and the window not closed.',
-    inputSchema: { type: 'object', properties: { maxWidth: { type: 'number', description: 'Width to scale down to, 320–3840. Default 1280.' } } },
+    inputSchema: { type: 'object', properties: { maxWidth: { type: 'number', description: 'Width to scale down to, in pixels (never scaled up). Default 1280.' } } },
     run: screenshot,
     locked: true
   },
@@ -585,8 +604,8 @@ const tools = [
       properties: {
         paths: { type: 'array', items: { type: 'string' }, description: 'Paths relative to the out folder, e.g. "logs/install.log".' },
         glob: { type: 'string', description: 'Pattern relative to the out folder, e.g. "**/*.png".' },
-        maxBytes: { type: 'number', description: 'Per file. Default 262144.' },
-        maxTotalBytes: { type: 'number', description: 'For the whole call. Default 1048576.' },
+        maxBytes: { type: 'number', description: `Per file. Default ${Math.min(256 * 1024, S.COLLECT_MAX_BYTES)}, at most ${S.COLLECT_MAX_BYTES}.` },
+        maxTotalBytes: { type: 'number', description: `For the whole call. Default ${Math.min(1024 * 1024, S.COLLECT_MAX_TOTAL_BYTES)}, at most ${S.COLLECT_MAX_TOTAL_BYTES}.` },
         base64: { type: 'boolean', description: 'Return binary files (other than images) as base64. Default false.' }
       }
     },
@@ -619,7 +638,14 @@ const INSTRUCTIONS = [
 // ---------- JSON-RPC ----------
 
 function reply(id, result) {
-  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\n')
+  let line
+  try {
+    line = JSON.stringify({ jsonrpc: '2.0', id, result })
+  } catch (e) {
+    // One reply is one JavaScript string: past V8's limit (about 512 MB) it can't be sent at all, so say so instead.
+    line = JSON.stringify({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: `The reply is too large to send (${e.message}): ask for less, e.g. a smaller maxTotalBytes.` }], isError: true } })
+  }
+  process.stdout.write(line + '\n')
 }
 
 function replyError(id, code, message) {
