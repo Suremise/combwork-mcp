@@ -245,7 +245,8 @@ function Use-StorageFolder {
 }
 
 # Writes a file with exactly this security from the moment it exists: a new file under a temporary name (CreateNew, with
-# its FileSecurity), then renamed over the old one, keeping its own security.
+# its security descriptor, through Storage.cs: the same call under Windows PowerShell 5.1 and PowerShell 7, MC-1575),
+# then renamed over the old one, keeping its own security.
 function Write-SecureFile([string]$Path, [string]$Text, [string[]]$Grants, [string]$OwnerSid) {
   $fs = New-Object Security.AccessControl.FileSecurity
   $fs.SetAccessRuleProtection($true, $false)
@@ -255,7 +256,7 @@ function Write-SecureFile([string]$Path, [string]$Text, [string[]]$Grants, [stri
   }
   $fs.SetOwner((New-Object Security.Principal.SecurityIdentifier $OwnerSid))
   $tmp = "$Path.new-$([guid]::NewGuid().ToString('n'))"
-  $stream = New-Object IO.FileStream($tmp, [IO.FileMode]::CreateNew, [Security.AccessControl.FileSystemRights]::Write, [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough, $fs)
+  $stream = [HvMcpStorage]::CreateSecureFile($tmp, $fs.GetSecurityDescriptorBinaryForm())
   try { $b = (New-Object Text.UTF8Encoding $false).GetBytes($Text); $stream.Write($b, 0, $b.Length) } finally { $stream.Dispose() }
   [HvMcpStorage]::RenameOver($tmp, $Path)
 }

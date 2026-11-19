@@ -1,8 +1,9 @@
 # Removes the hyper-v MCP helper. Settings > Apps > Installed apps > "Hyper-V MCP helper and test VMs" > Uninstall runs
-# it (MC-1557), or in an admin PowerShell (one line), from the installed copy (no repo needed) or the repo's:
-#   powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\hyperv-mcp\uninstall\uninstall.ps1"
-#   powershell -NoProfile -ExecutionPolicy Bypass -File "<repo>\servers\hyper-v\setup\uninstall.ps1" -KeepPool
-#   powershell -NoProfile -ExecutionPolicy Bypass -File "<repo>\servers\hyper-v\setup\uninstall.ps1" -RemovePool
+# it (MC-1557), or one line in an admin terminal (cmd or PowerShell, the same line, MC-1575), from the installed copy
+# (no repo needed) or the repo's:
+#   cmd /c call "C:\Program Files\hyperv-mcp\uninstall.cmd"
+#   cmd /c call "<repo>\servers\hyper-v\setup\uninstall.cmd" -KeepPool
+#   cmd /c call "<repo>\servers\hyper-v\setup\uninstall.cmd" -RemovePool
 # With neither option it shows the helper's recorded inventory and asks: remove everything (the default), keep the pool,
 # or list only. -WhatIf lists what each would remove and changes nothing (no record, no approval, no service change).
 # For an install made by an older setup (no storage receipts), also name its disk folder: -LegacyDiskFolder D:\hyperv-mcp
@@ -18,23 +19,15 @@
 #   -Interactive the menu (the default with neither option); -Retire only the last phase (the entry's launcher runs it
 #   from uninstall.retiring\); -FromCopy internal: run from the protected temporary copy of an installed uninstaller.
 param([switch]$KeepPool, [switch]$RemovePool, [switch]$Interactive, [switch]$WhatIf, [switch]$Retire, [string]$LegacyDiskFolder, [ValidateSet('Service', 'Direct')][string]$Mode = 'Service', [string]$User = [Security.Principal.WindowsIdentity]::GetCurrent().Name, [string]$FromCopy)
-# Windows PowerShell 5.1 only (MC-1506), refused before any check or change:
-# it uses setup's storage and ACL routines, which need .NET Framework calls
-# that PowerShell 7 doesn't have.
-# Run from PowerShell 7, an earlier setup stopped the service, then failed part-way. The refusal says how to run it
-# under 5.1, with the arguments used (they aren't rebuilt here: -File can't carry every type).
-if ($PSVersionTable.PSEdition -ne 'Desktop') {
-  [Console]::Error.WriteLine("This needs Windows PowerShell 5.1, not PowerShell $($PSVersionTable.PSVersion): nothing was checked or changed. Run it again in an admin Windows PowerShell, as one line, with the same arguments you used:`n  powershell -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" <the same arguments>")
-  exit 1
-}
 $ErrorActionPreference = 'Stop'
-# Started from a PowerShell 7 window, this 5.1 inherits PS7's module folders and can't load its own Get-Acl: drop them.
-$env:PSModulePath = (($env:PSModulePath -split ';') | Where-Object { $_ -and $_ -notmatch '(?<!Windows)PowerShell\\(\d[^\\]*\\)?Modules\\?$' }) -join ';'
+# Runs under Windows PowerShell 5.1 or PowerShell 7 (MC-1575). Under 5.1 started from a PowerShell 7 window, it
+# inherits PS7's module folders and can't load its own Get-Acl: drop them (only under 5.1: they are 7's own).
+if ($PSVersionTable.PSEdition -eq 'Desktop') { $env:PSModulePath = (($env:PSModulePath -split ';') | Where-Object { $_ -and $_ -notmatch '(?<!Windows)PowerShell\\(\d[^\\]*\\)?Modules\\?$' }) -join ';' }
 function Step($m) { Write-Host "- $m" }
 function PipeOpen { return [bool]([IO.Directory]::GetFiles('\\.\pipe\') | Where-Object { $_ -ieq '\\.\pipe\hyperv-mcp' }) }
 
 $me = New-Object Security.Principal.WindowsPrincipal ([Security.Principal.WindowsIdentity]::GetCurrent())
-if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run this in an admin PowerShell (Run as administrator).' }
+if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run this in an admin terminal (Run as administrator).' }
 if ($KeepPool -and $RemovePool) { throw 'Choose -KeepPool or -RemovePool, not both.' }
 if ($LegacyDiskFolder) {
   $LegacyDiskFolder = [IO.Path]::GetFullPath($LegacyDiskFolder).TrimEnd('\')
@@ -68,7 +61,7 @@ if (-not $FromCopy -and $here.ToLowerInvariant().StartsWith($install.ToLowerInva
   }
   $argList += @('-FromCopy', $here)
   Push-Location -LiteralPath $tmp
-  try { & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') @argList; $code = $LASTEXITCODE } finally { Pop-Location; Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+  try { & (Get-PsEngine) @argList; $code = $LASTEXITCODE } finally { Pop-Location; Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue }
   exit $code
 }
 $runnerSid = if ($Mode -eq 'Service') {

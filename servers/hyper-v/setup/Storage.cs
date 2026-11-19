@@ -1,6 +1,8 @@
 // Native helpers for setup's trusted storage (acl.ps1 loads this with Add-Type; it compiles with the in-box compiler):
 //   CreateSecure  CreateDirectoryW with a SECURITY_ATTRIBUTES: the folder exists with its final security descriptor from
 //                 the first instant, or the call fails. Returns false when the path already exists (never reuses it).
+//   CreateSecureFile  the same for a new file (CreateFileW, CREATE_NEW, write-through), opened for writing only, shared
+//                 with no one (MC-1575: .NET's FileStream constructor that took a FileSecurity is .NET Framework only).
 //   Open          opens a folder (or file) for reading its attributes and security only, without following a reparse
 //                 point, sharing read and write but NOT delete: while the handle is open nobody can rename, delete or
 //                 replace it. Setup holds these handles ("pins") for as long as it runs, and checks through them.
@@ -44,7 +46,8 @@ public static class HvMcpStorage {
   }
 
   const uint READ_CONTROL = 0x00020000, FILE_READ_ATTRIBUTES = 0x80, FILE_LIST_DIRECTORY = 0x1;
-  const uint FILE_SHARE_READ = 1, FILE_SHARE_WRITE = 2, OPEN_EXISTING = 3;
+  const uint FILE_SHARE_READ = 1, FILE_SHARE_WRITE = 2, OPEN_EXISTING = 3, CREATE_NEW = 1, GENERIC_WRITE = 0x40000000;
+  const uint FILE_ATTRIBUTE_NORMAL = 0x80, FILE_FLAG_WRITE_THROUGH = 0x80000000;
   const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000, FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
   const int ERROR_ALREADY_EXISTS = 183;
   const int FileBasicInfo = 0, FileIdInfo = 0x12, SE_FILE_OBJECT = 1, OWNER_SECURITY_INFORMATION = 1, DACL_SECURITY_INFORMATION = 4;
@@ -60,6 +63,24 @@ public static class HvMcpStorage {
       if (err == ERROR_ALREADY_EXISTS) return false;
       throw new Win32Exception(err, "CreateDirectoryW " + path);
     } finally { pin.Free(); }
+  }
+
+  /// <summary>Creates a new file with exactly this security descriptor (self-relative bytes) from its first instant,
+  /// open for writing only and shared with no one, written through. Throws if it already exists or can't be made.</summary>
+  public static FileStream CreateSecureFile(string path, byte[] sd) {
+    GCHandle pin = GCHandle.Alloc(sd, GCHandleType.Pinned);
+    IntPtr sa = IntPtr.Zero;
+    try {
+      var attrs = new SECURITY_ATTRIBUTES { nLength = Marshal.SizeOf(typeof(SECURITY_ATTRIBUTES)), lpSecurityDescriptor = pin.AddrOfPinnedObject(), bInheritHandle = false };
+      sa = Marshal.AllocHGlobal(attrs.nLength);
+      Marshal.StructureToPtr(attrs, sa, false);
+      var h = CreateFileW(path, GENERIC_WRITE, 0, sa, CREATE_NEW, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, IntPtr.Zero);
+      if (h.IsInvalid) { int err = Marshal.GetLastWin32Error(); h.Dispose(); throw new Win32Exception(err, "create " + path); }
+      return new FileStream(h, FileAccess.Write, 4096);
+    } finally {
+      if (sa != IntPtr.Zero) Marshal.FreeHGlobal(sa);
+      pin.Free();
+    }
   }
 
   /// <summary>Opens without following reparse points, sharing read/write but not delete (pins it). Throws on failure.

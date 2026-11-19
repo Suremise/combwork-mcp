@@ -11,7 +11,6 @@ const path = require('path')
 const { spawnSync } = require('child_process')
 const { T, scratch, startHelper, withPool, approve, waitFor } = require('./helpers')
 const { server } = require('../client')
-const { ps51Env } = require('../helper/hv')
 
 const windows = process.platform === 'win32'
 const Q = T.profile('queue')
@@ -265,7 +264,8 @@ m.Helper.prototype.request = async function (connId, op, args) {
   assert.doesNotMatch((await s.call('vm_status')).text, /Your project:/)
 })
 
-test('setup\'s -ProjectsFile check uses the helper\'s own policy code, before anything changes', { skip: !windows }, () => {
+// MC-1575: setup runs under Windows PowerShell 5.1 or PowerShell 7 (their ConvertFrom-Json differs on arrays): each.
+for (const E of require('./helpers').psEngines()) test(`setup's -ProjectsFile check uses the helper's own policy code, before anything changes (PowerShell ${E.name})`, () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'setup', 'install.ps1'), 'utf8')
   const block = /^\$projects = @\(\)\r?\n[\s\S]*?\r?\n(?=# The helper refuses a policy whose session cap)/m.exec(src)
   assert.ok(block, 'the projects block in install.ps1')
@@ -277,8 +277,10 @@ test('setup\'s -ProjectsFile check uses the helper\'s own policy code, before an
   const run = (json, maxVms = 3) => {
     const pf = path.join(sc.dir, `p-${Math.random().toString(16).slice(2)}.json`)
     fs.writeFileSync(pf, json)
-    return spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, '-ProjectsFile', pf, '-state', sc.stateDir, '-src', path.join(__dirname, '..'), '-MaxVms', String(maxVms)], { encoding: 'utf8', env: ps51Env() })
+    return spawnSync(E.exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, '-ProjectsFile', pf, '-state', sc.stateDir, '-src', path.join(__dirname, '..'), '-MaxVms', String(maxVms)], { encoding: 'utf8', env: E.env })
   }
+  // What it said, as one line: PowerShell wraps its error lines (7 also colours them, and starts each wrapped line "|").
+  const saidBy = r => (r.stdout + r.stderr).replace(/\x1b\[[0-9;]*m/g, '').replace(/\s*\r?\n\s*\|\s*/g, ' ').replace(/\s+/g, ' ')
   const good = run(JSON.stringify([{ name: 'cli', folders: ['D:\\Dev\\cli'], maxVms: 2 }, { name: 'mcp', folders: ['D:\\Dev\\mcp'] }]))
   assert.strictEqual(good.status, 0, good.stdout + good.stderr)
   assert.match(good.stdout, /projects: 2/)
@@ -290,13 +292,13 @@ test('setup\'s -ProjectsFile check uses the helper\'s own policy code, before an
   // A file from before reserved VMs were dropped is refused here, before anything changes, saying why.
   const reserved = run(JSON.stringify([{ name: 'cli', folders: ['D:\\Dev\\cli'], reserveVms: { windows: 1 } }]), 1)
   assert.notStrictEqual(reserved.status, 0)
-  assert.match((reserved.stdout + reserved.stderr).replace(/\s+/g, ' '), /The projects can't be used: project "cli": reserveVms isn't supported \(projects share the pool by their maxVms caps and the line\)\. Nothing was changed\./)
+  assert.match(saidBy(reserved), /The projects can't be used: project "cli": reserveVms isn't supported \(projects share the pool by their maxVms caps and the line\)\. Nothing was changed\./)
   const bad = run(JSON.stringify([{ name: 'cli', folders: ['D:\\Dev'], maxVms: -1 }, { name: 'cli', folders: ['D:\\Dev\\mcp'] }]))
   assert.notStrictEqual(bad.status, 0)
-  const said = (bad.stdout + bad.stderr).replace(/\s+/g, ' ') // PowerShell wraps its error lines
+  const said = saidBy(bad)
   assert.match(said, /The projects can't be used: project "cli": maxVms must be a whole number 0-64, or one per OS .*; project "cli": the name is taken; project "cli": folder "D:\\Dev\\mcp" overlaps another of its folders .*Nothing was changed\./)
   const overlap = run(JSON.stringify([{ name: 'cli', folders: ['D:\\Dev'] }, { name: 'mcp', folders: ['D:\\Dev\\mcp'] }]))
-  assert.match((overlap.stdout + overlap.stderr).replace(/\s+/g, ' '), /project "mcp": folder "D:\\Dev\\mcp" overlaps project "cli"'s \(one root must belong to one project\)/)
+  assert.match(saidBy(overlap), /project "mcp": folder "D:\\Dev\\mcp" overlaps project "cli"'s \(one root must belong to one project\)/)
   const notJson = run('{ nope')
   assert.match(notJson.stdout + notJson.stderr, /can't be read as JSON/)
 })

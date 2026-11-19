@@ -22,8 +22,12 @@
  *     upload <file>              copy a file (the Windows ISO) to C:\hvnest-proof\upload, checked by SHA-256
  *     install-node <msi>         upload node-vX.Y.Z-x64.msi and install it, only if validly signed by the OpenJS Foundation
  *     deploy [--commit <sha>]    copy the repo (git archive of a commit) into the outer VM
- *     setup --max-network <InternetLan|Host>   run the deployed setup inside the outer VM
- *     approve <planId>           approve.ps1 inside the outer VM (digest typed by the driver; the user's permission)
+ *     install-pwsh <msi>         upload PowerShell-X.Y.Z-win-x64.msi and install it, only if validly signed by Microsoft
+ *     setup --max-network <InternetLan|Host> [--engine launcher|7]   run the deployed setup inside the outer VM: by the
+ *                                user's own line (install.cmd, the default), or under PowerShell 7, so the service runs
+ *                                hv.ps1 under 7 (MC-1575); prints the engine setup recorded for the service
+ *     approve <planId>           the user's approve line (approve.cmd) inside the outer VM (digest typed by the driver;
+ *                                the user's permission)
  *     call <tool> [json]         one tool call in a fresh session as proofuser (pool_plan, pool_create, pool_status, ...)
  *     matrix                     MC-1559's network matrix on the Windows and the Debian pool VM
  *     refusal <os> <mode> <pool|policy>   one run asked above a cap: passes only if refused for that cap
@@ -548,6 +552,10 @@ function report(run) {
   return lines.join('\n')
 }
 
+/** $pwsh: the outer VM's registered PowerShell 7 (HKLM), as the helper finds it; throws if there's none. */
+const PWSH_PS = `$pwsh = @(Get-ChildItem 'HKLM:\\SOFTWARE\\Microsoft\\PowerShellCore\\InstalledVersions' -ErrorAction SilentlyContinue | ForEach-Object { Join-Path ([string](Get-ItemProperty -LiteralPath $_.PSPath).InstallLocation) 'pwsh.exe' } | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }) | Select-Object -Last 1
+if (-not $pwsh) { throw 'PowerShell 7 is not installed in the outer VM: run install-pwsh' }`
+
 /** The command line's other admin scripts, kept here so the tests can parse each one. */
 const SCRIPTS = {
   preflight: `@{ elevated=[bool]([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator); hyperv=[string](Get-WindowsOptionalFeature -Online -FeatureName Microsoft-Hyper-V).State; vmhost=[bool](Get-VMHost -ErrorAction SilentlyContinue); defaultSwitch=[bool](Get-VMSwitch -Name 'Default Switch' -ErrorAction SilentlyContinue); dsw=@(Get-NetIPAddress -InterfaceAlias 'vEthernet (Default Switch)' -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object { "$($_.IPAddress)/$($_.PrefixLength)" }); v4=@(Get-NetIPAddress -AddressFamily IPv4 | ForEach-Object { "$($_.InterfaceAlias) $($_.IPAddress)/$($_.PrefixLength)" }); node=[string](Get-Item -LiteralPath '${GUEST_NODE}' -ErrorAction SilentlyContinue).VersionInfo.ProductVersion; ssh=[bool](Get-Command ssh -ErrorAction SilentlyContinue); freeGB=[math]::Round((Get-PSDrive C).Free/1GB) } | ConvertTo-Json -Compress`,
@@ -574,10 +582,36 @@ $p=Start-Process msiexec.exe -ArgumentList @('/i', ('"' + $f + '"'), '/qn', '/no
 if ($p.ExitCode -ne 0) { throw "msiexec exited $($p.ExitCode)" }
 @{ node=[string](Get-Item -LiteralPath '${GUEST_NODE}').VersionInfo.ProductVersion; signer=[string]$s.SignerCertificate.Subject } | ConvertTo-Json -Compress`
   },
-  setup: (repoDir, max) => {
-    if (!/^C:\\hvnest-proof\\repo-[0-9a-f]{12}$/.test(repoDir) || !['InternetLan', 'Host'].includes(max)) throw new Error('bad setup arguments')
-    return `& powershell -NoProfile -ExecutionPolicy Bypass -File '${repoDir}\\servers\\hyper-v\\setup\\install.ps1' -DiskFolder C:\\hyperv-mcp-disks -User '${HOST_ALIAS}\\${USERS.user}' -MaxNetwork ${max} -MaxCoresPerVm 2 -MaxVms 2 *>&1 | Out-String -Width 400; "exit=$LASTEXITCODE"`
+  /** MC-1575: PowerShell 7 from an uploaded MSI, only when Authenticode-signed by Microsoft and valid; its registration read back. */
+  installPwsh: name => {
+    if (!/^PowerShell-\d+\.\d+\.\d+-win-x64\.msi$/.test(name)) throw new Error('bad PowerShell msi name (PowerShell-X.Y.Z-win-x64.msi)')
+    return `$f='${GUEST_ROOT}\\upload\\${name}'; $s=Get-AuthenticodeSignature -LiteralPath $f
+if ($s.Status -ne 'Valid' -or $s.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') { throw "the MSI's signature isn't a valid Microsoft one ($($s.Status), $($s.SignerCertificate.Subject)): not installed" }
+$p=Start-Process msiexec.exe -ArgumentList @('/i', ('"' + $f + '"'), '/qn', '/norestart') -Wait -PassThru
+if ($p.ExitCode -ne 0) { throw "msiexec exited $($p.ExitCode)" }
+${PWSH_PS}
+@{ pwsh=$pwsh; version=[string](Get-Item -LiteralPath $pwsh).VersionInfo.ProductVersion; signer=[string]$s.SignerCertificate.Subject } | ConvertTo-Json -Compress`
+  },
+  /**
+   * Setup inside the outer VM, by engine (MC-1575): 'launcher' is the user's own line (cmd /c call install.cmd, which
+   * picks Windows PowerShell there); '7' runs install.ps1 under the registered PowerShell 7, so the service runs hv.ps1
+   * under 7. Either way the engine setup recorded for the service is printed after.
+   */
+  setup: (repoDir, max, engine = 'launcher') => {
+    if (!/^C:\\hvnest-proof\\repo-[0-9a-f]{12}$/.test(repoDir) || !['InternetLan', 'Host'].includes(max) || !['launcher', '7'].includes(engine)) throw new Error('bad setup arguments')
+    const args = `-DiskFolder C:\\hyperv-mcp-disks -User '${HOST_ALIAS}\\${USERS.user}' -MaxNetwork ${max} -MaxCoresPerVm 2 -MaxVms 2`
+    const run = engine === '7'
+      ? `${PWSH_PS}\n& $pwsh -NoProfile -ExecutionPolicy Bypass -File '${repoDir}\\servers\\hyper-v\\setup\\install.ps1' ${args} *>&1 | Out-String -Width 400`
+      : `cmd /c call "${repoDir}\\servers\\hyper-v\\setup\\install.cmd" ${args.replace(/'/g, '"')} *>&1 | Out-String -Width 400`
+    return `${run}; "exit=$LASTEXITCODE"
+"engine: " + [string](Get-Content -LiteralPath 'C:\\Program Files\\hyperv-mcp\\host.config' -ErrorAction SilentlyContinue | Where-Object { $_ -like 'powershell=*' })`
   }
+}
+
+/** The approve line a user types (MC-1575), run raw (sshd's shell is cmd), so through the launcher as a user's is. */
+const approveLine = plan => {
+  if (!PLAN_RE.test(plan || '')) throw new Error('approve <p-...>')
+  return `cmd /c call "C:\\Program Files\\hyperv-mcp\\approve.cmd" -Plan ${plan}`
 }
 
 // ---------- the command line ----------
@@ -656,33 +690,34 @@ async function main(argv) {
     fs.writeFileSync(path.join(KEY_DIR, 'proof.json'), JSON.stringify({ ...JSON.parse(fs.readFileSync(path.join(KEY_DIR, 'proof.json'), 'utf8')), commit, repoDir }, null, 2))
     return
   }
-  if (cmd === 'upload' || cmd === 'install-node') {
+  if (cmd === 'upload' || cmd === 'install-node' || cmd === 'install-pwsh') {
     const local = rest[0]
     if (!local || !fs.statSync(local).isFile()) throw new Error(`${cmd} <local file>`)
     const name = path.basename(local)
-    const check = cmd === 'install-node' ? SCRIPTS.installNode(name) : null // validates the name before anything is sent
+    const check = cmd === 'install-node' ? SCRIPTS.installNode(name) : cmd === 'install-pwsh' ? SCRIPTS.installPwsh(name) : null // validates the name before anything is sent
     const sha256 = await new Promise((res, rej) => { const h = crypto.createHash('sha256'); fs.createReadStream(local).on('data', d => h.update(d)).on('end', () => res(h.digest('hex'))).on('error', rej) })
     jsonOut(remote.run('admin', SCRIPTS.deployPrepare))
     if (remote.copy('admin', local, `${GUEST_ROOT}\\upload\\${name}`).code !== 0) throw new Error('scp failed')
     assertTarget(remote, expected, log, `checking the upload of ${name}`)
     console.log(JSON.stringify(jsonOut(remote.run('admin', SCRIPTS.uploadCheck(name, sha256)))))
-    if (check) { assertTarget(remote, expected, log, 'installing node'); console.log(JSON.stringify(jsonOut(remote.run('admin', check)))) }
+    if (check) { assertTarget(remote, expected, log, `installing ${cmd === 'install-pwsh' ? 'PowerShell 7' : 'node'}`); console.log(JSON.stringify(jsonOut(remote.run('admin', check)))) }
     return
   }
   if (cmd === 'setup') {
     needRepo()
     const i = rest.indexOf('--max-network')
     const max = i >= 0 ? rest[i + 1] : ''
-    if (!['InternetLan', 'Host'].includes(max)) throw new Error('setup --max-network InternetLan|Host')
+    if (!['InternetLan', 'Host'].includes(max)) throw new Error('setup --max-network InternetLan|Host [--engine launcher|7]')
+    const e = rest.indexOf('--engine')
+    const script = SCRIPTS.setup(cfg.repoDir, max, e >= 0 ? rest[e + 1] : 'launcher') // validates before anything is sent
     assertTarget(remote, expected, log, 'setup')
-    const r = remote.run('admin', SCRIPTS.setup(cfg.repoDir, max), { timeoutMs: 60 * 60_000 })
+    const r = remote.run('admin', script, { timeoutMs: 60 * 60_000 })
     console.log(r.stdout, r.stderr)
     return
   }
   if (cmd === 'approve') {
     const plan = rest[0]
-    if (!PLAN_RE.test(plan || '')) throw new Error('approve <p-...>')
-    const line = `powershell -NoProfile -ExecutionPolicy Bypass -File "C:\\Program Files\\hyperv-mcp\\approve.ps1" -Plan ${plan}`
+    const line = approveLine(plan)
     assertTarget(remote, expected, log, `reading plan ${plan}`)
     const first = remote.run('admin', line, { raw: true, input: 'no\r\n' }) // cancels: only shows the plan and its digest
     const m = /Digest: ([0-9a-f]{64})/.exec(first.stdout)
@@ -734,7 +769,7 @@ module.exports = {
   HOSTNAME, HOST_ROOT, FW_RULE, EXPECT, CONTROL_MODE, MODES, OSES,
   normGuid, parseIdentityTxt, targetProblems, expectedAcls, aclVerdict, aclReadPs, psProbe, bashProbe, probeScript,
   parseProbes, targets, classify, broadAllows, h81Unclaimed, sshArgs, assertTarget, matrix, refusal, report, bridgeSession,
-  vmFromAcquire, SCRIPTS, IDENTITY_PS, FIREWALL_PS, LISTENERS_START_PS, LISTENERS_CHECK_PS, LISTENERS_STOP_PS, FW_ADD_PS, DEFAULT_SWITCH_PS, guardedCleanup, VM_RE
+  vmFromAcquire, SCRIPTS, approveLine, IDENTITY_PS, FIREWALL_PS, LISTENERS_START_PS, LISTENERS_CHECK_PS, LISTENERS_STOP_PS, FW_ADD_PS, DEFAULT_SWITCH_PS, guardedCleanup, VM_RE
 }
 
 if (require.main === module) main(process.argv.slice(2)).catch(e => { console.error(e.message); process.exitCode = 1 })

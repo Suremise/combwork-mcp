@@ -11,7 +11,7 @@ const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
 const inventory = require('../helper/inventory')
-const { T, scratch, withPool, approve, waitFor } = require('./helpers')
+const { T, scratch, withPool, approve, waitFor, psEngines } = require('./helpers')
 const windows = process.platform === 'win32'
 
 const FACTS = {
@@ -30,7 +30,7 @@ test('the recorded inventory: labelled as the helper\'s record, every item with 
   const t = inventory.render(FACTS)
   assert.match(t, /^hyper-v MCP: the helper's recorded inventory\r\nAs of 2026-11-18T06:00:00\.000Z \(helper 2\.1\.0\)\. The uninstaller verifies each item live before it deletes\r\nanything, and never runs this text\./)
   assert.match(t, /Installed apps > "Hyper-V MCP helper and test VMs" > Uninstall/)
-  assert.match(t, /-File 'C:\\Program Files\\hyperv-mcp\\uninstall\\uninstall\.ps1'/)
+  assert.match(t, /in an admin terminal \(cmd or PowerShell\): cmd \/c call "C:\\Program Files\\hyperv-mcp\\uninstall\.cmd"/)
   assert.match(t, /VMs \(2\):\r\n- hvmcp-1a2b3c4d \(id aaaa-1; windows, image abababababab\); folder D:\\hyperv-mcp\\pool\\i-1; checkpoints: clean, tools \(pool\)\r\n    to remove by hand: Stop-VM -Id aaaa-1 -TurnOff -Force; Remove-VM -Id aaaa-1 -Force; Remove-Item -LiteralPath 'D:\\hyperv-mcp\\pool\\i-1' -Recurse -Force/)
   assert.match(t, /Remove-Item -LiteralPath 'D:\\hyperv-mcp\\pool\\i-2 o''x'/, 'a quote in a path is doubled, as PowerShell reads it')
   assert.match(t, /setup's host-mode switch hvmcp-host, with this PC's address on it\r\n    to remove by hand: Remove-VMSwitch -Name 'hvmcp-host' -Force/)
@@ -67,7 +67,7 @@ test('the helper keeps inventory.txt current: at start, after a pool change, wit
 test('setup installs the uninstaller (the retiring set) and writes the Installed apps entry; a rerun clears a kept-pool record', () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'setup', 'install.ps1'), 'utf8')
   assert.match(src, /foreach \(\$f in \$script:RetiringSet\) \{ Copy-Item -LiteralPath \(Join-Path \$PSScriptRoot \$f\) -Destination \(Join-Path \$install "uninstall\\\$f"\) -Force \}/)
-  assert.match(src, /Set-AppsEntry \(\[Microsoft\.Win32\.Registry\]::LocalMachine\) \$script:EntryKeyPath \(Get-LauncherCommand \(Get-LauncherText\)\)\.command/)
+  assert.match(src, /Set-AppsEntry \(\[Microsoft\.Win32\.Registry\]::LocalMachine\) \$script:EntryKeyPath \(Get-LauncherCommand \(Get-LauncherText\) \$engine\)\.command/)
   assert.match(src, /DeleteValue\('KeptPool', \$false\)/)
   const apps = fs.readFileSync(path.join(__dirname, '..', 'setup', 'appsentry.ps1'), 'utf8')
   const set = /\$script:RetiringSet = @\(([^)]*)\)/.exec(apps)[1].split(',').map(s => s.trim().replace(/'/g, '')).sort()
@@ -79,17 +79,24 @@ test('setup installs the uninstaller (the retiring set) and writes the Installed
   assert.deepStrictEqual(sourced, ['acl.ps1', 'appsentry.ps1', 'teardown.ps1'])
 })
 
-test('the Installed apps entry, run for real (5.1, non-elevated, scratch Program Files and HKCU): each interrupted state finished, refusals intact', { skip: !windows, timeout: T.longTestMs }, () => {
+for (const E of psEngines()) test(`the Installed apps entry, run for real under PowerShell ${E.name} (non-elevated, scratch Program Files and HKCU): each interrupted state finished, refusals intact`, { timeout: T.longTestMs }, () => {
   const { spawnSync } = require('child_process')
-  const { ps51Env } = require('../helper/hv')
-  const sc = scratch('appsentry')
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, 'appsentry-check.ps1'), '-Dir', sc.dir], { encoding: 'utf8', env: ps51Env(), timeout: T.longScriptMs, cwd: sc.dir })
+  const sc = scratch(`appsentry-${E.name}`)
+  const r = spawnSync(E.exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, 'appsentry-check.ps1'), '-Dir', sc.dir], { encoding: 'utf8', env: E.env, timeout: T.longScriptMs, cwd: sc.dir })
   const line = (r.stdout || '').trim().split(/\r?\n/).pop()
   let a
   try { a = JSON.parse(line) } catch { assert.fail(`appsentry-check.ps1 failed: ${r.stdout}\n${r.stderr}`) }
-  // The production launcher: parses, no test overrides, round-trips, and fits a CreateProcess command line.
+  assert.strictEqual(a.engine, E.name === '7' ? 'Core' : 'Desktop')
+  // The production launcher: parses, no test overrides, round-trips, run by the engine named by its full path (MC-1575),
+  // and fits a CreateProcess command line.
   assert.deepStrictEqual([a.prodParses, a.prodNoOverrides, a.prodRoundTrip, a.prodCommand], [true, true, true, true])
   assert.ok(a.prodLength < 32767, `the UninstallString is ${a.prodLength} characters`)
+  // MC-1575: the engine from its registration: 5.1 first, else the last PowerShell 7, a missing file skipped; setup's own
+  // only when registered.
+  assert.deepStrictEqual(a.engines, {
+    all: ['ps51\\powershell.exe', 'ps7a\\pwsh.exe', 'ps7b\\pwsh.exe'], pick: 'ps51\\powershell.exe', pickNo51: 'ps7b\\pwsh.exe', pickGone51: 'ps7b\\pwsh.exe',
+    none: 'Neither Windows PowerShell nor PowerShell 7 is installed.', setupRegistered: 'ps7a\\pwsh.exe', setupElsewhere: 'ps51\\powershell.exe', live: true
+  })
   assert.deepStrictEqual({ ...a.entry, location: undefined }, { name: 'Hyper-V MCP helper and test VMs', publisher: 'Combwork MCP servers', version: '9.9.9', noModify: 1, noRepair: 1, location: undefined })
   // a and b: the installed (or retiring) uninstaller is what runs; nothing else changes.
   assert.deepStrictEqual(a.a, { launched: '-Interactive', entry: true, helper: true })

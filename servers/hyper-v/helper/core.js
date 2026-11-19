@@ -2486,7 +2486,8 @@ class Helper {
 
   approveLine(planId) {
     const dir = process.env.HYPERV_MCP_INSTALL_DIR || 'C:\\Program Files\\hyperv-mcp'
-    return `powershell -NoProfile -ExecutionPolicy Bypass -File "${dir}\\approve.ps1" -Plan ${planId}`
+    // MC-1575: one line for any terminal (cmd, Windows PowerShell or PowerShell 7); approve.cmd picks the engine.
+    return `cmd /c call "${dir}\\approve.cmd" -Plan ${planId}`
   }
 
   /**
@@ -2767,7 +2768,7 @@ class Helper {
       if (fs.lstatSync(file).isSymbolicLink()) throw new Error('link')
       a = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^\uFEFF/, ''))
     } catch {
-      throw new Error(`Plan ${plan.id} is not approved. The user approves it in an admin PowerShell with:\n${this.approveLine(plan.id)}`)
+      throw new Error(`Plan ${plan.id} is not approved. The user approves it in an admin terminal (cmd or PowerShell) with:\n${this.approveLine(plan.id)}`)
     }
     const bad = []
     if (a.planId !== plan.id) bad.push('it names another plan')
@@ -3430,7 +3431,7 @@ function describePlan(plan, digest, approve, T) {
   else if (plan.add?.length && !linux) lines.push('- activation: none (each new VM stays offline; its licence is read and shown)')
   if (plan.add?.length && plan.image && !plan.image.evaluation && !linux) lines.push(`- product key: ${plan.productKey ? 'the pool\'s (set by install.ps1 -ProductKeyFile), written only into the answer file' : 'none'}`)
   if (plan.host) lines.push(`Host: ${plan.host.logicalCpus} logical CPUs, ${plan.host.memoryMB} MB.`)
-  lines.push('', 'Nothing is changed until the user approves this exact plan, in an admin PowerShell (one UAC prompt):', approve,
+  lines.push('', 'Nothing is changed until the user approves this exact plan, as one line in an admin terminal (cmd or PowerShell):', approve,
     'It shows the plan from the helper\'s own record and asks for the 6 characters above. Then call ' + `pool_${plan.op}({ planId: "${plan.id}" }).`,
     'Don\'t approve it for the user: only they can, and only they should.')
   return lines.join('\n')

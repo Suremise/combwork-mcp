@@ -107,9 +107,10 @@ function localRequires(packed) {
 }
 
 /** Text files holding a CR: the repo stores LF (.gitattributes), so the installed copy would differ from the published
- * file by its line endings. A file with a NUL byte is binary and isn't checked, as git decides. */
+ * file by its line endings. A file with a NUL byte is binary and isn't checked, as git decides; nor is a batch file
+ * (.cmd, .bat), which the repo stores CRLF as is (MC-1575). */
 function crlfFiles(packed) {
-  return packed.filter(f => !f.data.includes(0) && f.data.includes(13)).map(f => `CR line endings (the repo's copy is LF): ${f.name}`)
+  return packed.filter(f => !f.data.includes(0) && !/\.(cmd|bat)$/i.test(f.name) && f.data.includes(13)).map(f => `CR line endings (the repo's copy is LF): ${f.name}`)
 }
 
 /** The files under path (itself, if a file), as [{ name: '<under>/<relative>', data }], in name order. */

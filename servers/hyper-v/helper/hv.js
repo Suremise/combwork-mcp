@@ -1,14 +1,19 @@
 /**
- * Runs one Hyper-V operation: `powershell.exe -File hv.ps1`, the fixed script beside this file, with the operation and
+ * Runs one Hyper-V operation: `<PowerShell> -File hv.ps1`, the fixed script beside this file, with the operation and
  * its arguments as one JSON object on stdin. Nothing an agent sends is ever put on a command line or into script text:
  * hv.ps1 reads its input with ConvertFrom-Json and uses each value as data. Its answer is the last stdout line that
  * starts with HVJSON:.
+ *
+ * The PowerShell (MC-1575): HYPERV_MCP_POWERSHELL (the service sets it from host.config, admin-only: the one setup ran
+ * in), else the one registered in HKLM, as setup's .cmd launchers choose it: Windows PowerShell 5.1 where it is installed,
+ * else PowerShell 7. Never one found on PATH.
  *
  * Tests: HYPERV_MCP_PS_STUB names a Node script run instead of PowerShell (same stdin, same answer), and
  * HYPERV_MCP_CRASH_AT ("before:<op>" or "after:<op>", optionally "#<n>" for the n-th call) ends the process at that
  * boundary, the way a crash or a kill would, so recovery can be tested at every side effect.
  */
-const { spawn } = require('child_process')
+const { spawn, spawnSync } = require('child_process')
+const { existsSync } = require('fs')
 const { join } = require('path')
 
 const SCRIPT = join(__dirname, 'hv.ps1')
@@ -32,6 +37,48 @@ function ps51Env(env = process.env) {
   return out
 }
 
+const KEY51 = 'HKLM\\SOFTWARE\\Microsoft\\PowerShell\\3\\PowerShellEngine'
+const KEY7 = 'HKLM\\SOFTWARE\\Microsoft\\PowerShellCore\\InstalledVersions'
+
+/** reg.exe query's values named name, under key (with /s, its subkeys too), in its order. */
+function regValues(key, name, recurse, run = spawnSync) {
+  const reg = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'reg.exe')
+  const r = run(reg, ['query', key, ...(recurse ? ['/s'] : []), '/v', name], { encoding: 'utf8', windowsHide: true })
+  if (r.status !== 0 || !r.stdout) return []
+  const out = []
+  for (const line of r.stdout.split(/\r?\n/)) {
+    const m = /^\s+(\S+)\s+REG_(?:EXPAND_)?SZ\s+(.*?)\s*$/.exec(line)
+    if (m && m[1].toLowerCase() === name.toLowerCase()) out.push(m[2])
+  }
+  return out
+}
+
+/**
+ * The PowerShell for hv.ps1, as the launchers choose it (setup\install.cmd): Windows PowerShell 5.1's powershell.exe
+ * where it is registered and present, else the last PowerShell 7 registered. Throws if neither. opts (tests only):
+ * key51, key7, exists, run.
+ */
+function findEngine({ key51 = KEY51, key7 = KEY7, exists = existsSync, run } = {}) {
+  for (const b of regValues(key51, 'ApplicationBase', false, run)) { const e = join(b, 'powershell.exe'); if (exists(e)) return e }
+  let found = null
+  for (const b of regValues(key7, 'InstallLocation', true, run)) { const e = join(b, 'pwsh.exe'); if (exists(e)) found = e }
+  if (found) return found
+  throw new Error('neither Windows PowerShell nor PowerShell 7 is installed')
+}
+
+let engineCache = null
+/** HYPERV_MCP_POWERSHELL, else findEngine's (once). */
+function psEngine() {
+  if (process.env.HYPERV_MCP_POWERSHELL) return process.env.HYPERV_MCP_POWERSHELL
+  if (!engineCache) engineCache = findEngine()
+  return engineCache
+}
+
+/** The environment for a child of engine: ps51Env's for Windows PowerShell, this one unchanged for PowerShell 7. */
+function psEnv(engine, env = process.env) {
+  return /pwsh\.exe$/i.test(engine) ? { ...env } : ps51Env(env)
+}
+
 function crashPoint(when, op) {
   const want = process.env.HYPERV_MCP_CRASH_AT
   if (!want) return
@@ -53,11 +100,16 @@ function crashPoint(when, op) {
 function hv(op, args = {}, { timeoutMs = 120_000, onChild } = {}) {
   crashPoint('before', op)
   const stub = process.env.HYPERV_MCP_PS_STUB
-  const [cmd, argv] = stub
-    ? [process.execPath, [stub]]
-    : ['powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', SCRIPT]]
+  let cmd, argv
+  try {
+    ;[cmd, argv] = stub
+      ? [process.execPath, [stub]]
+      : [psEngine(), ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', SCRIPT]]
+  } catch (e) {
+    return Promise.reject(new Error(`can't run PowerShell for ${op}: ${e.message}`))
+  }
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, argv, { env: ps51Env(), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+    const child = spawn(cmd, argv, { env: stub ? ps51Env() : psEnv(cmd), stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
     if (onChild) onChild(child)
     let out = ''
     let err = ''
@@ -84,4 +136,4 @@ function hv(op, args = {}, { timeoutMs = 120_000, onChild } = {}) {
   })
 }
 
-module.exports = { hv, ps51Env, SCRIPT, MARK }
+module.exports = { hv, ps51Env, psEnv, psEngine, findEngine, regValues, SCRIPT, MARK }

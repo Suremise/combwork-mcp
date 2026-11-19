@@ -311,14 +311,17 @@ const JOBS_BLOCK = (() => { const a = HV_PS.indexOf('\n$JobsIdle = {'); const e 
 
 test('job states (MC-1529), for real: idle only when every job is in a documented terminal state', { skip: process.platform !== 'win32' || !JOBS_BLOCK }, () => {
   const { spawnSync } = require('child_process')
-  const { ps51Env } = require('../helper/hv')
+  const { psEngines } = require('./helpers')
   const sc = scratch('jobs-idle')
   const file = path.join(sc.dir, 'jobs.ps1')
   const cases = [[], [7, 8, 10, 32768], [7, 2], [7, 3], [4], [5], [6], [9], [11], [12345]]
   fs.writeFileSync(file, `${JOBS_BLOCK}\n${cases.map(c => `'OUT:' + (ConvertTo-Json -InputObject (& $JobsIdle @(${c.join(',')})) -Compress)`).join('\n')}\n`)
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: ps51Env(), timeout: T.spawnMs })
-  const out = r.stdout.split(/\r?\n/).filter(l => l.startsWith('OUT:')).map(l => JSON.parse(l.slice(4)).idle)
-  assert.deepStrictEqual(out, [true, true, false, false, false, false, false, false, false, false], r.stdout + r.stderr)
+  // MC-1575: a host-side block, so under every PowerShell installed (the service runs hv.ps1 under setup's).
+  for (const E of psEngines()) {
+    const r = spawnSync(E.exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file], { encoding: 'utf8', env: E.env, timeout: T.spawnMs })
+    const out = r.stdout.split(/\r?\n/).filter(l => l.startsWith('OUT:')).map(l => JSON.parse(l.slice(4)).idle)
+    assert.deepStrictEqual(out, [true, true, false, false, false, false, false, false, false, false], `PowerShell ${E.name}: ${r.stdout}${r.stderr}`)
+  }
 })
 
 test('server.js: vm_checkpoint and vm_restore are refused, before anything is sent, by a helper without the checkpoints feature', async t => {

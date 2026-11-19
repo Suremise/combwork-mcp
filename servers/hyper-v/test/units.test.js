@@ -6,7 +6,9 @@ const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
 const crypto = require('crypto')
-const { T, scratch, startHelper, approve, waitFor } = require('./helpers')
+const { T, scratch, startHelper, approve, waitFor, psEngines } = require('./helpers')
+// MC-1575: setup, uninstall and approve run under Windows PowerShell 5.1 and PowerShell 7; each check runs under both.
+const ENGINES = psEngines()
 const iso = require('../helper/iso')
 const images = require('../helper/images')
 const policy = require('../helper/policy')
@@ -349,10 +351,10 @@ test('a build\'s licence (MC-1513): an evaluation must be licensed with at least
   assert.deepStrictEqual(licenceOf({ status: 5 }, false, now), { kind: 'own', activated: false, status: 5 })
 })
 
-test('setup storage and ACLs (non-elevated): grants removed; VM grants kept; links refused; secure creation, receipts, parents, pins', { skip: !windows }, () => {
+for (const E of ENGINES) test(`setup storage and ACLs under PowerShell ${E.name} (non-elevated): grants removed; VM grants kept; links refused; secure creation, receipts, parents, pins`, () => {
   const { spawnSync } = require('child_process')
-  const sc = scratch('acl')
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, 'acl-check.ps1'), '-Dir', sc.dir], { encoding: 'utf8', env: ps51Env() })
+  const sc = scratch(`acl-${E.name}`)
+  const r = spawnSync(E.exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, 'acl-check.ps1'), '-Dir', sc.dir], { encoding: 'utf8', env: E.env })
   const line = (r.stdout || '').split(/\r?\n/).find(l => l.startsWith('RESULT:'))
   assert.ok(line, `acl-check.ps1 failed: ${r.stdout}\n${r.stderr}`)
   const a = JSON.parse(line.slice(7))
@@ -398,49 +400,29 @@ test('setup storage and ACLs (non-elevated): grants removed; VM grants kept; lin
   assert.match(a.weakKey, /isn't protected \(S-1-5-32-545 can write it\)/, 'a receipts key that Users can write is refused')
 })
 
-test('approve.ps1 runs only from the installed, admin-only folder', { skip: !windows }, () => {
+for (const E of ENGINES) test(`approve.ps1 runs only from the installed, admin-only folder (PowerShell ${E.name})`, () => {
   const { spawnSync } = require('child_process')
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, '..', 'helper', 'approve.ps1'), '-Plan', 'p-0123456789abcdef'], { encoding: 'utf8' })
+  const r = spawnSync(E.exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, '..', 'helper', 'approve.ps1'), '-Plan', 'p-0123456789abcdef'], { encoding: 'utf8', env: E.env })
   assert.notStrictEqual(r.status, 0)
   assert.match(r.stderr + r.stdout, /Run approve\.ps1 from .*hyperv-mcp, not from/)
 })
 
-// MC-1506: setup run from PowerShell 7 once stopped the service, then failed part-way (acl.ps1's Framework-only calls).
-const PWSH = (() => {
-  if (!windows) return null
-  const r = require('child_process').spawnSync('where.exe', ['pwsh.exe'], { encoding: 'utf8' })
-  return r.status === 0 ? r.stdout.split(/\r?\n/)[0].trim() : null
-})()
-
-test('setup, uninstall and approve refuse PowerShell 7 first, change nothing, and say how to run them under 5.1', { skip: !PWSH && 'pwsh is not installed' }, () => {
+// MC-1506 refused PowerShell 7 (acl.ps1's Framework-only FileStream constructor); MC-1575 replaced that call, so setup,
+// uninstall and approve run under either, each going on to its own checks (here, non-elevated, the admin check), with
+// nothing made on the way.
+for (const E of ENGINES) test(`setup, uninstall and approve run under PowerShell ${E.name}, on to their own checks, changing nothing`, () => {
   const { spawnSync } = require('child_process')
-  const sc = scratch('ps7-refused')
+  const sc = scratch(`runs-under-${E.name}`)
   const disk = path.join(sc.dir, 'never-made')
-  const run = (file, args) => spawnSync(PWSH, ['-NoProfile', '-NonInteractive', '-File', file, ...args], { encoding: 'utf8' })
+  const run = (file, args) => spawnSync(E.exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, ...args], { encoding: 'utf8', env: E.env })
   const setup = path.join(__dirname, '..', 'setup')
-  const cases = [
-    [path.join(setup, 'install.ps1'), ['-DiskFolder', disk, '-BuildRoot', 'C:\\some build', '-AllowUnpinnedIso']],
-    [path.join(setup, 'uninstall.ps1'), ['-KeepPool']],
-    [path.join(__dirname, '..', 'helper', 'approve.ps1'), ['-Plan', 'p-0123456789abcdef']]
-  ]
-  for (const [file, args] of cases) {
+  for (const [file, args] of [[path.join(setup, 'install.ps1'), ['-DiskFolder', disk]], [path.join(setup, 'uninstall.ps1'), ['-KeepPool']]]) {
     const r = run(file, args)
-    assert.strictEqual(r.status, 1, `${file}: ${r.stdout}${r.stderr}`)
-    assert.match(r.stderr, /This needs Windows PowerShell 5\.1, not PowerShell 7[^:]*: nothing was checked or changed\. Run it again in an admin Windows PowerShell, as one line, with the same arguments you used:/)
-    // The fixed 5.1 line with this script's own path; the arguments are the user's to repeat, not rebuilt here.
-    assert.ok(r.stderr.includes(`powershell -NoProfile -ExecutionPolicy Bypass -File "${file}" <the same arguments>`), `the line to run again, for ${file}: ${r.stderr}`)
-    // Refused before anything else: not even the admin check ran.
-    assert.doesNotMatch(r.stdout + r.stderr, /Run this in an admin PowerShell|Run approve\.ps1 from/)
+    assert.notStrictEqual(r.status, 0)
+    assert.doesNotMatch(r.stdout + r.stderr, /needs Windows PowerShell 5\.1/)
+    assert.match(r.stdout + r.stderr, /Run this in an admin terminal \(Run as administrator\)/, `${file}: the tests run non-elevated, so the admin check is next: ${r.stdout}${r.stderr}`)
   }
   assert.ok(!fs.existsSync(disk), 'setup made its disk folder')
-})
-
-test('setup under Windows PowerShell 5.1 goes past the PowerShell 7 refusal to its own checks', { skip: !windows }, () => {
-  const { spawnSync } = require('child_process')
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, '..', 'setup', 'install.ps1'), '-DiskFolder', path.join(scratch('ps51-passes').dir, 'never-made')], { encoding: 'utf8', env: ps51Env() })
-  assert.notStrictEqual(r.status, 0)
-  assert.doesNotMatch(r.stdout + r.stderr, /This needs Windows PowerShell 5\.1/)
-  assert.match(r.stdout + r.stderr, /Run this in an admin PowerShell/, 'the tests run non-elevated: the admin check is next')
 })
 
 test('ps51Env drops only PowerShell 7\'s module folders from PSModulePath', () => {
@@ -457,15 +439,16 @@ test('ps51Env drops only PowerShell 7\'s module folders from PSModulePath', () =
   assert.strictEqual(env.Path, 'C:\\Program Files\\PowerShell\\7', 'other variables are kept as they were')
 })
 
-// The line a user types for setup, uninstall or an approval may be typed in a PowerShell 7 window: each script drops
-// PS7's module folders itself, with the same rule as ps51Env.
+// Under 5.1 started from a PowerShell 7 window, each script drops PS7's module folders itself, with the same rule as
+// ps51Env; under PowerShell 7 they are its own, and kept (MC-1575).
 const PS7_DIR = path.join(process.env.ProgramFiles || 'C:\\Program Files', 'PowerShell', '7', 'Modules')
+const SCRUB = /^if \(\$PSVersionTable\.PSEdition -eq 'Desktop'\) \{ (\$env:PSModulePath = .*) \}$/m
 test('setup, uninstall and approve.ps1 load 5.1\'s own modules when started from PowerShell 7', { skip: !windows || !fs.existsSync(PS7_DIR) }, () => {
   const { spawnSync } = require('child_process')
   const lines = ['setup/install.ps1', 'setup/uninstall.ps1', 'helper/approve.ps1'].map(f => {
-    const m = fs.readFileSync(path.join(__dirname, '..', f), 'utf8').match(/^\$env:PSModulePath = .*$/m)
-    assert.ok(m, `${f} drops PowerShell 7's module folders`)
-    return m[0]
+    const m = fs.readFileSync(path.join(__dirname, '..', f), 'utf8').match(SCRUB)
+    assert.ok(m, `${f} drops PowerShell 7's module folders, under 5.1 only`)
+    return m[1]
   })
   assert.strictEqual(new Set(lines).size, 1, 'the same line in each')
   // As a PowerShell 7 window hands it down: PS7's own folders first.
@@ -479,12 +462,19 @@ test('setup, uninstall and approve.ps1 load 5.1\'s own modules when started from
   const fixed = run(`$ErrorActionPreference = 'Stop'; ${lines[0]}; ${probe}`)
   assert.strictEqual(fixed.status, 0, fixed.stderr)
   assert.match(fixed.stdout, /\S/)
+  // Under PowerShell 7 the guarded line leaves its module folders as they are, and Get-Acl loads.
+  const seven = ENGINES.find(e => e.name === '7')
+  if (seven) {
+    const guarded = fs.readFileSync(path.join(__dirname, '..', 'setup', 'install.ps1'), 'utf8').match(SCRUB)[0]
+    const r = spawnSync(seven.exe, ['-NoProfile', '-NonInteractive', '-Command', `$ErrorActionPreference = 'Stop'; $before = $env:PSModulePath; ${guarded}; if ($env:PSModulePath -ne $before) { exit 3 }; ${probe}`], { encoding: 'utf8', env: seven.env })
+    assert.strictEqual(r.status, 0, `under 7: ${r.stdout}${r.stderr}`)
+  }
 })
 
-test('uninstall teardown (non-elevated, fakes): verified targets only; resumable after a crash at every boundary', { skip: !windows, timeout: T.longTestMs }, () => {
+for (const E of ENGINES) test(`uninstall teardown under PowerShell ${E.name} (non-elevated, fakes): verified targets only; resumable after a crash at every boundary`, { timeout: T.longTestMs }, () => {
   const { spawnSync } = require('child_process')
-  const sc = scratch('teardown')
-  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, 'teardown-check.ps1'), '-Dir', sc.dir], { encoding: 'utf8', env: ps51Env(), timeout: T.longScriptMs })
+  const sc = scratch(`teardown-${E.name}`)
+  const r = spawnSync(E.exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', path.join(__dirname, 'teardown-check.ps1'), '-Dir', sc.dir], { encoding: 'utf8', env: E.env, timeout: T.longScriptMs })
   const line = (r.stdout || '').split(/\r?\n/).find(l => l.startsWith('RESULT:'))
   assert.ok(line, `teardown-check.ps1 failed: ${r.stdout}\n${r.stderr}`)
   const a = JSON.parse(line.slice(7))
@@ -559,7 +549,7 @@ test('uninstall teardown (non-elevated, fakes): verified targets only; resumable
 
 // install.ps1's -BuildRoot checks, run as setup runs them (the block itself, cut from the script, not elevated): they
 // refuse what the helper's policy check would (more than 16, a drive root, '..'), before setup changes anything.
-test('setup: -BuildRoot is refused as the policy would, before anything changes', { skip: !windows }, () => {
+for (const E of ENGINES) test(`setup: -BuildRoot is refused as the policy would, before anything changes (PowerShell ${E.name})`, () => {
   const { spawnSync } = require('child_process')
   const src = fs.readFileSync(path.join(__dirname, '..', 'setup', 'install.ps1'), 'utf8')
   const block = /^\$buildRoots = @\(\$BuildRoot[\s\S]*?^if \(\$buildRoots\.Count -gt 16\).*$/m.exec(src)
@@ -567,7 +557,7 @@ test('setup: -BuildRoot is refused as the policy would, before anything changes'
   const sc = scratch('setup-buildroots')
   const file = path.join(sc.dir, 'buildroots.ps1')
   fs.writeFileSync(file, `param([string[]]$BuildRoot = @())\n$ErrorActionPreference = 'Stop'\n${block[0]}\nConvertTo-Json -Compress @{ buildRoots = @($buildRoots) }\n`)
-  const run = roots => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', `& '${file}' -BuildRoot ${roots.map(r => `'${r}'`).join(',')} 3>$null`], { encoding: 'utf8', env: ps51Env() })
+  const run = roots => spawnSync(E.exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', `& '${file}' -BuildRoot ${roots.map(r => `'${r}'`).join(',')} 3>$null`], { encoding: 'utf8', env: E.env })
   const many = n => Array.from({ length: n }, (_, i) => path.join(sc.dir, `root-${i}`))
   const sixteen = run([...many(16), path.join(sc.dir, 'root-0') + '\\'])
   assert.strictEqual(sixteen.status, 0, sixteen.stderr)
@@ -593,13 +583,13 @@ test('setup copies every helper file the service runs (guest-sync.ps1, guests/ a
   // Every file the service runs, in the helper folder and its subfolders (the service host's source is compiled, not
   // copied); MC-1501 added guests/ and the Linux dispatcher (guest.py, copied into each Linux guest's seed).
   const helperDir = path.join(__dirname, '..', 'helper')
-  const shipped = fs.readdirSync(helperDir, { recursive: true }).map(f => f.replace(/\\/g, '/')).filter(f => /\.(js|ps1|py)$/.test(f) && !f.startsWith('host/')).sort()
+  const shipped = fs.readdirSync(helperDir, { recursive: true }).map(f => f.replace(/\\/g, '/')).filter(f => /\.(js|ps1|py|cmd)$/.test(f) && !f.startsWith('host/')).sort()
   assert.deepStrictEqual(copied, shipped)
   const { SERVERS } = await import(require('url').pathToFileURL(path.join(__dirname, '..', '..', '..', 'scripts', 'pack.mjs')).href)
   assert.ok(SERVERS['hyper-v'].some(([from]) => from === 'helper'), 'the zip holds the whole helper folder')
 })
 
-test('setup: -MaxSessionMinutes is checked as the helper checks it, before anything changes', { skip: !windows }, () => {
+for (const E of ENGINES) test(`setup: -MaxSessionMinutes is checked as the helper checks it, before anything changes (PowerShell ${E.name})`, () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'setup', 'install.ps1'), 'utf8')
   const { spawnSync } = require('child_process')
   const line = /^if \(\$MaxSessionMinutes -and .*$/m.exec(src)
@@ -607,7 +597,7 @@ test('setup: -MaxSessionMinutes is checked as the helper checks it, before anyth
   const sc = scratch('setup-session')
   const file = path.join(sc.dir, 'session.ps1')
   fs.writeFileSync(file, `param([int]$MaxLeaseMinutes = 240, [int]$MaxSessionMinutes = 0)\n$ErrorActionPreference = 'Stop'\n${line[0]}\n'ok'\n`)
-  const run = (lease, session) => spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, '-MaxLeaseMinutes', String(lease), '-MaxSessionMinutes', String(session)], { encoding: 'utf8', env: ps51Env() })
+  const run = (lease, session) => spawnSync(E.exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, '-MaxLeaseMinutes', String(lease), '-MaxSessionMinutes', String(session)], { encoding: 'utf8', env: E.env })
   for (const [lease, session, ok] of [[240, 0, true], [240, 480, true], [240, 240, true], [240, 239, false], [60, 4, false], [240, 1441, false]]) {
     const r = run(lease, session)
     assert.strictEqual(r.status === 0, ok, `${lease}/${session}: ${r.stdout}${r.stderr}`)

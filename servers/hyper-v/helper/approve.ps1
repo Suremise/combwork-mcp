@@ -1,5 +1,6 @@
-# Approves one hyper-v pool plan. The user runs it in an admin PowerShell (one UAC prompt), from the installed copy:
-#   powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\hyperv-mcp\approve.ps1" -Plan p-0123456789abcdef
+# Approves one hyper-v pool plan. The user runs it as one line in an admin terminal (cmd or PowerShell, the same line,
+# MC-1575), from the installed copy, through its launcher:
+#   cmd /c call "C:\Program Files\hyperv-mcp\approve.cmd" -Plan p-0123456789abcdef
 #
 # It shows the plan from the helper's own record (never from an agent's text), asks for the first 6 characters of its
 # digest (a check that the plan on screen is the one approved: not a secret), and writes a single-use approval that
@@ -8,23 +9,15 @@
 #
 # It runs only from %ProgramFiles%\hyperv-mcp (admin-only writable), dot-sources nothing and uses only in-box cmdlets.
 param([Parameter(Mandatory = $true)][string]$Plan)
-# Windows PowerShell 5.1 only (MC-1506), refused before any check or change:
-# every elevated line of this server's is Windows PowerShell's, and this is
-# only tested there.
-# Run from PowerShell 7, an earlier setup stopped the service, then failed part-way. The refusal says how to run it
-# under 5.1, with the arguments used (they aren't rebuilt here: -File can't carry every type).
-if ($PSVersionTable.PSEdition -ne 'Desktop') {
-  [Console]::Error.WriteLine("This needs Windows PowerShell 5.1, not PowerShell $($PSVersionTable.PSVersion): nothing was checked or changed. Run it again in an admin Windows PowerShell, as one line, with the same arguments you used:`n  powershell -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" <the same arguments>")
-  exit 1
-}
 $ErrorActionPreference = 'Stop'
-# Started from a PowerShell 7 window, this 5.1 inherits PS7's module folders and can't load its own Get-Acl: drop them.
-$env:PSModulePath = (($env:PSModulePath -split ';') | Where-Object { $_ -and $_ -notmatch '(?<!Windows)PowerShell\\(\d[^\\]*\\)?Modules\\?$' }) -join ';'
+# Runs under Windows PowerShell 5.1 or PowerShell 7 (MC-1575). Under 5.1 started from a PowerShell 7 window, it
+# inherits PS7's module folders and can't load its own Get-Acl: drop them (only under 5.1: they are 7's own).
+if ($PSVersionTable.PSEdition -eq 'Desktop') { $env:PSModulePath = (($env:PSModulePath -split ';') | Where-Object { $_ -and $_ -notmatch '(?<!Windows)PowerShell\\(\d[^\\]*\\)?Modules\\?$' }) -join ';' }
 
 $install = Join-Path $env:ProgramFiles 'hyperv-mcp'
 if ((Split-Path -Parent $PSCommandPath).TrimEnd('\') -ne $install) { throw "Run approve.ps1 from $install, not from $(Split-Path -Parent $PSCommandPath)." }
 $me = New-Object Security.Principal.WindowsPrincipal ([Security.Principal.WindowsIdentity]::GetCurrent())
-if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run this in an admin PowerShell (Run as administrator).' }
+if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run this in an admin terminal (Run as administrator).' }
 if ($Plan -notmatch '^p-[0-9a-f]{16}$') { throw "'$Plan' is not a plan id (p- and 16 hex digits)." }
 
 $state = Join-Path $env:ProgramData 'hyperv-mcp'
