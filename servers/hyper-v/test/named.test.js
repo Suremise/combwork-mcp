@@ -193,7 +193,7 @@ function bare() {
   h.journal = { state: () => state }
   h.now = () => Date.now()
   h.policy = { projects: [], maxLeaseMinutes: 240, buildRoots: [] }
-  Object.assign(h, { leases: new Map(), startFailed: new Map(), conns: new Map([[1, { pid: 1 }], [2, { pid: 2 }]]), queue: [], tokens: 0, timers: new Set(), quiesced: null, pcpBusy: new Set(), refreshing: new Set() })
+  Object.assign(h, { leases: new Map(), startFailed: new Map(), conns: new Map([[1, { pid: 1, vmIds: new Set() }], [2, { pid: 2, vmIds: new Set() }]]), queue: [], tokens: 0, timers: new Set(), quiesced: null, pcpBusy: new Set(), refreshing: new Set() })
   h.poolLock = fn => fn()
   h.armDeadline = () => {}
   return { h, vm, state }
