@@ -120,6 +120,9 @@ using the new server: the helper's protocol and features changed, and an older h
 - Setup, approvals and the uninstaller each take one line that works the same in any admin terminal (cmd, Windows
   Terminal, Windows PowerShell or PowerShell 7), and they run under PowerShell 7 on a Windows without Windows PowerShell.
 - Until the rerun, the 4.0.0 helper still gives the old `powershell -File ... approve.ps1` line, which still works.
+- New builds add no guest tweaks of their own (MC-1577): no Defender exclusions and no `DisableForceUnload` policy. Put
+  any you want in your own guest setup script, named in the plan (see "Guest setup script"). VMs you already have keep
+  what their clean checkpoint holds.
 
 1. Turn on Hyper-V (see Requirements), and check `Get-Service vmms` says Running.
 2. In an **admin terminal** (cmd, Windows Terminal, Windows PowerShell or PowerShell 7), run setup once (one line,
@@ -257,13 +260,6 @@ approval → change**:
    - about 20–40 minutes each, one VM at a time, so the host's CPU isn't flooded;
    - then the guest set-up, a sanity check of the installed edition and build, Windows' activation when the plan says
      so (see "Windows licences");
-   - in the guest set-up, the **"Do not forcefully unload the user's registry at user logoff"** policy
-     (`DisableForceUnload`, MC-1522), read back. A session-0 run outlives the short PowerShell Direct session that
-     started it (see "Long runs"). The suspected cause, not yet proven (MC-1521's real-build trial checks it): without
-     the policy, Windows force-unloads the account's registry when that session ends, under the still-running run, and
-     its registry reads fail. A run did hit "registry key marked for deletion"; in .NET, a freshly compiled assembly's
-     LoadFile failed with E_UNEXPECTED about 1 time in 4, and 0 times in 9 with the policy set (a small sample). The
-     policy only stops the forced unload of a registry still in use; it changes no security boundary;
    - then **the test accounts' profiles**, still offline: `hvadmin`, then `hvuser`, each logged on interactively once,
      exactly as an interactive start does, and left until Windows' first-logon work (AppX provisioning, OneDrive
      setup, the user setup screens, the per-user AppContainer profiles) is observed quiet: four minutes of samples in
@@ -304,14 +300,41 @@ approval → change**:
      back Windows' own `Userinit` and recreates `C:\hvmcp` empty with inherited permissions only, so the next logon
      starts clean and the checkpoint keeps none of it. The profiles stay, so an interactive start doesn't replay
      first-logon work (it took 2–5 minutes, and sometimes failed);
-   - then **Defender exclusions** for the test work folders `C:\build`, `C:\out`, `C:\trial-session` and `C:\hvmcp`
-     (MC-1519): the user's chosen mitigation for an intermittent failure to load a freshly written large exe
-     (E_UNEXPECTED). Defender's scan of the new file is suspected, not established. They're read back, and the build
-     fails unless exactly those four are excluded and real-time protection is still on: Defender stays on for
-     everything else. The trade-off: an exclusion path takes those folders out of Defender's real-time **and**
-     scheduled scans, which matters less in a guest that is offline and restored after every lease. Nothing changes on
-     the host;
+   - then **your guest setup script**, if the plan names one (below);
    - and the clean checkpoint, taken with the VM off and its adapter disconnected.
+
+### Guest setup script
+
+A plain build adds nothing to the guest beyond what the helper itself needs: its two accounts and its folders
+(`C:\build`, `C:\out`, `C:\hvmcp`; on Linux `/build`, `/out`, `/hvmcp`). Anything else you want in every VM (Defender
+exclusions, a registry policy, tools, settings) goes in your own script, which the plan names (MC-1577):
+
+```
+pool_plan({ action: "create", vms: 2, image: { iso: "D:\\Downloads\\Win11_Eval.iso" }, guestScript: "D:\\vm-setup\\guest.ps1" })
+```
+
+- **Windows guests** take a `.ps1` (run by Windows PowerShell), `.cmd` or `.bat`. **Linux guests** take a `.sh`
+  (run by bash). The file may be UTF-8 (with or without its BOM) or UTF-16 with its BOM (as Windows PowerShell's
+  `Out-File` writes it); the helper decodes it, and a `.ps1` reaches the guest marked UTF-8, so non-ASCII text survives.
+- The helper reads the file when you plan, keeps its own copy, and the plan shows its path, size and SHA-256. You
+  approve those exact bytes: a later change to your file doesn't change what runs (plan again to use it).
+- It runs once in each VM the plan builds, as the guest's admin (root on Linux), offline, in `C:\build` (`/build`),
+  after the build's own steps and before the clean checkpoint. So what it does is in every lease's clean start.
+- It has `HYPERV_MCP_GUEST_SCRIPT_MINUTES` (default 30) to finish. A non-zero exit, or no exit in time, fails that
+  VM's build, and the job's note gives the end of its output. Its own command and output files are removed before the
+  checkpoint.
+- At most 1 MB: the whole script goes to the guest in one call. Have it fetch nothing: the guest is offline.
+- A resize names it again for the VMs it adds; without one, they're built plain. `pool_refresh` doesn't rerun it:
+  what it did is already in the clean checkpoint it refreshes from.
+
+For example, the work folders out of Defender's scanning, and the registry of a user who logs off kept loaded for a
+session-0 run that outlives the session that started it (the build's own tweaks before MC-1577):
+
+```
+Add-MpPreference -ExclusionPath 'C:\build', 'C:\out', 'C:\hvmcp'
+New-Item -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Force | Out-Null
+Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System' -Name DisableForceUnload -Value 1 -Type DWord
+```
 
 **Rebuilding.** An evaluation VM lasts about 90 days from its activation at build; `vm_status` and `pool_status` show
 the days left and warn 14 days before. Plan a `remove`, then a new `create`, each approved the same way. **Teardown** is
@@ -382,7 +405,7 @@ you approved.
 - **x64 only:** an x64 Hyper-V host doesn't run ARM guests, so an ISO with no x64 image is refused, saying so.
 - **Windows** needs `sources\install.wim` (an ISO with only `install.esd` isn't read) and an edition the unattended
   install can drive: a Generation 2 VM with Secure Boot and a vTPM, `autounattend.xml` (UEFI partitions, two local
-  accounts, OOBE skipped), PowerShell Direct for the guest steps, and Defender exclusions. It has been run on Windows 11
+  accounts, OOBE skipped) and PowerShell Direct for the guest steps. It has been run on Windows 11
   (Enterprise evaluation 25H2). Windows 10 and Windows Server 2019 or later use the same steps but haven't been tried:
   a step that can't work fails by name, and the build stops there.
 - **Linux** needs a qcow2 cloud image of at most 4 GB with cloud-init, systemd, OpenSSH and the `hv_sock` module (see
@@ -402,7 +425,7 @@ you approved.
 | `vm_stop({ keep=false })` | Turns the VM off and restores the clean checkpoint, then **verifies** it: Off, at the checkpoint (by id), adapter disconnected, reserve 0. It says "Reverted" only then. Otherwise **CLEANUP FAILED**, and the VM is quarantined. The lease stays. `keep` (or a failed run with `keepOnFailure`) leaves it as it is until release or the deadline. |
 | `vm_checkpoint({ name })` | Takes a named checkpoint of your leased VM as it runs now: files, installed software and the registry (a production checkpoint, disk only: not running programs or a logon session). Yours only, removed when the lease ends. See "Checkpoints within a lease". |
 | `vm_restore({ name })` | Restores one of your lease's checkpoints and starts the VM from it, with the lease's current network and CPU reserve. No one is logged on interactively afterwards, and C:\build is unconfirmed until a full `vm_sync`. |
-| `pool_refresh({ planId })` | Carries out an approved refresh-clean plan: reruns the build's guest setup and Defender steps on each VM (profiles kept as built) and makes that its new clean checkpoint, keeping its pool checkpoints and evaluation days. See "Refreshing a VM's clean checkpoint in place". |
+| `pool_refresh({ planId })` | Carries out an approved refresh-clean plan: reruns the build's guest setup on each VM (profiles kept as built) and makes that its new clean checkpoint, keeping its pool checkpoints and evaluation days. See "Refreshing a VM's clean checkpoint in place". |
 | `pool_checkpoint({ planId })` | Carries out an approved pool-checkpoint plan: publishes (or replaces, or removes) a named checkpoint of each VM a lease prepared. See "Pool checkpoints". |
 | `vm_release()` | Restores the VM (as `vm_stop`) and ends the lease. |
 | `vm_status()` | The pool, every lease, your VM, any pool job, the policy, and where builds may come from. Works with the server turned off. |
@@ -431,13 +454,14 @@ unseen and the agent was left idle with nothing to wake it (MC-1553). So:
 
 ### Refreshing a VM's clean checkpoint in place
 
-When a fix changes what the build's guest setup puts in the guest (MC-1522's registry policy, the Defender exclusions),
+When a fix changes what the build's guest setup puts in the guest (its folders and their permissions),
 `pool_plan({ action: 'refresh-clean', targets: [vm, ...] })` and, after the user's approve line, `pool_refresh({ planId })`
 (MC-1531) apply it to existing VMs without a rebuild. It's a pool job, like a create. Each VM is handled on its own
 while it's free, and isn't leased meanwhile.
 
 - **What it does:** restores the VM's clean checkpoint, starts it offline, and reruns the build's guest steps (the
-  guest setup and its registry policy, the Defender exclusions). No account logs on: the test accounts' profiles are
+  guest setup: its folders and their permissions; not your guest setup script, whose work is already in the clean
+  checkpoint). No account logs on: the test accounts' profiles are
   carried unchanged in the clean checkpoint (MC-1539). It reads the licence for the record, shuts the guest down, and takes a new checkpoint of the
   Off VM, verified. Only then does it make that the VM's clean checkpoint (a journalled commit) and remove the old one.
   Nothing goes online, Windows isn't re-activated, and the VM's evaluation end stays as recorded, whatever the guest
@@ -801,6 +825,7 @@ each within its range and within setup's caps (below). vm_status shows the value
 | `HYPERV_MCP_CLOUD_INIT_MINUTES` | 15 | 5-60 | cloud-init in a new Linux VM |
 | `HYPERV_MCP_COPY_IDLE_MINUTES` | 5 | 1-9 | a Windows build copy or vm_sync with no 32 MB part or file finished (below) |
 | `HYPERV_MCP_NETWORK_SECONDS` | 90 | 30-600 | a connected start's guest network: read back until it is right (a DHCP address, its route and DNS; or host mode's static address) and has held, then it goes on at once. This is only the ceiling (MC-1566) |
+| `HYPERV_MCP_GUEST_SCRIPT_MINUTES` | 30 | 1-360 | the guest setup script a plan names, in each VM it builds (see "Guest setup script") |
 
 - **Whose values apply.** A lease keeps the values its connection had when it was acquired: for everything done for it,
   its restore at release, disconnect or deadline included (which then runs to its own bound, but never runs guest work
@@ -1262,9 +1287,14 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   before any check (MC-1524) retried straight after its diagnosis and undo, noted as expected, twice failing in full;
   a first logon that never begins (MC-1526) retried after the sign window, noted as expected, twice failing in full;
   an undo that doesn't verify
-  (an explicit ACE left on `C:\hvmcp`, UAC still off) failing the build; Defender's exclusions (MC-1519) added after
-  the profiles and before the checkpoint, exactly the four test folders, and a read-back missing one, with another, or
-  with real-time protection off failing the build.
+  (an explicit ACE left on `C:\hvmcp`, UAC still off) failing the build. The guest setup script (MC-1577): a plain build
+  with no Defender step, registry policy or script (the plan says "none"); a named script shown in the plan by path,
+  size and SHA-256, run once as the admin after the profiles, its run cleared, then the checkpoint (which keeps what it
+  did); the helper's copy running, whatever the user's file becomes after the plan, and a changed copy refusing the
+  plan; a non-zero exit or a timeout (the run killed) failing the build with its output, rolled back; a relative,
+  missing, wrong-kind, empty or over-1 MB file refused at plan time. `linux.test.js` runs a `.sh` as root after the
+  guest's checks and before cloud-init is turned off, its run folder gone at finish; `server.test.js` refuses a
+  `guestScript` on a helper without the `guest-script` feature.
 - `provision-readiness.test.js`, the wait for App Readiness (MC-1528) on a fake clock: no acceptance while it's
   pending, even when everything else is unchanged; the quiet counted only after it finishes, and started over by new
   work, a new completion or an unreadable sample; unknown (or a probe without it) never accepted; never finishing

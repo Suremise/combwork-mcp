@@ -258,3 +258,24 @@ test('MC-1553: vm_renew and vm_release run beside a slow vm_start; the release e
   assert.match(w.text, /^vm_start finished/, 'its outcome is still given')
   assert.doesNotMatch(w.text, /^vm_start finished[^\n]*\nStarted /, 'not a start: the lease ended under it')
 })
+
+test('server.js (MC-1577): a helper without the guest-script feature is never sent a guestScript: pool_plan refuses it with "run setup again"', async t => {
+  const sc = scratch('gs-feature', { policy: { maxVms: 3 } })
+  let h = await startHelper(sc)
+  await h.stop()
+  // A 4.1.0-era helper: no guest-script feature. It would ignore the script and build plain VMs.
+  const shim = path.join(sc.dir, 'older-core.js')
+  fs.writeFileSync(shim, `const m = require(${JSON.stringify(path.join(__dirname, '..', 'helper', 'core.js'))})
+const request = m.Helper.prototype.request
+m.Helper.prototype.request = async function (connId, op, args) {
+  if (op === 'version') { const v = await request.call(this, connId, op, args); return { ...v, data: { ...v.data, features: v.data.features.filter(f => f !== 'guest-script') } } }
+  if (op === 'pool_plan' && args?.guestScript !== undefined) throw new Error('should not be sent: guestScript')
+  return request.call(this, connId, op, args)
+}
+`)
+  const env = { ...sc.env, HYPERV_MCP_ENABLED: '1', HYPERV_MCP_MODE: 'direct', NODE_OPTIONS: `--require ${JSON.stringify(shim)}` }
+  const s = server(env)
+  t.after(() => s.close())
+  const r = await s.call('pool_plan', { vms: 1, cores: 2, memoryGB: 4, guestScript: 'C:\setup\guest.ps1' })
+  assert.match(r.text, /has no 'guest-script' feature, which a guest setup script \(guestScript\) needs: run setup again/)
+})

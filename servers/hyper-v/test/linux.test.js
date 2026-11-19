@@ -62,6 +62,30 @@ async function mixedPool(name, stub = {}) {
   return { sc, h: helper, admin, built, linux: linuxVm(sc) }
 }
 
+test('MC-1577: a Linux build runs the plan\'s guest setup script (.sh) as root after the checks and before cloud-init is turned off; its run folder goes at finish', async () => {
+  const sc = scratch('lx-guest-script', { policy: { maxVms: 4, maxMemoryMBTotal: 65536 } })
+  const { h } = await withPool(sc, 1)
+  await h.stop()
+  addDebian(sc)
+  const helper = await startHelper(sc, T.profile('queueKeep'))
+  const admin = helper.conn(99)
+  const file = path.join(sc.dir, 'user', 'guest.sh')
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  fs.writeFileSync(file, 'write /etc/hvmcp-user-setup ran')
+  fs.writeFileSync(path.join(sc.dir, 'user', 'guest.ps1'), 'write C:\\x y')
+  await assert.rejects(admin.request('pool_plan', { action: 'resize', image: D, vms: 1, guestScript: path.join(sc.dir, 'user', 'guest.ps1') }), /guestScript must be a \.sh file for Linux guests/)
+  const built = await change(sc, admin, { action: 'resize', image: D, vms: 1, guestScript: file })
+  assert.match(built.plan.text, /- guest setup script: .*guest\.sh \(31 bytes, SHA-256 [0-9a-f]{64}\), run once in each new VM as its admin/)
+  const vm = linuxVm(sc)
+  const ops = sc.stub().sshCalls.filter(x => x.vmId === vm.id).map(x => x.op)
+  assert.ok(ops.indexOf('verify') < ops.indexOf('run-start') && ops.indexOf('run-start') < ops.indexOf('finish'), ops.join(' '))
+  assert.strictEqual(sc.stub().sshCalls.find(x => x.op === 'run-start' && x.vmId === vm.id).command, 'write /etc/hvmcp-user-setup ran')
+  assert.ok(vm.checkpoints.find(c => c.name === 'clean').disk['/etc/hvmcp-user-setup'], 'what it did is in the clean checkpoint')
+  assert.deepStrictEqual(vm.runs, {}, 'its run cleared at finish')
+  assert.strictEqual(sc.journal().find(r => r.t === 'ready' && r.vmId === vm.id).guestScript.name, 'guest.sh')
+  await helper.stop()
+})
+
 test('a Linux build: seed and keys, first boot with its diagnostics, readiness, checks, cloud-init off, seed and COM gone, clean checkpoint', async () => {
   const { sc, h, admin, built, linux } = await mixedPool('lx-build')
   assert.match(built.line, /created hvmcp-[0-9a-f]+ \(debian 13, kernel 6\.12\.117\+deb13-cloud-amd64; SSH over the Hyper-V socket \(hv_sock present\)\)/)

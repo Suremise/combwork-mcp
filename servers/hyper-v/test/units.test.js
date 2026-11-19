@@ -208,12 +208,11 @@ test('images: one edition per ISO (MC-1513): a multi-edition ISO needs edition; 
 
 test('images: the guest\'s report after the install is a sanity check against the image', () => {
   const img = { edition: 'EnterpriseEval', build: '26300.9457' }
-  assert.strictEqual(images.guestReportProblem({ editionId: 'EnterpriseEval', build: '26300', disableForceUnload: 1 }, img), null)
-  assert.match(images.guestReportProblem({ editionId: 'Professional', build: '26300', disableForceUnload: 1 }, img), /edition/)
-  assert.match(images.guestReportProblem({ editionId: 'EnterpriseEval', build: '26200', disableForceUnload: 1 }, img), /build 26200, the image 26300\.9457/)
-  // MC-1522: the registry policy must read back 1.
-  assert.match(images.guestReportProblem({ editionId: 'EnterpriseEval', build: '26300' }, img), /DisableForceUnload policy reads nothing, not 1/)
-  assert.match(images.guestReportProblem({ editionId: 'EnterpriseEval', build: '26300', disableForceUnload: 0 }, img), /reads 0, not 1/)
+  assert.strictEqual(images.guestReportProblem({ editionId: 'EnterpriseEval', build: '26300' }, img), null)
+  assert.match(images.guestReportProblem({ editionId: 'Professional', build: '26300' }, img), /edition/)
+  assert.match(images.guestReportProblem({ editionId: 'EnterpriseEval', build: '26200' }, img), /build 26200, the image 26300\.9457/)
+  // MC-1577: no registry policy of the build's own is checked any more (MC-1522's is gone).
+  assert.strictEqual(images.guestReportProblem({ editionId: 'EnterpriseEval', build: '26300', disableForceUnload: 0 }, img), null)
   assert.ok(images.isEvalEdition('EnterpriseEval') && images.isEvalEdition('ServerDatacenterEval') && !images.isEvalEdition('Enterprise'))
 })
 

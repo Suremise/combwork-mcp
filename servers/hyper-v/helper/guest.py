@@ -324,7 +324,10 @@ def op_run_start(req, _):
     shell = req.get('shell', 'bash')
     as_ = req.get('as', 'admin')
     cwd = req.get('cwd') or BUILD
-    if not isinstance(command, str) or not command.strip() or len(command) > 8000 or '\0' in command:
+    # MC-1577: the helper's own build-time runs (the user's guest setup script, numbered 800000000 up, as admin) may be
+    # up to 1 MB; any other run's command stays at most 8000 characters.
+    limit = 1024 * 1024 if n >= 800000000 and as_ == 'admin' else 8000
+    if not isinstance(command, str) or not command.strip() or len(command) > limit or '\0' in command:
         raise Refused('a bad command')
     if shell not in ('bash', 'sh'):
         raise Refused('shell must be bash or sh')
@@ -587,6 +590,9 @@ def op_finish(req, _):
         elif os.path.isdir(x):
             shutil.rmtree(x)
     left = [x for x in CLOUD_CACHE if os.path.lexists(x)]
+    # MC-1577: the build's own runs (the guest setup script's command and output) don't go into the clean checkpoint.
+    if os.path.isdir(RUNS) and not os.path.islink(RUNS):
+        shutil.rmtree(RUNS)
     os.sync()
     return {'finished': True, 'seedCacheLeft': left}
 

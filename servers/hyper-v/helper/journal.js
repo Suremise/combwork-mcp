@@ -145,7 +145,7 @@ class Journal {
         }
         case 'ready': {
           const vm = s.vms.get(r.vmId)
-          if (vm) Object.assign(vm, { ready: true, cleanCheckpointId: r.cleanCheckpointId, readyAt: r.at, licence: r.licence ?? null, transport: r.transport ?? null, guest: r.guest ?? null })
+          if (vm) Object.assign(vm, { ready: true, cleanCheckpointId: r.cleanCheckpointId, readyAt: r.at, licence: r.licence ?? null, transport: r.transport ?? null, guest: r.guest ?? null, guestScript: r.guestScript ?? null })
           const i = s.intents.get(r.intentId)
           if (i) i.done = true
           break

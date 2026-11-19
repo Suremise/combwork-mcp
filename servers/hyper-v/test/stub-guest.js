@@ -82,7 +82,7 @@ function run(s, vm, req, data) {
       }
     }
     // MC-1551: the dispatcher removes cloud-init's cached seed; s.seedCacheLeft makes it report one it couldn't.
-    case 'finish': vm.disk['/etc/cloud/cloud-init.disabled'] = b64('off'); return { finished: true, seedCacheLeft: s.seedCacheLeft || [] }
+    case 'finish': vm.disk['/etc/cloud/cloud-init.disabled'] = b64('off'); vm.runs = {}; return { finished: true, seedCacheLeft: s.seedCacheLeft || [] }
     case 'poweroff': vm.state = 'Off'; return { poweringOff: true }
     case 'run-start': {
       if (!['bash', 'sh'].includes(req.shell)) throw new Error('shell must be bash or sh')

@@ -64,8 +64,9 @@ test('a refresh with a pool checkpoint present: the new clean has the fix, the o
   // MC-1539 (the user's decision): no account logs on during the refresh job (the pool's own create provisioned
   // before calls0); the steps it keeps all run, the new clean verified by fresh reads.
   const ops = sc.stub().calls.slice(calls0).map(c => c.op)
-  for (const op of ['guest-logon', 'guest-session', 'guest-provisioned', 'guest-logon-undo']) assert.ok(!ops.includes(op), `no ${op} in a refresh (${ops.join(' ')})`)
-  for (const op of ['restore', 'configure-start', 'guest-setup', 'guest-defender', 'guest-licence', 'guest-shutdown', 'pool-take', 'facts-vm']) assert.ok(ops.includes(op), `${op} still runs`)
+  // MC-1577: no Defender step any more, and the guest setup script (in the clean checkpoint already) isn't rerun.
+  for (const op of ['guest-logon', 'guest-session', 'guest-provisioned', 'guest-logon-undo', 'guest-defender', 'guest-run-start']) assert.ok(!ops.includes(op), `no ${op} in a refresh (${ops.join(' ')})`)
+  for (const op of ['restore', 'configure-start', 'guest-setup', 'guest-licence', 'guest-shutdown', 'pool-take', 'facts-vm']) assert.ok(ops.includes(op), `${op} still runs`)
   assert.ok(ops.lastIndexOf('restore') > ops.indexOf('pool-take') && ops.lastIndexOf('facts-vm') > ops.lastIndexOf('restore'), 'the selected clean restored and verified from a fresh read')
   const v = stubVm(sc, v1)
   assert.ok(!v.checkpoints.some(c => c.id === oldClean), 'the old clean removed')
@@ -302,12 +303,12 @@ test('live failures before the commit: a Defender read-back failure whose cleanu
   sc.patchStub(st => { st.factsParentWrong = true })
   assert.match(await refresh(env, [v1]), /FAILED \(the new clean checkpoint didn't verify .*\); its old clean checkpoint is kept/)
   assert.deepStrictEqual(stubVm(sc, v1).checkpoints.map(c => c.id), [oldClean])
-  // A failure in a step the refresh keeps (MC-1539: Defender's read-back shows real-time protection off), then a cleanup
+  // A failure in a step the refresh keeps (the guest setup's read-back without its folders), then a cleanup
   // restore that doesn't verify: quarantined; a retry (a restart) abandons it. The knobs
   // are set before the job (the stub reloads its state per call); the cleanup restore's failure is switched on by a
   // file once the guest steps have begun, so the refresh's own first restore still verifies.
   const entered = path.join(sc.dir, 'setup-entered'); const gate = path.join(sc.dir, 'setup-gate'); const leaves = path.join(sc.dir, 'leaves-now')
-  sc.patchStub(st => { st.setupEntered = entered; st.setupGate = gate; st.defenderOverride = { realTime: false }; st.restoreLeaves = { switchName: 'stuck' }; st.restoreLeavesWhen = leaves })
+  sc.patchStub(st => { st.setupEntered = entered; st.setupGate = gate; st.setupOverride = { folders: false }; st.restoreLeaves = { switchName: 'stuck' }; st.restoreLeavesWhen = leaves })
   const p = await req(admin, 'pool_plan', { action: 'refresh-clean', targets: [v1] })
   approve(sc, p.data.planId)
   await req(admin, 'pool_refresh', { planId: p.data.planId })
@@ -315,10 +316,10 @@ test('live failures before the commit: a Defender read-back failure whose cleanu
   fs.writeFileSync(leaves, 'now')
   fs.writeFileSync(gate, 'open')
   await waitFor(async () => !/Pool job in progress/.test(await status(admin)) && /refresh cleanup pending|refreshed/.test(await jobLine(admin)), T.waitForMs, 'the job')
-  assert.match(await jobLine(admin), /FAILED \(.*real-time protection is off.*\); refresh cleanup pending: its old clean checkpoint doesn't verify .*it stays quarantined/, 'the failure was Defender\'s read-back')
+  assert.match(await jobLine(admin), /FAILED \(.*read back without its folders.*\); refresh cleanup pending: its old clean checkpoint doesn't verify .*it stays quarantined/, 'the failure was the guest setup\'s read-back')
   assert.match(await status(admin), new RegExp(`${v1}: .*QUARANTINED \\(refresh cleanup pending`))
   await h.stop()
-  sc.patchStub(st => { st.defenderOverride = null; st.restoreLeaves = null; st.restoreLeavesWhen = null; st.setupGate = null; st.setupEntered = null })
+  sc.patchStub(st => { st.setupOverride = null; st.restoreLeaves = null; st.restoreLeavesWhen = null; st.setupGate = null; st.setupEntered = null })
   const h2 = await startHelper(sc)
   assert.match(await status(h2.conn(1)), new RegExp(`${v1}: .*; free`))
   const v = stubVm(sc, v1)

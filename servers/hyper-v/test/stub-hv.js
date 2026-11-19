@@ -27,8 +27,8 @@
  * guest-logon-undo puts Userinit, UAC and autologon back (undoOverride: fields it reports instead). guest-provisioned
  * samples the account's first-logon work: busy for provisionBusy samples (or provisionNever, or at sample
  * provisionBusyAt), failing at sample provisionFailAt, and losing the logon at sample provisionLoseOnce (once).
- * Defender (MC-1519): guest-defender records the exclusions (vm.exclusions) and answers them with real-time on;
- * defenderOverride: fields it reports instead.
+ * The guest setup script (MC-1577) runs as a run does (guest-run-start/poll below); guest-run-clear removes the run's
+ * record and lists its number in state.cleared.
  * Logon diagnostics (MC-1520): guest-logon-diag answers state.diag, or a sample that also carries fields the helper must
  * drop (an event message, a command line, a password), to show only the allowlisted ones are kept.
  * Linux VMs (MC-1501): create-vm with os 'linux' needs its base VHDX and its seed ISO (make-iso with label cidata keeps
@@ -115,11 +115,12 @@ function run(s, op, a) {
       if (!s.activateStaysConnected) vm.switchName = null
       return { ...r, disconnected: !vm.switchName }
     }
-    case 'guest-defender': {
+    case 'guest-run-clear': {
       const vm = own(s, a)
       if (vm.state !== 'Running') throw new Error('the VM is not running')
-      vm.exclusions = [...new Set([...(vm.exclusions || []), ...a.paths])]
-      return { exclusions: vm.exclusions, realTime: true, service: true, tamper: true, ...(s.defenderOverride || {}) }
+      s.cleared = [...(s.cleared || []), a.n]
+      delete vm.runs?.[a.n]
+      return { cleared: true }
     }
     case 'guest-logon-diag': {
       const vm = own(s, a)
@@ -200,7 +201,7 @@ function run(s, op, a) {
     }
     // MC-1531 knobs: setupMarker (written to C:\marker.txt, a stand-in for a fix the setup applies), setupThrows,
     // setupEntered + setupGate (held as it begins).
-    case 'guest-setup': { const vm = own(s, a); if (s.setupEntered) fs.writeFileSync(s.setupEntered, 'entered'); if (s.setupGate) while (!fs.existsSync(s.setupGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25); s.setupCalls = (s.setupCalls || 0) + 1; if (s.setupTransport > 0) { s.setupTransport--; save(s); throw new Error('the PowerShell Direct connection was lost (injected)') } if (s.setupHang > 0) { s.setupHang--; save(s); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3_600_000) } if (s.setupThrows) throw new Error('injected: the guest setup failed'); vm.disk['C:\\build'] = ''; if (s.setupMarker) vm.disk['C:\\marker.txt'] = Buffer.from(s.setupMarker).toString('base64'); return { editionId: s.guestEdition ?? 'EnterpriseEval', build: '26200', ubr: 6584, disableForceUnload: 1, folders: true, buildProtected: true, ...(s.setupOverride || {}) } }
+    case 'guest-setup': { const vm = own(s, a); if (s.setupEntered) fs.writeFileSync(s.setupEntered, 'entered'); if (s.setupGate) while (!fs.existsSync(s.setupGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25); s.setupCalls = (s.setupCalls || 0) + 1; if (s.setupTransport > 0) { s.setupTransport--; save(s); throw new Error('the PowerShell Direct connection was lost (injected)') } if (s.setupHang > 0) { s.setupHang--; save(s); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 3_600_000) } if (s.setupThrows) throw new Error('injected: the guest setup failed'); vm.disk['C:\\build'] = ''; if (s.setupMarker) vm.disk['C:\\marker.txt'] = Buffer.from(s.setupMarker).toString('base64'); return { editionId: s.guestEdition ?? 'EnterpriseEval', build: '26200', ubr: 6584, folders: true, buildProtected: true, ...(s.setupOverride || {}) } }
     case 'make-clean': {
       const vm = own(s, a)
       s.makeCleans = [...(s.makeCleans || []), a.shutdownMs ?? null] // MC-1558: the job's shutdown wait
@@ -599,7 +600,7 @@ function run(s, op, a) {
       if (run.result) return run.result
       const blank = { stdout: '', stdoutCut: false, stderr: '', stderrCut: false }
       if (!run.taken || (run.interactive && (vm.loggedOn !== run.taken || !vm.watcher))) return { ...blank, done: false, pending: run.interactive }
-      const [cmd, ...rest] = run.command.split(' ')
+      const [cmd, ...rest] = run.command.replace(/^﻿/, '').split(' ') // MC-1577: a .ps1 setup script's BOM
       if (run.killed || cmd === 'sleep') return { ...blank, stdout: 'partial\r\n', done: false, pending: false }
       if (cmd === 'slow' && run.polls < Number(rest[0])) return { ...blank, done: false, pending: false }
       const put = (p, t) => { vm.disk[p.includes(':') ? p : `C:\\out\\${p}`] = Buffer.from(t).toString('base64') }

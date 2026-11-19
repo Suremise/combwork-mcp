@@ -58,10 +58,11 @@ const FIRST_LOGON_SIGN_MS = Number(process.env.HYPERV_MCP_FIRST_LOGON_SIGN_MS ||
 const DIAG_LOGS = ['lsm', 'security', 'winlogon', 'profile', 'shellCore', 'appReadinessAdmin', 'appReadinessOperational', 'cloudExperienceHost']
 const FIRST_LOGON_WORKERS = ['OneDriveSetup', 'UserOOBEBroker', 'msedgewebview2', 'CloudExperienceHostBroker', 'StartMenuExperienceHost', 'SearchHost']
 const USERINIT = 'C:\\Windows\\system32\\userinit.exe,' // Windows' own list, as the build's undo leaves it
-// MC-1519 (the user's decision): the guest's test work folders, excluded from Defender's scanning at build (real-time
-// and scheduled scans: an ExclusionPath). The user's chosen mitigation for an intermittent load failure of a freshly
-// written exe; Defender's part in it is suspected, not established.
-const DEFENDER_EXCLUSIONS = ['C:\\build', 'C:\\out', 'C:\\trial-session', 'C:\\hvmcp']
+// MC-1577: the build adds no guest tweaks of its own (MC-1519's Defender exclusions and MC-1522's registry policy are
+// gone): a plan may name the user's own guest setup script, run in each VM it builds (runGuestScript). Its size cap: the
+// whole script travels in one guest call (a PowerShell Direct argument, or one dispatcher line).
+const GUEST_SCRIPT_MAX = 1024 * 1024
+const GUEST_SCRIPT_RUN_BASE = 800_000_000 // its run numbers: above any lease's, below the Linux network scripts' 900000000
 const RETRY_MS = Number(process.env.HYPERV_MCP_RETRY_MS || 5 * 60_000)
 // The build's one online step (MC-1513): its call's bound, and net-off's after a failure.
 const ACTIVATE_MS = Number(process.env.HYPERV_MCP_ACTIVATE_MS || 8 * 60_000)
@@ -97,6 +98,27 @@ const CLEANUP_MS = 60_000
 const hex = n => crypto.randomBytes(n).toString('hex')
 const sleep = ms => new Promise(r => setTimeout(r, ms))
 const sha256 = buf => crypto.createHash('sha256').update(buf).digest('hex')
+/**
+ * MC-1577: a guest setup script's text, from its file's bytes: UTF-8 (with or without its BOM), or UTF-16 LE or BE
+ * marked by its BOM (as Windows PowerShell's Out-File writes it). Anything that doesn't decode cleanly, or holds a NUL,
+ * is refused. For a .ps1 the text goes to the guest with a BOM again (the run file is written as UTF-8), so Windows
+ * PowerShell 5.1 reads it as UTF-8 rather than the guest's ANSI code page; a .sh or .cmd goes without one.
+ */
+function decodeScript(bytes, shell) {
+  let text
+  try {
+    if (bytes[0] === 0xff && bytes[1] === 0xfe) text = new TextDecoder('utf-16le', { fatal: true }).decode(bytes.subarray(2))
+    else if (bytes[0] === 0xfe && bytes[1] === 0xff) text = new TextDecoder('utf-16be', { fatal: true }).decode(bytes.subarray(2))
+    else text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(bytes)
+  } catch { throw new Error('guestScript must be a text file: UTF-8, or UTF-16 with its byte order mark') }
+  if (!text.trim() || text.includes('\0')) throw new Error('guestScript must be a text file: UTF-8, or UTF-16 with its byte order mark')
+  return shell === 'powershell' ? `﻿${text}` : text
+}
+/** MC-1577: the end of a run's output, for a failure's reason (printable text only, at most 1500 characters). */
+const tail = r => {
+  const t = `${r?.stdout || ''}${r?.stderr ? `\n${r.stderr}` : ''}`.replace(/[^\x20-\x7e\n\t]/g, '').trim()
+  return t ? `. Its output ends:\n${t.slice(-1500)}` : ''
+}
 const mins = ms => `${Math.max(0, Math.round(ms / 60000))} min`
 
 /** MC-1558: copies length bytes of a file from offset into a new file (a part of a Windows copy). */
@@ -1171,7 +1193,7 @@ class Helper {
           let licNote
           if (this.isLinux(vm)) {
             // MC-1501: a Linux VM's guest steps: its seed's files, sshd and keys checked again (they aren't rewritten in
-            // place; a change to them needs a rebuild). No Defender, no licence.
+            // place; a change to them needs a rebuild). No licence.
             step('rechecking the guest (its dispatcher, sshd and keys)')
             await this.linux.guestSteps(vm)
             licNote = 'Linux, no licence'
@@ -1179,13 +1201,12 @@ class Helper {
             step('rerunning the guest setup')
             const g = await this.guestSetup(vm, creds)
             const img = this.state.images.get(this.imageOf(vm))
-            const why = img ? images.guestReportProblem(g, img) : (g?.disableForceUnload === 1 ? null : 'DisableForceUnload is not 1')
+            const why = img ? images.guestReportProblem(g, img) : null
             if (why) throw new Error(`the guest's sanity check failed: ${why}`)
             // MC-1539 (the user's decision): no account logs on. The test accounts' profiles are carried unchanged in the
             // clean checkpoint (an already-provisioned account's re-logon makes App Readiness log nothing at all, so the
             // build's first-logon wait could never complete here); fixes to the build's profile setup need a rebuild.
-            step('excluding the test folders from Defender\'s scanning (offline)')
-            await this.defenderStep(vm, creds)
+            // MC-1577: the user's guest setup script isn't rerun: what it did is in the clean checkpoint refreshed from.
             // The licence, read while it runs, for the record only: nothing is activated, and the host's evaluation end
             // (vm.licence.expiresAt) is never rewritten.
             const lic = await this.hv('guest-licence', { ...this.ident(vm), cred: creds.admin }, { timeoutMs: 120_000 })
@@ -2416,6 +2437,12 @@ class Helper {
         plan.activation = online ? 'online-once' : 'none'
         plan.productKey = plan.image.os !== 'linux' && !evaluation && !!this.productKey()
       }
+      // MC-1577 (the user's choice): their own guest setup script, run in each VM this plan builds. None by default: a
+      // plain build adds nothing of its own to the guest. A resize names it again for the VMs it adds.
+      if (args.guestScript !== undefined && args.guestScript !== null) {
+        if (!plan.add.length) throw new Error('guestScript is for a plan that builds VMs: this one builds none.')
+        plan.guestScript = this.takeGuestScript(args.guestScript, plan.image?.os === 'linux' ? 'linux' : 'windows')
+      }
       // MC-1545 (the user's decision, debug only, off by default): a Linux build that fails keeps its VM, turned on,
       // disconnected and never leased, for an administrator to inspect in Hyper-V Manager. The plan says so.
       if (args.debugKeepFailedBuild !== undefined) {
@@ -2563,6 +2590,11 @@ class Helper {
         if (rec.os !== 'linux' && (rec.edition !== plan.image.edition || (rec.imageIndex ?? 1) !== (plan.image.imageIndex ?? 1))) throw new Error('The plan\'s image edition no longer matches its record: make a new plan.')
         if (isEval(plan.image) && plan.activation !== 'online-once') throw new Error(`Plan ${planId} doesn't activate its evaluation image (it was made before activation was planned): make a new plan.`)
         if (plan.productKey && !this.productKey()) throw new Error(`Plan ${planId} uses the pool's product key, but setup holds none now: make a new plan.`)
+        if (plan.guestScript) {
+          let gsBytes = null
+          try { gsBytes = fs.readFileSync(this.guestScriptFile(plan.guestScript)) } catch { /* below */ }
+          if (!gsBytes || sha256(gsBytes) !== plan.guestScript.sha256) throw new Error(`Plan ${planId}'s guest setup script (its helper copy) is missing or changed: make a new plan.`)
+        }
       }
       const jobId = `j-${hex(6)}`
       this.journal.append({ t: 'job', jobId, op, planId, nonce })
@@ -2899,8 +2931,11 @@ class Helper {
     const licence = await this.licenceStep(vm, a, plan, creds)
     step('provisioning the test accounts\' profiles (offline)')
     const profiles = await this.provisionProfiles(vm, creds, t => step(`provisioning the test accounts' profiles (offline): ${t}`))
-    step('excluding the test folders from Defender\'s scanning (offline)')
-    const defender = await this.defenderStep(vm, creds)
+    let guestScript = null
+    if (plan.guestScript) {
+      step(`running the guest setup script ${plan.guestScript.name} (offline)`)
+      guestScript = await this.runGuestScript(vm, plan.guestScript)
+    }
     step('shutting down and taking the clean checkpoint')
     const cp = await this.hv('make-clean', { ...this.ident(vm), shutdownMs: this.tm().ms.shutdownMinutes }, { timeoutMs: this.tm().d.makeCleanCallMs })
     fs.rmSync(media, { recursive: true, force: true })
@@ -2908,7 +2943,7 @@ class Helper {
     const facts = await this.restoreVia(vm, 'restore', { ...this.ident(vm), checkpointId: cp.checkpointId })
     const bad = baselineProblem(facts, { ...vm, cleanCheckpointId: cp.checkpointId })
     if (bad) throw new Error(`its clean baseline doesn't verify: ${bad}`)
-    this.journal.append({ t: 'ready', intentId: a.intentId, vmId: vm.vmId, cleanCheckpointId: cp.checkpointId, licence, profiles, defender })
+    this.journal.append({ t: 'ready', intentId: a.intentId, vmId: vm.vmId, cleanCheckpointId: cp.checkpointId, licence, profiles, guestScript })
     return buildNote(profiles)
   }
 
@@ -2930,19 +2965,66 @@ class Helper {
   }
 
   /**
-   * MC-1519: hv.ps1 'guest-defender' adds the test folders as Defender exclusions; the read-back must hold exactly those
-   * folders, with real-time protection and the antivirus service still on, or the build fails.
+   * MC-1577: the guest setup script a plan names: the user's own file, for the plan's guests' OS (.ps1, .cmd or .bat
+   * for Windows; .sh for Linux), read now and kept as the helper's copy (scripts\<sha256><ext>, in its own folder), so
+   * the bytes the plan names by their SHA-256 are the bytes that run. Returns the plan's record of it.
    */
-  async defenderStep(vm, creds) {
-    const r = await this.hv('guest-defender', { ...this.ident(vm), cred: creds.admin, paths: DEFENDER_EXCLUSIONS }, { timeoutMs: 120_000 })
-    const got = (Array.isArray(r?.exclusions) ? r.exclusions : []).map(p => String(p).replace(/\\+$/, '').toLowerCase()).sort()
-    const want = DEFENDER_EXCLUSIONS.map(p => p.toLowerCase()).sort()
-    const bad = []
-    if (got.join('|') !== want.join('|')) bad.push(`its exclusions are ${got.length ? got.join(', ') : 'none'}, not exactly ${want.join(', ')}`)
-    if (r?.realTime !== true) bad.push('real-time protection is off')
-    if (r?.service !== true) bad.push('the antivirus service is off')
-    if (bad.length) throw new Error(`Defender's settings didn't verify: ${bad.join('; ')}`)
-    return { exclusions: DEFENDER_EXCLUSIONS, realTime: true }
+  takeGuestScript(p, os) {
+    if (typeof p !== 'string' || !win32.isAbsolute(p) || /^\\\\/.test(p)) throw new Error('guestScript must be an absolute local path to the script file')
+    let real
+    try { real = fs.realpathSync.native(p) } catch { throw new Error(`guestScript ${p} can't be read: no such file`) }
+    const ext = win32.extname(real).toLowerCase()
+    const allowed = os === 'linux' ? ['.sh'] : ['.ps1', '.cmd', '.bat']
+    if (!allowed.includes(ext)) throw new Error(`guestScript must be a ${allowed.join(', ')} file for ${os === 'linux' ? 'Linux' : 'Windows'} guests`)
+    if (real.toLowerCase().startsWith(this.dir.toLowerCase() + '\\')) throw new Error('guestScript can\'t be in the helper\'s own folder')
+    const st = fs.lstatSync(real)
+    if (!st.isFile()) throw new Error('guestScript is not a plain file')
+    if (st.size === 0 || st.size > GUEST_SCRIPT_MAX) throw new Error(`guestScript must hold 1 byte to ${GUEST_SCRIPT_MAX} bytes (the whole script goes to the guest in one call)`)
+    const bytes = fs.readFileSync(real)
+    const shell = ext === '.sh' ? 'bash' : ext === '.ps1' ? 'powershell' : 'cmd'
+    decodeScript(bytes, shell) // refused here, at plan time, unless it is text
+    const rec = { sha256: sha256(bytes), name: win32.basename(real), path: real, bytes: bytes.length, shell }
+    const file = this.guestScriptFile(rec)
+    fs.mkdirSync(join(this.dir, 'scripts'), { recursive: true })
+    if (!fs.existsSync(file)) {
+      try { fs.writeFileSync(file, bytes, { flag: 'wx' }) } catch (e) { if (e.code !== 'EEXIST') throw e }
+    }
+    return rec
+  }
+
+  guestScriptFile(gs) { return join(this.dir, 'scripts', `${gs.sha256}${gs.shell === 'bash' ? '.sh' : gs.shell === 'powershell' ? '.ps1' : '.cmd'}`) }
+
+  /**
+   * MC-1577: the plan's guest setup script, run once in a VM being built (after Windows' own steps, or a Linux guest's
+   * checks), as the guest's admin, offline, from the helper's copy checked against the plan's SHA-256 again first. It
+   * runs as a run does (started, then polled; never one long guest call), within the guestScriptMinutes timing. A
+   * non-zero exit, or no exit in time (the run is then killed), fails the build with the end of its output. Its run
+   * files are cleared before the clean checkpoint. Returns the ready record's { sha256, name }.
+   */
+  async runGuestScript(vm, gs) {
+    const bytes = fs.readFileSync(this.guestScriptFile(gs))
+    if (sha256(bytes) !== gs.sha256) throw new Error('the guest setup script\'s copy doesn\'t match the plan\'s SHA-256: refused')
+    const creds = this.creds()
+    this.scriptRuns = ((this.scriptRuns || 0) % 99_999_999) + 1
+    const n = GUEST_SCRIPT_RUN_BASE + this.scriptRuns
+    const base = { ...this.ident(vm), cred: creds.admin, n }
+    const started = await this.guestCall(vm, 'guest-run-start', { ...base, command: decodeScript(bytes, gs.shell), shell: gs.shell, cwd: this.paths(vm).build, cap: OUTPUT_CAP, runAs: null }, { timeoutMs: CALL_MS })
+    const limitMs = this.tm().ms.guestScriptMinutes
+    const deadline = this.now() + limitMs
+    let last = null
+    for (;;) {
+      await sleep(Math.min(POLL_MS, 1000))
+      const r = await this.guestCall(vm, 'guest-run-poll', { ...base, cap: OUTPUT_CAP }, { timeoutMs: CALL_MS }).catch(() => null)
+      if (r) last = r
+      if (r?.done) break
+      if (this.now() > deadline) {
+        await this.guestCall(vm, 'guest-run-kill', { ...base, pid: started?.pid ?? null, started: started?.started ?? null, job: started?.job ?? null }, { timeoutMs: CALL_MS }).catch(() => {})
+        throw new Error(`the guest setup script ${gs.name} didn't finish within ${Math.round(limitMs / 60_000)} min (the guestScriptMinutes timing)${tail(last)}`)
+      }
+    }
+    await this.guestCall(vm, 'guest-run-clear', base, { timeoutMs: CALL_MS })
+    if (last.exitCode !== 0) throw new Error(`the guest setup script ${gs.name} exited ${last.exitCode ?? 'with no code'}${tail(last)}`)
+    return { sha256: gs.sha256, name: gs.name }
   }
 
   /**
@@ -3191,7 +3273,7 @@ const PROTOCOL = 'hyperv-mcp/3' // 2: renew, sync_plan, sync (MC-1497); 3: start
 // 'timing' = set-timing, a connection's timings (MC-1558).
 // 'user-images' = pool_plan's image is any local file the user names ({ iso } of any x64 edition, or a Linux { file }),
 // with no pins and no downloads; acquire's distro is any /etc/os-release ID (MC-1572).
-const FEATURES = ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean', 'linux', 'debug-keep', 'timing', 'network-modes', 'user-images']
+const FEATURES = ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean', 'linux', 'debug-keep', 'timing', 'network-modes', 'user-images', 'guest-script']
 const LEASE_CHECKPOINT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$/
 // MC-1532: a pool checkpoint's name.
 const POOL_CHECKPOINT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._+-]{0,39}$/
@@ -3424,8 +3506,13 @@ function describePlan(plan, digest, approve, T) {
   if (linux && plan.add?.length) lines.push('- Linux build: each new VM is a copy of the image\'s verified base VHDX with a cloud-init seed (users hvadmin and hvuser with locked passwords; SSH keys made by the helper and held only by it; sshd only on the Hyper-V socket, for the helper\'s forced command), first booted offline; cloud-init is turned off and the seed removed before its clean checkpoint')
   if (plan.debugKeepFailedBuild) lines.push('- DEBUG (MC-1545): if a Linux build fails, its VM is kept, turned on, network disconnected, never leased, for an administrator to inspect in Hyper-V Manager (its console, its COM1 diagnostics, a host-side HvMcpVsock retry; no login or other access to the guest is added; its seed, with its host key, stays with it); a resize plan with no image and vms equal to the number of other VMs in the pool removes only it; any other create or resize removes it too, along with the changes it asks for; a remove plan removes the whole pool')
   if (plan.image && !linux) lines.push(`- image: ${plan.image.edition}${plan.image.imageIndex > 1 ? ` (index ${plan.image.imageIndex})` : ''} build ${plan.image.build}, SHA-256 ${plan.image.sha256}, ${imageFrom(plan.image)}${plan.image.signature ? `; setup files: ${plan.image.signature.microsoft ? 'signed by Microsoft' : `not signed by Microsoft (${plan.image.signature.note}): information only`}` : ''}`)
-  if (plan.add?.length && !linux) lines.push('- registry: a user\'s registry isn\'t forcibly unloaded at logoff (the DisableForceUnload policy): the suspected cause of runs losing their HKCU after the short PowerShell Direct session that started them ends (MC-1522; its real-build trial is MC-1521)')
-  if (plan.add?.length && !linux) lines.push(`- Defender: the test work folders ${DEFENDER_EXCLUSIONS.join(', ')} are excluded from Defender's scanning (real-time and scheduled scans) in the guest image; Defender stays on otherwise`)
+  // MC-1577: the user's guest setup script, or none: the build adds no guest changes of its own.
+  if (plan.add?.length) {
+    const gs = plan.guestScript
+    lines.push(gs
+      ? `- guest setup script: ${gs.path} (${gs.bytes} bytes, SHA-256 ${gs.sha256}), run once in each new VM as its admin, offline, before its clean checkpoint; a non-zero exit fails that VM's build`
+      : '- guest setup script: none (nothing is added to the guest beyond the build\'s own accounts and folders)')
+  }
   if (plan.add?.length && !linux) lines.push(`- provisioning: each new VM logs hvadmin and hvuser on interactively once (offline), waits for Windows' first-logon setup to finish, then turns autologon off and resets UAC and the watcher's start before its clean checkpoint; each account within ${Math.round(T.ms.provisionMinutes / 60_000)} min (a logon attempt up to ${Math.round(BUILD_LOGON_WAIT_MS / 60_000)} min once it has begun, one with no sign of a logon ${Math.round(FIRST_LOGON_SIGN_MS / 60_000)} min after its new boot is seen retried at once, then accepted once Windows' App Readiness reports the account's first-logon app setup finished and ${Math.round(PROVISION_QUIET_MS / 60_000)} min of observed quiet follow, one retry if needed; the time Windows itself suspends that setup isn't counted, up to ${Math.round(T.ms.provisionMinutes / 60_000)} min more)`)
   if (plan.activation === 'online-once') lines.push('- activation: each new VM goes online once, through Windows\' Default Switch, to activate Windows; it is disconnected (verified) before its clean checkpoint, and no start ever uses that switch')
   else if (plan.add?.length && !linux) lines.push('- activation: none (each new VM stays offline; its licence is read and shown)')
@@ -3437,4 +3524,4 @@ function describePlan(plan, digest, approve, T) {
   return lines.join('\n')
 }
 
-module.exports = { Helper, canonical, baselineProblem, expiry, licenceOf, diagSummary, diagLine, keyOf, ancestorClash, PLAN_ID_RE, PROTOCOL }
+module.exports = { Helper, canonical, baselineProblem, expiry, licenceOf, diagSummary, diagLine, keyOf, ancestorClash, decodeScript, PLAN_ID_RE, PROTOCOL }
