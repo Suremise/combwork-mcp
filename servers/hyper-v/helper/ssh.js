@@ -19,6 +19,8 @@ const { join } = require('path')
 
 const MARK = 'HVJSON:'
 const OUT_CAP = 100 * 1024 * 1024
+// Node's timers fire at once past this (about 24.8 days): a longer call bound waits this long instead (MC-1579).
+const TIMER_MAX_MS = 2 ** 31 - 1
 const SSH = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'OpenSSH', 'ssh.exe')
 const INSTALL_DIR = process.env.HYPERV_MCP_INSTALL_DIR || join(process.env.ProgramFiles || 'C:\\Program Files', 'hyperv-mcp')
 const BRIDGE = join(INSTALL_DIR, 'HvMcpVsock.exe')
@@ -62,7 +64,7 @@ function call(target, request, { files = [], timeoutMs = 120_000, onChild, verbo
     const timer = setTimeout(() => {
       try { child.kill() } catch { /* gone */ }
       finish(reject, new Error(`the guest call ${request.op} timed out after ${Math.round(timeoutMs / 1000)} s${said()}`))
-    }, timeoutMs)
+    }, Math.min(timeoutMs, TIMER_MAX_MS))
     child.stdout.on('data', d => { if (out.length < OUT_CAP) out += d })
     child.stderr.on('data', d => { if (err.length < 16 * 1024) err += d })
     child.on('error', e => finish(reject, new Error(`can't run ssh for ${request.op}: ${e.message}`)))

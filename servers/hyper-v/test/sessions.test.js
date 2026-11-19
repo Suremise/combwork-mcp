@@ -414,8 +414,8 @@ test('renew: refused at the deadline even before its timer fires; within maxLeas
 test('renew: the policy\'s maxSessionMinutes is checked against maxLeaseMinutes, and sets the cap', async t => {
   const base = { ...policy.DEFAULTS, diskFolders: ['D:\\hv'] }
   assert.deepStrictEqual(policy.problems({ ...base, maxSessionMinutes: undefined }), [])
-  assert.match(policy.problems({ ...base, maxLeaseMinutes: 240, maxSessionMinutes: 100 }).join(), /maxSessionMinutes must be 5-1440 and at least maxLeaseMinutes/)
-  assert.match(policy.problems({ ...base, maxSessionMinutes: 2000 }).join(), /maxSessionMinutes/)
+  assert.match(policy.problems({ ...base, maxLeaseMinutes: 240, maxSessionMinutes: 100 }).join(), /maxSessionMinutes must be a whole number, at least maxLeaseMinutes/)
+  assert.deepStrictEqual(policy.problems({ ...base, maxSessionMinutes: 2000 }), [], 'MC-1579: no ceiling (formerly 1440)')
   assert.strictEqual(policy.sessionMinutes({ maxLeaseMinutes: 240 }), 480)
   assert.strictEqual(policy.sessionMinutes({ maxLeaseMinutes: 600 }), 600)
   assert.strictEqual(policy.sessionMinutes({ maxLeaseMinutes: 60, maxSessionMinutes: 90 }), 90)

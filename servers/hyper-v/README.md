@@ -116,6 +116,19 @@ using the new server: the helper's protocol and features changed, and an older h
   again" (it would refuse files it doesn't know). Images and VMs you already have are kept and stay usable.
 - `vm_acquire`'s `distro` takes any `/etc/os-release` ID (`debian`, `ubuntu`, `fedora`...).
 
+**From 4.1.0 to 4.2.0 (settings, not fixed limits, MC-1579): rerun setup for the helper's side.**
+- Every setting is in the shipped `combwork-mcp.example.json`'s `env` with its default, so the MCP editor shows them all
+  (see "Configuration"). A setting has a default and no range of its own: a cap is left only where a larger value breaks
+  something, and its reason is given.
+- The timings lose their ranges (e.g. restore at most 30 min, logon 30): any value above 0 is used, except
+  `HYPERV_MCP_COPY_IDLE_MINUTES`, still at most 9 (PowerShell Direct's call limit). New: `HYPERV_MCP_OUTPUT_BYTES`,
+  `vm_run`'s output per stream (default 16384, formerly fixed), up to 1 MB.
+- The policy loses its own ceilings: leases and work sessions longer than 24 h, any number of projects, build roots and
+  project images (formerly 16), more cores, memory and disk up to Hyper-V's own maximums. The checkpoint counts may go
+  up to Hyper-V's 50 per VM (formerly 8 each), and setup takes them: `-MaxLeaseCheckpoints`, `-MaxCheckpointsPerVm`,
+  `-MinFreeGBForCheckpoint`. Image files have no size cap (formerly 16 GB for an ISO, 4 GB for a qcow2).
+- Without the rerun, the 4.1.0 helper keeps its ranges, and ignores `HYPERV_MCP_OUTPUT_BYTES` (16 KB).
+
 **From 4.0.0 to 4.1.0 (any terminal, MC-1575): rerun setup to get the new lines.**
 - Setup, approvals and the uninstaller each take one line that works the same in any admin terminal (cmd, Windows
   Terminal, Windows PowerShell or PowerShell 7), and they run under PowerShell 7 on a Windows without Windows PowerShell.
@@ -155,8 +168,10 @@ using the new server: the helper's protocol and features changed, and an older h
      install; a rerun keeps the current value). Override any of them: `-MaxVms`,
      `-MaxCoresPerVm`, `-MaxMemoryGB`, `-MaxDiskGBPerVm`, `-MaxNetwork None|Host|Internet|InternetLan` (with
      `-HostSubnet`; see "Network modes"), `-MaxReservePercent`, `-MaxLeaseMinutes`, `-MaxSessionMinutes`
-     (a work session's cap for `vm_renew`: 5-1440 and at least `-MaxLeaseMinutes`; left out, 480 or
-     `-MaxLeaseMinutes` if that is more), `-MaxBuildMB`. (`-AllowUnpinnedIso` is no
+     (a work session's cap for `vm_renew`: at least `-MaxLeaseMinutes`, with no upper limit; left out, 480 or
+     `-MaxLeaseMinutes` if that is more), `-MaxBuildMB`, and the checkpoint settings `-MaxLeaseCheckpoints` (default
+     3), `-MaxCheckpointsPerVm` (default 4) and `-MinFreeGBForCheckpoint` (default 20; see "Checkpoints within a
+     lease" and "Pool checkpoints"). None has a ceiling of setup's own (see "Limits that are settings"). (`-AllowUnpinnedIso` is no
      longer needed, from 4.0.0: setup accepts it and ignores it.) `-BuildRoot` names folders builds may also
      come from (see "Build folders set by an admin"). `-ProjectsFile` names the projects that share the pool fairly (see
      "Sharing the pool between projects"). `-ProductKeyFile` names a file holding a Windows product key for VMs built
@@ -408,7 +423,7 @@ you approved.
   accounts, OOBE skipped) and PowerShell Direct for the guest steps. It has been run on Windows 11
   (Enterprise evaluation 25H2). Windows 10 and Windows Server 2019 or later use the same steps but haven't been tried:
   a step that can't work fails by name, and the build stops there.
-- **Linux** needs a qcow2 cloud image of at most 4 GB with cloud-init, systemd, OpenSSH and the `hv_sock` module (see
+- **Linux** needs a qcow2 cloud image (of any file size; its disk's virtual size is held to `maxDiskGBPerVm`) with cloud-init, systemd, OpenSSH and the `hv_sock` module (see
   "Linux guests"). It has been run on Debian 13 and Ubuntu 26.04.
 
 ## Tools
@@ -420,7 +435,7 @@ you approved.
 | `vm_renew({ minutes=60 })` | Sets the lease's deadline to now + `minutes` (1 to the policy's `maxLeaseMinutes`), never past the work session's end: `maxSessionMinutes` after `vm_acquire` (`vm_status` shows both). Refused once the deadline has passed, even a moment before the helper ends the lease. |
 | `vm_sync({ build?, full=false, delete=true })` | Copies only the files that changed in `build` (default: the folder last started or synced) into the **running** guest's `C:\build`, without a restore: `C:\out`, installed software and anything else the runs left stay. The server hashes the folder (same roots checks as `vm_start`, every time; links skipped); the helper compares that with what it placed in `C:\build` and takes only the new or changed files, hashing them itself as they arrive. Files gone from the folder are removed unless `delete` is false. Only what the helper copied is tracked: if your runs changed `C:\build` themselves, use `full: true` (clears `C:\build`, copies everything) or `vm_reset`. After a sync fails, only those two are accepted. |
 | `vm_reset({ build?, network?, reserveCpu?, interactive? })` | A clean VM now: exactly `vm_start` (restore first, verified), with this session's last start's `network`, `reserveCpu` and `interactive` and its last build unless given. |
-| `vm_run({ command, shell='cmd'\|'powershell'\|'bash'\|'sh', as='admin'\|'user', timeoutSec=120, cwd='C:\build', session='service'\|'interactive' })` | Runs in the guest (on Linux: bash by default, in `/build`, as root or `hvuser`, killed with everything it started on a timeout; see "Linux guests"). stdout and stderr go to `C:\out\.run-<n>.*`, and the reply has the exit code and 16 KB of each. `as: 'user'` runs as the standard user, for whom `C:\build` is read-only. `session: 'service'` (the default) runs in session 0; on a timeout, everything the run started is killed inside: each run starts in its own Job object (MC-1547), so the kill ends every process in it, whenever it was created (taskkill /T's snapshot missed a child created as it ran). A run that can't be put in its job isn't started (the reply says why), and a job kill that can't be confirmed restores the VM instead, which ends everything the run started: a run is never chased process by process. (A run started without a job, by an older helper, is still killed by its PID with `taskkill /T /F`, only while that PID is still the run's process.) A run's program can't break away from the job; one that makes its own job gets a nested one, which ends with it. A run is started in one short PowerShell Direct call and its exit file then polled with short calls (see "Long runs"), so it may take as long as `timeoutSec` allows. `session: 'interactive'` runs in the desktop session `vm_start`'s `interactive` logged on, as that account (`as` must name it), through a watcher started in that session at logon (`hvadmin` elevated, `hvuser` a standard user). If it times out or doesn't finish cleanly, its output so far is returned and the VM is restored, which ends everything it started; `vm_start` or `vm_reset` goes on. |
+| `vm_run({ command, shell='cmd'\|'powershell'\|'bash'\|'sh', as='admin'\|'user', timeoutSec=120, cwd='C:\build', session='service'\|'interactive' })` | Runs in the guest (on Linux: bash by default, in `/build`, as root or `hvuser`, killed with everything it started on a timeout; see "Linux guests"). stdout and stderr go to `C:\out\.run-<n>.*`, and the reply has the exit code and 16 KB of each (`HYPERV_MCP_OUTPUT_BYTES`). `as: 'user'` runs as the standard user, for whom `C:\build` is read-only. `session: 'service'` (the default) runs in session 0; on a timeout, everything the run started is killed inside: each run starts in its own Job object (MC-1547), so the kill ends every process in it, whenever it was created (taskkill /T's snapshot missed a child created as it ran). A run that can't be put in its job isn't started (the reply says why), and a job kill that can't be confirmed restores the VM instead, which ends everything the run started: a run is never chased process by process. (A run started without a job, by an older helper, is still killed by its PID with `taskkill /T /F`, only while that PID is still the run's process.) A run's program can't break away from the job; one that makes its own job gets a nested one, which ends with it. A run is started in one short PowerShell Direct call and its exit file then polled with short calls (see "Long runs"), so it may take as long as `timeoutSec` allows. `session: 'interactive'` runs in the desktop session `vm_start`'s `interactive` logged on, as that account (`as` must name it), through a watcher started in that session at logon (`hvadmin` elevated, `hvuser` a standard user). If it times out or doesn't finish cleanly, its output so far is returned and the VM is restored, which ends everything it started; `vm_start` or `vm_reset` goes on. |
 | `vm_read_out({ paths?, glob?, maxBytes=256 KB, maxTotalBytes=1 MB, base64=false })` | Files from the guest's `C:\out`, read in the guest and capped while reading, returned as data. Paths are relative and checked before the call (no `..`, drives, UNC or device paths, streams or device names). `glob` is matched against a listing. Links are skipped. With neither, it lists. Text as text, PNG/JPEG as images. Read before `vm_stop`, which discards them. |
 | `vm_stop({ keep=false })` | Turns the VM off and restores the clean checkpoint, then **verifies** it: Off, at the checkpoint (by id), adapter disconnected, reserve 0. It says "Reverted" only then. Otherwise **CLEANUP FAILED**, and the VM is quarantined. The lease stays. `keep` (or a failed run with `keepOnFailure`) leaves it as it is until release or the deadline. |
 | `vm_checkpoint({ name })` | Takes a named checkpoint of your leased VM as it runs now: files, installed software and the registry (a production checkpoint, disk only: not running programs or a logon session). Yours only, removed when the lease ends. See "Checkpoints within a lease". |
@@ -793,46 +808,59 @@ A pool can hold VMs built from several verified images, and so of several kinds:
 
 ## Configuration (`env`)
 
+Every setting is in the shipped `combwork-mcp.example.json`'s `env`, with its default, so Combwork's MCP editor shows
+each one (`.combwork/mcp/hyper-v.json`). A number setting has a default and no range of its own: a value is held back
+only where a larger one would break something, and the reason is given here.
+
 | Variable | Meaning |
 |---|---|
 | `HYPERV_MCP_ENABLED` | Must be `1`, or every tool refuses (`vm_status` still answers). A kill switch, not authentication. |
 | `HYPERV_MCP_MODE` | `direct` for direct mode (see above); otherwise service mode. |
 | `HYPERV_MCP_ALLOWED_ROOTS`, `HYPERV_MCP_ROOTS_FROM_CWD` | Where builds may come from, for clients that send no roots (see "Multiple projects"). |
-| `HYPERV_MCP_MAX_BUILD_MB` | Optional. A cap this server applies before streaming a build (default 2048). The policy's `maxBuildMB` is the helper's own cap. |
+| `HYPERV_MCP_MAX_BUILD_MB` | A cap this server applies before streaming a build (default 2048, no upper limit). The policy's `maxBuildMB` is the helper's own cap. |
 | `HYPERV_MCP_PIPE` | Optional. The pipe's name (default `hyperv-mcp`). |
-| `HYPERV_MCP_REPLY_MS` | Optional. How long a slow tool, or `vm_wait`, waits before replying "still in progress" (default 45000, at least 1000; see "Slow operations"). Keep it under your MCP client's tool-call timeout. |
-| `HYPERV_MCP_*_MINUTES`, `HYPERV_MCP_*_SECONDS` | Optional. How long the helper waits for slow work (see "Timings" below). |
+| `HYPERV_MCP_REPLY_MS` | How long a slow tool, or `vm_wait`, waits before replying "still in progress" (default 45000, at least 1000; see "Slow operations"). Keep it under your MCP client's tool-call timeout. At most about 24.8 days: Node's timers fire at once past that. |
+| `HYPERV_MCP_OUTPUT_BYTES` | How much of each of a `vm_run`'s stdout and stderr comes back (default 16384). At most 1 MB: a Linux guest's dispatcher (`guest.py`, copied into each VM when it is built) returns no more. Sent to the helper like the timings, so a lease keeps its connection's value. |
+| `HYPERV_MCP_*_MINUTES`, `HYPERV_MCP_*_SECONDS` | How long the helper waits for slow work (see "Timings" below). |
 
 ### Timings
 
 How long the helper waits before it gives up on slow work (MC-1558). The defaults are generous, sized for a slow or busy
-PC rather than a fast one. Change one only if your PC needs it: in Combwork, add the key to this server's `env` (the MCP
-editor, `.combwork/mcp/hyper-v.json`). This server sends them to the helper each time it connects, and the helper keeps
-each within its range and within setup's caps (below). vm_status shows the values in effect for your connection.
+PC rather than a fast one. Change one if your PC needs it: in Combwork, in this server's `env` (the MCP editor,
+`.combwork/mcp/hyper-v.json`), where each is listed with its default. This server sends them to the helper each time it
+connects. vm_status shows the values in effect for your connection.
 
-| Key | Default | Range | What it bounds |
-|---|---|---|---|
-| `HYPERV_MCP_GUEST_READY_MINUTES` | 10 | 2-60 | a started or restored guest answering (and a new Linux VM's first boot) |
-| `HYPERV_MCP_RESTORE_MINUTES` | 10 | 2-30 | a checkpoint restore once the VM is off |
-| `HYPERV_MCP_OFF_WAIT_SECONDS` | 120 | 20-600 | a VM reaching Off before a restore. The restore's call allows this plus the restore |
-| `HYPERV_MCP_RESTORE_VERIFY_SECONDS` | 180 | 30-900 | a restored VM's new checkpoint showing, read fresh after the restore |
-| `HYPERV_MCP_CHECKPOINT_MINUTES` | 10 | 2-60 | taking a checkpoint, or removing one (removing merges its disk) |
-| `HYPERV_MCP_QUEUE_KEEP_MINUTES` | 10 | 2-60 | a place in vm_acquire's line between two calls |
-| `HYPERV_MCP_LOGON_MINUTES` | 10 | 5-30 | an interactive logon at vm_start |
-| `HYPERV_MCP_SHUTDOWN_MINUTES` | 5 | 2-30 | a guest shutting down cleanly (its call allows 1 min more; the clean checkpoint's, 10) |
-| `HYPERV_MCP_INSTALL_MINUTES` | 90 | 30-360 | Windows setup in a new pool VM |
-| `HYPERV_MCP_PROVISION_MINUTES` | 30 | 15-120 | each account's first-logon provisioning at build |
-| `HYPERV_MCP_CLOUD_INIT_MINUTES` | 15 | 5-60 | cloud-init in a new Linux VM |
-| `HYPERV_MCP_COPY_IDLE_MINUTES` | 5 | 1-9 | a Windows build copy or vm_sync with no 32 MB part or file finished (below) |
-| `HYPERV_MCP_NETWORK_SECONDS` | 90 | 30-600 | a connected start's guest network: read back until it is right (a DHCP address, its route and DNS; or host mode's static address) and has held, then it goes on at once. This is only the ceiling (MC-1566) |
-| `HYPERV_MCP_GUEST_SCRIPT_MINUTES` | 30 | 1-360 | the guest setup script a plan names, in each VM it builds (see "Guest setup script") |
+Any value above 0 is used as given (fractions too); 0 or less, or not a number, is ignored with a note and the default
+used. There is no range (MC-1579), except where a larger value breaks something:
+- `HYPERV_MCP_COPY_IDLE_MINUTES` is at most 9: PowerShell Direct ends any one call after about 10 minutes (below).
+- Every timing is at most about 24.8 days (35791 minutes): Node's timers, and `hv.ps1`'s `[int]` milliseconds, stop
+  there. A call whose bound adds several timings is held to that too.
+A value over its most is used at its most, with a note saying why.
+
+| Key | Default | What it bounds |
+|---|---|---|
+| `HYPERV_MCP_GUEST_READY_MINUTES` | 10 | a started or restored guest answering (and a new Linux VM's first boot) |
+| `HYPERV_MCP_RESTORE_MINUTES` | 10 | a checkpoint restore once the VM is off |
+| `HYPERV_MCP_OFF_WAIT_SECONDS` | 120 | a VM reaching Off before a restore. The restore's call allows this plus the restore |
+| `HYPERV_MCP_RESTORE_VERIFY_SECONDS` | 180 | a restored VM's new checkpoint showing, read fresh after the restore |
+| `HYPERV_MCP_CHECKPOINT_MINUTES` | 10 | taking a checkpoint, or removing one (removing merges its disk) |
+| `HYPERV_MCP_QUEUE_KEEP_MINUTES` | 10 | a place in vm_acquire's line between two calls |
+| `HYPERV_MCP_LOGON_MINUTES` | 10 | an interactive logon at vm_start |
+| `HYPERV_MCP_SHUTDOWN_MINUTES` | 5 | a guest shutting down cleanly (its call allows 1 min more; the clean checkpoint's, 10) |
+| `HYPERV_MCP_INSTALL_MINUTES` | 90 | Windows setup in a new pool VM |
+| `HYPERV_MCP_PROVISION_MINUTES` | 30 | each account's first-logon provisioning at build |
+| `HYPERV_MCP_CLOUD_INIT_MINUTES` | 15 | cloud-init in a new Linux VM |
+| `HYPERV_MCP_COPY_IDLE_MINUTES` | 5 | a Windows build copy or vm_sync with no 32 MB part or file finished (below); at most 9 |
+| `HYPERV_MCP_NETWORK_SECONDS` | 90 | a connected start's guest network: read back until it is right (a DHCP address, its route and DNS; or host mode's static address) and has held, then it goes on at once. This is only the ceiling (MC-1566) |
+| `HYPERV_MCP_GUEST_SCRIPT_MINUTES` | 30 | the guest setup script a plan names, in each VM it builds (see "Guest setup script") |
 
 - **Whose values apply.** A lease keeps the values its connection had when it was acquired: for everything done for it,
   its restore at release, disconnect or deadline included (which then runs to its own bound, but never runs guest work
   after the lease ended). A pool job keeps the values of the connection that applied it. Work with no client behind it
   (start-up recovery, retrying a quarantined VM) uses the defaults. A place in line uses the waiting connection's.
 - **Setup's caps.** policy.json may hold `timingCaps`, `{ key: highest value }` with the keys above in their camelCase
-  form (`guestReadyMinutes`, `offWaitSeconds`, ...), each within its range. A cap lowers the default too. An invalid one
+  form (`guestReadyMinutes`, `offWaitSeconds`, `outputBytes`, ...): an admin's own limit, which setup doesn't set (none
+  ships). Each must be above 0 and at most the key's most (above). A cap lowers the default too. An invalid one
   stops the helper from starting, saying why. policy.json is only writable by Administrators.
 - **Windows copies.** A build's copy-in and vm_sync go in calls of at most 64 MB and 500 files, a file over 32 MB as 32 MB
   parts, each appended in the guest at once. The copy fails only when a call finishes no part or file within
@@ -856,7 +884,7 @@ Test-only:
 - `HYPERV_MCP_CRASH_AT`: crash injection;
 - `HYPERV_MCP_STATE_DIR`;
 - timing: the `HYPERV_MCP_*_MS` variables in `test\timing.json` (its defaults, narrow values and named profiles; each
-  replaces a default, below its range), plus
+  replaces a default), plus
   `HYPERV_MCP_MINUTE_MS`, `HYPERV_MCP_COPY_PART_BYTES` and the service host's `HYPERV_MCP_HOST_HEARTBEAT_MS`;
 - `HYPERV_MCP_MIN_ISO_BYTES`.
 
@@ -1140,9 +1168,32 @@ path from the registry or the inventory.
 
 ## Limits
 
+### Limits that are settings
+
+Nothing here is a fixed limit of the server's own (MC-1579): each is a setting with a default, and a ceiling is left
+only where a larger value breaks something, named with its reason.
+- **In the server's `env`** (see "Configuration"): the timings, `vm_run`'s output (`HYPERV_MCP_OUTPUT_BYTES`), the
+  build size this server streams and the reply wait.
+- **In setup's policy** (an admin's, see "Setup"): VMs, cores, memory and disk, up to Hyper-V's own maximums (1024 VMs
+  on a host, 240 virtual processors and 12 TB of memory for one VM, a 64 TB VHDX), and a disk of at least 64 GB
+  (Windows 11 needs it); leases and work sessions of up to 10^9 minutes (formerly at most 24 h; the end must be a date JavaScript can hold, and a deadline past Node's
+  24.8-day timer is waited for in steps); `maxBuildMB` with no upper limit; any number of projects, of folders and
+  build roots, and of images in a project (formerly 16); and the checkpoint settings, `maxLeaseCheckpoints` (default
+  3) and `maxCheckpointsPerVm` (default 4), which together may be at most 48: Hyper-V keeps at most 50 checkpoints of
+  a VM, and its clean checkpoint, with a second one while it is refreshed, takes 2. `minFreeGBForCheckpoint` (default
+  20) may be 0.
+- **Images** have no size cap (formerly 16 GB for an ISO, 4 GB for a qcow2). A Linux image's disk is held to its
+  virtual size, at most `maxDiskGBPerVm` (and VHD's own 2040 GB, the format it is converted through). The build's
+  check of an ISO's hash allows 10 minutes and 1 more per GB.
+- **Kept, with their reasons:** `HYPERV_MCP_COPY_IDLE_MINUTES` at most 9 (PowerShell Direct's ~10-minute call);
+  `HYPERV_MCP_OUTPUT_BYTES` at most 1 MB (`guest.py`); a request to the helper at most 4 MB (the service host's line
+  limit).
+
+### Other limits
+
 - A cold start of a VM boots Windows: tens of seconds. A start from a checkpoint taken while running would be faster,
   but the clean baseline is taken powered off, so that "clean" is exact.
-- Output is capped at 16 KB per stream for `vm_run`, and `vm_read_out` at 256 KB per file and 1 MB per call by default.
+- `vm_run` returns 16 KB per stream by default (`HYPERV_MCP_OUTPUT_BYTES`, up to 1 MB; see "Configuration"), and `vm_read_out` at 256 KB per file and 1 MB per call by default.
   Write big results to a file in `C:\out` and read it in parts.
 - Commands run over PowerShell Direct in session 0, as the admin, or as the standard user in its own PowerShell Direct
   session. For that, the guest's admin adds the user to the guest's Remote Management Users group first, inside that
@@ -1462,7 +1513,8 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
 
   Every network and CIM cmdlet name in the block is renamed to a stub before it runs, and the test refuses to run on one
   it doesn't stub or on a call to ipconfig or netsh, so nothing reaches the PC's real network settings.
-- `timing.test.js` (MC-1558): the timings' defaults, floors, caps and derived call bounds; an invalid `timingCaps`
+- `timing.test.js` (MC-1558, MC-1579): the timings' defaults, the ceilings left only where a value breaks (copy idle,
+  the output, Node's timer limit), with no floors, and the derived call bounds; an invalid `timingCaps`
   refusing the start; values per connection, kept by a lease through its cleanup after a disconnect and by a pool job,
   defaults for recovery, the queue place's, what server.js sends; the restore call holding the off-wait; a Windows copy
   in parts, past one call's bound, stalled, resumed and cancelled; guest-setup retried once after a timeout or a lost
@@ -1675,7 +1727,7 @@ Then delete `%USERPROFILE%\.ssh\hvnest-proof\`. No host firewall rule, switch or
   (`install.cmd`, `uninstall.cmd`; setup installs `uninstall.cmd` beside `approve.cmd`). `setup\teardown.ps1` is
   uninstall's teardown, and `setup\appsentry.ps1` the Installed apps entry, its launcher and the last phase (MC-1557);
   setup copies `uninstall.ps1`, `teardown.ps1`, `acl.ps1`, `appsentry.ps1` and `Storage.cs` into
-  `%ProgramFiles%\hyperv-mcp\uninstall`. `helper\inventory.js` renders the helper's recorded inventory. `helper\timing.js` holds the timings' keys, defaults, ranges and caps (MC-1558). `setup\acl.ps1` holds
+  `%ProgramFiles%\hyperv-mcp\uninstall`. `helper\inventory.js` renders the helper's recorded inventory. `helper\timing.js` holds the timings' keys and defaults, and the most a value can be where more breaks (MC-1558, MC-1579). `setup\acl.ps1` holds
   setup's storage and ACL routines, with `setup\Storage.cs` for the Windows calls they need (both tested non-elevated
   by `test\acl-check.ps1`).
 - `test\live\`: the nested live proof (MC-1559, "Live proof in a nested VM"). `nested-proof.js` is the host-side

@@ -33,8 +33,12 @@
 # hvmcp-host and gives this PC a static address on -HostSubnet (default 10.137.42.0/24; this PC is .1, VMs .10 up),
 # refused if anything on this PC already uses that range. Setup changes no firewall rule: it prints the lines that would
 # let host-mode VMs reach a service, for you to run if you want. Lowering it below Host removes that switch.
-# -MaxSessionMinutes caps a work session (vm_renew can extend a lease up to it, from vm_acquire): 5-1440 and at least
-# -MaxLeaseMinutes. Left out, the helper uses 480 (or -MaxLeaseMinutes, if that is more).
+# -MaxSessionMinutes caps a work session (vm_renew can extend a lease up to it, from vm_acquire): at least
+# -MaxLeaseMinutes, with no upper limit (MC-1579). Left out, the helper uses 480 (or -MaxLeaseMinutes, if that is more).
+# -MaxLeaseCheckpoints (default 3), -MaxCheckpointsPerVm (default 4) and -MinFreeGBForCheckpoint (default 20) set how many
+# checkpoints one lease may take, how many pool checkpoints one VM may hold, and the free space a take must leave
+# (MC-1579). The two counts together may be at most 48: Hyper-V keeps at most 50 checkpoints of a VM, and the clean
+# checkpoint, with a second one while it is refreshed, takes 2. Left out, the helper's defaults.
 # It is idempotent: run it again to update the helper or change the policy. It keeps an existing pool and its state.
 # It never enables Windows features or restarts the PC: if Hyper-V is off, it says how to turn it on and stops.
 param(
@@ -51,6 +55,9 @@ param(
   [int]$MaxReservePercent = 100,
   [int]$MaxLeaseMinutes = 240,
   [int]$MaxSessionMinutes = 0,
+  [int]$MaxLeaseCheckpoints = -1,
+  [int]$MaxCheckpointsPerVm = -1,
+  [int]$MinFreeGBForCheckpoint = -1,
   [int]$MaxBuildMB = 2048,
   [switch]$AllowUnpinnedIso, # MC-1572: obsolete, accepted and ignored (any image the approved plan names is used)
   [string[]]$BuildRoot = @(),
@@ -136,8 +143,6 @@ $buildRoots = @($BuildRoot | Where-Object { $_ } | ForEach-Object {
   if (-not (Test-Path -LiteralPath $b -PathType Container)) { Write-Warning "Build root $b doesn't exist yet: it is recorded, and used once it exists." }
   $b
 } | Select-Object -Unique)
-# The helper's policy check allows at most 16 (helper/policy.js): refuse more here, before anything changes.
-if ($buildRoots.Count -gt 16) { throw "At most 16 build roots: $($buildRoots.Count) were given." }
 # Projects (MC-1502): -ProjectsFile's list, checked by the helper's own policy.js (with node, which setup needs anyway)
 # before anything changes; left out, the current policy's list is kept; 'none' clears it.
 $projects = @()
@@ -174,7 +179,11 @@ if ($projects.Count) {
   $projectsLine = ($projects | ForEach-Object { "$($_.name) (cap $(Format-Share $_.maxVms)$(if ($_.images) { ", images $(@($_.images).Count)" }))" }) -join '; '
 }
 # The helper refuses a policy whose session cap is below one lease (helper/policy.js): refuse it here first.
-if ($MaxSessionMinutes -and ($MaxSessionMinutes -lt 5 -or $MaxSessionMinutes -gt 1440 -or $MaxSessionMinutes -lt $MaxLeaseMinutes)) { throw "-MaxSessionMinutes must be 5-1440 and at least -MaxLeaseMinutes ($MaxLeaseMinutes)." }
+if ($MaxSessionMinutes -and ($MaxSessionMinutes -lt 1 -or $MaxSessionMinutes -lt $MaxLeaseMinutes)) { throw "-MaxSessionMinutes must be at least -MaxLeaseMinutes ($MaxLeaseMinutes)." }
+# The checkpoint settings (MC-1579), checked as the helper checks them: left out (-1), the helper's defaults 3 and 4.
+$leaseCps = $(if ($MaxLeaseCheckpoints -ge 0) { $MaxLeaseCheckpoints } else { 3 })
+$poolCps = $(if ($MaxCheckpointsPerVm -ge 0) { $MaxCheckpointsPerVm } else { 4 })
+if ($leaseCps + $poolCps -gt 48) { throw "-MaxLeaseCheckpoints ($leaseCps) and -MaxCheckpointsPerVm ($poolCps) together must be at most 48: Hyper-V keeps at most 50 checkpoints of a VM, and the clean checkpoint, with a second one while it is refreshed, takes 2." }
 # MC-1556: the network ceiling, and host mode's subnet, worked out and checked here (read-only), before anything changes.
 if ($MaxNetwork -and $PSBoundParameters.ContainsKey('AllowNetwork')) { throw 'Give -MaxNetwork, or the older -AllowNetwork, not both. Nothing was changed.' }
 $curPolicy = $null
@@ -368,6 +377,9 @@ $policy = [ordered]@{
 }
 if ($projects.Count) { $policy.projects = @($projects) } # checked, against this maxVms, before anything changed
 if ($MaxSessionMinutes) { $policy.maxSessionMinutes = $MaxSessionMinutes }
+if ($MaxLeaseCheckpoints -ge 0) { $policy.maxLeaseCheckpoints = $MaxLeaseCheckpoints }
+if ($MaxCheckpointsPerVm -ge 0) { $policy.maxCheckpointsPerVm = $MaxCheckpointsPerVm }
+if ($MinFreeGBForCheckpoint -ge 0) { $policy.minFreeGBForCheckpoint = $MinFreeGBForCheckpoint }
 if ($hostNetwork) { $policy.hostNetwork = $hostNetwork } # MC-1556
 $policyFile = Join-Path $state 'policy.json'
 Write-SecureFile $policyFile ($policy | ConvertTo-Json -Depth 4) @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=ReadAndExecute") $ADMINS

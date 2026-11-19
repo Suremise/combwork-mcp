@@ -32,7 +32,6 @@ const { LinuxDriver, PATHS: LINUX_PATHS } = require('./guests/linux')
 
 const PLAN_ID_RE = /^p-[0-9a-f]{16}$/
 const PLAN_TTL_MS = 30 * 60_000
-const OUTPUT_CAP = 16 * 1024
 const MAX_COMMAND = 8000
 // MC-1558: the user-adjustable timings (guest ready, logon, install, provisioning, restore, checkpoints, the queue place,
 // copy) are timing.js's, per connection, lease or job: this.tm(lease).
@@ -882,10 +881,14 @@ class Helper {
 
   armDeadline(lease) {
     if (lease.timer) { clearTimeout(lease.timer); this.timers.delete(lease.timer) }
+    // MC-1579: leases have no ceiling of their own, and Node's timers fire at once past ~24.8 days, so a later deadline
+    // is waited for in steps of at most that long.
+    const left = Math.max(0, lease.deadline - this.now())
     lease.timer = setTimeout(() => {
       this.timers.delete(lease.timer)
+      if (left > timing.TIMER_MAX_MS) { this.armDeadline(lease); return }
       void this.endLease(lease, 'its deadline passed')
-    }, Math.max(0, lease.deadline - this.now()))
+    }, Math.min(left, timing.TIMER_MAX_MS))
     lease.timer.unref?.()
     this.timers.add(lease.timer)
   }
@@ -1132,7 +1135,7 @@ class Helper {
   async planRefresh(args) {
     const list = Array.isArray(args.targets) ? args.targets : Array.isArray(args.vms) ? args.vms : []
     const names = [...new Set(list)]
-    if (!names.length || names.length > 16 || names.some(n => typeof n !== 'string')) throw new Error('targets must list 1-16 VM names (vm_status lists them).')
+    if (!names.length || names.some(n => typeof n !== 'string')) throw new Error('targets must list at least one VM name (vm_status lists them).')
     const s = this.state
     const floor = this.policy.minFreeGBForCheckpoint ?? 20
     const facts = await this.hv('facts', { folders: this.policy.diskFolders })
@@ -1721,7 +1724,7 @@ class Helper {
         if (okSince === null) okSince = now
         if (now - okSince >= NET_STABLE_MS) break
       } else okSince = null
-      if (now - t0 > waitMs) throw new Error(`its network (${lease.network}) wasn't ready and steady within ${Math.round(waitMs / 1000)} s (HYPERV_MCP_NETWORK_SECONDS, up to ${timing.KEYS.networkSeconds.max} s, if it needs longer): ${why || 'it changed while it was read'}`)
+      if (now - t0 > waitMs) throw new Error(`its network (${lease.network}) wasn't ready and steady within ${Math.round(waitMs / 1000)} s (raise HYPERV_MCP_NETWORK_SECONDS if it needs longer): ${why || 'it changed while it was read'}`)
       await this.sleep(Math.min(1000, Math.max(50, NET_STABLE_MS / 5)))
     }
     return lease.network === 'host'
@@ -1958,7 +1961,7 @@ class Helper {
       }
       const n = ++lease.runs
       const creds = this.creds()
-      const args = { ...this.ident(vm), cred: creds.admin, n, command, shell, cwd: cwd || this.paths(vm).build, cap: OUTPUT_CAP }
+      const args = { ...this.ident(vm), cred: creds.admin, n, command, shell, cwd: cwd || this.paths(vm).build, cap: this.tm(lease).ms.outputBytes }
       // Started (or published), then polled with short calls against one deadline, counted from the start's reply
       // (MC-1510): no PowerShell Direct call is held for the run, since one call ends after 10 minutes.
       let started = null
@@ -1981,7 +1984,7 @@ class Helper {
         this.stillHeld(lease)
         const k = await this.guestCall(vm, 'guest-run-kill', { ...this.ident(vm), cred: creds.admin, pid: started.pid, started: started.started, n, job: started.job ?? null }, this.forLease(lease, CLEANUP_MS)).catch(e => ({ killed: false, why: e.message }))
         this.stillHeld(lease)
-        const last = await this.guestCall(vm, 'guest-run-poll', { ...this.ident(vm), cred: creds.admin, n, cap: OUTPUT_CAP }, this.forLease(lease, CLEANUP_MS)).catch(() => null)
+        const last = await this.guestCall(vm, 'guest-run-poll', { ...this.ident(vm), cred: creds.admin, n, cap: this.tm(lease).ms.outputBytes }, this.forLease(lease, CLEANUP_MS)).catch(() => null)
         r = last?.done && k.gone ? last : { ...(last || {}), exitCode: null, timedOut: true, killed: !!k.killed, killVia: k.via, killWhy: k.why }
       } else if (interactive && !r) {
         const pending = polled.last?.pending
@@ -1989,7 +1992,7 @@ class Helper {
       } else if (interactive) r = { ...r, clean: true }
       const exit = Number.isInteger(r.exitCode) ? r.exitCode : null
       if (r.timedOut || exit !== 0) lease.failed = true
-      const out = s => (typeof s === 'string' ? s : '').slice(0, OUTPUT_CAP)
+      const out = s => (typeof s === 'string' ? s : '').slice(0, this.tm(lease).ms.outputBytes)
       // An interactive run that didn't finish cleanly isn't chased: the VM is restored, which ends whatever it started.
       // MC-1547: a Windows run in its own job whose timeout kill couldn't be confirmed through that job is never chased
       // process by process (a PID-tree kill could miss a child created as it ran): the VM is restored, as for an
@@ -2004,8 +2007,8 @@ class Helper {
             : r.timedOut
             ? `Timed out after ${timeoutSec} s: ${r.killed ? (linux ? 'killed inside the guest with everything it started (its systemd unit' + "'" + 's cgroup).' : r.killVia === 'job' ? 'killed inside the guest with everything it started (its job object, MC-1547).' : 'killed inside the guest by its PID (taskkill /T /F).') : `not confirmed killed${r.killWhy ? ` (${r.killWhy})` : ''}; vm_stop is the fallback.`}`
             : `Exit code ${exit === null ? 'unknown' : exit}.`,
-        `--- stdout${r.stdoutCut ? ` (first ${OUTPUT_CAP} bytes)` : ''} ---`, out(r.stdout),
-        `--- stderr${r.stderrCut ? ` (first ${OUTPUT_CAP} bytes)` : ''} ---`, out(r.stderr)
+        `--- stdout${r.stdoutCut ? ` (first ${this.tm(lease).ms.outputBytes} bytes)` : ''} ---`, out(r.stdout),
+        `--- stderr${r.stderrCut ? ` (first ${this.tm(lease).ms.outputBytes} bytes)` : ''} ---`, out(r.stderr)
       ]
       return { text: lines.join('\n'), isError: !!r.timedOut || !!restored, data: { exitCode: exit, timedOut: !!r.timedOut, session, ...(restored ? { restored: true } : {}) } }
     })
@@ -2028,7 +2031,7 @@ class Helper {
       if (polls > 0 || left > 0) await sleep(Math.max(0, Math.min(left, this.now() - t0 < 10_000 ? Math.min(1000, POLL_MS) : POLL_MS)))
       this.stillHeld(lease)
       const bound = Math.max(MIN_POLL_MS, Math.min(CALL_MS, deadline - this.now()))
-      const r = await this.guestCall(vm, 'guest-run-poll', { ...this.ident(vm), cred: creds.admin, n, cap: OUTPUT_CAP }, this.forLease(lease, bound)).catch(() => null)
+      const r = await this.guestCall(vm, 'guest-run-poll', { ...this.ident(vm), cred: creds.admin, n, cap: this.tm(lease).ms.outputBytes }, this.forLease(lease, bound)).catch(() => null)
       if (r) last = r
       if (r?.done) return { result: r, last }
     }
@@ -2132,7 +2135,7 @@ class Helper {
       if (lease.sync.trusted === false) throw new Error(`${this.paths(vm).build} is unconfirmed (a copy or sync didn't finish): run a full vm_sync or vm_reset first.`)
       const mine = this.leaseCheckpoints(lease)
       if (mine.some(x => x.name === name)) throw new Error(`This lease already has a checkpoint "${name}".`)
-      const cap = this.policy.maxLeaseCheckpoints ?? 3
+      const cap = this.policy.maxLeaseCheckpoints ?? policyMod.DEFAULT_LEASE_CHECKPOINTS
       if (mine.length >= cap) throw new Error(`This lease holds ${mine.length} checkpoints, the policy's maxLeaseCheckpoints (${cap}).`)
       const floor = this.policy.minFreeGBForCheckpoint ?? 20
       const facts = await this.hv('facts', { folders: [vm.folder] }, this.forLease(lease))
@@ -2471,10 +2474,10 @@ class Helper {
     if (typeof name !== 'string' || !POOL_CHECKPOINT_RE.test(name) || name.toLowerCase() === 'clean') throw new Error('name must be 1-40 letters, digits, spaces, dots, dashes, pluses or underscores, starting with a letter or digit, and not "clean".')
     const list = Array.isArray(args.targets) ? args.targets : Array.isArray(args.vms) ? args.vms : []
     const names = [...new Set(list)]
-    if (!names.length || names.length > 16 || names.some(n => typeof n !== 'string')) throw new Error('targets must list 1-16 VM names (vm_status lists them).')
+    if (!names.length || names.some(n => typeof n !== 'string')) throw new Error('targets must list at least one VM name (vm_status lists them).')
     const project = this.projectOf(args.roots)
     const s = this.state
-    const cap = this.policy.maxCheckpointsPerVm ?? 4
+    const cap = this.policy.maxCheckpointsPerVm ?? policyMod.DEFAULT_POOL_CHECKPOINTS
     const floor = this.policy.minFreeGBForCheckpoint ?? 20
     const facts = mode === 'remove' ? null : await this.hv('facts', { folders: this.policy.diskFolders })
     const entries = []
@@ -2664,7 +2667,7 @@ class Helper {
     }
     let lease = bound()
     if (this.pcpBusy.has(e.vmId)) throw new Error('another pool-checkpoint operation is running on it')
-    const cap = this.policy.maxCheckpointsPerVm ?? 4
+    const cap = this.policy.maxCheckpointsPerVm ?? policyMod.DEFAULT_POOL_CHECKPOINTS
     const held = [...this.state.poolSnaps.values()].filter(x => x.vmId === e.vmId).length + [...this.state.leaseSnaps.values()].filter(x => x.vmId === e.vmId && x.snapName.startsWith('hvmcp-pool-')).length
     if (held + 1 > cap) throw new Error(`it would hold more than maxCheckpointsPerVm (${cap}) pool checkpoints`)
     this.pcpBusy.add(e.vmId)
@@ -2915,7 +2918,7 @@ class Helper {
     // MC-1572: the bytes approved are the bytes built: hv.ps1 hashes the helper's copy against the approved SHA-256 just
     // before it attaches it, and refuses a mismatch with nothing created.
     step('checking the ISO copy against the approved SHA-256, then creating the VM')
-    const c = await this.hv('create-vm', { name: a.name, folder: a.folder, cores: a.cores, memoryMB: a.memoryMB, diskGB: a.diskGB, iso: img.file, isoSha256: plan.image.sha256, unattendIso }, { timeoutMs: 10 * 60_000 }) // hashing up to 16 GB first
+    const c = await this.hv('create-vm', { name: a.name, folder: a.folder, cores: a.cores, memoryMB: a.memoryMB, diskGB: a.diskGB, iso: img.file, isoSha256: plan.image.sha256, unattendIso }, { timeoutMs: 10 * 60_000 + Math.ceil((img.size || 0) / 1024 ** 3) * 60_000 }) // hashing the ISO first: 10 min, and 1 more per GB (MC-1579: no size cap)
     this.journal.append({ t: 'created', intentId: a.intentId, vmId: c.vmId })
     const vm = this.state.vms.get(c.vmId)
     step('installing Windows unattended (network off)')

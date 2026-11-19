@@ -28,7 +28,9 @@ const VERSION = (() => {
 const ENABLED = process.env.HYPERV_MCP_ENABLED === '1'
 const MODE = process.env.HYPERV_MCP_MODE === 'direct' ? 'direct' : 'service'
 const PIPE = `\\\\.\\pipe\\${process.env.HYPERV_MCP_PIPE || 'hyperv-mcp'}`
-const MAX_BUILD_MB = Number(process.env.HYPERV_MCP_MAX_BUILD_MB || 2048)
+// MC-1579: a number above 0, no upper limit; empty or anything else is the default (2048). The policy's maxBuildMB is the
+// helper's own cap.
+const MAX_BUILD_MB = (n => Number.isFinite(n) && n > 0 ? n : 2048)(Number(String(process.env.HYPERV_MCP_MAX_BUILD_MB ?? '').trim() || NaN))
 const CHUNK = 768 * 1024
 const MANIFEST_BYTES = 1024 * 1024
 // The service host closes a connection whose request line is over 4 MB (HvMcpHost.cs MaxLine), and with it the lease:
@@ -300,7 +302,8 @@ const session = { start: null, build: null }
  * if it is still going, by saying so and that vm_wait (which waits up to REPLY_MS again) is the next call to make. The
  * operation itself, the lease and its deadline are unchanged; this server exiting still ends the lease.
  */
-const REPLY_MS = Math.max(1000, Number(process.env.HYPERV_MCP_REPLY_MS) || 45_000)
+// At least 1 s; at most Node's timer limit (about 24.8 days: a longer delay would fire at once).
+const REPLY_MS = Math.min(2 ** 31 - 1, Math.max(1000, Number(process.env.HYPERV_MCP_REPLY_MS) || 45_000))
 const BOUNDED = new Set(['vm_start', 'vm_reset', 'vm_restore', 'vm_checkpoint', 'vm_run', 'vm_sync'])
 // While one is in progress, only these run beside it: waiting, reading status, renewing the lease (a long run may
 // need it), and releasing it, which ends the operation as it always has (the helper restores the VM).
@@ -526,7 +529,7 @@ const tools = [
   },
   {
     name: 'vm_run',
-    description: 'Run a command in the running VM and return its exit code, stdout and stderr (16 KB each). Runs as the guest\'s admin, or as its standard user. Windows: by default in session 0 (PowerShell Direct: no desktop; on a timeout it is killed by its PID). Linux: bash or sh, as root or hvuser, in its own systemd unit (on a timeout it is killed with everything it started). With session: \'interactive\' (after vm_start with interactive), in the logged-on account\'s desktop session instead; if such a run times out or doesn\'t finish cleanly, the VM is restored (its output is read first), which ends everything it started: vm_start or vm_reset to go on.',
+    description: 'Run a command in the running VM and return its exit code, stdout and stderr (16 KB each by default: HYPERV_MCP_OUTPUT_BYTES). Runs as the guest\'s admin, or as its standard user. Windows: by default in session 0 (PowerShell Direct: no desktop; on a timeout it is killed by its PID). Linux: bash or sh, as root or hvuser, in its own systemd unit (on a timeout it is killed with everything it started). With session: \'interactive\' (after vm_start with interactive), in the logged-on account\'s desktop session instead; if such a run times out or doesn\'t finish cleanly, the VM is restored (its output is read first), which ends everything it started: vm_start or vm_reset to go on.',
     inputSchema: {
       type: 'object',
       properties: {
