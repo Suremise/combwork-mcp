@@ -357,7 +357,9 @@ pool_plan({ action: "create", vms: 2, image: { iso: "D:\\Downloads\\Win11_Eval.i
 - It has `HYPERV_MCP_GUEST_SCRIPT_MINUTES` (default 30) to finish. A non-zero exit, or no exit in time, fails that
   VM's build, and the job's note gives the end of its output. Its own command and output files are removed before the
   checkpoint.
-- At most 1 MB: the whole script goes to the guest in one call. Have it fetch nothing: the guest is offline.
+- Up to about 512 MB (MC-1588; formerly 1 MB): the helper reads it as text, and Node holds a string of at most
+  536870888 characters. It reaches a Windows guest in 1 MB pieces, and a Linux guest as bytes after its request, so
+  no one guest call carries it whole. Have it fetch nothing: the guest is offline.
 - A resize names it again for the VMs it adds; without one, they're built plain. `pool_refresh` doesn't rerun it:
   what it did is already in the clean checkpoint it refreshes from.
 
@@ -455,7 +457,7 @@ you approved.
 | `vm_sync({ build?, full=false, delete=true })` | Copies only the files that changed in `build` (default: the folder last started or synced) into the **running** guest's `C:\build`, without a restore: `C:\out`, installed software and anything else the runs left stay. The server hashes the folder (same roots checks as `vm_start`, every time; links skipped); the helper compares that with what it placed in `C:\build` and takes only the new or changed files, hashing them itself as they arrive. Files gone from the folder are removed unless `delete` is false. Only what the helper copied is tracked: if your runs changed `C:\build` themselves, use `full: true` (clears `C:\build`, copies everything) or `vm_reset`. After a sync fails, only those two are accepted. |
 | `vm_reset({ build?, network?, reserveCpu?, interactive? })` | A clean VM now: exactly `vm_start` (restore first, verified), with this session's last start's `network`, `reserveCpu` and `interactive` and its last build unless given. |
 | `vm_run({ command, shell='cmd'\|'powershell'\|'bash'\|'sh', as='admin'\|'user', timeoutSec=120, cwd='C:\build', session='service'\|'interactive' })` | Runs in the guest (on Linux: bash by default, in `/build`, as root or `hvuser`, killed with everything it started on a timeout; see "Linux guests"). stdout and stderr go to `C:\out\.run-<n>.*`, and the reply has the exit code and 16 KB of each (`HYPERV_MCP_OUTPUT_BYTES`). `as: 'user'` runs as the standard user, for whom `C:\build` is read-only. `session: 'service'` (the default) runs in session 0; on a timeout, everything the run started is killed inside: each run starts in its own Job object (MC-1547), so the kill ends every process in it, whenever it was created (taskkill /T's snapshot missed a child created as it ran). A run that can't be put in its job isn't started (the reply says why), and a job kill that can't be confirmed restores the VM instead, which ends everything the run started: a run is never chased process by process. (A run started without a job, by an older helper, is still killed by its PID with `taskkill /T /F`, only while that PID is still the run's process.) A run's program can't break away from the job; one that makes its own job gets a nested one, which ends with it. A run is started in one short PowerShell Direct call and its exit file then polled with short calls (see "Long runs"), so it may take as long as `timeoutSec` allows. `session: 'interactive'` runs in the desktop session `vm_start`'s `interactive` logged on, as that account (`as` must name it), through a watcher started in that session at logon (`hvadmin` elevated, `hvuser` a standard user). If it times out or doesn't finish cleanly, its output so far is returned and the VM is restored, which ends everything it started; `vm_start` or `vm_reset` goes on. |
-| `vm_read_out({ paths?, glob?, maxBytes=256 KB, maxTotalBytes=1 MB, base64=false })` | Files from the guest's `C:\out`, read in the guest and capped while reading, returned as data. Paths are relative and checked before the call (no `..`, drives, UNC or device paths, streams or device names). `glob` is matched against a listing. Links are skipped. With neither, it lists. Text as text, PNG/JPEG as images. Read before `vm_stop`, which discards them. |
+| `vm_read_out({ paths?, glob?, maxBytes=256 KB, maxTotalBytes=1 MB, base64=false })` | Files from the guest's `C:\out`, read in the guest and capped while reading, returned as data. `maxBytes` has no cap of its own; `maxTotalBytes` at most about 85 MB (see "Limits"). A Windows guest's files come back in calls of at most 2 MB. Paths are relative and checked before the call (no `..`, drives, UNC or device paths, streams or device names). `glob` is matched against a listing. Links are skipped. With neither, it lists. Text as text, PNG/JPEG as images. Read before `vm_stop`, which discards them. |
 | `vm_stop({ keep=false })` | Turns the VM off and restores the clean checkpoint, then **verifies** it: Off, at the checkpoint (by id), adapter disconnected, reserve 0. It says "Reverted" only then. Otherwise **CLEANUP FAILED**, and the VM is quarantined. The lease stays. `keep` (or a failed run with `keepOnFailure`) leaves it as it is until release or the deadline. |
 | `vm_checkpoint({ name })` | Takes a named checkpoint of your leased VM as it runs now: files, installed software and the registry (a production checkpoint, disk only: not running programs or a logon session). Yours only, removed when the lease ends. See "Checkpoints within a lease". |
 | `vm_restore({ name })` | Restores one of your lease's checkpoints and starts the VM from it, with the lease's current network and CPU reserve. No one is logged on interactively afterwards, and C:\build is unconfirmed until a full `vm_sync`. |
@@ -858,6 +860,7 @@ only where a larger one would break something, and the reason is given here.
 | `HYPERV_MCP_PIPE` | Optional. The pipe's name (default `hyperv-mcp`). |
 | `HYPERV_MCP_REPLY_MS` | How long a slow tool, or `vm_wait`, waits before replying "still in progress" (default 45000, at least 1000; see "Slow operations"). Keep it under your MCP client's tool-call timeout. At most about 24.8 days: Node's timers fire at once past that. |
 | `HYPERV_MCP_OUTPUT_BYTES` | How much of each of a `vm_run`'s stdout and stderr comes back (default 16384). At most 1 MB: a Linux guest's dispatcher (`guest.py`, copied into each VM when it is built) returns no more. Sent to the helper like the timings, so a lease keeps its connection's value. |
+| `HYPERV_MCP_COMMAND_CHARS` | How long a `vm_run` command may be, in characters (default 8000, formerly fixed; MC-1588). At most 4194304: the command reaches the helper inside one request line of at most 4 MB (the service host's line limit), so a command with many characters JSON escapes (`\uXXXX`) is refused by that limit sooner. A long command reaches a Windows guest in 1 MB pieces and a Linux guest as bytes after its request, so no guest call carries it whole. A Linux VM built before MC-1588 takes at most 8000 characters (its `guest.py`): rebuild it for longer ones, and the reply says so. Sent to the helper like the timings, so a lease keeps its connection's value. |
 | `HYPERV_MCP_*_MINUTES`, `HYPERV_MCP_*_SECONDS` | How long the helper waits for slow work (see "Timings" below). |
 
 ### Timings
@@ -1213,8 +1216,9 @@ path from the registry or the inventory.
 
 Nothing here is a fixed limit of the server's own (MC-1579): each is a setting with a default, and a ceiling is left
 only where a larger value breaks something, named with its reason.
-- **In the server's `env`** (see "Configuration"): the timings, `vm_run`'s output (`HYPERV_MCP_OUTPUT_BYTES`), the
-  build size this server streams and the reply wait.
+- **In the server's `env`** (see "Configuration"): the timings, `vm_run`'s output (`HYPERV_MCP_OUTPUT_BYTES`) and
+  its command's length (`HYPERV_MCP_COMMAND_CHARS`, default 8000, formerly fixed), the build size this server streams
+  and the reply wait.
 - **In setup's policy** (an admin's, see "Setup"): VMs, cores, memory and disk with no ceiling of setup's (formerly 64
   VMs, 64 cores, 1 TB, 4 TB). Hyper-V's own maximums depend on its version ([Microsoft's table](https://learn.microsoft.com/en-us/windows-server/virtualization/hyper-v/maximum-scale-limits)
   lists Windows Server's, not Windows 11's), so Hyper-V itself refuses a VM past them, by name, when it is created. A
@@ -1230,20 +1234,36 @@ only where a larger value breaks something, named with its reason.
   check of an ISO's hash allows 10 minutes and 1 more per GB.
 - **Kept, with their reasons:** `HYPERV_MCP_COPY_IDLE_MINUTES` at most 9 (PowerShell Direct's ~10-minute call);
   `HYPERV_MCP_OUTPUT_BYTES` at most 1 MB (`guest.py`); a request to the helper at most 4 MB (the service host's line
-  limit).
+  limit), and so `HYPERV_MCP_COMMAND_CHARS` at most 4194304.
 - **`vm_run`'s `timeoutSec`** has no ceiling (formerly 3600): a run is started in one short call and then polled, so no
   call is held for it. `HYPERV_MCP_GUEST_SCRIPT_MINUTES` (MC-1577) has no range either (formerly 1-360), for the same
   reason.
-- **Not yet settled (MC-1588):** a guest setup script at most 1 MB, a `vm_run` command at most 8000 characters, and
-  `vm_read_out` at most 16 MB per file and 64 MB per call. Each goes to or from the guest in one call; what that call
-  can really carry (PowerShell Direct on Windows, `guest.py` on Linux) is still to be found, and each will then be a
-  setting or keep that limit with its reason.
+- **Settled by MC-1588:** three limits that went to or from the guest in one call. None travels in one call now, so
+  what one call carries no longer limits them. A PowerShell Direct call refuses an object over PowerShell remoting's
+  `MaximumReceivedObjectSizeMB` (10 MB by default; not measured on a real VM for PowerShell Direct), so every piece
+  stays under it even counted at two bytes a character.
+  - A `vm_run` command: a setting, `HYPERV_MCP_COMMAND_CHARS` (default 8000), at most 4194304 (the helper's 4 MB
+    request line; see "Configuration"). Over 256K characters, it reaches a Windows guest in 1 MB pieces (base64), as
+    the account that runs it, and the start refuses it unless the staged file holds exactly the bytes sent. Over 8000,
+    it reaches a Linux guest as bytes after the request line; `guest.py` no longer caps its length. Neither the cmd.exe
+    line limit (8191) nor the Windows command line (32767) applies: the command is written to a script file in the
+    guest and run from there (a single line of a `.cmd` over 8191 characters is still cmd's own error).
+  - The guest setup script: at most 536870887 bytes (about 512 MB; formerly 1 MB). The helper reads it as text, and
+    Node holds a string of at most 536870888 characters (`buffer.constants.MAX_STRING_LENGTH`), one of which a `.ps1`'s
+    byte order mark takes. It goes to the guest as a long command does.
+  - `vm_read_out`: `maxBytes` has no cap of its own (formerly 16 MB); `maxTotalBytes` at most 89303718 (about 85 MB;
+    formerly 64 MB, which a Windows guest couldn't return: `hv.js` read a reply up to 16 M characters, and 64 MB is 85
+    M characters of base64). The files come back in one reply, held as one string on the way (the helper's reply line,
+    the server's MCP reply), and a text file's control characters are written as `\u00XX`, six characters a byte: so a
+    sixth of Node's string limit, less 1 MB for the rest. A Windows guest's files are read in calls of at most 2 MB,
+    each going on where the last stopped; a Linux guest's in one call (`ssh.js` reads its answer up to 192 M
+    characters).
 
 ### Other limits
 
 - A cold start of a VM boots Windows: tens of seconds. A start from a checkpoint taken while running would be faster,
   but the clean baseline is taken powered off, so that "clean" is exact.
-- `vm_run` returns 16 KB per stream by default (`HYPERV_MCP_OUTPUT_BYTES`, up to 1 MB; see "Configuration"), and `vm_read_out` at 256 KB per file and 1 MB per call by default.
+- `vm_run` returns 16 KB per stream by default (`HYPERV_MCP_OUTPUT_BYTES`, up to 1 MB; see "Configuration"), and `vm_read_out` at 256 KB per file and 1 MB per call by default (up to about 85 MB a call).
   Write big results to a file in `C:\out` and read it in parts.
 - Commands run over PowerShell Direct in session 0, as the admin, or as the standard user in its own PowerShell Direct
   session. For that, the guest's admin adds the user to the guest's Remote Management Users group first, inside that
@@ -1274,7 +1294,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\restorewait.test.js test\runs.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js test\linux-image.test.js test\linux-guest-files.test.js test\linux.test.js test\linux-ps.test.js test\bridge.test.js test\network.test.js test\guestnet.test.js test\uninstall.test.js test\timing.test.js test\nested-proof.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\restorewait.test.js test\runs.test.js test\caps.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js test\linux-image.test.js test\linux-guest-files.test.js test\linux.test.js test\linux-ps.test.js test\bridge.test.js test\network.test.js test\guestnet.test.js test\uninstall.test.js test\timing.test.js test\nested-proof.test.js
 ```
 
 - `units.test.js`:
@@ -1477,6 +1497,15 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   retried within the one deadline; nothing sent to the guest once the lease ends. And `hv.ps1`'s own kill, run with
   Windows PowerShell 5.1 on this machine's processes: the run's own process killed and confirmed, a process with
   another creation time or no recorded identity never killed, one already gone reported gone.
+- `caps.test.js` (MC-1588): a `vm_run` command held to `HYPERV_MCP_COMMAND_CHARS` (default 8000), the lease keeping
+  its value; a long one sent to a Windows guest in 1 MB pieces as the account that runs it, run byte for byte, and a
+  staging the guest doesn't confirm whole never started; `vm_read_out` reading a Windows guest's files in calls of at
+  most 2 MB, going on from an offset, cut by the call's total; its ceilings (`maxTotalBytes` at what one reply can hold,
+  `maxBytes` none); and `hv.ps1`'s `$GuestRunStage`, `$RunFiles` and `$GuestRead`, run with Windows PowerShell 5.1:
+  a 2.5 MB `.ps1` staged, moved into place and run as UTF-8, a short staging refused, a read from an offset.
+  `linux.test.js` has the Linux side (bytes after the request line; a dispatcher built before MC-1588 refusing them, the
+  reply saying why), `guest_unit_check.py` `guest.py`'s, and `provision.test.js` a 2.5 MB guest setup script staged at
+  build.
 - `approvals.test.js`:
   - unapproved plans;
   - forged approvals: another digest, operation or epoch, expired, a malformed nonce, another plan's id, a writable

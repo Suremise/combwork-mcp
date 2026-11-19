@@ -313,21 +313,31 @@ def private_file(path, owner, text):
     try:
         if os.geteuid() == 0:
             os.fchown(fd, owner[0], owner[1])
-        os.write(fd, text.encode('utf-8'))
+        data = memoryview(text.encode('utf-8'))
+        while data:
+            data = data[os.write(fd, data):]
     finally:
         os.close(fd)
 
 
-def op_run_start(req, _):
+def op_run_start(req, stream):
     n = run_number(req)
     command = req.get('command')
+    # MC-1588: a long command (the helper sends any over 8000 characters this way) comes as commandBytes bytes of UTF-8
+    # after the request line, not in it. No length cap of the dispatcher's own (formerly 8000 characters, 1 MB for the
+    # guest setup script): the helper holds the command's length to its own setting.
+    size = req.get('commandBytes')
+    if size is not None:
+        if command is not None or not isinstance(size, int) or isinstance(size, bool) or size < 1:
+            raise Refused('a bad command')
+        try:
+            command = read_exact(stream, size).decode('utf-8')
+        except UnicodeDecodeError:
+            raise Refused('a bad command')
     shell = req.get('shell', 'bash')
     as_ = req.get('as', 'admin')
     cwd = req.get('cwd') or BUILD
-    # MC-1577: the helper's own build-time runs (the user's guest setup script, numbered 800000000 up, as admin) may be
-    # up to 1 MB; any other run's command stays at most 8000 characters.
-    limit = 1024 * 1024 if n >= 800000000 and as_ == 'admin' else 8000
-    if not isinstance(command, str) or not command.strip() or len(command) > limit or '\0' in command:
+    if not isinstance(command, str) or not command.strip() or '\0' in command:
         raise Refused('a bad command')
     if shell not in ('bash', 'sh'):
         raise Refused('shell must be bash or sh')

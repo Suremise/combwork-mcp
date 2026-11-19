@@ -1,15 +1,16 @@
 /**
- * MC-1558: the user-adjustable timings, and (MC-1579) vm_run's output per stream. Each is an env key in the MCP server's
- * entry (Combwork's .combwork/mcp/hyper-v.json, its env block, where combwork-mcp.example.json ships each with its
- * default), which server.js sends to the helper once per connection (set-timing). A lease takes its connection's values
+ * MC-1558: the user-adjustable timings, (MC-1579) vm_run's output per stream and (MC-1588) its command's length. Each
+ * is an env key in the MCP server's entry (Combwork's .combwork/mcp/hyper-v.json, its env block, where
+ * combwork-mcp.example.json ships each with its default), which server.js sends to the helper once per connection
+ * (set-timing). A lease takes its connection's values
  * when it is acquired; a pool job takes the applying connection's; work with no client behind it (start-up recovery,
  * the quarantine retry) uses the defaults.
  *
  * MC-1579: a value has a default and no range of its own. Any number above 0 is used as given, up to the most it can
  * be where more would break something (`max`, with its reason in `why`): the timings up to Node's timer limit (also
  * hv.ps1's [int] milliseconds), copyIdleMinutes up to 9 (PowerShell Direct's ~10-minute call), outputBytes up to 1 MB
- * (a Linux guest's dispatcher). setup's policy may hold timingCaps, the admin's own highest value for a key, which
- * applies to the default too; setup ships none.
+ * (a Linux guest's dispatcher), commandChars (MC-1588) up to 4 MB (the helper's request line). setup's policy may hold
+ * timingCaps, the admin's own highest value for a key, which applies to the default too; setup ships none.
  *
  * The helper's older HYPERV_MCP_*_MS env variables stay as test-only base values (test/timing.json sets them): when one
  * is set it replaces that key's default, and a value sent by a client still applies over it.
@@ -49,9 +50,16 @@ const KEYS = {
   outputBytes: {
     env: 'HYPERV_MCP_OUTPUT_BYTES', unit: 1, def: 16 * 1024, test: null, what: "each of a vm_run's stdout and stderr", whole: true,
     max: 1024 * 1024, why: "a Linux guest's dispatcher (guest.py, copied into each VM when it is built) returns at most 1 MB a stream"
+  },
+  // MC-1588: how long a vm_run command may be, in characters (formerly a fixed 8000). A long command reaches the guest in
+  // pieces (core.js stageRun, guests/linux.js), so the guest side takes any length; the request carrying it from the
+  // server to the helper is one line of at most 4 MB (the service host's limit), which is the most it can be.
+  commandChars: {
+    env: 'HYPERV_MCP_COMMAND_CHARS', unit: 1, label: 'characters', def: 8000, test: null, what: "a vm_run's command", whole: true,
+    max: 4 * 1024 * 1024, why: "a vm_run reaches the helper as one request line of at most 4 MB (the service host's line limit), the command inside it"
   }
 }
-const unitName = k => KEYS[k].unit === MIN ? 'min' : KEYS[k].unit === SEC ? 's' : 'bytes'
+const unitName = k => KEYS[k].label || (KEYS[k].unit === MIN ? 'min' : KEYS[k].unit === SEC ? 's' : 'bytes')
 const fmt = (k, v) => `${+v.toFixed(2)} ${unitName(k)}`
 
 /** Problems with policy.timingCaps (an object of key -> number), for policy.problems. */
@@ -67,7 +75,7 @@ function capsProblems(caps) {
   return out
 }
 
-/** A key's value as used: whole bytes for outputBytes, at least 1; whole milliseconds for a timing, at least 1. */
+/** A key's value as used: whole bytes or characters for outputBytes and commandChars, at least 1; whole milliseconds for a timing, at least 1. */
 const toMs = (d, v) => Math.max(1, d.whole ? Math.floor(v) : Math.round(v * d.unit))
 
 /**

@@ -199,7 +199,15 @@ $RunFiles = {
   $base = "$(if ($j.out) { [string]$j.out } else { 'C:\out' })\.run-$n" # $j.out: the tests' own folder; the helper never sets it
   $ext = if ($j.shell -eq 'powershell') { 'ps1' } else { 'cmd' }
   $script = "$dir\run-$n.$ext"
-  [IO.File]::WriteAllText($script, [string]$j.command, (New-Object Text.UTF8Encoding $false))
+  if ([long]$j.staged -gt 0) {
+    # MC-1588: a long command came in pieces (guest-run-stage) to run-<n>.stage beside it, as the account that runs it:
+    # moved into place whole, or refused.
+    $stage = "$dir\run-$n.stage"
+    $item = Get-Item -LiteralPath $stage -Force -ErrorAction SilentlyContinue
+    if (-not $item -or $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.Length -ne [long]$j.staged) { throw "the run's command wasn't staged whole ($([long]$j.staged) bytes expected)" }
+    if (Test-Path -LiteralPath $script) { [IO.File]::Delete($script) }
+    [IO.File]::Move($stage, $script)
+  } else { [IO.File]::WriteAllText($script, [string]$j.command, (New-Object Text.UTF8Encoding $false)) }
   $inner = if ($ext -eq 'ps1') { "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$script`"" } else { "cmd.exe /d /c `"$script`"" }
   foreach ($f in "$base.exit", "$base.exit.tmp") { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
   # The exit code is written with the redirection first: "echo 0> file" would redirect handle 0 (cmd treats a digit
@@ -325,6 +333,26 @@ public static class HvMcpRunJob
 }
 '@
 
+# MC-1588: one piece of a long command (core.js stageRun), appended to run-<n>.stage in the folder its run file goes to
+# (part 0 starts it afresh). No one call carries more than a piece. Answers the staged file's length so far.
+$GuestRunStage = {
+  param($j)
+  $ErrorActionPreference = 'Stop'
+  New-Item -ItemType Directory -Force -Path ([string]$j.dir) | Out-Null
+  $f = "$([string]$j.dir)\run-$([int]$j.n).stage"
+  $b = [Convert]::FromBase64String([string]$j.data)
+  $fs = [IO.File]::Open($f, $(if ([int]$j.part -eq 0) { 'Create' } else { 'Append' }), 'Write', 'None')
+  try { $fs.Write($b, 0, $b.Length); $len = $fs.Length } finally { $fs.Close() }
+  @{ bytes = $len }
+}
+
+# A standard user's run (MC-1510) needs the account in Remote Management Users (S-1-5-32-580), like any remote session:
+# added as the guest's admin, inside this disposable guest only; a restore takes it away again.
+$RemoteUser = {
+  param($u)
+  if (-not (Get-LocalGroupMember -SID 'S-1-5-32-580' | Where-Object { $_.Name -like "*\$u" })) { Add-LocalGroupMember -SID 'S-1-5-32-580' -Member $u }
+}
+
 # A session-0 run's start, as the run's own account (its admin, or its standard user in its own PowerShell Direct
 # session): the files, then the wrapper, in the run's own job (MC-1547; $jobSource is $RunJob's text). Returns its PID,
 # its creation time, read from the started process's own handle (a process that has already exited has none to read:
@@ -448,11 +476,14 @@ $GuestList = {
   @{ files = $files; skipped = $skipped }
 }
 
-# Reads files from C:\out, capped while reading; each must resolve inside C:\out and not be a reparse point.
+# Reads files from C:\out, capped while reading; each must resolve inside C:\out and not be a reparse point. MC-1588: the
+# first path is read from $j.offset (the helper reads in parts, core.js readParts); maxBytes counts from each file's start.
 $GuestRead = {
   param($j)
-  $root = 'C:\out'; $total = 0; $out = @()
+  $root = 'C:\out'; $total = 0; $out = @(); $first = $true
   foreach ($p in $j.paths) {
+    $off = if ($first) { [long]$j.offset } else { [long]0 }
+    $first = $false
     $full = [IO.Path]::GetFullPath((Join-Path $root ([string]$p).Replace('/', '\')))
     if (-not $full.StartsWith($root + '\', [StringComparison]::OrdinalIgnoreCase)) { continue }
     $item = Get-Item -LiteralPath $full -Force -ErrorAction SilentlyContinue
@@ -460,11 +491,12 @@ $GuestRead = {
     $left = [long]$j.maxTotalBytes - $total; if ($left -le 0) { break }
     $fs = [IO.File]::Open($full, 'Open', 'Read', 'ReadWrite')
     try {
-      $len = [Math]::Min([Math]::Min($fs.Length, [long]$j.maxBytes), $left)
+      $len = [Math]::Max([long]0, [Math]::Min([Math]::Min($fs.Length, [long]$j.maxBytes) - $off, $left))
+      if ($off -gt 0) { [void]$fs.Seek($off, 'Begin') }
       $b = New-Object byte[] $len; $got = 0
       while ($got -lt $len) { $r = $fs.Read($b, $got, $len - $got); if ($r -le 0) { break }; $got += $r }
       $total += $got
-      $out += @{ path = [string]$p; size = $fs.Length; cut = ($fs.Length -gt $got); data = [Convert]::ToBase64String($b, 0, $got) }
+      $out += @{ path = [string]$p; size = $fs.Length; offset = $off; cut = ($fs.Length -gt ($off + $got)); data = [Convert]::ToBase64String($b, 0, $got) }
     } finally { $fs.Close() }
   }
   @{ files = $out }
@@ -1219,21 +1251,27 @@ try {
       # which (like any remote session) needs the account in Remote Management Users (S-1-5-32-580): added here, as the
       # guest's admin, inside this disposable guest only; a restore takes it away again.
       $vm = Get-OwnVm $a
-      $j = @{ n = [int]$a.n; command = [string]$a.command; shell = [string]$a.shell; cwd = [string]$a.cwd; dir = $(if ($a.runAs) { 'C:\hvmcp\user' } else { 'C:\hvmcp' }) }
+      $j = @{ n = [int]$a.n; command = [string]$a.command; staged = [long]$a.staged; shell = [string]$a.shell; cwd = [string]$a.cwd; dir = $(if ($a.runAs) { 'C:\hvmcp\user' } else { 'C:\hvmcp' }) }
       $as = Cred $a.cred
       if ($a.runAs) {
-        $user = [string]$a.runAs.user
-        Invoke-Command -VMId $vm.Id -Credential $as -ScriptBlock {
-          param($u)
-          if (-not (Get-LocalGroupMember -SID 'S-1-5-32-580' | Where-Object { $_.Name -like "*\$u" })) { Add-LocalGroupMember -SID 'S-1-5-32-580' -Member $u }
-        } -ArgumentList $user
+        Invoke-Command -VMId $vm.Id -Credential $as -ScriptBlock $RemoteUser -ArgumentList ([string]$a.runAs.user)
         $as = Cred $a.runAs
       }
       Invoke-Command -VMId $vm.Id -Credential $as -ScriptBlock $GuestRunStart -ArgumentList $j, $RunFiles.ToString(), $RunJob
     }
+    'guest-run-stage' {
+      # MC-1588: a piece of a long command, as the account the run will run as (see guest-run-start), into its folder.
+      $vm = Get-OwnVm $a
+      $as = Cred $a.cred
+      if ($a.runAs) {
+        Invoke-Command -VMId $vm.Id -Credential $as -ScriptBlock $RemoteUser -ArgumentList ([string]$a.runAs.user)
+        $as = Cred $a.runAs
+      }
+      Invoke-Command -VMId $vm.Id -Credential $as -ScriptBlock $GuestRunStage -ArgumentList @{ n = [int]$a.n; part = [int]$a.part; data = [string]$a.data; dir = $(if ($a.runAs) { 'C:\hvmcp\user' } else { 'C:\hvmcp' }) }
+    }
     'guest-run-publish' {
       $vm = Get-OwnVm $a
-      $j = @{ n = [int]$a.n; command = [string]$a.command; shell = [string]$a.shell; cwd = [string]$a.cwd }
+      $j = @{ n = [int]$a.n; command = [string]$a.command; staged = [long]$a.staged; shell = [string]$a.shell; cwd = [string]$a.cwd }
       Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestRunPublish -ArgumentList $j, $RunFiles.ToString()
     }
     'guest-run-poll' {

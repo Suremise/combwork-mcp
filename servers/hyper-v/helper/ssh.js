@@ -18,7 +18,9 @@ const { spawn } = require('child_process')
 const { join } = require('path')
 
 const MARK = 'HVJSON:'
-const OUT_CAP = 100 * 1024 * 1024
+// The dispatcher's answer, read up to this many characters. MC-1588: room for the largest, vm_read_out's most in one
+// call (core.js READ_TOTAL_MAX, about 85 MB) as base64 (4/3 of it), with room for the rest of the line.
+const OUT_CAP = 192 * 1024 * 1024
 // Node's timers fire at once past this (about 24.8 days): a longer call bound waits this long instead (MC-1579).
 const TIMER_MAX_MS = 2 ** 31 - 1
 const SSH = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'OpenSSH', 'ssh.exe')
@@ -41,8 +43,9 @@ function argv(t, { verbose = false } = {}) {
 }
 
 /**
- * Sends `request` to the target's dispatcher; then, when `files` is given (absolute host paths, in order), each file's
- * bytes. Resolves the dispatcher's result, or rejects with its error. onChild(child): so an ending lease can kill it.
+ * Sends `request` to the target's dispatcher; then, when `files` is given (absolute host paths, or Buffers, in order),
+ * each one's bytes. Resolves the dispatcher's result, or rejects with its error. onChild(child): so an ending lease can
+ * kill it.
  */
 function call(target, request, { files = [], timeoutMs = 120_000, onChild, verbose = false } = {}) {
   const stub = process.env.HYPERV_MCP_SSH_STUB
@@ -82,6 +85,7 @@ function call(target, request, { files = [], timeoutMs = 120_000, onChild, verbo
       const write = b => new Promise(res => { if (child.stdin.write(b)) res(); else child.stdin.once('drain', res) })
       await write(JSON.stringify(request) + '\n')
       for (const f of files) {
+        if (Buffer.isBuffer(f)) { if (done) return; await write(f); continue } // MC-1588: bytes held in memory (a long command)
         for await (const chunk of fs.createReadStream(f)) { if (done) return; await write(chunk) }
       }
       child.stdin.end()
@@ -89,4 +93,4 @@ function call(target, request, { files = [], timeoutMs = 120_000, onChild, verbo
   })
 }
 
-module.exports = { call, argv, SSH, BRIDGE }
+module.exports = { call, argv, SSH, BRIDGE, OUT_CAP }
