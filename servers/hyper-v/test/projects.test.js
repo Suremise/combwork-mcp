@@ -228,7 +228,7 @@ test('server.js: a newer helper still serves this server\'s features (protocol "
   fs.writeFileSync(shim, `const m = require(${JSON.stringify(path.join(__dirname, '..', 'helper', 'core.js'))})
 const request = m.Helper.prototype.request
 m.Helper.prototype.request = async function (connId, op, args) {
-  if (op === 'version') return { text: 'hyperv-mcp/9', data: { protocol: 'hyperv-mcp/9', features: ['projects', 'later'], buildRoots: [] } }
+  if (op === 'version') return { text: 'hyperv-mcp/9', data: { protocol: 'hyperv-mcp/9', features: ['projects', 'network-modes', 'later'], buildRoots: [] } }
   return request.call(this, connId, op, args)
 }
 `)
@@ -247,7 +247,7 @@ test('the projects feature: this helper still reports hyperv-mcp/3 (so hyper-v 1
   const helper = await startHelper(sc)
   const v = await helper.conn(1).request('version')
   assert.strictEqual(v.data.protocol, 'hyperv-mcp/3')
-  assert.deepStrictEqual(v.data.features, ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean', 'linux', 'debug-keep', 'timing'])
+  assert.deepStrictEqual(v.data.features, ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean', 'linux', 'debug-keep', 'timing', 'network-modes'])
   await helper.stop()
   const shim = path.join(sc.dir, 'older-core.js')
   fs.writeFileSync(shim, `const m = require(${JSON.stringify(path.join(__dirname, '..', 'helper', 'core.js'))})

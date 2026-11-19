@@ -439,3 +439,36 @@ test('setup: the host-subnet check loads helper/net.js and refuses a bad or clas
   assert.notStrictEqual(bad.status, 0)
   assert.match(bad.stdout + bad.stderr, /the host subnet must be a \/24 written as a\.b\.c\.0\/24/)
 })
+
+test('server.js (MC-1570): a helper without the network-modes feature is never sent a string network: vm_start, vm_reset and pool_plan refuse each mode, none included, with "run setup again"; the old booleans go through as before', async t => {
+  const { server } = require('../client')
+  const sc = scratch('net-feature', { policy: { maxVms: 3 } })
+  const shim = path.join(sc.dir, 'older-core.js')
+  // A 2.1.0-era helper: no network-modes feature. A string network reaching it would be read as networking on.
+  fs.writeFileSync(shim, `const m = require(${JSON.stringify(path.join(__dirname, '..', 'helper', 'core.js'))})
+m.Helper.prototype.request = async function (connId, op, args) {
+  if (op === 'version') return { text: 'hyperv-mcp/3', data: { protocol: 'hyperv-mcp/3', features: ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean', 'linux', 'debug-keep', 'timing'], buildRoots: [] } }
+  if (typeof args?.network === 'string') throw new Error('should not be sent: ' + op + ' ' + args.network)
+  if (op === 'start' || op === 'pool_plan') return { text: op + ' sent with network ' + JSON.stringify(args.network) }
+  throw new Error('unexpected ' + op)
+}
+`)
+  const env = { ...sc.env, HYPERV_MCP_ENABLED: '1', HYPERV_MCP_MODE: 'direct', USERPROFILE: path.join(sc.dir, 'home'), NODE_OPTIONS: `--require ${JSON.stringify(shim)}` }
+  const s = server(env, { roots: [sc.builds] })
+  t.after(() => s.close())
+  const refused = mode => new RegExp(`has no 'network-modes' feature, which .* with network '${mode}' needs: run setup again`)
+  for (const mode of ['none', 'host', 'internet', 'internet-lan']) {
+    assert.match((await s.call('vm_start', { network: mode })).text, refused(mode), `vm_start ${mode}`)
+    assert.match((await s.call('vm_reset', { network: mode })).text, refused(mode), `vm_reset ${mode}`)
+    assert.match((await s.call('pool_plan', { action: 'create', vms: 1, network: mode })).text, refused(mode), `pool_plan ${mode}`)
+  }
+  // The default is the string 'none' too: refused, never sent.
+  assert.match((await s.call('vm_start', {})).text, refused('none'))
+  assert.match((await s.call('vm_reset', {})).text, refused('none'))
+  // The booleans an older client sends map as before (true host, false none), and a reset keeps them.
+  assert.match((await s.call('vm_start', { network: true })).text, /^start sent with network true/)
+  assert.match((await s.call('vm_start', { network: false })).text, /^start sent with network false/)
+  assert.match((await s.call('vm_reset', {})).text, /^start sent with network false/)
+  // A plan without a network is unaffected.
+  assert.match((await s.call('pool_plan', { action: 'create', vms: 1 })).text, /^pool_plan sent with network undefined/)
+})

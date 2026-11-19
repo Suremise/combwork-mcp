@@ -101,8 +101,9 @@ using the new server: the helper's protocol and features changed, and an older h
 
 **From 2.1.0 to 3.0.0 (network modes, timings, the live-proof fixes): the rerun is required.**
 - Rerun setup before using the 3.0.0 server. A 2.1.0 helper doesn't understand 3.0.0's network modes: it takes every
-  `vm_start` as asking for the network, even with `network` left out, so it refuses offline starts ("The policy does
-  not allow networking") or connects the internal switch. Most fixes are in the helper too (MC-1555 to MC-1568).
+  `vm_start` as asking for the network, even with `network` left out. So the 3.0.0 server refuses every `vm_start`,
+  `vm_reset` and `pool_plan` network mode on a helper without the `network-modes` feature, with "run setup again",
+  rather than risk a wrong network (MC-1570). Most fixes are in the helper too (MC-1555 to MC-1568).
 - The rerun keeps the policy's network as it was (an older `-AllowNetwork $true` becomes `-MaxNetwork Host`); pass
   `-MaxNetwork Internet` or `InternetLan` to allow more, then resize the pool to that mode (see "Network modes").
 - New: the timings in the server's env (see "Timings"), and an installed uninstaller with an Installed apps entry,
@@ -817,6 +818,10 @@ names it, so a newer helper keeps serving older servers:
 - feature `projects` (protocol 3): projects, `vm_acquire`'s `wait` and a project's own build folders;
 - feature `images` (protocol 3): image groups, `vm_acquire`'s `os` and `image`, shares by OS, a project's image list.
   The server sends no `vm_acquire` at all for an `image`, or an OS other than Windows, to a helper without it.
+- feature `network-modes` (protocol 3): the network modes as strings (`none`, `host`, `internet`, `internet-lan`) in
+  `vm_start`, `vm_reset` and `pool_plan`. A helper without it would read any of them, `none` included, as networking
+  on, so the server refuses each with "run setup again" and sends nothing; the old booleans (`true` host, `false`
+  none) still go to it as before (MC-1570).
 
 The helper stays at protocol 3 for these features because an earlier server (MC-1503's) asks for exactly hyperv-mcp/3 before an
 interactive run: it keeps working with this helper. An older helper refuses each newer feature with "run setup again"
