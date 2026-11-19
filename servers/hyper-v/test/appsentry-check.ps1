@@ -271,4 +271,41 @@ $files = @($set | ForEach-Object { $p = Join-Path $src $_; Set-Content $p "# $_"
 $tmp = New-ProtectedCopy $Dir $files -Owners @($me) -Grants @($me, $SYSTEM)
 $r.copy = [ordered]@{ files = @(Get-ChildItem $tmp | ForEach-Object { $_.Name } | Sort-Object); problems = @(Test-ExclusiveAcl $tmp -Allowed @($me, $SYSTEM) -Writers @($me, $SYSTEM) -Owners @($me)); protected = (Get-Acl $tmp).AreAccessRulesProtected }
 
+# MC-1567: an interrupted run's copy is removed by a later run, only when it is exactly such a copy; nothing else is.
+$sp = Join-Path $Dir 'stale-parent'; New-Item -ItemType Directory -Force $sp | Out-Null
+$mk = { New-ProtectedCopy $sp $files -Owners @($me) -Grants @($me, $SYSTEM) }
+$hex = { [guid]::NewGuid().ToString('n') }
+$cases = [ordered]@{}
+$cases.stale = & $mk
+$cases.stale2 = & $mk
+$cases.current = & $mk
+$cases.inuse = & $mk
+$cases.extra = & $mk; Set-Content (Join-Path $cases.extra 'notes.txt') 'x'
+$cases.subfolder = & $mk; New-Item -ItemType Directory (Join-Path $cases.subfolder 'sub') | Out-Null
+$cases.loose = Join-Path $sp "hvmcp-uninstall-$(& $hex)"; New-Item -ItemType Directory $cases.loose | Out-Null; Set-Content (Join-Path $cases.loose 'uninstall.ps1') 'x'
+$cases.othername = Join-Path $sp 'hvmcp-uninstall-notacopy'; New-Item -ItemType Directory $cases.othername | Out-Null; Set-Content (Join-Path $cases.othername 'uninstall.ps1') 'x'
+$cases.afile = Join-Path $sp "hvmcp-uninstall-$(& $hex)"; Set-Content $cases.afile 'x'
+$cases.unrelated = Join-Path $sp 'other.txt'; Set-Content $cases.unrelated 'x'
+$target = & $mk; $cases.linktarget = Join-Path $sp 'link-target'; [IO.Directory]::Move($target, $cases.linktarget)
+$cases.link = Join-Path $sp "hvmcp-uninstall-$(& $hex)"; cmd /c mklink /J "$($cases.link)" "$($cases.linktarget)" | Out-Null
+# A run still using a copy: a process naming it on its command line (stopped below by its own handle).
+$busy = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') -ArgumentList @('-NoProfile', '-Command', "Start-Sleep -Seconds 120 # $($cases.inuse)\uninstall.ps1") -WindowStyle Hidden -PassThru
+try {
+  $t = (Get-Date).AddSeconds(30)
+  while (-not @(Get-CimInstance Win32_Process -Filter "ProcessId=$($busy.Id)" | Where-Object { $_.CommandLine -like "*$($cases.inuse)*" }).Count -and (Get-Date) -lt $t) { Start-Sleep -Milliseconds 200 }
+  # An owner other than the allowed one: left.
+  $ownerLines = @(Remove-StaleProtectedCopies $sp -Owners @($SYSTEM) -Grants @($me, $SYSTEM) -Skip $cases.current)
+  $lines = @(Remove-StaleProtectedCopies $sp -Owners @($me) -Grants @($me, $SYSTEM) -Skip $cases.current)
+} finally { if (-not $busy.HasExited) { $busy.Kill() }; $busy.WaitForExit() }
+$name = @{}; foreach ($k in $cases.Keys) { $name[$cases[$k]] = $k }
+$label = { param($l) $m = [regex]::Match($l, '^(removed|left) (\S+)( \((.*)\))?$'); "$($m.Groups[1].Value) $($name[$m.Groups[2].Value]) $($m.Groups[4].Value)".Trim() }
+$exists = [ordered]@{}; foreach ($k in $cases.Keys) { $exists[$k] = Test-Path -LiteralPath $cases[$k] }
+$r.stale = [ordered]@{
+  owner = @($ownerLines | ForEach-Object { & $label $_ } | Sort-Object)
+  lines = @($lines | ForEach-Object { & $label $_ } | Sort-Object)
+  exists = $exists
+  linkTargetFiles = @(Get-ChildItem $cases.linktarget | ForEach-Object { $_.Name } | Sort-Object)
+}
+cmd /c rmdir "$($cases.link)" | Out-Null
+
 $r | ConvertTo-Json -Compress -Depth 6

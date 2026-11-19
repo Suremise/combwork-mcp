@@ -999,7 +999,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "C:\Program Files\hyperv-mcp
 powershell -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\combwork-mcp\servers\hyper-v\setup\uninstall.ps1" -KeepPool
 ```
 An installed copy runs itself from a protected temporary copy (only SYSTEM and Administrators), so it can remove its own
-folder. With neither option it asks (see above). Choose one:
+folder. If a run is interrupted (its window closed), the next uninstall or setup removes that run's copy, only when it
+is exactly such a copy (`C:\Windows\Temp\hvmcp-uninstall-<32 hex>`, no links, owned by Administrators, only SYSTEM and
+Administrators granted, only the uninstaller's files) and no uninstall still runs from it; nothing else there is touched.
+With neither option it asks (see above). Choose one:
 - `-KeepPool` removes the service, its rights, the group and the code, and **keeps** the VMs, the helper's state (the
   journal, policy and guest credentials), the disk folders and their storage receipts. Running setup again recognises
   them by their receipts.
@@ -1374,7 +1377,9 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
     file or folder, a junction, an untrusted owner, a service still installed, the state folder, an unfinished
     uninstall, an entry that isn't setup's, a missing or other install's mark), each with everything left in place; an
     InstallLocation pointing elsewhere never a target; the last phase crashed after its rename and after removing the
-    rest, each finished by relaunching the entry; a junction for `uninstall\` refused; the protected temporary copy;
+    rest, each finished by relaunching the entry; a junction for `uninstall\` refused; the protected temporary copy, and an interrupted run's copy
+    removed later only when it is exactly one (not the current run's, one in use, a link, another owner, a looser ACL or
+    extra contents);
   - nothing run unless trusted: a complete set behind a junction (either folder), a folder or file others may write,
     an extra file in the set, each refused with no script run;
   - the uninstaller's top level (`Invoke-UninstallFlow`) with a fake world: remove, keep (the mark after the check,

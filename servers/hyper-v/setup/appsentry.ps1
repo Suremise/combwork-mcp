@@ -213,6 +213,45 @@ function New-ProtectedCopy([string]$Parent, [string[]]$Files, [string[]]$Owners,
   return $dir
 }
 
+# MC-1567: an earlier run's protected copy, left when that run was interrupted (its window closed, so its finally never
+# ran). Removed only when it is exactly what New-ProtectedCopy makes: a folder (not a link) directly under $Parent named
+# hvmcp-uninstall-<32 hex>, owned by one of $Owners, only $Grants granted (on it and everything in it), holding only
+# regular files with the RetiringSet's names. A copy a running process names on its command line (an uninstall still
+# running from it) and $Skip are left. Each is removed by its file names, then the empty folder: never recursively.
+# Anything else under $Parent is never touched. Returns one line per copy: removed, or left and why.
+function Remove-StaleProtectedCopies([string]$Parent, [string[]]$Owners, [string[]]$Grants, [string]$Skip) {
+  $out = @()
+  if (-not (Test-Path -LiteralPath $Parent -PathType Container)) { return $out }
+  $cands = @(Get-ChildItem -LiteralPath $Parent -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^hvmcp-uninstall-[0-9a-f]{32}$' })
+  if (-not $cands.Count) { return $out }
+  $cmds = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object { [string]$_.CommandLine } | Where-Object { $_ })
+  foreach ($d in $cands) {
+    $p = $d.FullName
+    $why = $null
+    if ($Skip -and $p -ieq $Skip.TrimEnd('\')) { continue }
+    if ($d.Attributes -band [IO.FileAttributes]::ReparsePoint) { $why = 'it is a link' }
+    elseif (-not $d.PSIsContainer) { $why = 'it is not a folder' }
+    elseif (@($cmds | Where-Object { $_.IndexOf($p, [StringComparison]::OrdinalIgnoreCase) -ge 0 }).Count) { $why = 'an uninstall is still running from it' }
+    else {
+      $owner = try { (Get-Acl -LiteralPath $p).GetOwner([Security.Principal.SecurityIdentifier]).Value } catch { $null }
+      if ($Owners -notcontains $owner) { $why = "it is owned by $owner" }
+      else {
+        # Its contents first (no folders or links inside, so the ACL check below reads only these files).
+        $odd = @(Get-ChildItem -LiteralPath $p -Force | Where-Object { $_.PSIsContainer -or ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $script:RetiringSet -notcontains $_.Name })
+        if ($odd.Count) { $why = "it holds $($odd[0].Name), which the uninstaller doesn't copy there" }
+        else { $bad = @(Test-ExclusiveAcl $p -Allowed $Grants -Writers $Grants); if ($bad.Count) { $why = $bad[0] } }
+      }
+    }
+    if ($why) { $out += "left $p ($why)"; continue }
+    try {
+      foreach ($n in $script:RetiringSet) { $f = Join-Path $p $n; if ([IO.File]::Exists($f)) { [IO.File]::Delete($f) } }
+      [IO.Directory]::Delete($p)
+      $out += "removed $p"
+    } catch { $out += "left $p ($($_.Exception.Message))" }
+  }
+  return $out
+}
+
 # The retire phase, after R1 passed (or from uninstall.retiring\, after R2). $Launcher: the launcher's text as a script
 # block (the same text as the entry's); $Expected: its encoded command, which the entry must carry to be removed.
 function Invoke-Retire([string]$ProgramFiles, [string[]]$Trusted, [string[]]$RootOwners, [scriptblock]$Launcher, [string]$Expected, [scriptblock]$Crash) {
