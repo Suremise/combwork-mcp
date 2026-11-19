@@ -13,7 +13,11 @@ const { server } = require('../../client')
 const extra = process.argv[2] ? JSON.parse(Buffer.from(process.argv[2], 'base64').toString('utf8')) : {}
 const env = { ...process.env, HYPERV_MCP_ENABLED: '1' }
 for (const [k, v] of Object.entries(extra)) if (/^HYPERV_MCP_[A-Z_]+$/.test(k) && k !== 'HYPERV_MCP_MODE' && k !== 'HYPERV_MCP_PIPE') env[k] = String(v)
-const srv = server(env, { roots: process.env.USERPROFILE ? [process.env.USERPROFILE] : undefined })
+// MC-1561: the session's one root is a project folder in proofuser's profile, as a real client's would be: the profile
+// itself is refused as a root (it holds its keys and settings), so a build copy from it never ran.
+const ROOT = require('path').join(process.env.USERPROFILE || 'C:\\Users\\proofuser', 'proof-project')
+require('fs').mkdirSync(ROOT, { recursive: true })
+const srv = server(env, { roots: [ROOT] })
 const out = m => process.stdout.write(JSON.stringify(m) + '\n')
 const MAX_WAITS = 480 // vm_wait waits up to 45 s each: about 6 hours, beyond any bound of the helper's
 
