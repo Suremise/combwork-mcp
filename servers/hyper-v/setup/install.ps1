@@ -220,10 +220,10 @@ $trusted = @($SYSTEM, $ADMINS, $script:TrustedInstaller)
 foreach ($p in @($state, $install) + $folders) { Open-TrustedAncestors $p $trusted $pins }
 $receipts = Open-ReceiptKey ([Microsoft.Win32.Registry]::LocalMachine) 'SOFTWARE\hyperv-mcp\Storage' @($SYSTEM, $ADMINS) $ADMINS
 $who = @($SYSTEM, $ADMINS, $runnerSid)
-$stateIs = Use-StorageFolder $state @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=Modify") $ADMINS $receipts -Allowed $who -Owners $who -Pins $pins -Confirm ${function:Confirm-RemoveReaders}
+$stateIs = Use-StorageFolder $state @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=Modify") $ADMINS $receipts -Allowed $who -Owners $who -Pins $pins -Confirm ${function:Confirm-RemoveGrants}
 $approvals = Join-Path $state 'approvals'
-$apprIs = Use-StorageFolder $approvals @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=ReadAndExecute") $ADMINS $receipts -Allowed $who -Writers $SYSTEM, $ADMINS -Owners $SYSTEM, $ADMINS -Pins $pins -Confirm ${function:Confirm-RemoveReaders}
-$diskIs = foreach ($d in $folders) { "$d $(Use-StorageFolder $d @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=FullControl") $ADMINS $receipts -Allowed $who -Owners $who -AllowPattern $script:HyperVGrantees -Pins $pins -Confirm ${function:Confirm-RemoveReaders})" }
+$apprIs = Use-StorageFolder $approvals @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=ReadAndExecute") $ADMINS $receipts -Allowed $who -Writers $SYSTEM, $ADMINS -Owners $SYSTEM, $ADMINS -Pins $pins -Confirm ${function:Confirm-RemoveGrants}
+$diskIs = foreach ($d in $folders) { "$d $(Use-StorageFolder $d @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=FullControl") $ADMINS $receipts -Allowed $who -Owners $who -AllowPattern $script:HyperVGrantees -Pins $pins -Confirm ${function:Confirm-RemoveGrants} -WriteRepair)" }
 Step "Storage: state $stateIs, approvals $apprIs, disks $($diskIs -join ', ') (parents checked and held while setup runs)."
 # This installation's generation: an uninstall's record is bound to it.
 $ik = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\hyperv-mcp', $true)

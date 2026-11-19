@@ -92,8 +92,29 @@ try {
   $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule((New-Object Security.Principal.SecurityIdentifier $USERS), 'Modify', 'Allow')))
   Set-Acl -LiteralPath $vhdx -AclObject $acl
   $r.hyperVPlusUsers = & { try { Use-StorageFolder $disk $grants $me $receipts -Allowed $trusted -Owners $trusted -AllowPattern $script:HyperVGrantees -Pins $pins } catch { $_.Exception.Message } }
-  # MC-1581: write access by another account is still refused, even when the admin would agree to a removal.
+  # MC-1581: without -WriteRepair (the state folder's case), write access by another account is still refused, even
+  # when the admin would agree to a removal.
   $r.writeWithYes = & { try { Use-StorageFolder $disk $grants $me $receipts -Allowed $trusted -Owners $trusted -AllowPattern $script:HyperVGrantees -Pins $pins -Confirm { $true } } catch { $_.Exception.Message } }
+
+  # MC-1581 (Darren's decision B): a disk folder (-WriteRepair) after Explorer's "Continue", which gives the user Full
+  # Control of it and everything in it (KB 950934): shown as able to write, removed only on a yes, Hyper-V's own grants
+  # kept, then trusted again.
+  $dx = Join-Path $base 'disk-explored'
+  [void](Use-StorageFolder $dx $grants $me $receipts -Allowed $trusted -Owners $trusted -AllowPattern $script:HyperVGrantees -Pins $pins)
+  $dvhd = Join-Path $dx 'pool\disk.vhdx'
+  New-Item -ItemType Directory -Force (Split-Path $dvhd) | Out-Null; Set-Content $dvhd 'v'
+  & icacls.exe $dvhd /grant '*S-1-5-83-0:(F)' /Q | Out-Null
+  & icacls.exe $dx /grant "*${USERS}:(OI)(CI)F" /Q | Out-Null
+  $useDisk = { param($c) Use-StorageFolder $dx $grants $me $receipts -Allowed $trusted -Owners $trusted -AllowPattern $script:HyperVGrantees -Pins $pins -WriteRepair -Confirm $c }
+  $r.diskWriterNoQuestion = & { try { & $useDisk $null } catch { $_.Exception.Message } }
+  $script:shownW = $null
+  $r.diskWriterNo = & { try { & $useDisk { param($p, $x) $script:shownW = $x; $false } } catch { $_.Exception.Message } }
+  $r.diskWriterShown = @($script:shownW | ForEach-Object { [ordered]@{ sid = $_.sid; write = $_.write } })
+  $r.diskWriterKeptOnNo = Has $dvhd $USERS
+  $r.diskWriterYes = & { try { & $useDisk { $true } } catch { $_.Exception.Message } }
+  $r.diskWriterGone = -not ((Has $dx $USERS) -or (Has $dvhd $USERS))
+  $r.diskHyperVKept = Has $dvhd 'S-1-5-83-0'
+  $r.diskWriterAfter = & { try { & $useDisk $null } catch { $_.Exception.Message } }
 
   # MC-1581: an extra account's read-only grant (as Explorer's "Continue" adds: inherited by everything in it) on a
   # folder whose identity matches its receipt: shown, and removed only when the admin agrees; then trusted again.
