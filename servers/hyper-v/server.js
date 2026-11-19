@@ -586,7 +586,7 @@ const tools = [
       type: 'object',
       properties: {
         vm: VM_PROP,
-        command: { type: 'string', description: 'A cmd command line, or a PowerShell script with shell=powershell; on Linux, a bash (or sh) script.' },
+        command: { type: 'string', description: 'A cmd command line, or a PowerShell script with shell=powershell; on Linux, a bash (or sh) script. At most 8000 characters by default (the HYPERV_MCP_COMMAND_CHARS setting).' },
         shell: { type: 'string', enum: ['cmd', 'powershell', 'bash', 'sh'], description: 'Windows: cmd (default) or powershell. Linux: bash (default) or sh.' },
         as: { type: 'string', enum: ['admin', 'user'], description: 'admin (default; root on Linux) or user (a standard user; C:\\build, /build on Linux, is read-only for it).' },
         timeoutSec: { type: 'number', description: 'Seconds, above 0, with no upper limit (a run is polled, never one long call). Default 120.' },
@@ -607,7 +607,7 @@ const tools = [
         paths: { type: 'array', items: { type: 'string' } },
         glob: { type: 'string' },
         maxBytes: { type: 'number', description: 'Per file. Default 262144.' },
-        maxTotalBytes: { type: 'number', description: 'Per call. Default 1048576.' },
+        maxTotalBytes: { type: 'number', description: 'Per call. Default 1048576; at most about 85 MB (the reply is one string).' },
         base64: { type: 'boolean', description: 'Return binary files as base64. Default false.' }
       }
     },
@@ -673,7 +673,7 @@ const tools = [
         activate: { type: 'boolean', description: 'A non-evaluation image: also activate Windows online once as each VM is built (the plan says so). Default false (it stays offline; its licence is shown). An evaluation image is always activated.' },
         debugKeepFailedBuild: { type: 'boolean', description: 'Debugging only, for a plan that builds Linux VMs, and only when the user asks: if a build fails, its VM is kept (on, disconnected, never leased) for an administrator to inspect in Hyper-V Manager, instead of being rolled back. The plan says so. A resize plan with no image and vms equal to the number of other VMs in the pool removes only it; any other create or resize removes it too, along with the changes it asks for; a remove plan removes the whole pool. Default: left out (rolled back).' },
         image: { type: ['object', 'string'], description: 'A new image, the local file the user named: { iso: "<path to a Windows ISO>" }, with edition: "<edition ID>" when the ISO holds several x64 editions (one edition per ISO); or { file: "<path to a Linux qcow2 cloud image>" }; or (MC-1578) a ready-made Windows disk the user prepared: { vhdx: "<path to an installed, not generalized Windows .vhdx>", admin: "<its local administrator account>" }, or { vm: "<one of the user\'s own Hyper-V VMs, off, Generation 2, one disk>", admin: "<its local administrator account>" } (the VM is only read: its disk is flattened into a copy). A ready-made disk skips the unattended install, activation and the first-logon wait; the user types the admin\'s password when approving (never ask for it, and never pass it). The helper copies the image while hashing it, and the plan names its source and SHA-256 for the user to approve; it never downloads. Or a verified image\'s SHA-256 (or its first 12+ hex digits): create from it, or resize only the VMs built from it (its group). Omit to use the newest verified image (and, for resize, the whole pool).' },
-        guestScript: { type: 'string', description: 'create, resize: the user\'s own guest setup script, a local file they name (Windows guests: .ps1, .cmd or .bat; Linux: .sh; up to 1 MB), run once in each VM this plan builds, as the guest\'s admin, offline, before its clean checkpoint: for anything they want in every VM (Defender exclusions, policies, tools). The plan names its path and SHA-256 for the user to approve. A build adds nothing of its own otherwise. Only when the user names one; never write one for them unasked. A resize names it again for the VMs it adds.' }
+        guestScript: { type: 'string', description: 'create, resize: the user\'s own guest setup script, a local file they name (Windows guests: .ps1, .cmd or .bat; Linux: .sh; up to about 512 MB), run once in each VM this plan builds, as the guest\'s admin, offline, before its clean checkpoint: for anything they want in every VM (Defender exclusions, policies, tools). The plan names its path and SHA-256 for the user to approve. A build adds nothing of its own otherwise. Only when the user names one; never write one for them unasked. A resize names it again for the VMs it adds.' }
       }
     },
     run: async (args = {}) => {

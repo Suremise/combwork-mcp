@@ -19,7 +19,8 @@ const { join } = require('path')
 const SCRIPT = join(__dirname, 'hv.ps1')
 const MARK = 'HVJSON:'
 // hv.ps1's reply, read up to this many characters. MC-1579: room for a vm_run poll at the most output a stream may be
-// (timing.js outputBytes, 1 MB), twice, with ConvertTo-Json writing a character as up to six (\uXXXX).
+// (timing.js outputBytes, 1 MB), twice, with ConvertTo-Json writing a character as up to six (\uXXXX). MC-1588:
+// vm_read_out reads a Windows guest's files in calls of 2 MB (core.js READ_PART_BYTES), 2.8 M characters of base64.
 const OUT_CAP = 16 * 1024 * 1024
 // Node's timers fire at once past this (about 24.8 days): a longer call bound waits this long instead (MC-1579).
 const TIMER_MAX_MS = 2 ** 31 - 1

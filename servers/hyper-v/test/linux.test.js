@@ -319,6 +319,27 @@ test('a Linux run that times out is killed with its unit; a lease checkpoint is 
   await h.stop()
 })
 
+test('MC-1588: a Linux command over 8000 characters goes as bytes after the request line, and runs whole; a dispatcher built before MC-1588 refuses it, and the reply says why', async () => {
+  const { sc, h } = await mixedPool('lx-long-cmd')
+  const c = h.conn(7)
+  await c.request('set-timing', { timing: { commandChars: 2 * 1024 * 1024 } })
+  await c.request('acquire', { minutes: 30, os: 'linux' })
+  await c.request('start', {})
+  const short = `echo ${'s'.repeat(7995)}`
+  assert.match((await c.request('run', { command: short })).text, /^Exit code 0\./)
+  assert.strictEqual(sc.stub().sshCalls.filter(x => x.op === 'run-start').at(-1).command, short, '8000 characters: in the line, as every dispatcher takes it')
+  const long = `echo ${'ü'.repeat(1_000_000)}`
+  assert.match((await c.request('run', { command: long })).text, /^Exit code 0\./)
+  const st = sc.stub()
+  assert.strictEqual(st.sshCalls.filter(x => x.op === 'run-start').at(-1).command, undefined, 'not in the line')
+  assert.deepStrictEqual(st.longCommands.at(-1), { n: 2, bytes: Buffer.byteLength(long) })
+  assert.strictEqual(vmOf(sc, linuxVm(sc).name).runs[2].command, long, 'what runs is the command, byte for byte')
+  sc.patchStub(s => { s.oldDispatcher = true })
+  await assert.rejects(c.request('run', { command: long }), /hvmcp-\S+'s guest dispatcher takes a command of at most 8000 characters \(it was built before MC-1588\): rebuild the VM to run longer ones, or put the command in a script in the build/)
+  assert.match((await c.request('run', { command: short })).text, /^Exit code 0\./, 'a short one still runs on it')
+  await h.stop()
+})
+
 test('the helper killed mid-run: the next one\'s recovery restores the Linux VM and voids the lease', async () => {
   const { sc, h, linux } = await mixedPool('lx-crash')
   const c = h.conn(7)

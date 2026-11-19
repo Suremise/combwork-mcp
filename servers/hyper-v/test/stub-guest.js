@@ -89,6 +89,13 @@ function run(s, vm, req, data) {
       vm.runs ??= {}
       // As guest.py: a run of this number in this boot is refused; one from an earlier boot is replaced.
       if (vm.runs[req.n]?.boot === `boot-${vm.boot || 0}`) throw new Error(`run ${req.n} already exists`)
+      // MC-1588: a long command comes as commandBytes bytes after the line; s.oldDispatcher refuses that, as a guest.py
+      // built before MC-1588 does (no command in the line).
+      if (req.commandBytes !== undefined) {
+        if (s.oldDispatcher || req.command !== undefined || data.length !== req.commandBytes) throw new Error('a bad command')
+        req.command = data.toString('utf8')
+        s.longCommands = [...(s.longCommands || []), { n: req.n, bytes: req.commandBytes }]
+      }
       vm.runs[req.n] = { command: String(req.command), as: req.as === 'user' ? 'hvuser' : 'root', cwd: req.cwd, polls: 0, boot: `boot-${vm.boot || 0}` }
       return { started: true, unit: `hvmcp-run-${req.n}`, boot: `boot-${vm.boot || 0}` }
     }
