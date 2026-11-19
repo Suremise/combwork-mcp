@@ -219,17 +219,25 @@ function New-ProtectedCopy([string]$Parent, [string[]]$Files, [string[]]$Owners,
 # regular files with the RetiringSet's names. A copy a running process names on its command line (an uninstall still
 # running from it) and $Skip are left. Each is removed by its file names, then the empty folder: never recursively.
 # Anything else under $Parent is never touched. Returns one line per copy: removed, or left and why.
-function Remove-StaleProtectedCopies([string]$Parent, [string[]]$Owners, [string[]]$Grants, [string]$Skip) {
+# Whether a copy is in use is known only from a whole process list: any error from the query, or a list without this
+# process in it, leaves every copy (MC-1567 round 1). $ProcessQuery (tests only) replaces the query.
+function Remove-StaleProtectedCopies([string]$Parent, [string[]]$Owners, [string[]]$Grants, [string]$Skip, [scriptblock]$ProcessQuery = { Get-CimInstance Win32_Process -ErrorAction Stop }) {
   $out = @()
   if (-not (Test-Path -LiteralPath $Parent -PathType Container)) { return $out }
   $cands = @(Get-ChildItem -LiteralPath $Parent -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^hvmcp-uninstall-[0-9a-f]{32}$' })
   if (-not $cands.Count) { return $out }
-  $cmds = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | ForEach-Object { [string]$_.CommandLine } | Where-Object { $_ })
+  $unknown = $null
+  try {
+    $procs = @(& $ProcessQuery)
+    if (-not @($procs | Where-Object { [int]$_.ProcessId -eq $PID }).Count) { $unknown = 'the process list was incomplete' }
+    $cmds = @($procs | ForEach-Object { [string]$_.CommandLine } | Where-Object { $_ })
+  } catch { $unknown = "the process list couldn't be read: $($_.Exception.Message)" }
   foreach ($d in $cands) {
     $p = $d.FullName
     $why = $null
     if ($Skip -and $p -ieq $Skip.TrimEnd('\')) { continue }
-    if ($d.Attributes -band [IO.FileAttributes]::ReparsePoint) { $why = 'it is a link' }
+    if ($unknown) { $why = "whether an uninstall still runs from it is unknown: $unknown" }
+    elseif ($d.Attributes -band [IO.FileAttributes]::ReparsePoint) { $why = 'it is a link' }
     elseif (-not $d.PSIsContainer) { $why = 'it is not a folder' }
     elseif (@($cmds | Where-Object { $_.IndexOf($p, [StringComparison]::OrdinalIgnoreCase) -ge 0 }).Count) { $why = 'an uninstall is still running from it' }
     else {

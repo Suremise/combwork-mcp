@@ -293,6 +293,10 @@ $busy = Start-Process -FilePath (Join-Path $env:SystemRoot 'System32\WindowsPowe
 try {
   $t = (Get-Date).AddSeconds(30)
   while (-not @(Get-CimInstance Win32_Process -Filter "ProcessId=$($busy.Id)" | Where-Object { $_.CommandLine -like "*$($cases.inuse)*" }).Count -and (Get-Date) -lt $t) { Start-Sleep -Milliseconds 200 }
+  # The process list unreadable (an injected query error) or incomplete (this process missing): every copy left.
+  $failLines = @(Remove-StaleProtectedCopies $sp -Owners @($me) -Grants @($me, $SYSTEM) -Skip $cases.current -ProcessQuery { throw 'Access denied (injected)' })
+  $partLines = @(Remove-StaleProtectedCopies $sp -Owners @($me) -Grants @($me, $SYSTEM) -Skip $cases.current -ProcessQuery { @([pscustomobject]@{ ProcessId = 4; CommandLine = 'System' }) })
+  $afterFail = [ordered]@{ stale = (Test-Path -LiteralPath $cases.stale); stale2 = (Test-Path -LiteralPath $cases.stale2) }
   # An owner other than the allowed one: left.
   $ownerLines = @(Remove-StaleProtectedCopies $sp -Owners @($SYSTEM) -Grants @($me, $SYSTEM) -Skip $cases.current)
   $lines = @(Remove-StaleProtectedCopies $sp -Owners @($me) -Grants @($me, $SYSTEM) -Skip $cases.current)
@@ -301,6 +305,9 @@ $name = @{}; foreach ($k in $cases.Keys) { $name[$cases[$k]] = $k }
 $label = { param($l) $m = [regex]::Match($l, '^(removed|left) (\S+)( \((.*)\))?$'); "$($m.Groups[1].Value) $($name[$m.Groups[2].Value]) $($m.Groups[4].Value)".Trim() }
 $exists = [ordered]@{}; foreach ($k in $cases.Keys) { $exists[$k] = Test-Path -LiteralPath $cases[$k] }
 $r.stale = [ordered]@{
+  fail = @($failLines | ForEach-Object { & $label $_ } | Sort-Object)
+  part = @($partLines | ForEach-Object { & $label $_ } | Sort-Object)
+  afterFail = $afterFail
   owner = @($ownerLines | ForEach-Object { & $label $_ } | Sort-Object)
   lines = @($lines | ForEach-Object { & $label $_ } | Sort-Object)
   exists = $exists

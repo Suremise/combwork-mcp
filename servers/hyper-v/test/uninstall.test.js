@@ -169,6 +169,12 @@ test('the Installed apps entry, run for real (5.1, non-elevated, scratch Program
   // not exactly such a copy (an extra file, a subfolder, a looser ACL, another owner, a file, a link) and anything else
   // under the parent are left. The link's target is untouched.
   const st = a.stale
+  // Round 1: a process query that fails, or a list without this process, establishes nothing: every copy left, none
+  // removed (the stale ones included), each saying why.
+  const cands = ['afile', 'extra', 'inuse', 'link', 'loose', 'stale', 'stale2', 'subfolder']
+  assert.deepStrictEqual(st.fail, cands.map(k => `left ${k} whether an uninstall still runs from it is unknown: the process list couldn't be read: Access denied (injected)`))
+  assert.deepStrictEqual(st.part, cands.map(k => `left ${k} whether an uninstall still runs from it is unknown: the process list was incomplete`))
+  assert.deepStrictEqual(st.afterFail, { stale: true, stale2: true })
   const want = [
     /^left afile it is not a folder$/,
     /^left extra it holds notes\.txt, which the uninstaller doesn't copy there$/,
