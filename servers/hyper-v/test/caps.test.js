@@ -88,6 +88,13 @@ test('MC-1588: vm_read_out reads a Windows guest\'s files in calls of at most 2 
   assert.strictEqual(READ_TOTAL_MAX, Math.floor((require('buffer').constants.MAX_STRING_LENGTH - 1024 * 1024) / 6))
   await assert.rejects(a.request('read_out', { paths: ['a.bin'], maxTotalBytes: READ_TOTAL_MAX + 1 }), new RegExp(`maxTotalBytes must be 1-${READ_TOTAL_MAX}: the files come back in one reply, which Node holds as one string`))
   assert.strictEqual((await a.request('read_out', { paths: ['a.bin'], maxBytes: 2 ** 40, maxTotalBytes: READ_TOTAL_MAX })).files[0].size, small.length)
+  // Round 2: a maxBytes past Int64 (which hv.ps1 casts to [long]; the stub refuses it as that cast does) reaches the
+  // guest clamped to the call's total, so it reads as any other.
+  for (const huge of [1e20, 1e21, Number.MAX_SAFE_INTEGER * 2 ** 20]) {
+    const r = await a.request('read_out', { paths: ['a.bin', 'big.bin'], maxBytes: huge, maxTotalBytes: 1024 })
+    assert.deepStrictEqual(r.files.map(f => [f.path, Buffer.from(f.data, 'base64').length, f.cut]), [['a.bin', small.length, false], ['big.bin', 1024 - small.length, true]], `${huge}`)
+    assert.ok(sc.stub().readCalls.at(-1).maxBytes <= 1024, `${huge} sent as ${sc.stub().readCalls.at(-1).maxBytes}`)
+  }
   await assert.rejects(a.request('read_out', { maxBytes: 0 }), /maxBytes must be a whole number of bytes, at least 1/)
 })
 
@@ -135,6 +142,9 @@ $wrapper = & $RunFiles @{ n = 7; staged = ${script.length}; shell = 'powershell'
 $res.stageLeft = Test-Path -LiteralPath '${q(path.join(dir, 'run-7.stage'))}'
 $res.read = & $GuestRead @{ paths = @('f.bin', 'g.txt'); offset = 5; maxBytes = 12; maxTotalBytes = 100 }
 $res.read2 = & $GuestRead @{ paths = @('f.bin', 'g.txt'); offset = 0; maxBytes = 100; maxTotalBytes = 4 }
+$huge = '{"maxBytes":100000000000000000000}' | ConvertFrom-Json
+try { [void](& $GuestRead @{ paths = @('f.bin'); offset = 0; maxBytes = $huge.maxBytes; maxTotalBytes = 1024 }); $res.huge = 'read' } catch { $res.huge = $_.Exception.Message }
+$res.clamped = & $GuestRead @{ paths = @('f.bin'); offset = 0; maxBytes = ${Math.min(1e20, 1024)}; maxTotalBytes = 1024 }
 'RESULT:' + (ConvertTo-Json -InputObject $res -Depth 6 -Compress)
 `)
   const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', harness], { encoding: 'utf8', env: ps51Env(), timeout: T.spawnMs, windowsHide: true })
@@ -150,4 +160,8 @@ $res.read2 = & $GuestRead @{ paths = @('f.bin', 'g.txt'); offset = 0; maxBytes =
   const files = [].concat(res.read.files)
   assert.deepStrictEqual(files.map(f => [f.path, f.offset, f.cut, Buffer.from(f.data, 'base64').toString()]), [['f.bin', 5, true, '56789ab'], ['g.txt', 0, false, 'second']], 'the first from its offset, up to maxBytes from its start; the next from 0')
   assert.deepStrictEqual([].concat(res.read2.files).map(f => [f.path, f.cut, Buffer.from(f.data, 'base64').toString()]), [['f.bin', true, '0123']], 'the call\'s total stops it')
+  // Round 2: why core.js clamps maxBytes to the call's total before sending it: past Int64, $GuestRead's [long] cast
+  // fails; the clamped value (what the helper sends) reads as any other.
+  assert.match(res.huge, /Int64/, 'a maxBytes past Int64, unclamped, fails in the guest')
+  assert.deepStrictEqual([].concat(res.clamped.files).map(f => [f.path, f.cut, Buffer.from(f.data, 'base64').toString()]), [['f.bin', false, '0123456789abcdef']])
 })

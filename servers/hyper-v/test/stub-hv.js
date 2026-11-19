@@ -675,6 +675,8 @@ function run(s, op, a) {
     // recorded in state.readCalls.
     case 'guest-read': {
       const vm = own(s, a)
+      // As hv.ps1's [long] casts: a number past Int64 can't be converted.
+      for (const k of ['maxBytes', 'maxTotalBytes', 'offset']) if (typeof a[k] === 'number' && a[k] > 9223372036854775807) throw new Error(`Cannot convert value "${a[k]}" to type "System.Int64". Error: "Value was either too large or too small for an Int64."`)
       let total = 0
       const files = []
       for (const [i, p] of a.paths.entries()) {
@@ -688,7 +690,7 @@ function run(s, op, a) {
         total += take
         files.push({ path: p, size: buf.length, offset: off, cut: off + take < buf.length, data: buf.subarray(off, off + take).toString('base64') })
       }
-      s.readCalls = [...(s.readCalls || []), { paths: a.paths.length, offset: a.offset || 0, maxTotalBytes: a.maxTotalBytes, bytes: total }]
+      s.readCalls = [...(s.readCalls || []), { paths: a.paths.length, offset: a.offset || 0, maxBytes: a.maxBytes, maxTotalBytes: a.maxTotalBytes, bytes: total }]
       return { files }
     }
     case 'remove-vm': {

@@ -2179,8 +2179,10 @@ class Helper {
       const missing = []
       for (const p of want) { const f = byPath.get(p.toLowerCase()); if (f) chosen.push(f); else missing.push(p) }
       if (match) for (const f of files) if (match(f.path) && !chosen.includes(f)) chosen.push(f)
+      // MC-1588 round 2: the per-file allowance sent is at most the call's total (a file can't give more), so a huge
+      // maxBytes never reaches the guest side, which reads it as an Int64 (hv.ps1) or a JSON integer (guest.py).
       const r = chosen.length
-        ? await this.guestCall(vm, 'guest-read', { ...this.ident(vm), cred: creds.admin, paths: chosen.map(f => f.path), maxBytes, maxTotalBytes }, this.forLease(lease))
+        ? await this.guestCall(vm, 'guest-read', { ...this.ident(vm), cred: creds.admin, paths: chosen.map(f => f.path), maxBytes: Math.min(maxBytes, maxTotalBytes), maxTotalBytes }, this.forLease(lease))
         : { files: [] }
       let total = 0
       const got = []
