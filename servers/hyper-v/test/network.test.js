@@ -326,7 +326,7 @@ test('the guest\'s network: a wobble settles; one that never settles restores th
   await a.request('start', { network: 'host' })
   assert.strictEqual(sc.stub().netUnsteady, 0, 'the wobble was seen, and the read went on until it held')
   sc.patchStub(s => { s.netNeverReady = true })
-  await assert.rejects(a.request('start', { network: 'internet' }), /started, but its network \(internet\) wasn't ready and steady within 3 s: no DHCP address from the Default Switch yet.*It was restored to clean \(network disconnected\)/)
+  await assert.rejects(a.request('start', { network: 'internet' }), /started, but its network \(internet\) wasn't ready and steady within 3 s \(HYPERV_MCP_NETWORK_SECONDS, up to 600 s, if it needs longer\): no DHCP address from the Default Switch yet.*It was restored to clean \(network disconnected\)/)
   const vm = only(sc)
   assert.strictEqual(vm.state, 'Off')
   assert.strictEqual(vm.switchName, null)

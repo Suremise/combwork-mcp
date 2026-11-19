@@ -37,8 +37,8 @@ const MAX_COMMAND = 8000
 // MC-1558: the user-adjustable timings (guest ready, logon, install, provisioning, restore, checkpoints, the queue place,
 // copy) are timing.js's, per connection, lease or job: this.tm(lease).
 // MC-1556: a connected start's guest network: read back until it has held for NET_STABLE_MS (a network manager undoing
-// a static address shows within it), within NET_WAIT_MS (a DHCP lease and DNS take a few seconds).
-const NET_WAIT_MS = Number(process.env.HYPERV_MCP_NET_WAIT_MS || 90_000)
+// a static address shows within it), within the lease's networkSeconds (MC-1566: a timing; a DHCP lease and DNS take a
+// few seconds).
 const NET_STABLE_MS = Number(process.env.HYPERV_MCP_NET_STABLE_MS || 5000)
 // The interactive logon's own wait (MC-1518): a guest restart, the logon and the watcher starting in its session; a
 // first logon from the clean checkpoint runs Windows' per-user first-logon work and can take several minutes.
@@ -1659,7 +1659,8 @@ class Helper {
 
   /**
    * The guest's own network for the lease's mode (host: its static address; internet: DHCP), then read back until it has
-   * held for NET_STABLE_MS, within NET_WAIT_MS. Returns the text for the reply. Throws with the last reason seen.
+   * held for NET_STABLE_MS, within the lease's networkSeconds (MC-1566). Returns the text for the reply. Throws with the
+   * last reason seen, naming the setting.
    */
   async guestNet(vm, lease, creds) {
     const spec = lease.net
@@ -1672,6 +1673,7 @@ class Helper {
     const want = { mode: lease.network, mac: f.mac, address: spec.address, subnet: spec.subnet, gateway: spec.gateway }
     await this.guestCall(vm, 'guest-net', { ...this.ident(vm), cred, mode: net.defaultSwitch(lease.network) ? 'internet' : 'host', mac: f.mac, address: spec.address }, opts)
     this.stillHeld(lease)
+    const waitMs = this.tm(lease).ms.networkSeconds
     const t0 = this.now()
     let okSince = null
     let why = 'not read yet'
@@ -1685,7 +1687,7 @@ class Helper {
         if (okSince === null) okSince = now
         if (now - okSince >= NET_STABLE_MS) break
       } else okSince = null
-      if (now - t0 > NET_WAIT_MS) throw new Error(`its network (${lease.network}) wasn't ready and steady within ${Math.round(NET_WAIT_MS / 1000)} s: ${why || 'it changed while it was read'}`)
+      if (now - t0 > waitMs) throw new Error(`its network (${lease.network}) wasn't ready and steady within ${Math.round(waitMs / 1000)} s (HYPERV_MCP_NETWORK_SECONDS, up to ${timing.KEYS.networkSeconds.max} s, if it needs longer): ${why || 'it changed while it was read'}`)
       await this.sleep(Math.min(1000, Math.max(50, NET_STABLE_MS / 5)))
     }
     return lease.network === 'host'

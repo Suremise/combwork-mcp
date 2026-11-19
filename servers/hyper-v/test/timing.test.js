@@ -301,3 +301,55 @@ test('server.js sends its env\'s timing keys to the helper on connecting (direct
   const st = (await s.call('vm_status')).text
   assert.match(st, /Timings for this connection: .*offWaitSeconds 250 s.*queueKeepMinutes 60 min.*; restore call 850 s/, 'the env\'s keys, clamped (99 min to 60)')
 })
+
+// ---------- MC-1566: the guest network's wait ----------
+
+test('MC-1566: networkSeconds is a timing like the others: default, floor, cap, setup\'s cap, the env a server sends, vm_status', () => {
+  assert.strictEqual(timing.resolve({}, null, {}).values.networkSeconds, 90)
+  const r = timing.resolve({ networkSeconds: 5 }, null, {})
+  assert.strictEqual(r.values.networkSeconds, 30, 'its floor')
+  assert.ok(r.notes.some(n => /networkSeconds 5 s is outside 30-600: 30 used/.test(n)))
+  assert.strictEqual(timing.resolve({ networkSeconds: 9999 }, null, {}).values.networkSeconds, 600, 'its maximum')
+  assert.strictEqual(timing.resolve({ networkSeconds: 300 }, { networkSeconds: 120 }, {}).values.networkSeconds, 120, 'setup\'s cap')
+  assert.strictEqual(timing.resolve({}, { networkSeconds: 60 }, {}).values.networkSeconds, 60, 'a cap lowers the default too')
+  assert.deepStrictEqual(timing.fromEnv({ HYPERV_MCP_NETWORK_SECONDS: '240' }), { networkSeconds: 240 })
+  assert.match(timing.describe(timing.resolve({ networkSeconds: 240 }, null, {})), /networkSeconds 240 s/)
+  const base = { ...policy.DEFAULTS, diskFolders: ['D:\\hv'] }
+  assert.match(policy.problems({ ...base, timingCaps: { networkSeconds: 10 } }).join(), /timingCaps\.networkSeconds must be a number from 30 to 600/)
+})
+
+/** A helper whose guestNet runs on a fake clock that moves only by its own sleeps and calls; reads from readAt(t). */
+function netHelper(networkMs, readAt) {
+  const h = Object.create(Helper.prototype)
+  let t = 0
+  const reads = []
+  h.now = () => t
+  h.sleep = async ms => { t += ms }
+  h.tm = () => ({ ms: { networkSeconds: networkMs } })
+  h.forLease = () => ({ timeoutMs: 1 })
+  h.stillHeld = () => {}
+  h.ident = vm => ({ vmId: vm.vmId })
+  h.creds = () => ({ admin: { user: 'hvadmin', password: 'a' } })
+  h.hv = async op => { if (op === 'facts-vm') return { mac: '00155D586D01' }; throw new Error(`unexpected ${op}`) }
+  h.guestCall = async (vm, op) => { t += 1; if (op === 'guest-net') return { set: true }; reads.push(t); return readAt(t) }
+  return { h, reads, now: () => t }
+}
+const NET_LEASE = { network: 'internet', net: { subnet: '172.30.160.0/20', gateway: '172.30.160.1' } }
+const NET_VM = { vmId: 'v', vmName: 'hvmcp-test' }
+const READY = { nics: [{ name: 'Ethernet', mac: '00155D586D01', ipv4: [{ ip: '172.30.161.168', prefix: 20 }] }], routes: [{ dest: '0.0.0.0/0', gateway: '172.30.160.1' }], dns: ['172.30.160.1'], lookup: true }
+const APIPA = { nics: [{ name: 'Ethernet', mac: '00155D586D01', ipv4: [{ ip: '169.254.137.170', prefix: 16 }] }], routes: [], dns: [], lookup: false }
+
+test('MC-1566: the guest network waits on its read-back (a condition), bounded only by the lease\'s networkSeconds, named when it runs out', async () => {
+  // Ready from the start: accepted once it has held, long before the ceiling.
+  const fast = netHelper(600_000, () => READY)
+  assert.match(await fast.h.guestNet(NET_VM, NET_LEASE), /internet \(DHCP from Windows' Default Switch; the LAN is blocked\)/)
+  assert.ok(fast.now() < 60_000, `accepted on the condition, not at the ceiling (${fast.now()})`)
+  // A lease ready only after 150 s: a 120 s wait gives up, saying which setting to raise; 240 s waits for it.
+  const late = t => t >= 150_000 ? READY : APIPA
+  const short = netHelper(120_000, late)
+  await assert.rejects(short.h.guestNet(NET_VM, NET_LEASE), /its network \(internet\) wasn't ready and steady within 120 s \(HYPERV_MCP_NETWORK_SECONDS, up to 600 s, if it needs longer\): no DHCP address from the Default Switch yet \(it has 169\.254\.137\.170\/16\)/)
+  assert.ok(short.now() > 120_000 && short.now() < 150_000, `gave up at its own ceiling (${short.now()})`)
+  const long = netHelper(240_000, late)
+  await long.h.guestNet(NET_VM, NET_LEASE)
+  assert.ok(long.now() >= 150_000 && long.now() < 240_000, `accepted when ready, within the longer ceiling (${long.now()})`)
+})

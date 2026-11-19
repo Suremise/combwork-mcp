@@ -24,7 +24,10 @@ const KEYS = {
   installMinutes: { env: 'HYPERV_MCP_INSTALL_MINUTES', unit: MIN, def: 90, floor: 30, max: 360, test: 'HYPERV_MCP_INSTALL_WAIT_MS', what: 'Windows setup in a new pool VM' },
   provisionMinutes: { env: 'HYPERV_MCP_PROVISION_MINUTES', unit: MIN, def: 30, floor: 15, max: 120, test: 'HYPERV_MCP_PROVISION_WAIT_MS', what: 'an account\'s first-logon provisioning at build' },
   cloudInitMinutes: { env: 'HYPERV_MCP_CLOUD_INIT_MINUTES', unit: MIN, def: 15, floor: 5, max: 60, test: 'HYPERV_MCP_LINUX_CLOUD_INIT_MS', what: 'cloud-init in a new Linux VM' },
-  copyIdleMinutes: { env: 'HYPERV_MCP_COPY_IDLE_MINUTES', unit: MIN, def: 5, floor: 1, max: 9, test: 'HYPERV_MCP_COPY_IDLE_MS', what: 'a Windows build copy or vm_sync with no 32 MB part or file finished' }
+  copyIdleMinutes: { env: 'HYPERV_MCP_COPY_IDLE_MINUTES', unit: MIN, def: 5, floor: 1, max: 9, test: 'HYPERV_MCP_COPY_IDLE_MS', what: 'a Windows build copy or vm_sync with no 32 MB part or file finished' },
+  // MC-1566: a connected start's guest network read back until it is right and has held (a condition); this is only
+  // its ceiling, formerly a fixed 90 s.
+  networkSeconds: { env: 'HYPERV_MCP_NETWORK_SECONDS', unit: SEC, def: 90, floor: 30, max: 600, test: 'HYPERV_MCP_NET_WAIT_MS', what: "a connected start's guest network being ready and steady (a DHCP address, or host mode's static one)" }
 }
 const unitName = k => KEYS[k].unit === MIN ? 'min' : 's'
 
