@@ -114,6 +114,57 @@ async function prepare({ want, dir, hv, known, ownDirs = [], progress = () => {}
   }
 }
 
+/**
+ * MC-1578: a ready-made Windows disk as an image: { vhdx: "<path>", admin } (a disk already installed and set up, not
+ * generalized) or { vm: "<name or id>", admin } (one of the user's own VMs outside the pool: off, Generation 2, one
+ * disk; hv.ps1 'image-from-vm' reads it and flattens its disk, checkpoints included, into a copy, and never changes,
+ * starts or owns the VM). The copy goes into dir while hashed (vhdx) or is hashed after the flattening (vm); only that
+ * copy is used, and the build hashes it again first. admin: the local administrator account in it, whose password the
+ * user types when approving (approve.ps1). poolVmIds: the pool's own VMs, never a source. Resolves the image record.
+ */
+const ADMIN_RE = /^[A-Za-z0-9][A-Za-z0-9._ -]{0,19}$/
+async function prepareReady({ want, dir, hv, known, ownDirs = [], poolVmIds = [], progress = () => {} }) {
+  if (typeof want.admin !== 'string' || !ADMIN_RE.test(want.admin)) throw new Error('image.admin must name a local administrator account in that Windows (1-20 letters, digits, dots, dashes, spaces or underscores): you type its password when you approve the plan')
+  if ((want.vhdx !== undefined) === (want.vm !== undefined)) throw new Error('image is { vhdx, admin } or { vm, admin }, not both')
+  fs.mkdirSync(dir, { recursive: true })
+  const tmp = join(dir, `incoming-${crypto.randomBytes(6).toString('hex')}.vhdx`)
+  try {
+    let sha256, size, source
+    if (want.vhdx !== undefined) {
+      const p = want.vhdx
+      if (typeof p !== 'string' || !win32.isAbsolute(p) || /^\\\\/.test(p)) throw new Error('image.vhdx must be an absolute local path to a .vhdx file')
+      let real
+      try { real = fs.realpathSync.native(p) } catch { throw new Error(`image.vhdx ${p} can't be read: no such file`) }
+      if (!/\.vhdx$/i.test(real)) throw new Error('image.vhdx must be a .vhdx file')
+      for (const d of [...ownDirs, dir]) if (real.toLowerCase().startsWith(d.toLowerCase() + '\\')) throw new Error('image.vhdx can\'t be in the helper\'s own folders')
+      if (!fs.lstatSync(real).isFile()) throw new Error('image.vhdx is not a plain file')
+      progress('copying the disk into the helper\'s folder while hashing it')
+      ;({ sha256, size } = await copyHashing(fs.createReadStream(real), tmp, progress))
+      source = { source: 'vhdx', path: real }
+    } else {
+      if (typeof want.vm !== 'string' || !want.vm.trim() || want.vm.length > 100) throw new Error('image.vm must name one of your Hyper-V VMs (its name or id)')
+      progress(`reading the VM ${want.vm}'s disk into the helper's folder (the VM itself is only read)`)
+      const r = await hv('image-from-vm', { vm: want.vm, out: tmp, poolVmIds }, { timeoutMs: 6 * 60 * 60_000 })
+      progress('hashing the copy')
+      sha256 = (await hashFile(tmp)).toUpperCase()
+      size = fs.statSync(tmp).size
+      source = { source: 'vm', vmName: String(r.name), vmId: String(r.vmId) }
+    }
+    const lower = sha256.toLowerCase()
+    if (known?.has(lower) && fs.existsSync(known.get(lower).file)) {
+      const rec = known.get(lower)
+      if (!rec.ready) throw new Error('this disk is already a verified image of another kind: use it by its SHA-256')
+      if (rec.admin !== want.admin) throw new Error(`this disk is recorded with its admin account ${rec.admin}: name that one, or use another disk`)
+      return { ...rec, existing: true }
+    }
+    const file = join(dir, `${lower}.vhdx`)
+    fs.renameSync(tmp, file)
+    return { sha256: lower, size, file, ...source, os: 'windows', ready: true, admin: want.admin, imageIndex: 1, evaluation: false }
+  } finally {
+    fs.rmSync(tmp, { force: true })
+  }
+}
+
 /** SHA-256 (lower-case hex) of a file, streaming: the build's recheck of the copy against the approved hash. */
 function hashFile(file) {
   return new Promise((resolve, reject) => {
@@ -130,4 +181,4 @@ function guestReportProblem(g, img) {
   return null
 }
 
-module.exports = { prepare, guestReportProblem, localIso, hashFile, isEvalEdition, NO_DOWNLOAD, EVAL }
+module.exports = { prepare, prepareReady, guestReportProblem, localIso, hashFile, isEvalEdition, NO_DOWNLOAD, EVAL }

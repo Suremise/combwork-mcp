@@ -75,7 +75,8 @@ process.stdin.on('end', () => {
   // MC-1501: com-read runs alongside a Linux build's other calls, so it only reads: it never saves (a save racing
   // another call's read could hand that call a half-written file).
   const keep = op !== 'com-read'
-  s.calls.push({ op, argv: process.argv.slice(2), vmId: a.vmId, command: a.command, ...(a.kind ? { kind: a.kind } : {}) })
+  // MC-1578: which account a guest call signed in as (a.cred.user; never its password).
+  s.calls.push({ op, argv: process.argv.slice(2), vmId: a.vmId, command: a.command, ...(a.kind ? { kind: a.kind } : {}), ...(a.cred?.user ? { as: a.cred.user } : {}) })
   if (keep) save(s) // logged before it runs, so a test can see a call in progress
   try {
     if (s.fail[op] > 0) { s.fail[op]--; if (keep) save(s); throw new Error(`injected failure of ${op}`) }
@@ -137,6 +138,8 @@ function run(s, op, a) {
       vm.userinit = USERINIT
       vm.enableLUA = 1
       vm.armed = false
+      vm.autologon = false // MC-1578: whatever a ready-made disk came with
+      vm.lsaSecret = false
       vm.undos = (vm.undos || 0) + 1
       return { autoAdminLogon: '0', defaultUserName: '', secretRemoved: true, enableLUA: 1, userinit: USERINIT, hvmcpEmpty: true, hvmcpExplicitAces: 0, hvmcpProtected: false, ...(s.undoOverride || {}) }
     }
@@ -179,6 +182,18 @@ function run(s, op, a) {
         if (s.failAfterCreate) { s.failAfterCreate = false; throw new Error('injected failure after New-VM') }
         return { vmId: id }
       }
+      // MC-1578: a ready-made Windows disk (baseVhdx): its hash checked against baseSha256 as hv.ps1 does, then copied.
+      // The guest is what state.readyGuest says the disk holds: { accounts: { name: { password, admin, enabled, rmu } },
+      // autologon, lsaSecret, generalized }; by default an installed Windows with one admin, Administrator / src-pw.
+      if (a.baseVhdx) {
+        if (!/^[0-9a-f]{64}$/.test(a.baseSha256 || '')) throw new Error('create-vm needs the approved disk\'s SHA-256')
+        const got = crypto.createHash('sha256').update(fs.readFileSync(a.baseVhdx)).digest('hex')
+        if (got !== a.baseSha256) throw new Error(`the disk's copy has changed since it was checked and approved (SHA-256 ${got}, not ${a.baseSha256}): refused, nothing created`)
+        fs.copyFileSync(a.baseVhdx, join(a.folder, 'disk.vhdx'))
+        const g = s.readyGuest || {}
+        s.vms[id] = { id, name: a.name, location: join(a.folder, a.name), state: 'Off', checkpoints: [], parent: null, switchName: null, reserve: 0, disk: {}, cores: a.cores, memoryMB: a.memoryMB, installed: true, fromDisk: true, accounts: JSON.parse(JSON.stringify(g.accounts || { Administrator: { password: 'src-pw', admin: true, enabled: true } })), autologon: !!g.autologon, lsaSecret: !!g.lsaSecret, generalized: !!g.generalized }
+        return { vmId: id }
+      }
       // MC-1572: hv.ps1 hashes the ISO against isoSha256 before anything is created (tested for real in units.test.js);
       // the stub only checks that the approved hash is passed, and keeps it for the tests to read.
       if (!/^[0-9a-f]{64}$/.test(a.isoSha256 || '')) throw new Error('create-vm needs the approved image\'s SHA-256')
@@ -197,7 +212,42 @@ function run(s, op, a) {
         while (!fs.existsSync(s.readyGate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25)
       }
       if (s.notReady) return { ready: false }
+      // MC-1578: a ready-made disk's guest answers only an enabled account with its own password (and never while
+      // generalized: it would still be in OOBE).
+      if (vm.fromDisk) {
+        const acct = vm.accounts?.[a.cred?.user]
+        return { ready: vm.state === 'Running' && !vm.generalized && !!acct && acct.enabled !== false && acct.password === a.cred.password }
+      }
       return { ready: vm.state === 'Running' && vm.installed !== false }
+    }
+    // MC-1578: the helper's accounts, made through the disk's admin, as hv.ps1's $GuestAccounts does; accountsOverride:
+    // fields the read-back reports instead (a reset that didn't take).
+    case 'guest-accounts': {
+      const vm = own(s, a)
+      if (vm.state !== 'Running' || !vm.fromDisk) throw new Error('the VM is not running a ready-made disk')
+      const by = vm.accounts[a.cred?.user]
+      if (!by || by.password !== a.cred.password || !by.admin) throw new Error('Access is denied (the disk\'s admin account)')
+      vm.accounts[a.admin.user] = { ...(vm.accounts[a.admin.user] || {}), password: a.admin.password, enabled: true, admin: true }
+      vm.accounts[a.user.user] = { ...(vm.accounts[a.user.user] || {}), password: a.user.password, enabled: true, admin: false, rmu: false }
+      const read = (x, o = {}) => { const u = vm.accounts[x.user]; return { exists: !!u, enabled: !!u?.enabled, isAdmin: !!u?.admin, remoteMgmt: !!u?.rmu, signsIn: u?.password === x.password, ...o } }
+      const o = s.accountsOverride || {}
+      return { admin: read(a.admin, o.admin), user: read(a.user, o.user) }
+    }
+    // MC-1578: one of the user's own VMs (state.outsideVms: { id: { name, state, generation, disks: [path], checkpoints } }),
+    // read only: its disk's bytes copied to a.out, as Convert-VHD flattens it.
+    case 'image-from-vm': {
+      const all = Object.entries(s.outsideVms || {})
+      const hit = all.find(([id]) => id === a.vm) || all.find(([, v]) => v.name === a.vm)
+      if (!hit && s.vms[a.vm]) throw new Error(`${s.vms[a.vm].name} is one of the pool's own VMs: name a VM of your own`)
+      if (!hit) throw new Error(`there's no VM named ${a.vm}`)
+      const [id, v] = hit
+      if ((a.poolVmIds || []).includes(id)) throw new Error(`${v.name} is one of the pool's own VMs: name a VM of your own`)
+      if (v.state !== 'Off') throw new Error(`${v.name} is ${v.state}: turn it off first (its disk is only read, and a running VM's isn't consistent)`)
+      if (v.generation !== 2) throw new Error(`${v.name} is a Generation ${v.generation} VM: pool VMs are Generation 2 (UEFI)`)
+      if (v.disks.length !== 1) throw new Error(`${v.name} has ${v.disks.length} disks: only a VM with one disk can be used`)
+      if (s.convertFails) throw new Error('Convert-VHD failed (injected)')
+      fs.copyFileSync(v.disks[0], a.out)
+      return { vmId: id, name: v.name }
     }
     // MC-1531 knobs: setupMarker (written to C:\marker.txt, a stand-in for a fix the setup applies), setupThrows,
     // setupEntered + setupGate (held as it begins).
@@ -210,7 +260,7 @@ function run(s, op, a) {
       vm.switchName = null
       vm.reserve = 0
       const id = crypto.randomUUID()
-      vm.checkpoints = [{ id, name: 'clean', parentId: null, disk: { ...vm.disk }, userinit: vm.userinit ?? null, enableLUA: vm.enableLUA ?? 1 }]
+      vm.checkpoints = [{ id, name: 'clean', parentId: null, disk: { ...vm.disk }, userinit: vm.userinit ?? null, enableLUA: vm.enableLUA ?? 1, ...(vm.fromDisk ? { autologon: vm.autologon, lsaSecret: vm.lsaSecret, accounts: JSON.parse(JSON.stringify(vm.accounts)) } : {}) }]
       vm.parent = id
       return { checkpointId: id }
     }

@@ -54,8 +54,8 @@ if ($p.switch) { Write-Host "  create the internal switch $($p.switch) (host and
 if ($p.removeSwitch) { Write-Host "  remove the switch $($p.removeSwitch)" }
 if ($p.image) {
   # MC-1572: the image is the file you chose; approving binds its SHA-256, and the build uses the helper's copy of exactly that.
-  $from = if ($p.image.path) { "from $($p.image.path)" } else { 'checked earlier' }
-  $what = if ($p.image.os -eq 'linux') { "Linux image $($p.image.name)" } else { "$($p.image.edition) build $($p.image.build)" }
+  $from = if ($p.image.path) { "from $($p.image.path)" } elseif ($p.image.vmName) { "a copy of your VM $($p.image.vmName) ($($p.image.vmId)), which is only read" } else { 'checked earlier' }
+  $what = if ($p.image.os -eq 'linux') { "Linux image $($p.image.name)" } elseif ($p.image.ready) { "ready-made Windows disk, built with its admin account $($p.image.admin)" } else { "$($p.image.edition) build $($p.image.build)" }
   Write-Host ("  image: {0}, SHA-256 {1} ({2})" -f $what, $p.image.sha256, $from)
   if ($p.image.signature) { Write-Host ("  setup files: {0}" -f $(if ($p.image.signature.microsoft) { 'signed by Microsoft' } else { "not signed by Microsoft ($($p.image.signature.note)): information only" })) }
 }
@@ -76,6 +76,22 @@ Get-ChildItem -LiteralPath $dir -Filter '*.json' -File | ForEach-Object {
   try { if ([DateTimeOffset]::Parse((Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json).expires).ToUnixTimeMilliseconds() -lt $now) { Remove-Item -LiteralPath $_.FullName -Force } } catch { Remove-Item -LiteralPath $_.FullName -Force }
 }
 $expires = [DateTimeOffset]::FromUnixTimeMilliseconds([Math]::Min([long]$p.expires, $now + 30 * 60 * 1000)).ToString('o')
+# MC-1578: a plan that builds VMs from a ready-made disk needs that disk's admin password, typed here by you (never by
+# an agent, never on a command line). It goes into the helper's secrets folder (SYSTEM, Administrators and the helper
+# only), bound to this plan, its digest, the disk's SHA-256 and the account; the helper deletes it when the plan's
+# builds end, or once this approval expires unused.
+if ($p.image.ready -and @($p.add | Where-Object { $_ }).Count) {
+  $secure = Read-Host -AsSecureString "Password of $($p.image.admin) in that disk (used once per VM, to make the helper's own accounts)"
+  $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+  try { $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) } finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+  if (-not $plain) { Write-Host 'No password typed: not approved.' -ForegroundColor Yellow; exit 1 }
+  $sdir = Join-Path $state 'secrets\source-admin'
+  if (-not (Test-Path -LiteralPath $sdir -PathType Container)) { New-Item -ItemType Directory -Path $sdir | Out-Null }
+  if ((Get-Item -LiteralPath $sdir -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "$sdir is a link: refusing." }
+  $cred = [ordered]@{ planId = $Plan; digest = $digest; imageSha256 = [string]$p.image.sha256; user = [string]$p.image.admin; password = $plain; expires = $expires } | ConvertTo-Json -Compress
+  [IO.File]::WriteAllText((Join-Path $sdir "$Plan.json"), $cred, (New-Object Text.UTF8Encoding $false))
+  $plain = $null; $cred = $null
+}
 $rng = [Security.Cryptography.RandomNumberGenerator]::Create(); $nb = New-Object byte[] 16; $rng.GetBytes($nb)
 $nonce = -join ($nb | ForEach-Object { $_.ToString('x2') })
 $approval = [ordered]@{ planId = $Plan; digest = $digest; op = $p.op; expires = $expires; nonce = $nonce; epoch = $epoch } | ConvertTo-Json -Compress
