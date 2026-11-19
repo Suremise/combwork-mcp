@@ -423,7 +423,20 @@ class Helper {
 
   // ---------- connections and leases ----------
 
-  connect(connId, pid) { this.conns.set(connId, { pid, vmId: null, stage: null }) }
+  // MC-1580: a connection may hold several leases (vmIds), each named by its VM in the lease ops' vm.
+  connect(connId, pid) { this.conns.set(connId, { pid, vmIds: new Set(), stage: null }) }
+
+  /** MC-1580: the leases this connection holds now (not ending), oldest first. */
+  heldLeases(connId) {
+    const c = this.conns.get(connId)
+    if (!c) return []
+    return [...c.vmIds].map(id => this.leases.get(id)).filter(l => l && l.connId === connId && !l.ending)
+  }
+
+  /** MC-1580: the lease a request names (vm), or its connection's only one; null when none fits (for the timing context). */
+  leaseFor(connId, vm) {
+    try { return this.leaseOf(connId, vm) } catch { return null }
+  }
 
   /**
    * A connection closed (its MCP server exited or was killed): its lease ends first (which kills its in-flight
@@ -436,20 +449,37 @@ class Helper {
     this.leaveQueue(connId, 'its connection closed')
     if (!c) return
     try {
-      const lease = c.vmId && this.leases.get(c.vmId)
-      if (lease && lease.connId === connId) {
+      // MC-1580: every lease the connection holds ends with it (a kept one reverts at its deadline).
+      const ends = []
+      for (const id of c.vmIds) {
+        const lease = this.leases.get(id)
+        if (!lease || lease.connId !== connId) continue
         lease.connId = null
-        if (!lease.kept) await this.endLease(lease, 'its connection closed') // a kept one reverts at its deadline
+        if (!lease.kept) ends.push(this.endLease(lease, 'its connection closed'))
       }
+      await Promise.all(ends)
     } finally {
       this.dropStage(c)
     }
   }
 
-  leaseOf(connId) {
+  /**
+   * MC-1580: the lease a lease op acts on. vm names one this connection holds; left out, its only one. With several and
+   * no vm, refused naming them: an op never guesses which VM.
+   */
+  leaseOf(connId, vm) {
     const c = this.conns.get(connId)
-    const lease = c?.vmId && this.leases.get(c.vmId)
-    if (!lease || lease.connId !== connId) throw new Error('This connection has no VM: call vm_acquire first.')
+    const mine = c ? [...c.vmIds].map(id => this.leases.get(id)).filter(l => l && l.connId === connId) : []
+    if (vm !== undefined && vm !== null) {
+      if (typeof vm !== 'string' || !vm) throw new Error('vm must be the name of a VM this session holds (vm_status lists them).')
+      const lease = mine.find(l => l.vmName === vm)
+      if (!lease) throw new Error(`This session holds no VM named ${vm}${mine.length ? ` (it holds ${mine.map(l => l.vmName).join(', ')})` : ': call vm_acquire first'}.`)
+      if (lease.ending) throw new Error(`This connection's lease on ${lease.vmName} is ending: call vm_acquire again.`)
+      return lease
+    }
+    if (!mine.length) throw new Error('This connection has no VM: call vm_acquire first.')
+    if (mine.length > 1) throw new Error(`This session holds ${mine.length} VMs (${mine.map(l => `${l.vmName}, ${l.os}`).join('; ')}): name one with vm.`)
+    const lease = mine[0]
     if (lease.ending) throw new Error(`This connection's lease on ${lease.vmName} is ending: call vm_acquire again.`)
     return lease
   }
@@ -684,7 +714,7 @@ class Helper {
     // MC-1532: a lease acquired by a pool checkpoint starts from that exact checkpoint by default (pinned).
     if (want.checkpoint) { const p = this.poolCheckpointOn(vm.vmId, want.checkpoint); lease.startFrom = { name: p.name, checkpointId: p.checkpointId }; lease.refs.add(p.checkpointId) }
     this.leases.set(vm.vmId, lease)
-    c.vmId = vm.vmId
+    c.vmIds.add(vm.vmId)
     this.armDeadline(lease)
     const share = `${project === 'other' ? '' : ` for project ${project}`}${this.osOf(vm) === 'windows' && !want.image ? '' : ` (${this.osOf(vm)}, image ${this.imageOf(vm).slice(0, 12)})`}`
     const failed = this.failedNote(vm)
@@ -763,7 +793,7 @@ class Helper {
       if (this.quiesced) throw new Error('The helper is being uninstalled: no new leases.')
       const c = this.conns.get(connId)
       if (!c) throw new Error('unknown connection')
-      if (c.vmId && this.leases.get(c.vmId)?.connId === connId) throw new Error(`This connection already has ${this.leases.get(c.vmId).vmName}: one VM per connection.`)
+      // MC-1580: a connection may hold several VMs; each lease counts toward the same caps and waits in the same line.
       const max = this.policy.maxLeaseMinutes
       if (!Number.isFinite(minutes) || minutes < 1 || minutes > max) throw new Error(`minutes must be 1-${max} (the policy's maxLeaseMinutes).`)
       const s = this.state
@@ -865,8 +895,8 @@ class Helper {
    * the policy's maxSessionMinutes). Refused once the deadline has passed, even before its timer has fired, so an
    * expired lease can't be brought back; and while the lease is ending.
    */
-  renew(connId, { minutes = 60 } = {}) {
-    const lease = this.leaseOf(connId)
+  renew(connId, { minutes = 60, vm: named } = {}) {
+    const lease = this.leaseOf(connId, named)
     const now = this.now()
     if (now >= lease.deadline) throw new Error(`This connection's lease on ${lease.vmName} has passed its deadline and is ending: it can't be renewed. vm_acquire again.`)
     const max = this.policy.maxLeaseMinutes
@@ -918,7 +948,7 @@ class Helper {
       if (vm) r = await this.vmLock(vm.vmId)(() => this.restore(vm))
       if (this.leases.get(lease.vmId) === lease) this.leases.delete(lease.vmId)
       const owner = this.conns.get(lease.ownerConn)
-      if (owner && owner.vmId === lease.vmId) owner.vmId = null
+      if (owner) owner.vmIds.delete(lease.vmId)
       this.log(`lease ${lease.leaseId} on ${lease.vmName} ended (${why}): ${r.text}`)
       this.kick()
       return r
@@ -1359,15 +1389,16 @@ class Helper {
    * Starts staging a build: for vm_start (no planId), or for a vm_sync plan (planId), whose staging takes exactly the
    * plan's needed files, each once, at the plan's size and SHA-256 (hashed here as the bytes arrive, never taken on trust).
    */
-  stageBegin(connId, { planId } = {}) {
-    const lease = this.leaseOf(connId)
+  stageBegin(connId, { planId, vm: named } = {}) {
+    const lease = this.leaseOf(connId, named)
     const c = this.conns.get(connId)
     let plan = null
     if (planId !== undefined) plan = this.currentPlan(lease, planId)
     this.dropStage(c)
     const dir = join(this.dir, 'runs', lease.leaseId + '-' + hex(4), 'staging')
     fs.mkdirSync(dir, { recursive: true })
-    c.stage = { dir, files: 0, bytes: 0, current: null, done: false, plan, hashes: new Map() }
+    // MC-1580: a staged build is for the lease it was begun for, and only that one's start copies it.
+    c.stage = { dir, files: 0, bytes: 0, current: null, done: false, plan, hashes: new Map(), leaseId: lease.leaseId }
     return { text: 'staging' }
   }
 
@@ -1448,15 +1479,15 @@ class Helper {
    * host's 4 MB frame limit, whatever the build's size: a line over it closes the connection, which would end the lease.
    * It is the connection's, bound to its lease and generation; sync_plan without `files` takes it (once).
    */
-  manifestBegin(connId) {
-    const lease = this.leaseOf(connId)
+  manifestBegin(connId, { vm: named } = {}) {
+    const lease = this.leaseOf(connId, named)
     const c = this.conns.get(connId)
     c.manifest = { leaseId: lease.leaseId, gen: lease.sync.gen, files: [] }
     return { text: 'manifest' }
   }
 
-  manifestAdd(connId, { files } = {}) {
-    const lease = this.leaseOf(connId)
+  manifestAdd(connId, { files, vm: named } = {}) {
+    const lease = this.leaseOf(connId, named)
     const m = this.conns.get(connId).manifest
     if (!m) throw new Error('no manifest being sent: manifest_begin first')
     if (m.leaseId !== lease.leaseId || m.gen !== lease.sync.gen) throw new Error('This manifest is stale (the VM was started, reset or synced since): call vm_sync again.')
@@ -1466,8 +1497,8 @@ class Helper {
     return { text: 'ok', data: { files: m.files.length } }
   }
 
-  syncPlan(connId, { files, full = false, delete: del = true } = {}) {
-    const lease = this.leaseOf(connId)
+  syncPlan(connId, { files, full = false, delete: del = true, vm: named } = {}) {
+    const lease = this.leaseOf(connId, named)
     const conn = this.conns.get(connId)
     if (files === undefined) {
       const m = conn.manifest
@@ -1526,8 +1557,8 @@ class Helper {
    * Rechecked inside the VM's lock. C:\build is untrusted from the first change until the apply finishes: a failure,
    * a timeout or the lease ending leaves it untrusted, and only a full sync or a reset may follow.
    */
-  async sync(connId, { planId } = {}) {
-    const lease = this.leaseOf(connId)
+  async sync(connId, { planId, vm: named } = {}) {
+    const lease = this.leaseOf(connId, named)
     const c = this.conns.get(connId)
     const vm = this.vmOf(lease)
     return this.vmLock(vm.vmId)(async () => {
@@ -1761,8 +1792,8 @@ class Helper {
 
   // ---------- runs ----------
 
-  async start(connId, { network, reserveCpu = 0, interactive = false, checkpoint } = {}) {
-    const lease = this.leaseOf(connId)
+  async start(connId, { network, reserveCpu = 0, interactive = false, checkpoint, vm: named } = {}) {
+    const lease = this.leaseOf(connId, named)
     const c = this.conns.get(connId)
     if (checkpoint !== undefined && (typeof checkpoint !== 'string' || !POOL_CHECKPOINT_RE.test(checkpoint))) throw new Error("checkpoint must be 'clean' or one of this VM's pool checkpoints (vm_status lists them).")
     if (![false, 'user', 'admin'].includes(interactive)) throw new Error("interactive must be false, 'user' or 'admin'")
@@ -1772,6 +1803,8 @@ class Helper {
     this.netAllowed(mode)
     if (!Number.isInteger(reserveCpu) || reserveCpu < 0 || reserveCpu > this.policy.maxReservePercent) throw new Error(`reserveCpu must be a whole percentage, 0-${this.policy.maxReservePercent} (the policy's cap).`)
     if (c.stage?.plan) this.dropStage(c) // a sync's partial staging is never a start's build
+    // MC-1580: a build staged for another of this session's VMs is never copied into this one.
+    if (c.stage && c.stage.leaseId !== lease.leaseId) { this.dropStage(c); throw new Error(`The build staged was for another VM of this session, not ${lease.vmName}: start again.`) }
     if (c.stage && !c.stage.done) throw new Error('the build is still being staged')
     const vm = this.vmOf(lease)
     return this.vmLock(vm.vmId)(async () => {
@@ -1935,8 +1968,8 @@ class Helper {
     return c
   }
 
-  async run(connId, { command, shell, as = 'admin', timeoutSec = 120, cwd, session = 'service' } = {}) {
-    const lease = this.leaseOf(connId)
+  async run(connId, { command, shell, as = 'admin', timeoutSec = 120, cwd, session = 'service', vm: named } = {}) {
+    const lease = this.leaseOf(connId, named)
     if (!lease.running) throw new Error('The VM is not running: call vm_start first.')
     if (!['service', 'interactive'].includes(session)) throw new Error("session must be 'service' or 'interactive'")
     if (typeof command !== 'string' || !command.trim()) throw new Error('command is required')
@@ -2040,8 +2073,8 @@ class Helper {
     }
   }
 
-  async readOut(connId, { paths, glob, maxBytes = 256 * 1024, maxTotalBytes = 1024 * 1024 } = {}) {
-    const lease = this.leaseOf(connId)
+  async readOut(connId, { paths, glob, maxBytes = 256 * 1024, maxTotalBytes = 1024 * 1024, vm: named } = {}) {
+    const lease = this.leaseOf(connId, named)
     if (!lease.running) throw new Error('The VM is not running: files in C:\\out are read while it runs (vm_stop restores it and discards them).')
     if (!Number.isInteger(maxBytes) || maxBytes < 1 || maxBytes > 16 * 1024 * 1024) throw new Error('maxBytes must be 1-16777216')
     if (!Number.isInteger(maxTotalBytes) || maxTotalBytes < 1 || maxTotalBytes > 64 * 1024 * 1024) throw new Error('maxTotalBytes must be 1-67108864')
@@ -2100,8 +2133,8 @@ class Helper {
       : `Restoring the VM to end what it started failed: ${r.text}`
   }
 
-  async stop(connId, { keep = false } = {}) {
-    const lease = this.leaseOf(connId)
+  async stop(connId, { keep = false, vm: named } = {}) {
+    const lease = this.leaseOf(connId, named)
     const vm = this.vmOf(lease)
     if (keep || (lease.keepOnFailure && lease.failed)) {
       lease.kept = true
@@ -2127,8 +2160,8 @@ class Helper {
    * Hyper-V name and confirmed after it. Only while running, not kept, with a trusted sync record; within the lease's
    * cap (unconfirmed takes count) and the disk floor. Dropped when the lease ends.
    */
-  async checkpoint(connId, { name } = {}) {
-    const lease = this.leaseOf(connId)
+  async checkpoint(connId, { name, vm: named } = {}) {
+    const lease = this.leaseOf(connId, named)
     if (typeof name !== 'string' || !LEASE_CHECKPOINT_RE.test(name) || name.toLowerCase() === 'clean') throw new Error('name must be 1-40 letters, digits, spaces, dots, dashes or underscores, starting with a letter or digit, and not "clean".')
     const vm = this.vmOf(lease)
     return this.vmLock(vm.vmId)(async () => {
@@ -2251,8 +2284,8 @@ class Helper {
    * the guest awaited, all read back. The sync record is cleared and untrusted; run numbers keep rising; no one is
    * logged on interactively afterwards.
    */
-  async restoreCheckpoint(connId, { name } = {}) {
-    const lease = this.leaseOf(connId)
+  async restoreCheckpoint(connId, { name, vm: named } = {}) {
+    const lease = this.leaseOf(connId, named)
     const vm = this.vmOf(lease)
     return this.vmLock(vm.vmId)(async () => {
       this.stillHeld(lease)
@@ -2296,11 +2329,17 @@ class Helper {
     })
   }
 
-  async release(connId) {
-    const lease = this.leaseOf(connId)
+  async release(connId, { vm: named } = {}) {
+    const lease = this.leaseOf(connId, named)
     lease.kept = false
     const r = await this.endLease(lease, 'released')
-    return { text: r.ok ? `Released. ${r.text}` : r.text, isError: !r.ok }
+    return { text: r.ok ? `Released. ${r.text}` : r.text, isError: !r.ok, data: { vm: lease.vmName } }
+  }
+
+  /** MC-1580: the leases this connection holds now, live (one ended by its deadline or a release is already gone). */
+  leasesOp(connId) {
+    const held = this.heldLeases(connId).map(l => ({ vm: l.vmName, os: l.os, running: !!l.running, deadline: l.deadline }))
+    return { text: held.length ? `This session holds ${held.map(l => `${l.vm} (${l.os}${l.running ? ', running' : ''})`).join(', ')}.` : 'This session holds no VM.', data: { leases: held } }
   }
 
   // ---------- status ----------
@@ -2326,7 +2365,7 @@ class Helper {
 
   status(connId) {
     const s = this.state
-    const mine = connId && this.conns.get(connId)?.vmId
+    const mine = new Set(connId ? this.heldLeases(connId).map(l => l.vmId) : [])
     const vms = [...s.vms.values()].map(v => {
       const l = this.leases.get(v.vmId)
       const state = s.quarantined.has(v.vmId) ? `QUARANTINED (${s.quarantined.get(v.vmId)})`
@@ -2335,7 +2374,7 @@ class Helper {
       const img = this.imageOf(v)
       const failed = this.failedNote(v)
       // MC-1529: the caller's own lease checkpoints (only theirs), and checkpoints neither clean nor a lease's, left alone.
-      const cps = l && v.vmId === mine ? this.leaseCheckpoints(l) : []
+      const cps = l && mine.has(v.vmId) ? this.leaseCheckpoints(l) : []
       const cpNote = cps.length ? `; your checkpoints: ${cps.map(x => `"${x.name}" (${x.checkpointId ? `taken ${x.at}` : 'unconfirmed'})`).join(', ')}` : ''
       // MC-1532: the VM's pool checkpoints, with their provenance (a shared name doesn't mean identical contents), and a
       // lease's start point.
@@ -2346,7 +2385,7 @@ class Helper {
       const unknownNote = unknown?.length ? `; unknown checkpoints left alone: ${unknown.join(', ')}` : ''
       const li = this.isLinux(v) ? s.images.get(img) : null
       const osLabel = li?.distro ? `linux (${li.name || `${li.distro} ${li.release}`}, build ${li.serial})` : this.isLinux(v) && v.guest?.id ? `linux (${v.guest.id} ${v.guest.versionId ?? ''}`.trimEnd() + ')' : this.osOf(v)
-      return `- ${v.vmName}: ${osLabel}, image ${img === 'legacy' ? 'unknown (made before images were recorded)' : img.slice(0, 12)}; ${v.cores} cores, ${v.memoryMB} MB, ${v.diskGB} GB disk; ${state}${v.vmId === mine ? ' (yours)' : ''}${expiry(v, this.now())}${failed ? `; ${failed}` : ''}${fromNote}${pcNote}${cpNote}${unknownNote}`
+      return `- ${v.vmName}: ${osLabel}, image ${img === 'legacy' ? 'unknown (made before images were recorded)' : img.slice(0, 12)}; ${v.cores} cores, ${v.memoryMB} MB, ${v.diskGB} GB disk; ${state}${mine.has(v.vmId) ? ' (yours)' : ''}${expiry(v, this.now())}${failed ? `; ${failed}` : ''}${fromNote}${pcNote}${cpNote}${unknownNote}`
     })
     const img = [...s.images.values()].at(-1)
     const lines = [
@@ -2362,7 +2401,7 @@ class Helper {
       `Policy: up to ${this.policy.maxVms} VMs, ${this.policy.maxCoresPerVm} cores each, ${this.policy.maxMemoryMBTotal} MB in all, ${this.policy.maxDiskGBPerVm} GB disks, in ${this.policy.diskFolders.join('; ')}; network up to ${this.policy.maxNetwork}${this.policy.hostNetwork ? ` (host mode: ${this.policy.hostNetwork.switchName}, this PC ${this.policy.hostNetwork.hostAddress} on ${this.policy.hostNetwork.subnet})` : ''}; CPU reserve up to ${this.policy.maxReservePercent}%; leases up to ${this.policy.maxLeaseMinutes} min at a time, renewable to ${policyMod.sessionMinutes(this.policy)} min per work session${this.policy.maxSessionMinutes === undefined ? ' (the default)' : ''}.`,
       `Build folders set by an admin (install.ps1 -BuildRoot): ${this.policy.buildRoots.length ? this.policy.buildRoots.join('; ') : 'none'}.`,
       // MC-1558: this connection's timings (its MCP server's HYPERV_MCP_* keys), and setup's caps when it set any.
-      `Timings for this connection: ${timing.describe(this.tm(connId && this.leases.get(this.conns.get(connId)?.vmId || '')?.connId === connId ? this.leases.get(this.conns.get(connId).vmId) : { timing: this.connTiming(connId) }))}${this.policy.timingCaps && Object.keys(this.policy.timingCaps).length ? `; setup's caps: ${Object.entries(this.policy.timingCaps).map(([k, v]) => `${k} ${v}`).join(', ')}` : ''}.`,
+      `Timings for this connection: ${timing.describe(this.tm({ timing: this.connTiming(connId) }))}${this.policy.timingCaps && Object.keys(this.policy.timingCaps).length ? `; setup's caps: ${Object.entries(this.policy.timingCaps).map(([k, v]) => `${k} ${v}`).join(', ')}` : ''}.`,
       'vm_acquire\'s vm names one VM: for trials and censuses on a specific VM, not for normal use (it waits in line like any other request, for that VM only).'
     ]
     return { text: lines.filter(Boolean).join('\n'), data: { vms: s.vms.size, job: this.job ? this.job.op : null, epoch: this.journal.epoch, connections: this.conns.size, lastJob: this.lastJob } }
@@ -3229,8 +3268,9 @@ class Helper {
   async request(connId, op, args = {}) {
     if (!this.ready) throw new Error('the helper is still starting')
     const c = this.conns.get(connId)
-    const lease = c?.vmId && this.leases.get(c.vmId)
-    return this.ctx.run((lease && lease.connId === connId && lease.timing) || c?.timing || this.defaultTiming, () => this.dispatch(connId, op, args))
+    // MC-1580: the lease the request names (or the connection's only one) gives the timing context.
+    const lease = c ? this.leaseFor(connId, args?.vm) : null
+    return this.ctx.run((lease && lease.timing) || c?.timing || this.defaultTiming, () => this.dispatch(connId, op, args))
   }
 
   async dispatch(connId, op, args) {
@@ -3239,7 +3279,7 @@ class Helper {
       case 'status': return this.status(connId)
       case 'acquire': return this.acquire(connId, args)
       case 'renew': return this.renew(connId, args)
-      case 'manifest_begin': return this.manifestBegin(connId)
+      case 'manifest_begin': return this.manifestBegin(connId, args)
       case 'manifest_add': return this.manifestAdd(connId, args)
       case 'sync_plan': return this.syncPlan(connId, args)
       case 'sync': return this.sync(connId, args)
@@ -3253,7 +3293,8 @@ class Helper {
       case 'stop': return this.stop(connId, args)
       case 'checkpoint': return this.checkpoint(connId, args)
       case 'restore-checkpoint': return this.restoreCheckpoint(connId, args)
-      case 'release': return this.release(connId)
+      case 'release': return this.release(connId, args)
+      case 'leases': return this.leasesOp(connId)
       case 'pool_plan': return this.plan(args)
       case 'pool_create': return this.apply('create', args)
       case 'pool_resize': return this.apply('resize', args)
@@ -3279,7 +3320,8 @@ const PROTOCOL = 'hyperv-mcp/3' // 2: renew, sync_plan, sync (MC-1497); 3: start
 // 'timing' = set-timing, a connection's timings (MC-1558).
 // 'user-images' = pool_plan's image is any local file the user names ({ iso } of any x64 edition, or a Linux { file }),
 // with no pins and no downloads; acquire's distro is any /etc/os-release ID (MC-1572).
-const FEATURES = ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean', 'linux', 'debug-keep', 'timing', 'network-modes', 'user-images', 'guest-script']
+// 'multi-vm' = a connection holds several leases; every lease op takes vm (the VM's name), and leases lists them (MC-1580).
+const FEATURES = ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean', 'linux', 'debug-keep', 'timing', 'network-modes', 'user-images', 'guest-script', 'multi-vm']
 const LEASE_CHECKPOINT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$/
 // MC-1532: a pool checkpoint's name.
 const POOL_CHECKPOINT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._+-]{0,39}$/

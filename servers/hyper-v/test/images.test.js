@@ -74,20 +74,23 @@ test('groups by image: a resize with an image adds to, or takes from, that image
   await h.stop()
 })
 
-test('vm_acquire by OS and image: only the matching VMs; one VM per session as before', async () => {
+test('vm_acquire by OS and image: only the matching VMs; a session may hold a Linux and a Windows VM (MC-1580)', async () => {
   const { sc, h, admin } = await mixed('img-acquire')
   const [c1, c2, c3, c4] = [h.conn(1), h.conn(2), h.conn(3), h.conn(4)]
   assert.match((await acquire(c1, { os: 'linux' })).error, /the pool has no free linux VM/)
   await change(sc, admin, { action: 'resize', image: L, vms: 1 })
   await change(sc, admin, { action: 'resize', image: B, vms: 1 })
   assert.match((await acquire(c1, { os: 'linux' })).text, /^Leased .* \(linux, image efefefefefef\)/)
-  assert.match((await acquire(c1, { os: 'windows' })).error, /already has .*: one VM per connection/)
   assert.match((await acquire(c2, { image: B.slice(0, 16) })).text, /\(windows, image cdcdcdcdcdcd\)/)
   assert.match((await acquire(c3, { image: B })).error, /^No VM for you now: none of image cdcdcdcdcdcd is free/)
   assert.match((await acquire(c3, { os: 'linux', image: A })).error, /image abababababab is a windows image, not linux/)
   assert.match((await acquire(c3, {})).text, /^Leased /, 'a plain acquire takes any Windows image')
   assert.match((await c3.request('status')).text, /windows, image abababababab;.*\(yours\)/)
   assert.match((await acquire(c4, { os: 'mac' })).error, /os must be windows or linux/)
+  // MC-1580: c1 holds its Linux VM and now the last free Windows one too; each is its own in status.
+  assert.match((await acquire(c1, { os: 'windows' })).text, /^Leased /)
+  assert.strictEqual(((await c1.request('status')).text.match(/\(yours\)/g) || []).length, 2)
+  assert.strictEqual((await c1.request('leases')).data.leases.length, 2)
   await h.stop()
 })
 

@@ -129,6 +129,9 @@ using the new server: the helper's protocol and features changed, and an older h
   own). The checkpoint counts may go
   up to Hyper-V's 50 per VM (formerly 8 each), and setup takes them: `-MaxLeaseCheckpoints`, `-MaxCheckpointsPerVm`,
   `-MinFreeGBForCheckpoint`. Image files have no size cap (formerly 16 GB for an ISO, 4 GB for a qcow2).
+- More than one VM per session (MC-1580): one agent can hold, say, a Windows and a Linux VM together, each counted
+  against the same caps; every lease tool takes `vm`, the VM's name (see "More than one VM per session"). Naming a VM
+  needs the 4.2.0 helper: the server refuses `vm` to an older one, with "run setup again", rather than send it.
 - Without the rerun, the 4.1.0 helper keeps its ranges, and ignores `HYPERV_MCP_OUTPUT_BYTES` (16 KB).
 
 **From 4.0.0 to 4.1.0 (any terminal, MC-1575): rerun setup to get the new lines.**
@@ -432,7 +435,7 @@ you approved.
 
 | Tool | What it does |
 |---|---|
-| `vm_acquire({ minutes=60, keepOnFailure=false, wait=false, os='windows', distro?, image?, vm? })` | Leases one VM of that OS (`distro`, an `/etc/os-release` ID such as `debian` or `ubuntu`, for a Linux VM of that distro; and image, when given; or the VM named by `vm`, for trials, see "One VM by name") to this session (one VM per session) until `vm_release`, its deadline (at most the policy's `maxLeaseMinutes`), or this server exiting. Without `wait`, it refuses when none is free for this session's project, saying why (none free, the project's cap, a VM kept for another project), when the next lease ends, and where it would stand in line. With `wait: true` it waits in line about 20 s, and a repeat call within 2 minutes keeps its place (see "Sharing the pool between projects"). |
+| `vm_acquire({ minutes=60, keepOnFailure=false, wait=false, os='windows', distro?, image?, vm? })` | Leases one VM of that OS (`distro`, an `/etc/os-release` ID such as `debian` or `ubuntu`, for a Linux VM of that distro; and image, when given; or the VM named by `vm`, for trials, see "One VM by name") to this session until `vm_release`, its deadline (at most the policy's `maxLeaseMinutes`), or this server exiting. Without `wait`, it refuses when none is free for this session's project, saying why (none free, the project's cap, a VM kept for another project), when the next lease ends, and where it would stand in line. With `wait: true` it waits in line about 20 s, and a repeat call within 2 minutes keeps its place (see "Sharing the pool between projects"). |
 | `vm_start({ build?, network='none', reserveCpu=0, interactive=false })` | Restores the clean checkpoint (always), applies this run's network mode (`none`, `host`, `internet` or `internet-lan`, at or below the pool's; see "Network modes") and CPU reserve, and starts the VM. It waits for the guest, then copies `build` in to `C:\build` and leaves an empty `C:\out`. With `interactive: 'user'` (the standard user) or `'admin'`, it first logs that account on interactively: autologon, one guest restart, then it waits up to 10 minutes for the account's desktop session (often 2–4 minutes on a first logon; see "The interactive session"). Refused on a VM kept for inspection: release it, and acquire again. |
 | `vm_renew({ minutes=60 })` | Sets the lease's deadline to now + `minutes` (1 to the policy's `maxLeaseMinutes`), never past the work session's end: `maxSessionMinutes` after `vm_acquire` (`vm_status` shows both). Refused once the deadline has passed, even a moment before the helper ends the lease. |
 | `vm_sync({ build?, full=false, delete=true })` | Copies only the files that changed in `build` (default: the folder last started or synced) into the **running** guest's `C:\build`, without a restore: `C:\out`, installed software and anything else the runs left stay. The server hashes the folder (same roots checks as `vm_start`, every time; links skipped); the helper compares that with what it placed in `C:\build` and takes only the new or changed files, hashing them itself as they arrive. Files gone from the folder are removed unless `delete` is false. Only what the helper copied is tracked: if your runs changed `C:\build` themselves, use `full: true` (clears `C:\build`, copies everything) or `vm_reset`. After a sync fails, only those two are accepted. |
@@ -453,6 +456,23 @@ you approved.
 
 The server's MCP instructions tell agents to use the pool tools only when the user asks, and never to run the approve
 line themselves.
+
+### More than one VM per session
+
+A session may hold several VMs at once (MC-1580), for example a Windows and a Linux VM for a test that needs both:
+call `vm_acquire` once for each (with `os`, `distro` or `image` as usual). Each lease is like any other: it counts
+toward the project's cap for its OS and the pool's, waits in the same line, and has its own deadline, network and
+checkpoints.
+- Every lease tool (`vm_start`, `vm_reset`, `vm_run`, `vm_read_out`, `vm_sync`, `vm_stop`, `vm_checkpoint`,
+  `vm_restore`, `vm_renew`, `vm_release`) takes `vm`, the VM's name from `vm_acquire`'s reply or `vm_status` (which
+  marks each of yours). With one VM held, `vm` may be left out, as before. With several, a tool without it is refused,
+  naming them: a tool never guesses.
+- Which VMs the session holds is read from the helper each time (a lease ended by its deadline is gone at once), never
+  from what the server remembers. `vm_reset`'s and `vm_sync`'s defaults (the last start's options and build folder)
+  are kept per VM, and dropped when that VM is released, no longer held, or acquired anew: one VM's build is never
+  copied into another.
+- A disconnect ends every lease the session holds; one lease's release or deadline leaves the others.
+- One slow operation at a time per session, as before (`vm_wait`): commands in two VMs run one after the other.
 
 ### Slow operations
 
@@ -702,7 +722,7 @@ differ: how a VM is built, and how the helper talks to its guest.
     It's the same promise as Windows': files and installed software, no running programs.
   - Pool checkpoints work as for Windows; there's no logon to undo.
   - A refresh-clean checks the guest again. A change to its seeded files needs a rebuild.
-- **One VM per session**, as before: a project that needs Windows and Linux together uses two sessions.
+- **Windows and Linux together:** one session may hold both (see "More than one VM per session").
 - Needs a helper with the `linux` feature: the server asks no Linux VM of an older helper, and says to run setup again.
 
 ## Multiple projects (MCP roots)
@@ -802,7 +822,8 @@ A pool can hold VMs built from several verified images, and so of several kinds:
   OS or image the session's project may not use is refused at once, never put in line. A waiter is only ever given a VM
   of its own kind.
 - **Caps by OS:** a project's cap for an OS counts its VMs of that OS.
-- **One VM per session**, as before: a project that needs Windows and Linux together uses two sessions (two agents).
+- **More than one VM per session:** each of a session's leases counts toward its project's cap for that VM's OS (see
+  "More than one VM per session").
 - Setup checks the file with the helper's own policy code before changing anything. A rerun without `-ProjectsFile`
   keeps the list; `-ProjectsFile none` clears it.
 - **It's advisory, like the roots it comes from:** it keeps honest agents from starving each other, not a determined one
@@ -902,6 +923,9 @@ names it, so a newer helper keeps serving older servers:
 - feature `projects` (protocol 3): projects, `vm_acquire`'s `wait` and a project's own build folders;
 - feature `images` (protocol 3): image groups, `vm_acquire`'s `os` and `image`, shares by OS, a project's image list.
   The server sends no `vm_acquire` at all for an `image`, or an OS other than Windows, to a helper without it.
+- feature `multi-vm` (protocol 3): several leases per connection, every lease op's `vm`, and the `leases` op. A helper
+  without it would ignore a `vm` it doesn't know and act on its one VM, so the server refuses `vm` to it, sending
+  nothing (MC-1580); without `vm`, one VM per session works as before.
 - feature `network-modes` (protocol 3): the network modes as strings (`none`, `host`, `internet`, `internet-lan`) in
   `vm_start`, `vm_reset` and `pool_plan`. A helper without it would read any of them, `none` included, as networking
   on, so the server refuses each with "run setup again" and sends nothing; the old booleans (`true` host, `false`
@@ -1301,6 +1325,12 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   - protocol abuse, and that an agent's command never reaches a host command line;
   - a lease that is ending: its connection refused at once; an operation already queued for the VM's lock when the
     lease ended (start, run) refused inside the lock; the VM handed on only once restored.
+- `multivm.test.js` (MC-1580, more than one VM per session): one connection holds two VMs, starts and runs in each
+  by `vm` and releases both; `vm` left out with several is refused naming them; a second lease counts toward the
+  project's cap; a disconnect ends both; a staged build is never copied into another VM. Through `server.js`: the
+  implied VM follows the helper's live leases (both held, one started: ambiguous; one released or ended by its
+  deadline: the other, with its own defaults; a VM acquired anew has none); a helper without `multi-vm` is never sent
+  `vm` (start, run and release naming one are refused with nothing sent).
 - `sessions.test.js` (warm work sessions):
   - one VM held across several runs through `server.js`: a sync with nothing changed copies nothing; an edited and an
     added file are the only ones copied; a removed one is removed; `C:\out` and the run's state stay; no restore until
@@ -1387,7 +1417,7 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   still serving this server; setup's projects check under Windows PowerShell 5.1 and PowerShell 7, before any change (caps per OS
   formatted, never cast; `reserveVms` refused); the policy's rules for projects.
 - `images.test.js`, a pool from more than one image (a stub "linux" kind, made only in the journal): groups by image
-  (a resize adding to or taking from one image's VMs only); `vm_acquire` by OS and image, one VM per session; VMs made
+  (a resize adding to or taking from one image's VMs only); `vm_acquire` by OS and image, and a Linux and a Windows VM in one session; VMs made
   before images were recorded, recovered through their plans, or unknown when that can't be proved (a plain Windows
   acquire takes one, an exact image never does, a group resize leaves them alone); caps by OS and the image list (a
   project at its Windows cap still gets Linux, a forbidden OS or image refused, never queued); a waiter never given

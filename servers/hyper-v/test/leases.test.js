@@ -9,7 +9,7 @@ const { T, scratch, startHelper, withPool, waitFor, seedImage } = require('./hel
 const vmOf = (sc, name) => Object.values(sc.stub().vms).find(v => v.name === name)
 const leased = async (c, opts) => (await c.request('acquire', opts)).data.vm
 
-test('two connections get two different VMs; a third is refused; one VM per connection', async t => {
+test('two connections get two different VMs; a third is refused; a connection\'s second VM waits for capacity like any other (MC-1580)', async t => {
   const sc = scratch('two-leases')
   const { h } = await withPool(sc, 2)
   t.after(() => h.stop())
@@ -18,7 +18,7 @@ test('two connections get two different VMs; a third is refused; one VM per conn
   const vb = await leased(b)
   assert.notStrictEqual(va, vb)
   await assert.rejects(c.request('acquire'), /No VM is free \(2 in the pool\).*The next lease ends by/)
-  await assert.rejects(a.request('acquire'), /already has .*one VM per connection/)
+  await assert.rejects(a.request('acquire'), /No VM is free \(2 in the pool\)/)
   await a.request('start'); await b.request('start')
   assert.strictEqual(vmOf(sc, va).state, 'Running')
   assert.strictEqual(vmOf(sc, vb).state, 'Running')

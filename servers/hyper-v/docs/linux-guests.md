@@ -326,7 +326,7 @@ The same tools, with nothing new:
 - `vm_status` and `pool_status` show OS, distro, release and serial;
 - `pool_plan({ image: { distro: 'debian' } })` picks the newest pinned Debian; or give a pin's SHA-256.
 
-There's still **one VM per session**: two VMs in one session stays out unless a real need shows up (MC-1502's note).
+A session may hold a Linux and a Windows VM together (MC-1580; the README, "More than one VM per session"): pass `vm`, each VM's name, to the lease tools.
 
 **Protocol:** a helper feature `linux` (protocol 3, like `images`). The server sends no Linux `vm_acquire` and no
 Linux `pool_plan` to a helper without it, and says "run setup again".

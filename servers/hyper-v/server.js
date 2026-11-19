@@ -224,9 +224,9 @@ function hashFile(f) {
 }
 
 /** Streams a build to the helper's staging folder. */
-async function stage(real) {
+async function stage(real, vm) {
   const { files, skipped, bytes } = walk(real)
-  await stageFiles(files)
+  await stageFiles(files, withVm({}, vm))
   return { files: files.length, bytes, skipped }
 }
 
@@ -290,9 +290,37 @@ async function needFeature(name, what) {
 
 const text = r => (typeof r === 'string' ? r : r?.text ?? '')
 
-// This session's last start (its options and build folder as given) and last synced build folder: vm_reset's and
-// vm_sync's defaults. A folder is checked again (buildFolder) every time it is used, never remembered as allowed.
-const session = { start: null, build: null }
+// Each VM's last start in this session (its options and build folder as given) and last synced build folder:
+// vm_reset's and vm_sync's defaults. A folder is checked again (buildFolder) every time it is used, never remembered
+// as allowed. MC-1580: kept per VM, by its name ('' with a helper before 'multi-vm', which holds one VM a session);
+// an entry goes when its VM is released, acquired anew, or no longer held when the helper's leases are read.
+const sessions = new Map()
+const sessionOf = name => {
+  const k = name ?? ''
+  if (!sessions.has(k)) sessions.set(k, { start: null, build: null })
+  return sessions.get(k)
+}
+
+/**
+ * MC-1580: the VM a lease tool acts on, by the leases the helper says this session holds now (never by what this server
+ * remembers). vm given: that name, sent only to a helper with 'multi-vm' (an older one would ignore it and act on its one
+ * VM). Left out: the one VM held; with several, refused naming them; with none, undefined (the helper then says so).
+ * Reading the leases also drops the defaults of any VM no longer held.
+ */
+async function targetVm(vm) {
+  if (vm !== undefined) {
+    if (typeof vm !== 'string' || !vm) throw new Error('vm must be the name of a VM this session holds (vm_status lists them).')
+    await needFeature('multi-vm', 'naming the VM a tool acts on (vm)')
+    return vm
+  }
+  const p = await helperProtocol()
+  if (!p.features.includes('multi-vm')) return undefined
+  const held = (await helper.request('leases')).data?.leases || []
+  for (const k of [...sessions.keys()]) if (!held.some(l => l.vm === k)) sessions.delete(k)
+  if (held.length > 1) throw new Error(`This session holds ${held.length} VMs (${held.map(l => `${l.vm}, ${l.os}`).join('; ')}): name one with vm.`)
+  return held[0]?.vm
+}
+const withVm = (args, vm) => (vm === undefined ? { ...(args || {}) } : { ...(args || {}), vm })
 
 /**
  * MC-1553: a slow tool never outlasts the client's patience. An MCP client caps how long it waits for a tool call
@@ -349,42 +377,47 @@ const NETWORK_DESC = 'Modes: none (disconnected); host (reaches only this PC, at
 // a string mode is refused unless it has the feature, so it never gets a network other than the one asked for. The
 // booleans an older client may send go through as before.
 const needNetworkModes = (network, what) => typeof network === 'string' ? needFeature('network-modes', `${what} with network '${network}'`) : undefined
-async function vmStart({ build, network = 'none', reserveCpu = 0, interactive = false, checkpoint } = {}) {
+async function vmStart({ build, network = 'none', reserveCpu = 0, interactive = false, checkpoint, vm } = {}, resolved) {
   if (interactive) await needInteractive()
   if (checkpoint !== undefined) await needFeature('pool-checkpoints', 'starting from a pool checkpoint (checkpoint)')
+  const name = resolved ? vm : await targetVm(vm)
   let staged = null
   if (build !== undefined) {
     if (typeof build !== 'string' || !build.trim()) throw new Error('build must be a folder path')
-    staged = await stage(await buildFolder(build))
+    staged = await stage(await buildFolder(build), name)
   }
   await needNetworkModes(network, 'starting a VM')
-  const r = await helper.request('start', { network, reserveCpu, ...(interactive ? { interactive } : {}), ...(checkpoint !== undefined ? { checkpoint } : {}) })
-  if (!r.isError) { session.start = { network, reserveCpu, interactive: interactive || false, checkpoint }; session.build = build ?? null }
+  const r = await helper.request('start', withVm({ network, reserveCpu, ...(interactive ? { interactive } : {}), ...(checkpoint !== undefined ? { checkpoint } : {}) }, name))
+  if (!r.isError) Object.assign(sessionOf(name), { start: { network, reserveCpu, interactive: interactive || false, checkpoint }, build: build ?? null })
   return { text: text(r) + skippedNote(staged?.skipped), isError: r.isError }
 }
 
-/** vm_reset: a start (restore first, always), with this session's last start's options and build unless given. */
-async function vmReset({ build, network, reserveCpu, interactive, checkpoint } = {}) {
-  const last = session.start || { network: 'none', reserveCpu: 0, interactive: false }
-  return vmStart({ build: build ?? session.build ?? undefined, network: network ?? last.network, reserveCpu: reserveCpu ?? last.reserveCpu, interactive: interactive ?? last.interactive, checkpoint: checkpoint ?? last.checkpoint })
+/** vm_reset: a start (restore first, always), with that VM's last start's options and build unless given. */
+async function vmReset({ build, network, reserveCpu, interactive, checkpoint, vm } = {}) {
+  const name = await targetVm(vm)
+  const own = sessionOf(name)
+  const last = own.start || { network: 'none', reserveCpu: 0, interactive: false }
+  return vmStart({ build: build ?? own.build ?? undefined, network: network ?? last.network, reserveCpu: reserveCpu ?? last.reserveCpu, interactive: interactive ?? last.interactive, checkpoint: checkpoint ?? last.checkpoint, vm: name }, true)
 }
 
 /**
  * vm_sync: hashes the build folder (an allowed one, checked by real path), asks the helper which files differ from what
  * it placed in C:\build, stages only those, and applies the plan in the running guest. No restore.
  */
-async function vmSync({ build, full = false, delete: del = true } = {}) {
-  const folder = build ?? session.build
-  if (folder === undefined || folder === null) throw new Error('build is required (no earlier vm_start or vm_sync in this session named one)')
+async function vmSync({ build, full = false, delete: del = true, vm } = {}) {
+  const name = await targetVm(vm)
+  const own = sessionOf(name)
+  const folder = build ?? own.build
+  if (folder === undefined || folder === null) throw new Error(`build is required (no earlier vm_start or vm_sync of ${name ?? 'this VM'} in this session named one)`)
   if (typeof folder !== 'string' || !folder.trim()) throw new Error('build must be a folder path')
   const real = await buildFolder(folder)
   const { files, skipped } = walk(real)
   // The manifest goes in batches of at most MANIFEST_BYTES of JSON (and the helper's 5000 entries), never one line:
   // the service host closes a connection whose line is over 4 MB, which would end the lease.
-  await warm('manifest_begin')
+  await warm('manifest_begin', withVm({}, name))
   let batch = []
   let size = 0
-  const flush = async () => { if (batch.length) await warm('manifest_add', { files: batch }); batch = []; size = 0 }
+  const flush = async () => { if (batch.length) await warm('manifest_add', withVm({ files: batch }, name)); batch = []; size = 0 }
   for (const f of files) {
     const e = { path: f.rel, size: f.size, sha256: hashFile(f) }
     const n = Buffer.byteLength(JSON.stringify(e)) + 1
@@ -393,13 +426,13 @@ async function vmSync({ build, full = false, delete: del = true } = {}) {
     size += n
   }
   await flush()
-  const plan = await warm('sync_plan', { full: !!full, delete: del !== false })
+  const plan = await warm('sync_plan', withVm({ full: !!full, delete: del !== false }, name))
   const byPath = new Map(files.map(f => [f.rel.replace(/\//g, '\\'), f]))
   const needed = (plan.data?.need || []).map(p => byPath.get(p))
   if (needed.some(f => !f)) throw new Error('The helper asked for a file this walk doesn\'t have: call vm_sync again.')
-  if (needed.length) await stageFiles(needed, { planId: plan.data.planId })
-  const r = await warm('sync', { planId: plan.data.planId })
-  if (!r.isError) session.build = folder
+  if (needed.length) await stageFiles(needed, withVm({ planId: plan.data.planId }, name))
+  const r = await warm('sync', withVm({ planId: plan.data.planId }, name))
+  if (!r.isError) own.build = folder
   return { text: text(r) + skippedNote(skipped), isError: r.isError }
 }
 
@@ -407,8 +440,8 @@ const imageType = buf =>
   buf.length > 8 && buf.readUInt32BE(0) === 0x89504e47 ? 'image/png' : buf.length > 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff ? 'image/jpeg' : null
 const isText = buf => !buf.includes(0) && Buffer.from(buf.toString('utf8'), 'utf8').equals(buf)
 
-async function vmReadOut({ paths, glob, maxBytes = 256 * 1024, maxTotalBytes = 1024 * 1024, base64 = false } = {}) {
-  const r = await helper.request('read_out', { paths, glob, maxBytes, maxTotalBytes })
+async function vmReadOut({ paths, glob, maxBytes = 256 * 1024, maxTotalBytes = 1024 * 1024, base64 = false, vm } = {}) {
+  const r = await helper.request('read_out', withVm({ paths, glob, maxBytes, maxTotalBytes }, await targetVm(vm)))
   if (!r.files) return { text: text(r) }
   const content = []
   const notes = []
@@ -446,11 +479,19 @@ async function status() {
 }
 
 const pass = op => async args => { const r = await helper.request(op, args); return { text: text(r), isError: r?.isError } }
+// MC-1580: a lease tool's call, for the VM it names or this session's only one (targetVm).
+const passVm = op => async (args = {}) => {
+  const { vm, ...rest } = args
+  const r = await helper.request(op, withVm(rest, await targetVm(vm)))
+  return { text: text(r), isError: r?.isError, data: r?.data }
+}
+// The vm property every lease tool takes.
+const VM_PROP = { type: 'string', description: 'The VM this acts on, by its name (vm_acquire\'s reply, vm_status). Needed only when this session holds more than one VM.' }
 
 const tools = [
   {
     name: 'vm_acquire',
-    description: 'Lease one VM from the pool, for this session only, until vm_release, the deadline, or this server exiting (which restores it). One VM per session. The pool may be shared fairly between projects (your project is the one your MCP roots are in): a project may have a cap, and VMs kept for another project are not yours. Without wait it refuses when none is free for you, saying why and where you\'d stand in line. With wait: true it waits in line (about 20 s per call); call it again within 2 minutes to keep your place until a VM is yours.',
+    description: 'Lease one VM from the pool, for this session only, until vm_release, the deadline, or this server exiting (which restores it). A session may hold more than one (for example a Windows and a Linux VM, MC-1580), each counted against the same caps and line: call it again for each, then name the one each tool acts on with vm. The pool may be shared fairly between projects (your project is the one your MCP roots are in): a project may have a cap, and VMs kept for another project are not yours. Without wait it refuses when none is free for you, saying why and where you\'d stand in line. With wait: true it waits in line (about 20 s per call); call it again within 2 minutes to keep your place until a VM is yours.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -475,6 +516,8 @@ const tools = [
       if (os === 'linux' || distro !== undefined) await needFeature('linux', `asking for a ${distro ?? 'Linux'} VM`)
       const args = { minutes, keepOnFailure, ...(p.features.includes('projects') ? { wait: !!wait, roots: await rootList() } : {}), ...(p.features.includes('images') ? { os, image } : {}), ...(vm !== undefined ? { vm } : {}), ...(checkpoint !== undefined ? { checkpoint } : {}), ...(distro !== undefined ? { distro } : {}) }
       const r = await helper.request('acquire', args)
+      // MC-1580: a new lease starts with no earlier defaults, even on a VM this session held before.
+      if (!r?.isError && typeof r?.data?.vm === 'string') sessions.delete(r.data.vm)
       return { text: text(r), isError: r?.isError }
     }
   },
@@ -484,6 +527,7 @@ const tools = [
     inputSchema: {
       type: 'object',
       properties: {
+        vm: VM_PROP,
         build: { type: 'string', description: 'A folder inside your project (your MCP roots), or inside a build folder an admin set (vm_status lists them), to copy in to C:\\build. Links are skipped.' },
         network: { enum: ['none', 'host', 'internet', 'internet-lan', false, true], description: NETWORK_DESC + ' At or below the pool\'s approved mode. Default none. (true means host, false none.)' },
         reserveCpu: { type: 'number', description: 'Reserve this percentage of the VM\'s cores for timed runs (up to the policy\'s cap). Default 0.' },
@@ -496,8 +540,8 @@ const tools = [
   {
     name: 'vm_renew',
     description: 'Extend this session\'s lease: its deadline becomes now + minutes (up to the policy\'s maxLeaseMinutes), never past the work session\'s end (the policy\'s maxSessionMinutes from vm_acquire; vm_status shows both). Refused once the deadline has passed.',
-    inputSchema: { type: 'object', properties: { minutes: { type: 'number', description: '1 to the policy\'s maxLeaseMinutes. Default 60.' } } },
-    run: async args => { const r = await warm('renew', args); return { text: text(r), isError: r?.isError } }
+    inputSchema: { type: 'object', properties: { vm: VM_PROP,  minutes: { type: 'number', description: '1 to the policy\'s maxLeaseMinutes. Default 60.' } } },
+    run: async (args = {}) => { const { vm, ...rest } = args; const r = await warm('renew', withVm(rest, await targetVm(vm))); return { text: text(r), isError: r?.isError } }
   },
   {
     name: 'vm_sync',
@@ -505,6 +549,7 @@ const tools = [
     inputSchema: {
       type: 'object',
       properties: {
+        vm: VM_PROP,
         build: { type: 'string', description: 'The build folder (as vm_start\'s build). Default: the one last started or synced in this session.' },
         full: { type: 'boolean', description: 'Clear C:\\build and copy the whole folder. Needed after a sync failed. Default false.' },
         delete: { type: 'boolean', description: 'Remove files that are gone from the folder. Default true.' }
@@ -518,6 +563,7 @@ const tools = [
     inputSchema: {
       type: 'object',
       properties: {
+        vm: VM_PROP,
         build: { type: 'string', description: 'Default: the build last started or synced in this session.' },
         network: { enum: ['none', 'host', 'internet', 'internet-lan', false, true], description: 'As vm_start\'s. Default: this session\'s last start\'s.' },
         reserveCpu: { type: 'number' },
@@ -533,6 +579,7 @@ const tools = [
     inputSchema: {
       type: 'object',
       properties: {
+        vm: VM_PROP,
         command: { type: 'string', description: 'A cmd command line, or a PowerShell script with shell=powershell; on Linux, a bash (or sh) script.' },
         shell: { type: 'string', enum: ['cmd', 'powershell', 'bash', 'sh'], description: 'Windows: cmd (default) or powershell. Linux: bash (default) or sh.' },
         as: { type: 'string', enum: ['admin', 'user'], description: 'admin (default; root on Linux) or user (a standard user; C:\\build, /build on Linux, is read-only for it).' },
@@ -542,7 +589,7 @@ const tools = [
       },
       required: ['command']
     },
-    run: async args => { if (args?.session === 'interactive') await needInteractive(); return pass('run')(args) }
+    run: async args => { if (args?.session === 'interactive') await needInteractive(); return passVm('run')(args) }
   },
   {
     name: 'vm_read_out',
@@ -550,6 +597,7 @@ const tools = [
     inputSchema: {
       type: 'object',
       properties: {
+        vm: VM_PROP,
         paths: { type: 'array', items: { type: 'string' } },
         glob: { type: 'string' },
         maxBytes: { type: 'number', description: 'Per file. Default 262144.' },
@@ -562,30 +610,34 @@ const tools = [
   {
     name: 'vm_stop',
     description: 'Turn the VM off and restore its clean checkpoint (verified: Off, at the checkpoint, network disconnected, no CPU reserve). The lease stays: vm_start again or vm_release. keep: leave it as it is for inspection until release or the deadline.',
-    inputSchema: { type: 'object', properties: { keep: { type: 'boolean', description: 'Keep it unrestored for inspection. Default false.' } } },
-    run: pass('stop')
+    inputSchema: { type: 'object', properties: { vm: VM_PROP,  keep: { type: 'boolean', description: 'Keep it unrestored for inspection. Default false.' } } },
+    run: passVm('stop')
   },
   {
     name: 'vm_checkpoint',
     description: 'Take a named checkpoint of the leased VM as it runs now (MC-1529): files, installed software and the registry, so you can try something and roll back with vm_restore. Not running programs or a logon session (it is a production checkpoint: disk only; a Linux guest is shut down for it and started again). Yours only, at most a few per lease (the policy\'s maxLeaseCheckpoints), and removed when the lease ends: vm_release always returns the VM to clean. Needs a running VM and a confirmed C:\\build.',
-    inputSchema: { type: 'object', properties: { name: { type: 'string', description: '1-40 letters, digits, spaces, dots, dashes or underscores; not "clean".' } }, required: ['name'] },
-    run: async args => { await needFeature('checkpoints', 'vm_checkpoint'); return pass('checkpoint')(args) }
+    inputSchema: { type: 'object', properties: { vm: VM_PROP,  name: { type: 'string', description: '1-40 letters, digits, spaces, dots, dashes or underscores; not "clean".' } }, required: ['name'] },
+    run: async args => { await needFeature('checkpoints', 'vm_checkpoint'); return passVm('checkpoint')(args) }
   },
   {
     name: 'vm_restore',
     description: 'Restore one of this lease\'s checkpoints (vm_checkpoint) and start the VM from it, with this lease\'s current network and CPU reserve. Files, installed software and the registry come back as they were; running programs and any logon session do not (the guest boots fresh, and no one is logged on interactively afterwards: vm_start or vm_reset, even with interactive, restore clean instead and discard this state). C:\\build is left unconfirmed: run a full vm_sync before relying on it.',
-    inputSchema: { type: 'object', properties: { name: { type: 'string', description: 'The checkpoint\'s name.' } }, required: ['name'] },
-    run: async args => { await needFeature('checkpoints', 'vm_restore'); return pass('restore-checkpoint')(args) }
+    inputSchema: { type: 'object', properties: { vm: VM_PROP,  name: { type: 'string', description: 'The checkpoint\'s name.' } }, required: ['name'] },
+    run: async args => { await needFeature('checkpoints', 'vm_restore'); return passVm('restore-checkpoint')(args) }
   },
   {
     name: 'vm_release',
     description: 'Restore the VM and end the lease. Always call it when done.',
-    inputSchema: { type: 'object', properties: {} },
-    run: pass('release')
+    inputSchema: { type: 'object', properties: { vm: VM_PROP } },
+    run: async (args = {}) => {
+      const r = await passVm('release')(args)
+      if (!r.isError && typeof r.data?.vm === 'string') sessions.delete(r.data.vm) // MC-1580: its defaults go with it
+      return { text: r.text, isError: r.isError }
+    }
   },
   {
     name: 'vm_status',
-    description: 'The pool, every lease, your VM, any pool job in progress, the policy, and where builds may come from.',
+    description: 'The pool, every lease, your VMs, any pool job in progress, the policy, and where builds may come from.',
     inputSchema: { type: 'object', properties: {} },
     run: status,
     open: true
@@ -659,7 +711,7 @@ const tools = [
 ]
 
 const INSTRUCTIONS = [
-  'Hyper-V tools give you a disposable Windows VM from a shared pool, or a Linux one (vm_acquire with os: "linux", or distro: "debian" | "ubuntu"): vm_acquire, vm_start (with your build folder), vm_run, vm_read_out, vm_stop, then always vm_release. On Linux the folders are /build and /out and commands are bash; everything else is the same.',
+  'Hyper-V tools give you a disposable Windows VM from a shared pool, or a Linux one (vm_acquire with os: "linux", or distro: "debian" | "ubuntu"): vm_acquire, vm_start (with your build folder), vm_run, vm_read_out, vm_stop, then always vm_release. On Linux the folders are /build and /out and commands are bash; everything else is the same. You may hold more than one VM at once (for example a Windows and a Linux one: vm_acquire for each); then pass vm (the name vm_acquire gave), to every other tool.',
   'Every start restores the VM\'s clean checkpoint. For a work session, keep the VM running instead: vm_sync copies only changed files into C:\\build, vm_reset gives a clean VM again, vm_renew extends the lease (within the policy). Runs are in session 0 (no desktop) unless the VM was started with interactive (a guest account logged on): then vm_run with session: "interactive" runs in that desktop session, for programs that make their own desktops or windows. Several agents can each hold a VM at once; if none is free, wait and retry.',
   'Network is none unless you ask, and never above the mode the user approved for the pool (vm_status): host (this PC only, on the ports its firewall allows), internet, or internet and LAN. Don\'t put real sign-ins, tokens or real CLIs in a VM.',
   'A slow vm_start, vm_reset, vm_restore, vm_checkpoint, vm_run or vm_sync replies within about 45 s: if it says "still in progress", call vm_wait (again and again) until it gives the result. Never end your turn while one is in progress: nothing wakes you when it finishes.',
