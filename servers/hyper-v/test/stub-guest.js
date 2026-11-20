@@ -16,16 +16,8 @@ const crypto = require('crypto')
 const stubNet = require('./stub-net')
 
 const FILE = process.env.HYPERV_MCP_STUB_STATE
-// A read that catches another stub process mid-write (a torn file) is retried, never taken as an empty state.
-const load = () => {
-  for (let i = 0; i < 50; i++) {
-    let text
-    try { text = fs.readFileSync(FILE, 'utf8') } catch { return {} }
-    try { return JSON.parse(text) } catch { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10) }
-  }
-  throw new Error('the stub state stays unreadable')
-}
-const save = st => fs.writeFileSync(FILE, JSON.stringify(st, null, 1))
+// MC-1594: the state is read and saved through stub-state.js: a save keeps what other calls changed meanwhile.
+const { load, save } = require('./stub-state').stubState(FILE)
 const answer = o => process.stdout.write('HVJSON:' + JSON.stringify(o) + '\n')
 const vmId = process.argv[2]
 

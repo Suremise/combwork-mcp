@@ -48,66 +48,9 @@ const { join } = require('path')
 const stubNet = require('./stub-net')
 
 const FILE = process.env.HYPERV_MCP_STUB_STATE
-// A read that catches another stub process mid-write (a torn file) is retried, never taken as an empty state.
-const load = () => { const s = loadRaw(); base ??= clone(s); return s }
-function loadRaw() {
-  for (let i = 0; i < 50; i++) {
-    let text
-    try { text = fs.readFileSync(FILE, 'utf8') } catch { return {} }
-    try { return JSON.parse(text) } catch { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10) }
-  }
-  throw new Error('the stub state stays unreadable')
-}
-// MC-1594: each call is its own process, and the helper runs calls for different VMs at once (a disconnect restores
-// all its leases' VMs together), as Hyper-V allows. A plain write of this process's whole state would put back what
-// another call changed meanwhile (one VM's restore undone by the other's save: "state is Running, not Off", and the
-// VM quarantined). So a save, under a short lock, writes only what this process changed since its last save over the
-// file as it is now; the rest stays the other calls'. Two calls changing the same field still end last-writer-wins,
-// as before; the helper never runs two calls on one VM at once (its per-VM lock).
-const sleepMs = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
-const same = (x, y) => JSON.stringify(x) === JSON.stringify(y)
-const isObj = v => v !== null && typeof v === 'object' && !Array.isArray(v)
-const clone = v => v === undefined ? undefined : JSON.parse(JSON.stringify(v))
-/** ours over theirs, field by field: what ours changed since base wins; arrays only appended to keep both appends. */
-function merge(base, ours, theirs) {
-  if (same(ours, base)) return theirs
-  if (isObj(base) && isObj(ours) && isObj(theirs)) {
-    const out = { ...theirs }
-    for (const k of new Set([...Object.keys(base), ...Object.keys(ours)])) {
-      if (same(ours[k], base[k])) continue
-      const v = k in ours ? merge(base[k], ours[k], theirs[k]) : undefined
-      if (v === undefined) delete out[k]; else out[k] = v
-    }
-    return out
-  }
-  if (Array.isArray(base) && Array.isArray(ours) && Array.isArray(theirs) && same(ours.slice(0, base.length), base) && same(theirs.slice(0, base.length), base)) return theirs.concat(ours.slice(base.length))
-  return ours
-}
-const LOCK = `${FILE}.lock`
-/** A lock file holding its owner's pid: taken by exclusive create; one whose owner is gone (a killed call) is taken over. */
-function locked(fn) {
-  const t0 = Date.now()
-  for (;;) {
-    try { fs.writeFileSync(LOCK, String(process.pid), { flag: 'wx' }); break } catch (e) { if (e.code !== 'EEXIST' && e.code !== 'EPERM') throw e }
-    let text
-    try { text = fs.readFileSync(LOCK, 'utf8') } catch { continue }
-    const owner = Number(text)
-    // Empty: its owner is between creating it and writing its pid (or was killed there: stale after a second).
-    let alive = text ? owner > 0 : (() => { try { return Date.now() - fs.statSync(LOCK).mtimeMs < 1000 } catch { return false } })()
-    if (alive && text) try { process.kill(owner, 0) } catch (e) { alive = e.code === 'EPERM' }
-    if (!alive) { try { fs.rmSync(LOCK, { force: true }) } catch { /* another took it over */ } continue }
-    if (Date.now() - t0 > 30_000) throw new Error(`the stub state's lock stays held (pid ${owner})`)
-    sleepMs(2)
-  }
-  try { return fn() } finally { try { fs.rmSync(LOCK, { force: true }) } catch { /* gone */ } }
-}
-let base = null // the state as this process last loaded or saved it
-const save = s => locked(() => {
-  const now = fs.existsSync(FILE) ? loadRaw() : {}
-  const out = base ? merge(base, s, now) : s
-  fs.writeFileSync(FILE, JSON.stringify(out, null, 1))
-  base = clone(s)
-})
+// MC-1594: the state is read and saved through stub-state.js: a save keeps what other calls changed meanwhile.
+const { stubState } = require('./stub-state')
+const { load, save } = stubState(FILE)
 const answer = o => { process.stdout.write('HVJSON:' + JSON.stringify(o) + '\n') }
 const norm = p => String(p).replace(/[\\/]+$/, '').toLowerCase()
 const USERINIT = 'C:\\Windows\\system32\\userinit.exe,'

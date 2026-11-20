@@ -93,7 +93,8 @@ function scratch(name, { policy = {}, stub = {}, timing = null } = {}) {
     },
     stub: () => JSON.parse(readState(state)),
     stubText: () => readState(state),
-    patchStub: fn => { const s = JSON.parse(readState(state)); fn(s); fs.writeFileSync(state, JSON.stringify(s)) },
+    // MC-1594: under the stubs' lock (stub-state.js), so a stub call's save and this change can't undo each other.
+    patchStub: fn => require('./stub-state').patch(state, fn),
     journal: () => fs.readFileSync(path.join(dir, 'state', 'journal.jsonl'), 'utf8').trim().split('\n').map(l => JSON.parse(l))
   }
 }

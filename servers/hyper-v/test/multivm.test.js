@@ -70,26 +70,60 @@ test('a disconnect ends every lease the connection holds; one lease\'s end leave
   assert.strictEqual(vmOf(sc, B).state, 'Off')
 })
 
-// MC-1594: the test above failed about half the time: the disconnect's two restores ran as two stub processes at once,
-// and the later one's save put back the other VM as it had read it (Running), so that VM was quarantined ("state is
-// Running, not Off") and never freed. Calls on different VMs at once must each keep their own change, as on Hyper-V.
+// ---------- the stubs' state (MC-1594) ----------
+
+// The disconnect test above failed about half the time: the disconnect's two restores ran as two stub processes at
+// once, and the later one's save put back the other VM as it had read it (Running), so that VM was quarantined
+// ("state is Running, not Off") and never freed. Calls on different VMs at once must each keep their own change, as on
+// Hyper-V; every write of the state is made under one ownership-safe lock (stub-state.js).
+
+/**
+ * Child processes a test starts (node with args): each ended when the test ends, pass or fail (killed if still
+ * running, and waited for). ch.done: { code, out } once it exits.
+ */
+function kids(t) {
+  const all = new Set()
+  t.after(async () => {
+    await Promise.all([...all].map(ch => ch.exitCode !== null || ch.signalCode !== null ? null : new Promise(r => { ch.on('exit', r); ch.kill() })))
+  })
+  return (args, opts = {}) => {
+    const ch = spawn(process.execPath, args, { stdio: ['pipe', 'pipe', 'inherit'], windowsHide: true, ...opts })
+    all.add(ch)
+    let out = ''
+    ch.stdout.on('data', d => { out += d })
+    ch.done = new Promise((resolve, reject) => { ch.on('error', reject); ch.on('exit', code => resolve({ code, out })) })
+    ch.done.catch(() => {}) // read where awaited; a test that fails first leaves it to the cleanup
+    return ch
+  }
+}
+const STATE_JS = path.join(__dirname, 'stub-state.js')
+const NO_STDIN = { stdio: ['ignore', 'pipe', 'inherit'] }
+/** node -e: a child that takes the lock, writes held (its pid), and keeps it until gate exists (or it is killed). */
+const HOLDER = `const fs = require('fs'); const [js, file, held, gate] = process.argv.slice(1)
+require(js).withLock(file, () => { fs.writeFileSync(held, String(process.pid)); while (!fs.existsSync(gate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5) })`
+/** node -e: a child that takes the lock and writes the time it entered. */
+const ENTER = `const fs = require('fs'); const [js, file, entered] = process.argv.slice(1)
+require(js).withLock(file, () => fs.writeFileSync(entered, String(Date.now())))`
+/** node -e: a child that adds 1 to the counter n times, each a patch under the lock. */
+const COUNTER = `const [js, file, n] = process.argv.slice(1)
+for (let i = 0; i < Number(n); i++) require(js).patch(file, s => { s.count = (s.count || 0) + 1 })`
+
 test('the stub: two calls on different VMs at once each keep their change (one held mid-call while the other ends)', async t => {
   const sc = scratch('mv-stub-race')
   const { h } = await withPool(sc, 2)
   await h.stop()
+  const run = kids(t)
   const [A, B] = Object.values(sc.stub().vms)
   const gate = path.join(sc.dir, 'restore-gate')
   sc.patchStub(s => { for (const v of Object.values(s.vms)) v.state = 'Running'; s.restoreGate = gate })
-  const call = (op, vm, args = {}) => new Promise((resolve, reject) => {
-    const ch = spawn(process.execPath, [STUB], { env: sc.env, stdio: ['pipe', 'pipe', 'inherit'], windowsHide: true })
-    let out = ''
-    ch.stdout.on('data', d => { out += d })
-    ch.on('error', reject)
-    ch.on('exit', () => { const m = /^HVJSON:(.*)$/m.exec(out); m ? resolve(JSON.parse(m[1])) : reject(new Error(`no answer from the stub: ${out}`)) })
+  const call = (op, vm, args = {}) => {
+    const ch = run([STUB], { env: sc.env })
     ch.stdin.end(JSON.stringify({ op, args: { vmId: vm.id, name: vm.name, folder: vm.location, ...args } }))
-  })
+    return ch.done.then(({ out }) => { const m = /^HVJSON:(.*)$/m.exec(out); if (!m) throw new Error(`no answer from the stub: ${out}`); return JSON.parse(m[1]) })
+  }
   const clean = A.checkpoints.find(c => c.name === 'clean').id
   const restoreA = call('restore', A, { checkpointId: clean })
+  restoreA.catch(() => {}) // awaited below; if the test fails first, the cleanup ends the call
   // A's restore has read the state (both Running) and waits at the gate; B is turned off meanwhile, and that call ends.
   await waitFor(() => sc.stub().calls.some(c => c.op === 'restore' && c.vmId === A.id), T.waitForMs, 'A\'s restore under way')
   assert.deepStrictEqual((await call('net-off', B)).result, { offline: true })
@@ -102,6 +136,63 @@ test('the stub: two calls on different VMs at once each keep their change (one h
   assert.strictEqual(end.vms[B.id].state, 'Off', 'B\'s turn-off kept: A\'s save didn\'t put back B as it read it')
   assert.ok(end.calls.some(c => c.op === 'net-off' && c.vmId === B.id), 'both calls logged')
 })
+
+test('the stubs\' lock: a live holder\'s lock is never cleared, whatever a contender saw; a contender waits for it', async t => {
+  const { withLock, breakStale, STALE_MS } = require('./stub-state')
+  const sc = scratch('mv-lock-live')
+  const run = kids(t)
+  const file = path.join(sc.dir, 'counter.json')
+  const lock = `${file}.lock`
+  const held = path.join(sc.dir, 'held')
+  const gate = path.join(sc.dir, 'gate')
+  const holder = run(['-e', HOLDER, STATE_JS, file, held, gate], NO_STDIN)
+  await waitFor(() => fs.existsSync(held), T.waitForMs, 'the holder holding the lock')
+  // Old enough to be a stale lock's age: only its holder being alive keeps it.
+  await new Promise(r => setTimeout(r, STALE_MS + T.pollMs))
+  // The review's interleaving: a contender that saw a dead owner acts after a live one has taken the lock. Its one act
+  // is breakStale, which can't move a folder a live process holds: refused, and the holder still owns it.
+  assert.strictEqual(breakStale(lock), false, 'a live holder\'s lock is not cleared')
+  assert.strictEqual(fs.readFileSync(path.join(lock, 'owner'), 'utf8'), String(holder.pid))
+  // A contender in another process waits for it.
+  const entered = path.join(sc.dir, 'entered')
+  const contender = run(['-e', ENTER, STATE_JS, file, entered], NO_STDIN)
+  await new Promise(r => setTimeout(r, STALE_MS + T.pollMs))
+  assert.ok(!fs.existsSync(entered), 'the contender is still waiting')
+  const opened = Date.now()
+  fs.writeFileSync(gate, 'open')
+  assert.strictEqual((await holder.done).code, 0)
+  assert.strictEqual((await contender.done).code, 0)
+  assert.ok(Number(fs.readFileSync(entered, 'utf8')) >= opened, 'it entered only once the holder let go')
+  // And in this process, once both are gone.
+  assert.strictEqual(withLock(file, () => 'mine'), 'mine')
+  assert.ok(!fs.existsSync(lock), 'released: no lock left')
+})
+
+test('the stubs\' lock: a killed holder\'s lock (and one made but never entered) is cleared, and writers contending meanwhile lose no update', async t => {
+  const { withLock, STALE_MS } = require('./stub-state')
+  const sc = scratch('mv-lock-dead')
+  const run = kids(t)
+  const file = path.join(sc.dir, 'counter.json')
+  const lock = `${file}.lock`
+  const held = path.join(sc.dir, 'held')
+  // A holder killed inside its critical section: its lock folder stays, with its owner file.
+  const holder = run(['-e', HOLDER, STATE_JS, file, held, path.join(sc.dir, 'never')], NO_STDIN)
+  await waitFor(() => fs.existsSync(held), T.waitForMs, 'the holder holding the lock')
+  holder.kill()
+  await holder.done
+  assert.ok(fs.existsSync(path.join(lock, 'owner')), 'left behind by the killed holder')
+  // Four writers contend for it at once, each adding to one counter 25 times: the stale lock is cleared as safely as
+  // any other, and every one of the 100 updates is kept.
+  const writers = [1, 2, 3, 4].map(() => run(['-e', COUNTER, STATE_JS, file, '25'], NO_STDIN))
+  for (const w of writers) assert.strictEqual((await w.done).code, 0)
+  assert.strictEqual(JSON.parse(fs.readFileSync(file, 'utf8')).count, 100)
+  assert.ok(!fs.existsSync(lock))
+  // A lock folder made but never entered (its maker killed between mkdir and chdir): left alone while new, then cleared.
+  fs.mkdirSync(lock)
+  const t0 = Date.now()
+  assert.strictEqual(withLock(file, () => Date.now() - t0 >= STALE_MS - T.pollMs), true, 'taken only once it was old enough to be stale')
+})
+
 
 test('a staged build is for the VM it was staged for: another VM\'s start refuses it, and copies nothing', async t => {
   const sc = scratch('mv-stage')
