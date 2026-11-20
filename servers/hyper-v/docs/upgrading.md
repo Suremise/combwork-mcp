@@ -65,3 +65,18 @@ older install that used `-Mode Direct` or another `-User` passes them on its fir
 - New builds add no guest tweaks of their own (MC-1577): no Defender exclusions and no `DisableForceUnload` policy. Put
   any you want in your own guest setup script, named in the plan (see [Guest setup script](pool.md#guest-setup-script)). VMs you already have keep
   what their clean checkpoint holds.
+
+**From 4.0.0 to 5.0.0 (the rewrite, MC-1575 to MC-1592): rerun setup, and check your approvals and guest tweaks.**
+4.1.0 and 4.2.0 were steps on the way, never released on their own: from 4.0.0, everything in their two sections above
+applies, and:
+- **Approvals (MC-1576):** a policy from before this option takes the new default, `WithinCaps`: a plan within the
+  policy's caps applies when the agent calls it, without an approval prompt, unless it brings a new image, a guest
+  setup script or a ready-made disk or VM. To keep approving every plan as 4.0.0 did, rerun setup with
+  `-ApprovePoolChanges Each` (see [Which changes need your approval](pool.md#which-changes-need-your-approval-mc-1576)).
+- **Guest tweaks (MC-1577):** new builds no longer add Defender exclusions or the `DisableForceUnload` policy; put them
+  in your own guest setup script if your runs need them.
+- New, with the rerun: pool VMs from a ready-made disk or your own VM (MC-1578), a persistent VM you keep (MC-1582),
+  disk folders at any depth (MC-1581), and an uninstall that asks once (MC-1583).
+- From this release on, a rerun keeps every setting you don't pass (MC-1592). This first rerun from 4.0.0 is the
+  exception for `-Mode` and `-User`, which 4.0.0 didn't record: pass them again if you used `-Mode Direct` or another
+  `-User`.
