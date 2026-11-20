@@ -3,7 +3,9 @@
 An MCP server that gives agents **disposable Hyper-V test VMs** from a pool. An agent leases a VM, starts it from its
 clean checkpoint with a build copied in, runs commands, reads files back, and stops it, which restores it. Several
 agents can each hold VMs at once, Windows or Linux (from a qcow2 cloud image you choose). A work session can keep its
-VM running (`vm_sync`, `vm_reset`, `vm_renew`); release still restores it.
+VM running (`vm_sync`, `vm_reset`, `vm_renew`); release still restores it. VMs are disposable by default; a pool may
+also hold **persistent** VMs, built only when you ask, which keep their state between leases for research (see
+[Persistent VMs](docs/tools.md#persistent-vms-a-vm-the-user-keeps-for-research-mc-1582)).
 
 It's the catalogue's alternative to [`windows-sandbox`](../windows-sandbox/): Windows Sandbox runs one guest at a time,
 this pool as many as you give it. It runs over stdio (`node server.js`) with Combwork or any MCP client, uses only Node
@@ -34,8 +36,10 @@ write. Your account isn't in Hyper-V Administrators, so agents running as you ca
 
 - The helper acts **only on VMs it created** (prefix, journal id and folder, each checked twice), writes only to its
   state folder and the disk folders setup named, and never exceeds `policy.json`, whatever a plan says.
-- Every start restores the **clean checkpoint**, and every stop and release restores and verifies it. A VM that can't be
-  confirmed clean is quarantined.
+- A disposable VM (the default) restores its **clean checkpoint** at every start, and at every stop and release
+  restores and verifies it. A VM that can't be confirmed clean is quarantined. A **persistent** VM (only when a plan you
+  asked for builds one) is shut down and disconnected instead, and keeps what its leases left for the next lease that
+  names it; it gives that guarantee up, and is restored only on request.
 - No host folder is shared into a guest: builds are **copied** from your MCP roots (by real path, links skipped).
 - **Network is off** unless a run asks for a mode at or below the pool's and the policy's.
 - **Don't put real sign-ins, tokens or real CLIs in a VM.** Use fake CLIs and test accounts.
@@ -43,8 +47,8 @@ write. Your account isn't in Hyper-V Administrators, so agents running as you ca
 ### What the confinement guarantees
 
 - **Guaranteed**, whatever any program running as you sends to the pipe: nothing outside the pool is touched; nothing
-  is written outside the helper's folders; nothing exceeds the policy; every lease starts clean; no host folder is
-  shared into a guest.
+  is written outside the helper's folders; nothing exceeds the policy; every lease of a disposable VM starts clean; no
+  host folder is shared into a guest.
 - **Not guaranteed:** that a build came from your roots, against a program running as you (it can send only files it
   could already read); that the **person** approved a change, if your account is an administrator and a program uses a
   UAC bypass; anything at all against a determined agent in **direct mode** (see [setup](docs/setup.md)).
@@ -64,7 +68,9 @@ The full model: [docs/security.md](docs/security.md).
    `-MaxMemoryGB`, `-MaxDiskGBPerVm`, `-MaxNetwork None|Host|Internet|InternetLan`, `-MaxLeaseMinutes` and the rest
    ([every option](docs/setup.md)). `-ApprovePoolChanges WithinCaps|Each` chooses which pool changes need your
    approval (below). It never enables a Windows feature or restarts the PC. Run it again to update or change the
-   policy: a rerun keeps what you don't pass.
+   policy, with the same options you used before: a rerun keeps some settings you leave out (the network ceiling, the
+   approval mode, the projects and product key), but the VM, core, memory and disk limits go back to their defaults
+   unless you pass them ([which ones](docs/setup.md)).
 3. Add the server to your client, with `HYPERV_MCP_ENABLED=1`:
    ```json
    { "mcpServers": { "hyper-v": { "command": "node",
@@ -74,7 +80,7 @@ The full model: [docs/security.md](docs/security.md).
    setting is in `combwork-mcp.example.json` with its default ([configuration](docs/configuration.md)).
 4. Ask an agent to plan a pool (next section).
 
-**Upgrading:** run setup again (the same line, with your options) before using a new server. An older helper refuses
+**Upgrading:** run setup again (the same line, with all your options) before using a new server. An older helper refuses
 newer features with "run setup again"; the pool's VMs and images are kept. What each release changed:
 [docs/upgrading.md](docs/upgrading.md).
 
@@ -106,12 +112,12 @@ guests in [docs/linux.md](docs/linux.md).
 | Tool | What it does |
 |---|---|
 | `vm_acquire` | Leases a VM (`os`, `distro`, `image` or a named `vm`), with `wait` to queue for one. |
-| `vm_start` | Restores clean, applies the run's `network` and `reserveCpu`, starts it, copies `build` to `C:\build`; `interactive` logs an account on. |
+| `vm_start` | Restores clean (a persistent VM only when asked), applies the run's `network` and `reserveCpu`, starts it, copies `build` to `C:\build`; `interactive` logs an account on. |
 | `vm_run` | Runs a command (cmd, powershell, bash, sh) as admin or user; returns its exit code and output. |
 | `vm_read_out` | Reads files from the guest's `C:\out`. |
 | `vm_sync` / `vm_reset` | In a work session: copy only changed files in / a clean VM again. |
 | `vm_checkpoint` / `vm_restore` | Checkpoints within your lease. |
-| `vm_stop` / `vm_release` | Restore and verify clean; release also ends the lease. |
+| `vm_stop` / `vm_release` | Restore and verify clean (a persistent VM: shut down, keeping its state); release also ends the lease. |
 | `vm_renew`, `vm_status`, `vm_wait` | Extend the lease; the pool and your leases; a slow tool's result. |
 | `pool_plan` | Plans a create, resize, remove, refresh or pool checkpoint; changes nothing. |
 | `pool_create` / `pool_resize` / `pool_remove` / `pool_refresh` / `pool_checkpoint` | Applies a plan, once. |
