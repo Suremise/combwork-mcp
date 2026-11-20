@@ -7,7 +7,8 @@ const test = require('node:test')
 const assert = require('assert')
 const fs = require('fs')
 const path = require('path')
-const { T, scratch, startHelper, withPool, waitFor } = require('./helpers')
+const { spawn } = require('child_process')
+const { T, scratch, startHelper, withPool, waitFor, STUB } = require('./helpers')
 const { server } = require('../client')
 
 const acquire = (c, args) => c.request('acquire', { minutes: 30, ...args }).then(r => r, e => ({ error: e.message }))
@@ -67,6 +68,39 @@ test('a disconnect ends every lease the connection holds; one lease\'s end leave
   await waitFor(async () => ((await admin.request('status')).text.match(/; free/g) || []).length === 2, T.waitForMs, 'both leases ended and both VMs free')
   assert.strictEqual(vmOf(sc, A).state, 'Off')
   assert.strictEqual(vmOf(sc, B).state, 'Off')
+})
+
+// MC-1594: the test above failed about half the time: the disconnect's two restores ran as two stub processes at once,
+// and the later one's save put back the other VM as it had read it (Running), so that VM was quarantined ("state is
+// Running, not Off") and never freed. Calls on different VMs at once must each keep their own change, as on Hyper-V.
+test('the stub: two calls on different VMs at once each keep their change (one held mid-call while the other ends)', async t => {
+  const sc = scratch('mv-stub-race')
+  const { h } = await withPool(sc, 2)
+  await h.stop()
+  const [A, B] = Object.values(sc.stub().vms)
+  const gate = path.join(sc.dir, 'restore-gate')
+  sc.patchStub(s => { for (const v of Object.values(s.vms)) v.state = 'Running'; s.restoreGate = gate })
+  const call = (op, vm, args = {}) => new Promise((resolve, reject) => {
+    const ch = spawn(process.execPath, [STUB], { env: sc.env, stdio: ['pipe', 'pipe', 'inherit'], windowsHide: true })
+    let out = ''
+    ch.stdout.on('data', d => { out += d })
+    ch.on('error', reject)
+    ch.on('exit', () => { const m = /^HVJSON:(.*)$/m.exec(out); m ? resolve(JSON.parse(m[1])) : reject(new Error(`no answer from the stub: ${out}`)) })
+    ch.stdin.end(JSON.stringify({ op, args: { vmId: vm.id, name: vm.name, folder: vm.location, ...args } }))
+  })
+  const clean = A.checkpoints.find(c => c.name === 'clean').id
+  const restoreA = call('restore', A, { checkpointId: clean })
+  // A's restore has read the state (both Running) and waits at the gate; B is turned off meanwhile, and that call ends.
+  await waitFor(() => sc.stub().calls.some(c => c.op === 'restore' && c.vmId === A.id), T.waitForMs, 'A\'s restore under way')
+  assert.deepStrictEqual((await call('net-off', B)).result, { offline: true })
+  assert.strictEqual(sc.stub().vms[B.id].state, 'Off')
+  fs.writeFileSync(gate, 'open')
+  assert.ok((await restoreA).result, 'A restored')
+  const end = sc.stub()
+  assert.strictEqual(end.vms[A.id].state, 'Off', 'A\'s restore kept')
+  assert.strictEqual(end.vms[A.id].parent, clean)
+  assert.strictEqual(end.vms[B.id].state, 'Off', 'B\'s turn-off kept: A\'s save didn\'t put back B as it read it')
+  assert.ok(end.calls.some(c => c.op === 'net-off' && c.vmId === B.id), 'both calls logged')
 })
 
 test('a staged build is for the VM it was staged for: another VM\'s start refuses it, and copies nothing', async t => {
