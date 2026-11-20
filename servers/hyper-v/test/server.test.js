@@ -28,7 +28,7 @@ test('tools, instructions and the kill switch', async t => {
   assert.strictEqual(init.result.serverInfo.name, 'hyper-v')
   assert.match(init.result.instructions, /turned off/)
   const list = await off.request('tools/list')
-  assert.deepStrictEqual(list.result.tools.map(x => x.name), ['vm_acquire', 'vm_start', 'vm_renew', 'vm_sync', 'vm_reset', 'vm_run', 'vm_read_out', 'vm_stop', 'vm_checkpoint', 'vm_restore', 'vm_release', 'vm_status', 'vm_wait', 'pool_plan', 'pool_refresh', 'pool_checkpoint', 'pool_create', 'pool_resize', 'pool_remove', 'pool_status'])
+  assert.deepStrictEqual(list.result.tools.map(x => x.name), ['vm_acquire', 'vm_start', 'vm_renew', 'vm_sync', 'vm_reset', 'vm_run', 'vm_read_out', 'vm_stop', 'vm_checkpoint', 'vm_restore', 'vm_release', 'vm_status', 'vm_wait', 'pool_plan', 'pool_refresh', 'pool_persistence', 'pool_checkpoint', 'pool_create', 'pool_resize', 'pool_remove', 'pool_status'])
   assert.match((await off.call('vm_acquire')).text, /turned off: set HYPERV_MCP_ENABLED=1/)
   assert.match((await off.call('vm_status')).text, /Mode: direct.*TURNED OFF/)
   assert.ok(fs.existsSync(sc.stateDir))
@@ -311,7 +311,7 @@ test('MC-1576 round 1: the advertised pool tools and instructions follow the pla
   assert.doesNotMatch(init.result.instructions, /approves each plan/)
   const tools = Object.fromEntries((await s.request('tools/list')).result.tools.map(x => [x.name, x.description]))
   assert.match(tools.pool_plan, /Within the policy's caps \(setup's default, WithinCaps\) it applies when you call its pool_\* tool, unless it needs the user's approval: a new image no approved plan has built from, a guest setup script, or a ready-made disk or VM \(or every plan, when setup chose Each\)\. Then the reply says why and holds the one line the USER runs .*never run that line yourself/)
-  for (const n of ['pool_refresh', 'pool_checkpoint', 'pool_create', 'pool_resize', 'pool_remove']) {
+  for (const n of ['pool_refresh', 'pool_persistence', 'pool_checkpoint', 'pool_create', 'pool_resize', 'pool_remove']) {
     assert.match(tools[n], /Applies once, as planned, within the policy's caps \(checked again now\)\. Refused if .* needs the user's approval \(its pool_plan reply said so: a new image, a guest setup script, a ready-made disk, or every plan when setup chose Each; and always uninstall's own pool removal\)/, n)
     assert.doesNotMatch(tools[n], /Refused unless the user approved|Carry out an approved/, n)
   }
