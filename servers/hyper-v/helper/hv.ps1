@@ -702,14 +702,16 @@ $GuestLicence = {
 # empty as guest-setup left it (no explicit ACEs, inherited only), so no earlier account's req grant survives. The
 # profiles (C:\Users) are kept. It reads every value back for the helper to check.
 $GuestLogonUndo = {
-  param($lsaCs)
+  # MC-1590: $lua, the UAC state to put back: 1 (on) for a build or a disposable VM; a persistent VM's own, read before
+  # its logon (guest-uac-read).
+  param($lsaCs, $lua = 1)
   $ErrorActionPreference = 'Stop'
   if (-not ('HvLsa' -as [type])) { Add-Type -TypeDefinition $lsaCs }
   $wl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
   Set-ItemProperty -Path $wl -Name AutoAdminLogon -Value '0'
   foreach ($n in 'DefaultUserName', 'DefaultDomainName', 'DefaultPassword') { Remove-ItemProperty -Path $wl -Name $n -ErrorAction SilentlyContinue }
   $secretRemoved = [HvLsa]::Remove('DefaultPassword')
-  Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name EnableLUA -Value 1 -Type DWord
+  Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name EnableLUA -Value ([int]$lua) -Type DWord
   Set-ItemProperty -Path $wl -Name Userinit -Value 'C:\Windows\system32\userinit.exe,'
   Remove-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run' -Name hvmcp-agent -ErrorAction SilentlyContinue
   if (Test-Path -LiteralPath 'C:\hvmcp') { Remove-Item -LiteralPath 'C:\hvmcp' -Recurse -Force }
@@ -1289,7 +1291,18 @@ try {
     }
     'guest-logon-undo' {
       $vm = Get-OwnVm $a
-      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestLogonUndo -ArgumentList $HvLsaCs
+      $lua = if ($null -ne $a.enableLUA) { [int]$a.enableLUA } else { 1 }
+      if ($lua -ne 0 -and $lua -ne 1) { throw 'enableLUA must be 0 or 1' }
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestLogonUndo -ArgumentList $HvLsaCs, $lua
+    }
+    'guest-uac-read' {
+      # MC-1590: a persistent VM's UAC (EnableLUA) before its interactive logon changes it, so the undo puts it back.
+      # Absent, Windows takes it as on (1). Only read.
+      $vm = Get-OwnVm $a
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock {
+        $v = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' -Name EnableLUA -ErrorAction SilentlyContinue).EnableLUA
+        @{ enableLUA = $(if ($null -eq $v) { 1 } elseif ([int]$v -eq 0) { 0 } else { 1 }) }
+      }
     }
     'guest-provisioned' {
       $vm = Get-OwnVm $a

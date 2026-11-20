@@ -126,7 +126,7 @@ test('an undo that doesn\'t verify fails the build: a leftover explicit ACE on C
   const ace = await build(t, 'prov-undo-ace', { undoOverride: { hvmcpExplicitAces: 1 } })
   assert.match(ace.line, /undoing a build logon didn't verify: C:\\hvmcp has explicit or protected ACLs/)
   const lua = await build(t, 'prov-undo-lua', { undoOverride: { enableLUA: 0, userinit: 'x' } })
-  assert.match(lua.line, /didn't verify: EnableLUA is 0; Userinit is x/)
+  assert.match(lua.line, /didn't verify: EnableLUA is 0, not 1; Userinit is x/)
   assert.deepStrictEqual(vms(lua.sc), [])
 })
 
