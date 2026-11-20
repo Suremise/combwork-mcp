@@ -132,16 +132,21 @@ function run(s, op, a) {
         processes: [{ name: 'explorer', s: 403 }, { name: 'OneDriveSetup', s: 410, commandLine: 'OneDriveSetup.exe /token=SECRET' }]
       }
     }
+    case 'guest-uac-read': { // MC-1590
+      const vm = own(s, a)
+      if (vm.state !== 'Running') throw new Error('the VM is not running')
+      return { enableLUA: vm.enableLUA ?? 1 }
+    }
     case 'guest-logon-undo': {
       const vm = own(s, a)
       if (vm.state !== 'Running') throw new Error('the VM is not running')
       vm.userinit = USERINIT
-      vm.enableLUA = 1
+      vm.enableLUA = a.enableLUA ?? 1 // MC-1590: the UAC state asked for (a persistent VM's own)
       vm.armed = false
       vm.autologon = false // MC-1578: whatever a ready-made disk came with
       vm.lsaSecret = false
       vm.undos = (vm.undos || 0) + 1
-      return { autoAdminLogon: '0', defaultUserName: '', secretRemoved: true, enableLUA: 1, userinit: USERINIT, hvmcpEmpty: true, hvmcpExplicitAces: 0, hvmcpProtected: false, ...(s.undoOverride || {}) }
+      return { autoAdminLogon: '0', defaultUserName: '', secretRemoved: true, enableLUA: vm.enableLUA, userinit: USERINIT, hvmcpEmpty: true, hvmcpExplicitAces: 0, hvmcpProtected: false, ...(s.undoOverride || {}) }
     }
     case 'guest-provisioned': {
       const vm = own(s, a)
@@ -300,6 +305,7 @@ function run(s, op, a) {
       vm.disk = { ...cp.disk }
       vm.loggedOn = null; vm.watcher = false; vm.elevated = false
       vm.userinit = cp.userinit ?? null; vm.enableLUA = cp.enableLUA ?? 1 // the checkpoint's
+      vm.armed = cp.armed ?? false // MC-1590: autologon as the checkpoint had it (a clean one: off)
       vm.restores = (vm.restores || 0) + 1
       if (s.restoreLeaves && (!s.restoreLeavesWhen || fs.existsSync(s.restoreLeavesWhen))) Object.assign(vm, s.restoreLeaves) // restoreLeavesWhen: only once that file exists
       return { ...facts(vm), parentCheckpointId: before, restore: { ok: true, phase: 'restored', timedOut: false, last: 'Off', waitedMs: 0 } }

@@ -1128,6 +1128,8 @@ class Helper {
       return { ok: false, text: `CLEANUP FAILED: ${vm.vmName} could not be confirmed clean (${why}). It is quarantined (never leased) until a restore confirms it; the helper retries every few minutes.` }
     }
     if (s.quarantined.has(vm.vmId)) this.journal.append({ t: 'unquarantine', vmId: vm.vmId })
+    // MC-1590: a verified restore (clean, or a pool checkpoint, published with its logon undone) undoes any logon too.
+    if (s.vms.get(vm.vmId)?.logonDirty) this.journal.append({ t: 'logon-undone', vmId: vm.vmId })
     return { ok: true, text: target ? `${vm.vmName} restored to its pool checkpoint "${target.name}".` : `${vm.vmName} restored to clean (Off, at its clean checkpoint, network disconnected, no CPU reserve).` }
   }
 
@@ -1139,14 +1141,16 @@ class Helper {
    * Returns { ok, text }, as restore does.
    */
   async park(vm, lease = null) {
-    let why = null
+    // MC-1590: an interactive logon not yet undone is undone first (verified), the guest started offline for it if it
+    // is off; a failure quarantines it below, and the retry tries again.
+    let why = this.state.vms.get(vm.vmId)?.logonDirty && !this.isLinux(vm) ? await this.undoPersistentLogon(vm, lease) : null
     try {
       const T = this.tm(lease)
       const f = await this.hv('park', { ...this.ident(vm), shutdownMs: T.ms.shutdownMinutes }, lease ? this.forLease(lease, T.d.shutdownCallMs) : { timeoutMs: T.d.shutdownCallMs })
-      why = parkProblem(f, vm)
+      why = why || parkProblem(f, vm)
     } catch (e) {
       if (lease && (lease.ending || this.leases.get(lease.vmId) !== lease)) return { ok: false, text: `This connection's lease on ${vm.vmName} ended while the request waited: call vm_acquire again.` }
-      why = e.message
+      why = why || e.message
     }
     if (!why) why = await this.dropLeaseSnapshots(vm)
     const s = this.state
@@ -1156,6 +1160,32 @@ class Helper {
     }
     if (s.quarantined.has(vm.vmId)) this.journal.append({ t: 'unquarantine', vmId: vm.vmId })
     return { ok: true, text: `${vm.vmName} parked (persistent: shut down, network disconnected, no CPU reserve; not restored, so its disk keeps what the lease left).`, parked: true }
+  }
+
+  /**
+   * MC-1590: undoes a persistent VM's interactive logon before its park: the network disconnected and the guest started
+   * from its disk if it is off (after a crash, or a park that shut it down), then hv.ps1 'guest-logon-undo' with the UAC
+   * state journalled before the logon: no autologon (and its LSA secret removed), Windows' own Userinit, that EnableLUA,
+   * C:\hvmcp empty with no explicit ACLs (the watcher's files and grants gone), every value read back. Then
+   * logon-undone. Returns null, or why it couldn't be confirmed (the caller quarantines).
+   */
+  async undoPersistentLogon(vm, lease = null) {
+    const opts = ms => lease ? this.forLease(lease, ms) : { timeoutMs: ms }
+    try {
+      const creds = this.creds()
+      const f = await this.hv('facts-vm', this.ident(vm), opts(60_000))
+      if (f.state !== 'Running') {
+        await this.hv('net-off', this.ident(vm), opts(120_000))
+        await this.hv('start-vm', { ...this.ident(vm), noKeys: true }, opts(120_000))
+        const ms = this.tm(lease).ms.guestReadyMinutes
+        if (await this.waitGuest(vm, creds.admin, ms, lease) === null) return `the interactive logon couldn't be undone: its guest didn't answer within ${Math.round(ms / 1000)} s`
+      }
+      await this.undoLogon(vm, creds, opts(120_000), this.state.vms.get(vm.vmId).logonDirty.enableLUA)
+      this.journal.append({ t: 'logon-undone', vmId: vm.vmId })
+      return null
+    } catch (e) {
+      return `the interactive logon couldn't be undone (${e.message})`
+    }
   }
 
   /**
@@ -1996,8 +2026,7 @@ class Helper {
     if (![false, 'user', 'admin'].includes(interactive)) throw new Error("interactive must be false, 'user' or 'admin'")
     if (lease.kept) throw new Error(`${lease.vmName} is kept for inspection: vm_release it, then vm_acquire again (a release restores it).`)
     if (interactive && lease.os === 'linux') throw new Error('Linux guests have no desktop session: interactive is for Windows guests.')
-    // MC-1582: an interactive logon changes the guest (autologon, the watcher) and only a restore undoes it.
-    if (interactive && this.state.vms.get(lease.vmId)?.persistent) throw new Error(`${lease.vmName} is persistent: an interactive start isn't offered on it yet (its logon changes would stay with no restore to undo them). Start it without interactive.`)
+    // MC-1590: an interactive logon on a persistent VM is undone (verified) before its next park instead of by a restore.
     const mode = net.modeOf(network)
     this.netAllowed(mode)
     if (!Number.isInteger(reserveCpu) || reserveCpu < 0 || reserveCpu > this.policy.maxReservePercent) throw new Error(`reserveCpu must be a whole percentage, 0-${this.policy.maxReservePercent} (the policy's cap).`)
@@ -2048,6 +2077,15 @@ class Helper {
       let logon = ''
       if (interactive) {
         const who = creds[interactive].user
+        // MC-1590: on a persistent VM, the guest's UAC before the logon changes it, journalled with the intent before the
+        // logon begins: every park until it is undone (verified) undoes it first, back to that UAC state.
+        const pv = this.state.vms.get(vm.vmId)
+        if (pv.persistent && !pv.logonDirty) {
+          const uac = await this.hv('guest-uac-read', { ...this.ident(vm), cred: creds.admin }, this.forLease(lease))
+          this.stillHeld(lease)
+          if (uac?.enableLUA !== 0 && uac?.enableLUA !== 1) throw new Error(`${vm.vmName}'s UAC setting (EnableLUA) couldn't be read before its logon: nothing was changed. Start it without interactive.`)
+          this.journal.append({ t: 'logon-dirty', vmId: vm.vmId, enableLUA: uac.enableLUA })
+        }
         const o = await this.logon(vm, lease, interactive, creds)
         const again = 'vm_reset to try again, or vm_release and vm_acquire for another VM (one whose start failed is leased last).'
         const wait = Math.round(this.tm(lease).ms.logonMinutes / 1000)
@@ -2077,7 +2115,7 @@ class Helper {
       s.trusted = true
       return {
         text: kept
-          ? `Started ${vm.vmName} from its disk as it was (persistent: not restored; vm_start({ checkpoint: 'clean' }) or vm_reset for clean): shut down and parked in ${((tRestore - t0) / 1000).toFixed(1)} s, guest ready after ${(waited / 1000).toFixed(1)} s; ${build}; network ${netText}; CPU reserve ${reserveCpu}%. ${this.paths(vm).out} keeps what earlier runs left. Deadline ${new Date(lease.deadline).toISOString()}.`
+          ? `Started ${vm.vmName} from its disk as it was (persistent: not restored; vm_start({ checkpoint: 'clean' }) or vm_reset for clean): shut down and parked in ${((tRestore - t0) / 1000).toFixed(1)} s, guest ready after ${(waited / 1000).toFixed(1)} s${logon}${logon ? " (MC-1590: the logon is undone, verified, before the VM's next park)" : ''}; ${build}; network ${netText}; CPU reserve ${reserveCpu}%. ${this.paths(vm).out} keeps what earlier runs left. Deadline ${new Date(lease.deadline).toISOString()}.`
           : `Started ${vm.vmName} from ${target ? `its pool checkpoint "${target.name}"` : 'its clean checkpoint'}: restore ${((tRestore - t0) / 1000).toFixed(1)} s, guest ready after ${(waited / 1000).toFixed(1)} s${logon}; ${build}; network ${netText}; CPU reserve ${reserveCpu}%. ${this.paths(vm).out} is empty. Deadline ${new Date(lease.deadline).toISOString()}.`,
         data: { vm: vm.vmName, network: mode, ...(lease.net?.address ? { address: lease.net.address, hostAddress: lease.net.hostAddress } : {}), reserveCpu, interactive, ...(kept ? { persistent: true, restored: false } : {}) }
       }
@@ -2426,7 +2464,9 @@ class Helper {
       // is interrupted (the call killed), the lease's end puts it back from this record.
       const origType = (await this.hv('checkpoint-type', this.ident(vm), this.forLease(lease))).type
       this.stillHeld(lease)
-      this.journal.append({ t: 'lcp-take', opId, vmId: vm.vmId, leaseId: lease.leaseId, name, snapName, origType, at: new Date(this.now()).toISOString() })
+      // MC-1590: taken while a persistent VM's interactive logon isn't undone, the checkpoint holds that logon too.
+      const logon = this.state.vms.get(vm.vmId)?.logonDirty || null
+      this.journal.append({ t: 'lcp-take', opId, vmId: vm.vmId, leaseId: lease.leaseId, name, snapName, origType, at: new Date(this.now()).toISOString(), ...(logon ? { logon } : {}) })
       let r = null
       try {
         r = await this.hv('lease-checkpoint', { ...this.ident(vm), snapName }, this.forLease(lease, this.tm(lease).ms.checkpointMinutes))
@@ -2596,6 +2636,8 @@ class Helper {
       const rp = restoreProblem(after) // MC-1536/1537: a timed-out phase is refused, whatever the facts say
       if (rp) throw new Error(`Restoring "${name}" didn't verify: ${rp}. vm_reset to go on from clean.`)
       if (after.vmId !== vm.vmId || after.parentCheckpointId !== cp.checkpointId || after.state !== 'Off') throw new Error(`Restoring "${name}" didn't verify (state ${after.state}, parent ${after.parentCheckpointId}): vm_reset to go on from clean.`)
+      // MC-1590: a checkpoint that holds an interactive logon (taken before its undo) makes it one to undo again.
+      if (cp.logon && !this.state.vms.get(vm.vmId)?.logonDirty) this.journal.append({ t: 'logon-dirty', vmId: vm.vmId, enableLUA: cp.logon.enableLUA })
       // MC-1556: the lease's mode, checked again against the pool's (lowered meanwhile? then refused, nothing started).
       this.netAllowed(lease.network)
       const spec = await this.configureStartOrClean(vm, lease, lease.network, lease.reserve || 0)
@@ -3117,7 +3159,12 @@ class Helper {
           // From here no interactive run may start: the undo removes the watcher's start and files, verified or not.
           stage = 'undo'
           lease.interactive = null
-          if (!this.isLinux(vm)) await this.undoLogon(vm, creds, opts()) // MC-1501: a Linux guest has no logon to undo
+          // MC-1590: a persistent VM's own UAC state is put back, and its logon then counts as undone.
+          if (!this.isLinux(vm)) {
+            const dirty = this.state.vms.get(vm.vmId)?.logonDirty
+            await this.undoLogon(vm, creds, opts(), dirty?.enableLUA ?? 1) // MC-1501: a Linux guest has no logon to undo
+            if (dirty) this.journal.append({ t: 'logon-undone', vmId: vm.vmId })
+          }
           lease = bound()
           // 2. The network disconnected, read back. Assumed off from the attempt on, whatever the call's outcome.
           stage = 'network'
@@ -3630,13 +3677,14 @@ class Helper {
   }
 
   /** MC-1516: hv.ps1 'guest-logon-undo', every value read back and checked; any mismatch fails the build. */
-  async undoLogon(vm, creds, opts = { timeoutMs: 120_000 }) {
-    const r = await this.hv('guest-logon-undo', { ...this.ident(vm), cred: creds.admin }, opts)
+  async undoLogon(vm, creds, opts = { timeoutMs: 120_000 }, enableLUA = 1) {
+    // MC-1590: enableLUA, the UAC state to put back (a persistent VM's own, read before its logon; else on, as built).
+    const r = await this.hv('guest-logon-undo', { ...this.ident(vm), cred: creds.admin, enableLUA }, opts)
     const bad = []
     if (r?.autoAdminLogon !== '0') bad.push(`AutoAdminLogon is ${r?.autoAdminLogon}`)
     if (r?.defaultUserName) bad.push('DefaultUserName is still set')
     if (r?.secretRemoved !== true) bad.push('the autologon password secret was not removed')
-    if (r?.enableLUA !== 1) bad.push(`EnableLUA is ${r?.enableLUA}`)
+    if (r?.enableLUA !== enableLUA) bad.push(`EnableLUA is ${r?.enableLUA}, not ${enableLUA}`)
     if (String(r?.userinit).toLowerCase() !== USERINIT.toLowerCase()) bad.push(`Userinit is ${r?.userinit}`)
     if (r?.hvmcpEmpty !== true) bad.push('C:\\hvmcp is not empty')
     if (r?.hvmcpExplicitAces !== 0 || r?.hvmcpProtected !== false) bad.push('C:\\hvmcp has explicit or protected ACLs')

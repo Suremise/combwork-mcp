@@ -253,7 +253,7 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   `vm_status`; plain acquires never get it, a named one does, with no work-session cap but `maxLeaseMinutes` per
   renewal; its state kept through stop, a plain start, release and the next lease, each a park and never a restore;
   an explicit clean start and `vm_reset` restoring it; a disconnect, a helper restart, a failed start's cleanup and a
-  quarantine retry each parking it; interactive starts and refresh refused; and, through `server.js`, `vm_reset`
+  quarantine retry each parking it; refresh refused; and, through `server.js`, `vm_reset`
   sending `reset` (`vm_start` never), and an older helper without the `persistent` feature never sent a persistent plan.
   MC-1589: a persistent VM's checkpoint kept at release and through a helper restart (journalled `lcp-keep`, still in
   Hyper-V), listed in `vm_status`, restored by a later named lease and removed only on request; a take Hyper-V
@@ -267,6 +267,11 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   and skipped by a job it was leased before; a failed restore quarantining it until the retry restores it; and
   `approve.ps1`'s own summary block, run in Windows PowerShell 5.1, explaining both directions (what is discarded,
   the kept checkpoints by name).
+  MC-1590: an interactive start on a persistent VM (the guest's UAC read and the logon journalled before it), undone
+  and verified before the park at release, stop, a plain start, a disconnect and a helper restart (no autologon,
+  Windows' own Userinit, the guest's own UAC state, its disk kept, never restored); an undo failure quarantining it
+  until the retry starts it offline and undoes it; a kept checkpoint taken while logged on making a later restore one
+  to undo again; and `vm_reset`'s verified clean restore counting as the undo.
 - `approvals.test.js`:
   - unapproved plans;
   - forged approvals: another digest, operation or epoch, expired, a malformed nonce, another plan's id, a writable

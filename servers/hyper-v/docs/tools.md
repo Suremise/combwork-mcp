@@ -208,8 +208,16 @@ it isn't meant to be.
   lease) or when the VM is removed. The checkpoints it keeps, with any pool checkpoints on it, are held to the
   policy's `maxCheckpointsPerVm` (default 4; each lease's own takes still to `maxLeaseCheckpoints`), which keeps the
   VM under Hyper-V's 50. A restore to clean (`vm_reset`) keeps them too.
-- Not offered on it yet: an interactive start (the logon's changes would stay with no restore to undo them) and a
-  clean-checkpoint refresh (it restores first). A resize that shrinks the pool removes disposable VMs before persistent
+- An interactive start works on it (MC-1590). The logon changes the guest (autologon and its stored password,
+  Userinit starting the session's watcher, the watcher's files and grants in `C:\hvmcp`, and UAC off for the admin),
+  and a park doesn't restore. So the helper reads the guest's UAC setting first and journals the logon, then **undoes
+  it before the VM's next park**: at `vm_stop`, a plain `vm_start`, release, the deadline, a disconnect, a helper
+  restart and a quarantine retry. If the VM is off by then, it is started offline for the undo. Each undo is verified:
+  no autologon or stored password, Windows' own Userinit, UAC as it was before the logon (a guest you set to UAC off
+  stays off), and `C:\hvmcp` empty with no explicit grants. An undo that can't be confirmed quarantines the VM until
+  a retry confirms one. A verified clean restore (`vm_reset`) counts as the undo. A checkpoint taken while logged on
+  holds the logon, so restoring it makes the logon one to undo again.
+- Not offered on it: a clean-checkpoint refresh (it restores first). A resize that shrinks the pool removes disposable VMs before persistent
   ones; a remove plan names each persistent VM it removes.
 
 ## Multiple projects (MCP roots)

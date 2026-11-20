@@ -40,7 +40,8 @@ write. Your account isn't in Hyper-V Administrators, so agents running as you ca
 - A disposable VM (the default) restores its **clean checkpoint** at every start, and at every stop and release
   restores and verifies it. A VM that can't be confirmed clean is quarantined. A **persistent** VM (only when a plan you
   asked for builds one) is shut down and disconnected instead, and keeps what its leases left for the next lease that
-  names it; it gives that guarantee up, and is restored only on request.
+  names it; it gives that guarantee up, and is restored only on request. An interactive logon on it is undone and
+  verified before it is shut down, or it is quarantined.
 - No host folder is shared into a guest: builds are **copied** from your MCP roots (by real path, links skipped).
 - **Network is off** unless a run asks for a mode at or below the pool's and the policy's.
 - **Don't put real sign-ins, tokens or real CLIs in a VM.** Use fake CLIs and test accounts.

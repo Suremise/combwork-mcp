@@ -36,6 +36,9 @@
  *             before its removal; lcp-dropped { opId } once confirmed gone (or never made); lcp-keep { opId, checkpointId }
  *             MC-1589: a persistent VM's lease checkpoint, settled at its lease's end as the VM's (kept across leases,
  *             its checkpoint type already put back), until it is removed on request (lcp-drop, lcp-dropped) or with the VM
+ *   logon-dirty { vmId, enableLUA } / logon-undone { vmId }  MC-1590: a persistent VM's interactive logon, journalled
+ *             before it begins with the guest's UAC before it; undone (verified) before its next park, then logon-undone.
+ *             An lcp-take while it is dirty carries logon { enableLUA }: restoring that checkpoint makes it dirty again
  *   persistence { jobId, vmId, persistent }               MC-1591: a VM switched by a persistence plan's job (a
  *             disposable one is restored to clean right after; a failed restore quarantines it)
  *   pcp-select { opId, name, vmId, checkpointId, snapName, owner, image, os, at, sourceLease, replaces? }  MC-1532: a
@@ -186,12 +189,16 @@ class Journal {
           break
         case 'pool-network': s.network = r.mode; break
         // MC-1529: a lease checkpoint's life: intent before the take, its id once confirmed, intent before removal, gone.
-        case 'lcp-take': s.leaseSnaps.set(r.opId, { opId: r.opId, vmId: r.vmId, leaseId: r.leaseId, name: r.name, snapName: r.snapName, origType: r.origType ?? null, checkpointId: null, at: r.at, dropping: false, kept: false }); break
+        case 'lcp-take': s.leaseSnaps.set(r.opId, { opId: r.opId, vmId: r.vmId, leaseId: r.leaseId, name: r.name, snapName: r.snapName, origType: r.origType ?? null, checkpointId: null, at: r.at, dropping: false, kept: false, logon: r.logon ?? null }); break
         case 'lcp-taken': { const x = s.leaseSnaps.get(r.opId); if (x) x.checkpointId = r.checkpointId; break }
         case 'lcp-drop': { const x = s.leaseSnaps.get(r.opId); if (x) x.dropping = true; break }
         case 'lcp-dropped': s.leaseSnaps.delete(r.opId); break
         // MC-1591: an existing VM switched between persistent and disposable by an approved (or within-caps) plan's job.
         case 'persistence': { const v = s.vms.get(r.vmId); if (v) v.persistent = r.persistent === true; break }
+        // MC-1590: a persistent VM's interactive logon (with the guest's UAC before it), until its undo is verified (or a
+        // verified restore of clean or a pool checkpoint undoes it).
+        case 'logon-dirty': { const v = s.vms.get(r.vmId); if (v) v.logonDirty = { enableLUA: r.enableLUA === 0 ? 0 : 1 }; break }
+        case 'logon-undone': { const v = s.vms.get(r.vmId); if (v) v.logonDirty = null; break }
         // MC-1589: a persistent VM's lease checkpoint, kept with the VM once its lease ended (no lease owns it now).
         case 'lcp-keep': { const x = s.leaseSnaps.get(r.opId); if (x) Object.assign(x, { kept: true, checkpointId: r.checkpointId, origType: null, dropping: false }); break }
         // MC-1532: a pool checkpoint published (out of the lease's records, durably), the one it replaces retiring in the
