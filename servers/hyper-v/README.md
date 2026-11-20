@@ -269,8 +269,36 @@ determined agent. Use the default service mode unless you accept that.
 
 ## Building the pool
 
-Pools are planned with you, not built by a fixed script: hardware and needs differ. Every change goes **plan → your
-approval → change**:
+Pools are planned with you, not built by a fixed script: hardware and needs differ. A change goes **plan → your
+approval → change**, or, within the caps you set at setup, **plan → change** (see "Which changes need your approval").
+
+### Which changes need your approval (MC-1576)
+
+Setup's `-ApprovePoolChanges` chooses. It's kept in `policy.json`, which only setup (as admin) can write, so no agent
+can change it; a rerun without it keeps the current choice.
+
+- **`WithinCaps`, the default** (also for a policy from before this option): a plan within the policy's caps applies
+  when the agent calls it, with no approval. That covers:
+  - the VM count, cores, memory, disk size and disk folder;
+  - the network mode, up to setup's `-MaxNetwork`;
+  - removing VMs, refreshing a clean checkpoint, and publishing, replacing or removing a pool checkpoint;
+  - building more VMs from an image a plan **you approved** has built from.
+
+  These still need your approval, because each puts new content into the clean state every lease starts from:
+  - an image no plan you approved has built from (checking an image, or naming one by its SHA-256, isn't approving it);
+  - a guest setup script;
+  - a ready-made disk or VM (you type its admin password when you approve).
+
+  The plan's reply says which, and why. Images of VMs already in the pool when you upgrade count as approved (they
+  were all built under your approval).
+- **`Each`:** every plan needs your approval, as before.
+
+Either way, the caps are checked again when a plan applies, and a plan applies once. Whether it needs approval is
+decided then too: from the policy the helper loaded when it started (setup restarts it, so a rerun's choice applies
+to every plan from then on, including plans made before) and the plans you've approved, not from what the plan's reply
+said. While uninstall has quiesced the helper, its own removal of the pool always needs its approval.
+
+The steps, for a plan that needs your approval:
 
 1. **Plan.** Ask an agent for a pool, for example "plan a hyper-v pool of 2 VMs from
    D:\Downloads\Win11_Eval.iso". It calls `pool_plan`, which reads the host (CPUs, memory, free disk, Hyper-V) and the
@@ -1454,6 +1482,13 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   - a source VM: its disk read into a copy; a running, Generation 1, two-disk, missing or pool VM refused, and a failed
     conversion; every outside VM's record and its disk unchanged;
   - `server.test.js`: the `ready-images` feature gate.
+- `approval-mode.test.js` (MC-1576): approvals within the caps:
+  - a checked image needing approval until an approved plan builds from it, then resizes applying as planned, also
+    after a restart;
+  - a plan applying once, also applied twice at once, after a restart, and after a failure;
+  - the decision made at apply: a policy switched to Each, a lowered cap or network ceiling;
+  - a guest script still needing approval; a refresh, a removal, a pool checkpoint's publish and removal applying;
+  - the upgrade: the images of VMs then in the pool counted as approved, once, and a checked-only one not.
 - `launchers.test.js` (MC-1575): `install.cmd`, `uninstall.cmd` and `approve.cmd`, each run for real by its one line
   typed in cmd, Windows PowerShell 5.1 and PowerShell 7, beside a stub script:
   - spaced paths for every path option, arriving exactly; exit codes 0 and 7 reaching each caller;

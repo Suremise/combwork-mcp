@@ -1,7 +1,8 @@
 /**
  * Hyper-V MCP server (stdio). Gives agents disposable Hyper-V VMs from a pool: lease one, start it from its clean
  * checkpoint with a build copied in, run commands, read files back from C:\out, and stop it (which restores it). Pools
- * are planned here and built by the helper once the user approves the exact plan in an elevated prompt.
+ * are planned here and built by the helper: within the policy's caps as planned, or once the user approves the exact plan
+ * in an elevated prompt when the plan needs it (MC-1576: setup's choice; the plan's reply says which).
  *
  * This process runs as the user and holds no Hyper-V rights. It talks to the helper service over a named pipe
  * (helper/), which holds them and enforces every rule about VMs; this process only adds the rules about the user's own
@@ -372,6 +373,8 @@ async function vmWait() {
 const skippedNote =list => list?.length ? `\nLinks skipped (never followed): ${list.slice(0, 20).join(', ')}${list.length > 20 ? ', …' : ''}` : ''
 
 // MC-1556: the network modes, as an agent describes them to the user when a pool is planned.
+// MC-1576: how a planned change applies, for every pool_* apply tool.
+const APPLY_DESC = 'Applies once, as planned, within the policy\'s caps (checked again now). Refused if it has expired, is outside the policy now, or needs the user\'s approval (its pool_plan reply said so: a new image, a guest setup script, a ready-made disk, or every plan when setup chose Each; and always uninstall\'s own pool removal) and they haven\'t approved that exact plan in an admin terminal (approve.cmd).'
 const NETWORK_DESC = 'Modes: none (disconnected); host (reaches only this PC, at a fixed address, on the ports its firewall allows, e.g. a local model server; no LAN, no internet); internet (through Windows\' Default Switch, so its traffic leaves this PC; not the LAN); internet-lan (the internet and the local network).'
 // MC-1570: a helper before the network modes reads any truthy network as on (its internal switch), 'none' included:
 // a string mode is refused unless it has the feature, so it never gets a network other than the one asked for. The
@@ -659,7 +662,7 @@ const tools = [
   },
   {
     name: 'pool_plan',
-    description: 'Plan a pool change from the host\'s CPUs, memory and disks and the policy: create, resize or remove. Only when the user asks for a pool change. Changes nothing: it returns the exact plan and the one line the USER runs in an admin terminal (cmd or PowerShell) to approve it; never run that line yourself. The first create also needs an image: the file the user names for these VMs (any x64 Windows ISO, or a Linux qcow2 cloud image), which the plan they approve names with its SHA-256. Never download one: ask the user which file to use. An evaluation image is activated online once as each VM is built (the plan says so), and lasts about 90 days from then.',
+    description: 'Plan a pool change from the host\'s CPUs, memory and disks and the policy: create, resize or remove. Only when the user asks for a pool change. Changes nothing: it returns the exact plan, and says how it applies. Within the policy\'s caps (setup\'s default, WithinCaps) it applies when you call its pool_* tool, unless it needs the user\'s approval: a new image no approved plan has built from, a guest setup script, or a ready-made disk or VM (or every plan, when setup chose Each). Then the reply says why and holds the one line the USER runs in an admin terminal (cmd or PowerShell) to approve it; never run that line yourself. The first create also needs an image: the file the user names for these VMs (any x64 Windows ISO, or a Linux qcow2 cloud image), which the plan they approve names with its SHA-256. Never download one: ask the user which file to use. An evaluation image is activated online once as each VM is built (the plan says so), and lasts about 90 days from then.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -700,19 +703,19 @@ const tools = [
   },
   {
     name: 'pool_refresh',
-    description: 'Carry out an approved refresh-clean plan (pool_plan with action refresh-clean): for each VM, its clean checkpoint is restored, the build\'s guest setup (its folders; profiles kept as built, no account logon; the guest setup script isn\'t rerun) rerun offline, and a new clean checkpoint taken and made current, then the old one removed. A pool job, like create; follow it with pool_status. Refused unless the user approved that exact plan (approve.cmd).',
+    description: 'Carry out a refresh-clean plan (pool_plan with action refresh-clean): for each VM, its clean checkpoint is restored, the build\'s guest setup (its folders; profiles kept as built, no account logon; the guest setup script isn\'t rerun) rerun offline, and a new clean checkpoint taken and made current, then the old one removed. A pool job, like create; follow it with pool_status. ' + APPLY_DESC,
     inputSchema: { type: 'object', properties: { planId: { type: 'string' } }, required: ['planId'] },
     run: async args => { await needFeature('refresh-clean', 'pool_refresh'); return pass('pool_refresh')(args) }
   },
   {
     name: 'pool_checkpoint',
-    description: 'Carry out an approved pool-checkpoint plan (pool_plan with action checkpoint or checkpoint-remove), VM by VM. Publishing undoes the guest\'s logon (verified), disconnects its network, shuts it down and checkpoints it Off; the reply says each VM\'s outcome. Refused unless the user approved that exact plan (approve.ps1).',
+    description: 'Carry out a pool-checkpoint plan (pool_plan with action checkpoint or checkpoint-remove), VM by VM. Publishing undoes the guest\'s logon (verified), disconnects its network, shuts it down and checkpoints it Off; the reply says each VM\'s outcome. ' + APPLY_DESC,
     inputSchema: { type: 'object', properties: { planId: { type: 'string' } }, required: ['planId'] },
     run: async args => { await needFeature('pool-checkpoints', 'pool_checkpoint'); return pass('pool_checkpoint')(args) }
   },
   ...['create', 'resize', 'remove'].map(op => ({
     name: `pool_${op}`,
-    description: `Carry out an approved ${op} plan. Refused unless the user approved that exact plan in an admin terminal (approve.cmd), it hasn't expired, and it is within the policy. Runs in the background: follow it with pool_status.`,
+    description: `Carry out a ${op} plan from pool_plan. ${APPLY_DESC} Runs in the background: follow it with pool_status.`,
     inputSchema: { type: 'object', properties: { planId: { type: 'string' } }, required: ['planId'] },
     run: pass(`pool_${op}`)
   })),
@@ -731,7 +734,7 @@ const INSTRUCTIONS = [
   'Network is none unless you ask, and never above the mode the user approved for the pool (vm_status): host (this PC only, on the ports its firewall allows), internet, or internet and LAN. Don\'t put real sign-ins, tokens or real CLIs in a VM.',
   'A slow vm_start, vm_reset, vm_restore, vm_checkpoint, vm_run or vm_sync replies within about 45 s: if it says "still in progress", call vm_wait (again and again) until it gives the result. Never end your turn while one is in progress: nothing wakes you when it finishes.',
   'Write anything you want back to C:\\out inside, and read it with vm_read_out before vm_stop.',
-  'pool_plan, pool_create, pool_resize and pool_remove change the pool: use them only when the user asks. The user approves each plan in an admin terminal (cmd or PowerShell); never run the approve line yourself.'
+  'pool_plan, pool_create, pool_resize and pool_remove change the pool: use them only when the user asks. A plan within the policy\'s caps applies when you call it; one whose reply says it needs the user\'s approval is approved by the user in an admin terminal (cmd or PowerShell): never run the approve line yourself.'
 ].join('\n')
 
 // ---------- JSON-RPC ----------

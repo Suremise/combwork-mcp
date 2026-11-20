@@ -25,7 +25,10 @@ const DEFAULTS = {
   maxLeaseMinutes: 240,
   maxSessionMinutes: 480,
   maxBuildMB: 2048,
-  buildRoots: []
+  buildRoots: [],
+  // MC-1576: 'within-caps' (plans within the policy apply; a new image, a guest setup script or a ready-made disk still
+  // needs the user's approval) or 'each' (every plan approved). A policy from before it has none: within-caps.
+  approvePoolChanges: 'within-caps'
 }
 
 // MC-1579: the policy's numbers have no ceiling of their own, and lower bounds stay only where a smaller value can't
@@ -71,6 +74,7 @@ function problems(p) {
   // Host mode's switch and addresses, made by setup: required for a policy that allows host or above.
   if (p.hostNetwork !== undefined) { const why = net.hostNetworkProblem(p.hostNetwork); if (why) out.push(why) }
   out.push(...timing.capsProblems(p.timingCaps)) // MC-1558: each a known key, a number within its floor and maximum
+  if (p.approvePoolChanges !== undefined && !['within-caps', 'each'].includes(p.approvePoolChanges)) out.push('approvePoolChanges must be within-caps or each')
   if (!int(p.maxReservePercent, 0, 100)) out.push('maxReservePercent must be 0-100')
   // MC-1579: leases and sessions have no ceiling (formerly 24 h): the helper waits for a deadline past Node's timer
   // limit in steps, and ends a session no later than the last date JavaScript can hold (core.js, DATE_MAX_MS).
@@ -158,7 +162,7 @@ function load(dir) {
   }))
   const maxNetwork = p.maxNetwork ?? (p.allowNetwork ? 'host' : 'none')
   const hostNetwork = p.hostNetwork ? Object.freeze({ ...p.hostNetwork }) : null
-  return Object.freeze({ ...p, maxNetwork, hostNetwork, diskFolders: Object.freeze(p.diskFolders.map(tidy)), buildRoots: Object.freeze((p.buildRoots ?? []).map(tidy)), projects: Object.freeze(projects) })
+  return Object.freeze({ ...p, approvePoolChanges: p.approvePoolChanges ?? DEFAULTS.approvePoolChanges, maxNetwork, hostNetwork, diskFolders: Object.freeze(p.diskFolders.map(tidy)), buildRoots: Object.freeze((p.buildRoots ?? []).map(tidy)), projects: Object.freeze(projects) })
 }
 
 /**

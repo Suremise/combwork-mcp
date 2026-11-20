@@ -66,7 +66,7 @@ test('a plan changed after approval no longer matches its digest', async t => {
 })
 
 test('an approval is used once: its nonce is journalled before any side effect', async t => {
-  const { sc, h, admin } = await fresh('single-use')
+  const { sc, h, admin } = await fresh('single-use', { policy: { approvePoolChanges: 'each' } }) // MC-1576: every plan approved, so the nonce is the guard
   t.after(() => h.stop())
   const p1 = (await plan(admin)).data.planId
   const a = approve(sc, p1)
@@ -78,7 +78,7 @@ test('an approval is used once: its nonce is journalled before any side effect',
   const p2 = (await admin.request('pool_plan', { action: 'resize', vms: 2 })).data.planId
   approve(sc, p2, { nonce: a.nonce })
   await assert.rejects(admin.request('pool_resize', { planId: p2 }), /already been used/)
-  await assert.rejects(admin.request('pool_create', { planId: p1 }), /already been used|no longer empty/)
+  await assert.rejects(admin.request('pool_create', { planId: p1 }), /was already applied/) // MC-1576: before its approval is even read
 })
 
 test('plan ids are opaque: anything else is refused before a file is touched', async t => {
@@ -226,4 +226,32 @@ test('uninstall -RemovePool interrupted mid-remove, then run again: recovery fin
   quiesceApproval(sc)
   assert.match((await admin.request('quiesce')).text, /Quiesced: no leases, every VM restored \(0\)/)
   assert.match((await admin.request('status')).text, /Pool: no VMs/)
+})
+
+test('MC-1576 round 1: within the caps (the default), uninstall\'s quiesce still admits only its own approved removal: an unapproved one is refused; keep-pool refuses every change', async t => {
+  const sc = scratch('uninstall-withincaps')
+  const { h, admin } = await withPool(sc, 2)
+  t.after(() => h.stop())
+  quiesceApproval(sc)
+  assert.match((await admin.request('quiesce')).text, /Quiesced/)
+  const p = await admin.request('pool_plan', { action: 'remove' })
+  assert.match(p.text, /It needs the user's approval: the helper is being uninstalled: only the uninstaller's own approved removal of the pool\./)
+  await assert.rejects(admin.request('pool_remove', { planId: p.data.planId }), /is not approved/)
+  assert.strictEqual(Object.keys(sc.stub().vms).length, 2, 'nothing removed')
+  assert.ok(!sc.journal().some(r => r.t === 'job' && r.approval === 'caps'), 'no job within the caps')
+  approve(sc, p.data.planId)
+  await admin.request('pool_remove', { planId: p.data.planId })
+  await waitFor(async () => /Last pool job: remove finished/.test((await admin.request('status')).text))
+  assert.deepStrictEqual(Object.keys(sc.stub().vms), [])
+
+  const sc2 = scratch('uninstall-withincaps-keep')
+  const w = await withPool(sc2, 1)
+  t.after(() => w.h.stop())
+  quiesceApproval(sc2, { purpose: 'keep-pool' })
+  await w.admin.request('quiesce')
+  for (const args of [{ action: 'remove' }, { action: 'resize', vms: 2 }]) {
+    const q = await w.admin.request('pool_plan', args).catch(e => ({ text: e.message }))
+    if (q.data?.planId) await assert.rejects(w.admin.request(`pool_${args.action}`, { planId: q.data.planId }), /being uninstalled: no pool changes/)
+  }
+  assert.strictEqual(Object.keys(sc2.stub().vms).length, 1)
 })
