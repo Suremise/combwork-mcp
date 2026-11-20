@@ -29,7 +29,7 @@ export const SERVERS = {
   // helper's code and the setup scripts ship too: setup installs the helper from them.
   'hyper-v': [
     ['server.js'], ['roots.js'], ['client.js'], ['helper'], ['setup'],
-    ['meta.json'], ['README.md'], ['combwork-mcp.example.json']
+    ['meta.json'], ['README.md'], ['docs'], ['combwork-mcp.example.json']
   ]
 }
 // The definition names Combwork reads in a zip (its MCP_ZIP_DEFINITIONS, from Combwork 1.1.0).

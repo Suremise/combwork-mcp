@@ -17,12 +17,12 @@
 # Direct mode (-Mode Direct) installs no service: it adds -User to Hyper-V Administrators instead, so any program you
 # run, agents included, can drive Hyper-V without the server's rules. Read the README before choosing it.
 #
-# -ProjectsFile names a JSON file listing projects that share the pool fairly (README, "Sharing the pool between
+# -ProjectsFile names a JSON file listing projects that share the pool fairly (docs\tools.md, "Sharing the pool between
 # projects"): each { name, folders, maxVms?, images?, buildRoots? }. It is checked by the helper's own policy code
 # before anything changes, and copied into policy.json. Left out, a rerun keeps the current list; -ProjectsFile none
 # clears it.
 # -ProductKeyFile names a file holding a Windows product key (XXXXX-XXXXX-XXXXX-XXXXX-XXXXX) for VMs built from a
-# non-evaluation image (README, "The image"): checked here, then stored in the state's secrets folder, readable only by
+# non-evaluation image (docs\pool.md, "The image"): checked here, then stored in the state's secrets folder, readable only by
 # SYSTEM, Administrators and the helper; it goes only into such a build's answer file. A file, so the key is never on
 # a command line. Left out, a rerun keeps the current key; -ProductKeyFile none removes it.
 # -MaxNetwork (MC-1556) is the highest network mode a pool may be planned with (the user then picks the pool's mode in
