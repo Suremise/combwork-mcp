@@ -860,6 +860,15 @@ for (const E of ENGINES) test(`setup: a rerun's policy keeps timingCaps and reco
   // Passed: they replace the recorded ones.
   const passed = run(`-Current '${cur}' -Mode Service -User 'PC\\other'`)
   assert.deepStrictEqual([passed.setupMode, passed.setupUser], ['Service', 'PC\\other'])
+  // -Mode in any case (ValidateSet takes it): recorded as the helper's policy check needs it.
+  for (const [m, want] of [['direct', 'Direct'], ['DIRECT', 'Direct'], ['sErViCe', 'Service']]) {
+    const r = run(`-Current '${cur}' -Mode ${m}`)
+    assert.strictEqual(r.setupMode, want, m)
+    assert.deepStrictEqual(policy.problems({ ...policy.DEFAULTS, diskFolders: ['D:\\hv'], setupMode: r.setupMode, setupUser: r.setupUser }), [], m)
+  }
+  fs.writeFileSync(cur, JSON.stringify({ ...stored, setupMode: 'direct' }))
+  assert.strictEqual(run(`-Current '${cur}'`).setupMode, 'Direct', 'a stored lower-case one too')
+  fs.writeFileSync(cur, JSON.stringify(stored))
   // An older policy without them: Service and the caller, as before; no timing caps, none written.
   fs.writeFileSync(cur, JSON.stringify({ schema: 1, maxVms: 2 }))
   const older = run(`-Current '${cur}'`)

@@ -120,6 +120,8 @@ if (Test-Path -LiteralPath $curPolicyFile) { try { $curPolicy = Get-Content -Raw
 # MC-1592 mode begin
 if (-not $PSBoundParameters.ContainsKey('Mode') -and $curPolicy -and @('Service', 'Direct') -contains [string]$curPolicy.setupMode) { $Mode = [string]$curPolicy.setupMode }
 if (-not $PSBoundParameters.ContainsKey('User') -and $curPolicy -and [string]$curPolicy.setupUser) { $User = [string]$curPolicy.setupUser }
+# ValidateSet takes any case (-Mode direct): recorded, and compared, as Service or Direct.
+$Mode = if ($Mode -eq 'Direct') { 'Direct' } else { 'Service' }
 # MC-1592 mode end
 
 # 1. Hyper-V
