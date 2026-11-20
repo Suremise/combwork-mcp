@@ -48,16 +48,9 @@ const { join } = require('path')
 const stubNet = require('./stub-net')
 
 const FILE = process.env.HYPERV_MCP_STUB_STATE
-// A read that catches another stub process mid-write (a torn file) is retried, never taken as an empty state.
-const load = () => {
-  for (let i = 0; i < 50; i++) {
-    let text
-    try { text = fs.readFileSync(FILE, 'utf8') } catch { return {} }
-    try { return JSON.parse(text) } catch { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10) }
-  }
-  throw new Error('the stub state stays unreadable')
-}
-const save = s => fs.writeFileSync(FILE, JSON.stringify(s, null, 1))
+// MC-1594: the state is read and saved through stub-state.js: a save keeps what other calls changed meanwhile.
+const { stubState } = require('./stub-state')
+const { load, save } = stubState(FILE)
 const answer = o => { process.stdout.write('HVJSON:' + JSON.stringify(o) + '\n') }
 const norm = p => String(p).replace(/[\\/]+$/, '').toLowerCase()
 const USERINIT = 'C:\\Windows\\system32\\userinit.exe,'
