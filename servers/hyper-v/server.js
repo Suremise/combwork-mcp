@@ -377,7 +377,7 @@ const NETWORK_DESC = 'Modes: none (disconnected); host (reaches only this PC, at
 // a string mode is refused unless it has the feature, so it never gets a network other than the one asked for. The
 // booleans an older client may send go through as before.
 const needNetworkModes = (network, what) => typeof network === 'string' ? needFeature('network-modes', `${what} with network '${network}'`) : undefined
-async function vmStart({ build, network = 'none', reserveCpu = 0, interactive = false, checkpoint, vm } = {}, resolved) {
+async function vmStart({ build, network = 'none', reserveCpu = 0, interactive = false, checkpoint, vm } = {}, resolved, reset = false) {
   if (interactive) await needInteractive()
   if (checkpoint !== undefined) await needFeature('pool-checkpoints', 'starting from a pool checkpoint (checkpoint)')
   const name = resolved ? vm : await targetVm(vm)
@@ -387,7 +387,10 @@ async function vmStart({ build, network = 'none', reserveCpu = 0, interactive = 
     staged = await stage(await buildFolder(build), name)
   }
   await needNetworkModes(network, 'starting a VM')
-  const r = await helper.request('start', withVm({ network, reserveCpu, ...(interactive ? { interactive } : {}), ...(checkpoint !== undefined ? { checkpoint } : {}) }, name))
+  // MC-1582: vm_reset says so, so a persistent VM is restored (a plain start only parks it); sent only to a helper that
+  // knows it (an older one has no persistent VMs, and restores at every start anyway).
+  const resetArg = reset && (await helperProtocol()).features.includes('persistent') ? { reset: true } : {}
+  const r = await helper.request('start', withVm({ network, reserveCpu, ...(interactive ? { interactive } : {}), ...(checkpoint !== undefined ? { checkpoint } : {}), ...resetArg }, name))
   if (!r.isError) Object.assign(sessionOf(name), { start: { network, reserveCpu, interactive: interactive || false, checkpoint }, build: build ?? null })
   return { text: text(r) + skippedNote(staged?.skipped), isError: r.isError }
 }
@@ -397,7 +400,7 @@ async function vmReset({ build, network, reserveCpu, interactive, checkpoint, vm
   const name = await targetVm(vm)
   const own = sessionOf(name)
   const last = own.start || { network: 'none', reserveCpu: 0, interactive: false }
-  return vmStart({ build: build ?? own.build ?? undefined, network: network ?? last.network, reserveCpu: reserveCpu ?? last.reserveCpu, interactive: interactive ?? last.interactive, checkpoint: checkpoint ?? last.checkpoint, vm: name }, true)
+  return vmStart({ build: build ?? own.build ?? undefined, network: network ?? last.network, reserveCpu: reserveCpu ?? last.reserveCpu, interactive: interactive ?? last.interactive, checkpoint: checkpoint ?? last.checkpoint, vm: name }, true, true)
 }
 
 /**
@@ -502,7 +505,7 @@ const tools = [
         distro: { type: 'string', description: 'Only a Linux VM of this distro, as its /etc/os-release ID names it (debian, ubuntu, ...; vm_status shows each VM\'s); implies os linux. Default: any Linux image your project may use.' },
         image: { type: 'string', description: 'Only a VM built from this image: its SHA-256, or its first 12+ hex digits (vm_status lists them). Default: any image of the OS your project may use.' },
         checkpoint: { type: 'string', description: 'Only a VM with this pool checkpoint (MC-1532: a state someone prepared and published, vm_status lists them with their owner and provenance); the lease then starts from it by default. A common name doesn\'t promise identical contents on every VM. Give os if the name is on VMs of more than one OS.' },
-        vm: { type: 'string', description: 'One particular VM, by its name from vm_status: for trials and censuses on a specific VM, not for normal use (leave it out and the pool picks). Refused, saying why, when that VM isn\'t free for you; with wait: true it waits in line for that VM only.' }
+        vm: { type: 'string', description: 'One particular VM, by its name from vm_status: for trials and censuses on a specific VM, not for normal use (leave it out and the pool picks). A persistent VM (vm_status says PERSISTENT) is leased only this way. Refused, saying why, when that VM isn\'t free for you; with wait: true it waits in line for that VM only.' }
       }
     },
     run: async ({ minutes, keepOnFailure, wait, os, image, vm, checkpoint, distro } = {}) => {
@@ -529,7 +532,7 @@ const tools = [
   },
   {
     name: 'vm_start',
-    description: 'Start the leased VM: always restores its clean checkpoint first, then optionally copies a build folder in to C:\\build (/build on Linux; a copy: the guest can never change your files), with an empty C:\\out (/out). Network is none unless asked, and never above the mode the user approved for the pool (vm_status shows it).',
+    description: 'Start the leased VM: always restores its clean checkpoint first (a persistent VM, MC-1582: only when checkpoint is given; otherwise it starts from its disk as the last lease left it), then optionally copies a build folder in to C:\\build (/build on Linux; a copy: the guest can never change your files), with an empty C:\\out (/out). Network is none unless asked, and never above the mode the user approved for the pool (vm_status shows it).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -565,7 +568,7 @@ const tools = [
   },
   {
     name: 'vm_reset',
-    description: 'Back to a clean VM now: restores its clean checkpoint and starts it again (exactly vm_start), with the build copied in. Defaults to this session\'s last start\'s network, reserveCpu and interactive, and the build last started or synced.',
+    description: 'Back to a clean VM now: restores its clean checkpoint and starts it again (exactly vm_start; on a persistent VM too, discarding what it kept), with the build copied in. Defaults to this session\'s last start\'s network, reserveCpu and interactive, and the build last started or synced.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -671,6 +674,7 @@ const tools = [
         location: { type: 'string', description: 'One of the policy\'s disk folders.' },
         network: { enum: ['none', 'host', 'internet', 'internet-lan'], description: 'create, resize: the pool\'s network mode, the highest a run may ask for. The user chooses it in this plan, like cores, memory and disk: describe the options to them. ' + NETWORK_DESC + ' Up to setup\'s policy (vm_status shows it). Default: none for create, the current mode for resize (a resize may change only this).' },
         activate: { type: 'boolean', description: 'A non-evaluation image: also activate Windows online once as each VM is built (the plan says so). Default false (it stays offline; its licence is shown). An evaluation image is always activated.' },
+        persistent: { type: 'boolean', description: 'create, resize: only when the user asks for a VM they keep, for research. Every VM this plan builds is persistent: never restored to clean at release, its deadline, a disconnect or a plain vm_start (it is shut down and disconnected instead), so it keeps whatever runs leave for the next lease; plain acquires never get it, vm_acquire({ vm }) does; no work-session cap. vm_start({ checkpoint: \'clean\' }) or vm_reset restores it to clean, discarding that. Default: left out (disposable).' },
         debugKeepFailedBuild: { type: 'boolean', description: 'Debugging only, for a plan that builds Linux VMs, and only when the user asks: if a build fails, its VM is kept (on, disconnected, never leased) for an administrator to inspect in Hyper-V Manager, instead of being rolled back. The plan says so. A resize plan with no image and vms equal to the number of other VMs in the pool removes only it; any other create or resize removes it too, along with the changes it asks for; a remove plan removes the whole pool. Default: left out (rolled back).' },
         image: { type: ['object', 'string'], description: 'A new image, the local file the user named: { iso: "<path to a Windows ISO>" }, with edition: "<edition ID>" when the ISO holds several x64 editions (one edition per ISO); or { file: "<path to a Linux qcow2 cloud image>" }. The helper copies it while hashing it, reads its edition and build, and the plan names its path and SHA-256 for the user to approve; it never downloads. Or a verified image\'s SHA-256 (or its first 12+ hex digits): create from it, or resize only the VMs built from it (its group). Omit to use the newest verified image (and, for resize, the whole pool).' },
         guestScript: { type: 'string', description: 'create, resize: the user\'s own guest setup script, a local file they name (Windows guests: .ps1, .cmd or .bat; Linux: .sh; up to about 512 MB), run once in each VM this plan builds, as the guest\'s admin, offline, before its clean checkpoint: for anything they want in every VM (Defender exclusions, policies, tools). The plan names its path and SHA-256 for the user to approve. A build adds nothing of its own otherwise. Only when the user names one; never write one for them unasked. A resize names it again for the VMs it adds.' }
@@ -684,6 +688,9 @@ const tools = [
       if (args.image && typeof args.image === 'object') await needFeature('user-images', 'an image file the user names')
       // MC-1545: an older helper would ignore the flag and roll a failed build back: refused before anything is sent.
       if (args.debugKeepFailedBuild !== undefined) await needFeature('debug-keep', 'keeping a failed Linux build for debugging (debugKeepFailedBuild)')
+      // MC-1582: an older helper would ignore persistent and build disposable VMs, whose restores would erase the state
+      // they were meant to keep: refused here, before anything is sent.
+      if (args.persistent !== undefined) await needFeature('persistent', 'a persistent VM (persistent)')
       // MC-1577: an older helper would ignore the script and build without it: refused before anything is sent.
       if (args.guestScript !== undefined) await needFeature('guest-script', 'a guest setup script (guestScript)')
       return pass('pool_plan')(args)
@@ -718,7 +725,7 @@ const tools = [
 
 const INSTRUCTIONS = [
   'Hyper-V tools give you a disposable Windows VM from a shared pool, or a Linux one (vm_acquire with os: "linux", or distro: "debian" | "ubuntu"): vm_acquire, vm_start (with your build folder), vm_run, vm_read_out, vm_stop, then always vm_release. On Linux the folders are /build and /out and commands are bash; everything else is the same. You may hold more than one VM at once (for example a Windows and a Linux one: vm_acquire for each); then pass vm (the name vm_acquire gave), to every other tool.',
-  'Every start restores the VM\'s clean checkpoint. For a work session, keep the VM running instead: vm_sync copies only changed files into C:\\build, vm_reset gives a clean VM again, vm_renew extends the lease (within the policy). Runs are in session 0 (no desktop) unless the VM was started with interactive (a guest account logged on): then vm_run with session: "interactive" runs in that desktop session, for programs that make their own desktops or windows. Several agents can each hold a VM at once; if none is free, wait and retry.',
+  'Every start restores the VM\'s clean checkpoint (except a persistent VM, which the user chose to keep: leased only by name, it starts as the last lease left it unless the start names a checkpoint or is a vm_reset). For a work session, keep the VM running instead: vm_sync copies only changed files into C:\\build, vm_reset gives a clean VM again, vm_renew extends the lease (within the policy). Runs are in session 0 (no desktop) unless the VM was started with interactive (a guest account logged on): then vm_run with session: "interactive" runs in that desktop session, for programs that make their own desktops or windows. Several agents can each hold a VM at once; if none is free, wait and retry.',
   'Network is none unless you ask, and never above the mode the user approved for the pool (vm_status): host (this PC only, on the ports its firewall allows), internet, or internet and LAN. Don\'t put real sign-ins, tokens or real CLIs in a VM.',
   'A slow vm_start, vm_reset, vm_restore, vm_checkpoint, vm_run or vm_sync replies within about 45 s: if it says "still in progress", call vm_wait (again and again) until it gives the result. Never end your turn while one is in progress: nothing wakes you when it finishes.',
   'Write anything you want back to C:\\out inside, and read it with vm_read_out before vm_stop.',

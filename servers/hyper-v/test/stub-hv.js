@@ -352,6 +352,20 @@ function run(s, op, a) {
     }
     // MC-1532: a pool checkpoint's steps. Knobs: disconnectFails (the adapter stays connected), shutdownFails (the guest
     // stays Running), poolTakeFail (Hyper-V's terminal failure), poolTakeEntered + poolTakeGate (held before the take).
+    // MC-1582: a persistent VM's park: shut down, disconnected, no ACLs, reserve 0; its disk and parent untouched.
+    // state.parkFails: n parks leave it Running (unverifiable); each park is recorded in state.parks.
+    case 'park': {
+      const vm = own(s, a)
+      s.parks = [...(s.parks || []), { vmId: a.vmId, shutdownMs: a.shutdownMs ?? null }]
+      if (s.parkFails > 0) { s.parkFails--; return { ...facts(vm), park: { forced: false } } }
+      vm.state = 'Off'
+      vm.loggedOn = null
+      vm.watcher = false
+      vm.switchName = null
+      vm.acls = []
+      vm.reserve = 0
+      return { ...facts(vm), park: { forced: false } }
+    }
     case 'net-disconnect': { const vm = own(s, a); if (!s.disconnectFails) { vm.switchName = null; vm.acls = [] } return facts(vm) }
     case 'net-prepare': {
       const vm = own(s, a)

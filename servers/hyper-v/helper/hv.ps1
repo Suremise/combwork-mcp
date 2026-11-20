@@ -1232,6 +1232,25 @@ try {
       $left = @(Get-VMNetworkAdapter -VM $vm | Where-Object { $_.SwitchName -or ($_.SwitchId -and $_.SwitchId -ne [guid]::Empty) })
       @{ status = $r.status; graceMinutes = $r.graceMinutes; evalEnd = $r.evalEnd; channel = $r.channel; error = $r.error; disconnected = ($left.Count -eq 0) }
     }
+    'park' {
+      # MC-1582: a persistent VM's cleanup, in place of a restore: its disk is left as it is (no checkpoint is applied or
+      # read). The guest shut down cleanly within shutdownMs (a saved state discarded; a paused or unanswering one turned
+      # off after the wait), then its adapter disconnected and port ACLs cleared (in that order), CPU reserve 0. The
+      # helper checks the answer (parkProblem): Off, disconnected, no ACLs, reserve 0.
+      $vm = Get-OwnVm $a
+      $forced = $false
+      if ($vm.State -eq 'Saved') { Remove-VMSavedState -VM $vm }
+      elseif ($vm.State -eq 'Running') { Stop-VM -VM $vm -Force -ErrorAction SilentlyContinue }
+      $t = (Get-Date).AddMilliseconds($(if ([int]$a.shutdownMs -gt 0) { [int]$a.shutdownMs } else { 300000 }))
+      while ((Get-VM -Id $vm.Id).State -ne 'Off' -and (Get-Date) -lt $t) { Start-Sleep 2 }
+      if ((Get-VM -Id $vm.Id).State -ne 'Off') { $forced = $true; Stop-VM -VM $vm -TurnOff -Force -ErrorAction Stop }
+      Get-VMNetworkAdapter -VM $vm | Disconnect-VMNetworkAdapter
+      Clear-Acls $vm
+      Set-VMProcessor -VM $vm -Reserve 0
+      $f = Facts $vm
+      $f.park = @{ forced = $forced }
+      $f
+    }
     'net-off' {
       # After a failed or killed online step: the guest off, then every adapter disconnected, verified.
       $vm = Get-OwnVm $a

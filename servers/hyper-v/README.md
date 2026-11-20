@@ -453,7 +453,7 @@ you approved.
 |---|---|
 | `vm_acquire({ minutes=60, keepOnFailure=false, wait=false, os='windows', distro?, image?, vm? })` | Leases one VM of that OS (`distro`, an `/etc/os-release` ID such as `debian` or `ubuntu`, for a Linux VM of that distro; and image, when given; or the VM named by `vm`, for trials, see "One VM by name") to this session until `vm_release`, its deadline (at most the policy's `maxLeaseMinutes`), or this server exiting. Without `wait`, it refuses when none is free for this session's project, saying why (none free, the project's cap, a VM kept for another project), when the next lease ends, and where it would stand in line. With `wait: true` it waits in line about 20 s, and a repeat call within 2 minutes keeps its place (see "Sharing the pool between projects"). |
 | `vm_start({ build?, network='none', reserveCpu=0, interactive=false })` | Restores the clean checkpoint (always), applies this run's network mode (`none`, `host`, `internet` or `internet-lan`, at or below the pool's; see "Network modes") and CPU reserve, and starts the VM. It waits for the guest, then copies `build` in to `C:\build` and leaves an empty `C:\out`. With `interactive: 'user'` (the standard user) or `'admin'`, it first logs that account on interactively: autologon, one guest restart, then it waits up to 10 minutes for the account's desktop session (often 2–4 minutes on a first logon; see "The interactive session"). Refused on a VM kept for inspection: release it, and acquire again. |
-| `vm_renew({ minutes=60 })` | Sets the lease's deadline to now + `minutes` (1 to the policy's `maxLeaseMinutes`), never past the work session's end: `maxSessionMinutes` after `vm_acquire` (`vm_status` shows both). Refused once the deadline has passed, even a moment before the helper ends the lease. |
+| `vm_renew({ minutes=60 })` | Sets the lease's deadline to now + `minutes` (1 to the policy's `maxLeaseMinutes`), never past the work session's end: `maxSessionMinutes` after `vm_acquire` (`vm_status` shows both; a persistent VM's lease has no session cap, see "Persistent VMs"). Refused once the deadline has passed, even a moment before the helper ends the lease. |
 | `vm_sync({ build?, full=false, delete=true })` | Copies only the files that changed in `build` (default: the folder last started or synced) into the **running** guest's `C:\build`, without a restore: `C:\out`, installed software and anything else the runs left stay. The server hashes the folder (same roots checks as `vm_start`, every time; links skipped); the helper compares that with what it placed in `C:\build` and takes only the new or changed files, hashing them itself as they arrive. Files gone from the folder are removed unless `delete` is false. Only what the helper copied is tracked: if your runs changed `C:\build` themselves, use `full: true` (clears `C:\build`, copies everything) or `vm_reset`. After a sync fails, only those two are accepted. |
 | `vm_reset({ build?, network?, reserveCpu?, interactive? })` | A clean VM now: exactly `vm_start` (restore first, verified), with this session's last start's `network`, `reserveCpu` and `interactive` and its last build unless given. |
 | `vm_run({ command, shell='cmd'\|'powershell'\|'bash'\|'sh', as='admin'\|'user', timeoutSec=120, cwd='C:\build', session='service'\|'interactive' })` | Runs in the guest (on Linux: bash by default, in `/build`, as root or `hvuser`, killed with everything it started on a timeout; see "Linux guests"). stdout and stderr go to `C:\out\.run-<n>.*`, and the reply has the exit code and 16 KB of each (`HYPERV_MCP_OUTPUT_BYTES`). `as: 'user'` runs as the standard user, for whom `C:\build` is read-only. `session: 'service'` (the default) runs in session 0; on a timeout, everything the run started is killed inside: each run starts in its own Job object (MC-1547), so the kill ends every process in it, whenever it was created (taskkill /T's snapshot missed a child created as it ran). A run that can't be put in its job isn't started (the reply says why), and a job kill that can't be confirmed restores the VM instead, which ends everything the run started: a run is never chased process by process. (A run started without a job, by an older helper, is still killed by its PID with `taskkill /T /F`, only while that PID is still the run's process.) A run's program can't break away from the job; one that makes its own job gets a nested one, which ends with it. A run is started in one short PowerShell Direct call and its exit file then polled with short calls (see "Long runs"), so it may take as long as `timeoutSec` allows. `session: 'interactive'` runs in the desktop session `vm_start`'s `interactive` logged on, as that account (`as` must name it), through a watcher started in that session at logon (`hvadmin` elevated, `hvuser` a standard user). If it times out or doesn't finish cleanly, its output so far is returned and the VM is restored, which ends everything it started; `vm_start` or `vm_reset` goes on. |
@@ -466,7 +466,7 @@ you approved.
 | `vm_release()` | Restores the VM (as `vm_stop`) and ends the lease. |
 | `vm_status()` | The pool, every lease, your VM, any pool job, the policy, and where builds may come from. Works with the server turned off. |
 | `vm_wait()` | Waits for this session's slow operation and gives its result (MC-1553, see "Slow operations"). Each call waits up to 45 s, `HYPERV_MCP_REPLY_MS`. |
-| `pool_plan({ action='create'\|'resize'\|'remove', vms?, cores?, memoryGB?, diskGB?, location?, network?, image?, activate? })` | Plans a pool change and changes nothing (see "Building the pool"). `network` is the pool's network mode, the highest a run may use (default `none` for a create, the current mode for a resize; a resize may change only this; see "Network modes"). `image` is the file the user names, to check (`{ iso, edition? }` for Windows, `{ file }` for a Linux qcow2; never downloaded), or a checked image's SHA-256: build from it, or resize only its group (see "A pool from more than one image"). An evaluation image's plan always activates Windows online once per new VM; `activate: true` asks the same for your own copy (see "Windows licences"). |
+| `pool_plan({ action='create'\|'resize'\|'remove', vms?, cores?, memoryGB?, diskGB?, location?, network?, image?, activate?, persistent? })` | `persistent: true` (MC-1582, only when the user asks): the VMs it builds are kept, never restored at release; see "Persistent VMs". Plans a pool change and changes nothing (see "Building the pool"). `network` is the pool's network mode, the highest a run may use (default `none` for a create, the current mode for a resize; a resize may change only this; see "Network modes"). `image` is the file the user names, to check (`{ iso, edition? }` for Windows, `{ file }` for a Linux qcow2; never downloaded), or a checked image's SHA-256: build from it, or resize only its group (see "A pool from more than one image"). An evaluation image's plan always activates Windows online once per new VM; `activate: true` asks the same for your own copy (see "Windows licences"). |
 | `pool_create` / `pool_resize` / `pool_remove({ planId })` | Carries out an approved plan in the background. |
 | `pool_status()` | The pool, the image, and any job or image check in progress. |
 
@@ -602,6 +602,41 @@ projects start from (MC-1532) and refreshing the clean checkpoint in place (MC-1
   `vm_status`.
 - **Limits:** a checkpoint never moves the lease's deadline or the VM's evaluation end, which come from the host's own
   records, not the guest's clock.
+
+### Persistent VMs: a VM the user keeps, for research (MC-1582)
+
+Every pool VM is disposable by default: restored to its clean checkpoint at every start and release. When the user asks
+for a VM to keep, for research, a create or resize plan can build persistent ones instead: `pool_plan({ action:
+'resize', vms: <n>, persistent: true })`. Every VM that plan builds is persistent. The plan says so, the approval shows
+it, and its digest binds it. An existing VM isn't converted: remove it and add a persistent one.
+
+**What a persistent VM gives up: the clean restore.** It is never restored at release, at its deadline, when its
+session disconnects, at a helper restart, after a cleanup failure, or at a plain `vm_start`. It is **parked** instead:
+the guest shut down (turned off if it doesn't within `HYPERV_MCP_SHUTDOWN_MINUTES`), its network adapter disconnected
+with no port ACLs, CPU reserve 0, all verified, with its disk as the lease left it. So whatever a run did stays for the
+next lease: installed software, files, settings, `C:\out`'s contents, anything malicious a test ran, and changes an
+agent made by mistake. Any agent that acquires it by name sees all of it. Nothing checks that it is "clean", because
+it isn't meant to be.
+
+**What it keeps:**
+- Network is off unless a start asks for a mode, never above the pool's approved mode, and disconnected at every
+  stop and release.
+- The policy's caps (VMs, cores, memory, disk), the pool boundary (the helper touches only its own VMs), its
+  quarantine (a park that doesn't verify takes it out of use until a retry parks it).
+- Its clean checkpoint. `vm_start({ checkpoint: 'clean' })`, a pool checkpoint's name, or `vm_reset` restores it,
+  discarding what it kept: an explicit choice, never a side effect.
+
+**How it is used:**
+- Plain acquires (by OS, image, distro or pool checkpoint) never get it: it holds earlier leases' state, so only
+  `vm_acquire({ vm: '<its name>' })` does. `vm_status` marks it PERSISTENT.
+- A plain `vm_start` parks it and starts it from its disk, with the start's network and CPU reserve; a build, if
+  given, is copied into `C:\build` as usual. `vm_stop` parks it.
+- Its leases have no work-session cap (`maxSessionMinutes`): each acquire and `vm_renew` is still at most
+  `maxLeaseMinutes`, renewed as often as needed. A Windows evaluation's end still ends it.
+- Its lease checkpoints (`vm_checkpoint`) are still the lease's, removed when it ends.
+- Not offered on it yet: an interactive start (the logon's changes would stay with no restore to undo them) and a
+  clean-checkpoint refresh (it restores first). A resize that shrinks the pool removes disposable VMs before persistent
+  ones; a remove plan names each persistent VM it removes.
 
 ## Network modes
 
@@ -1030,7 +1065,8 @@ since another program may have created it first.
 **Warm sessions.** A lease can stay running across runs. Nothing about its end changes: release, the deadline and a
 disconnect restore and verify the VM, and kill whatever is in flight, a sync included. Renewals are bounded by the
 policy (each up to `maxLeaseMinutes`, all within `maxSessionMinutes` of the acquire, which setup refuses below one
-lease), and refused once the deadline has passed. A sync:
+lease; a persistent VM's lease has no session cap), and refused once the deadline has passed. A persistent VM (see
+"Persistent VMs") is parked at those ends instead of restored. A sync:
 - is planned against the helper's record of the files it placed in `C:\build` (by canonical Windows identity: case
   and slashes don't count). A manifest naming one file twice, or a file and something inside it, is refused. The
   manifest goes to the helper in batches of at most 1 MB, whatever the build's size, and `server.js` never sends a
@@ -1304,7 +1340,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\restorewait.test.js test\runs.test.js test\caps.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js test\linux-image.test.js test\linux-guest-files.test.js test\linux.test.js test\linux-ps.test.js test\bridge.test.js test\network.test.js test\guestnet.test.js test\uninstall.test.js test\timing.test.js test\nested-proof.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\restorewait.test.js test\runs.test.js test\caps.test.js test\persistent.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js test\linux-image.test.js test\linux-guest-files.test.js test\linux.test.js test\linux-ps.test.js test\bridge.test.js test\network.test.js test\guestnet.test.js test\uninstall.test.js test\timing.test.js test\nested-proof.test.js
 ```
 
 - `units.test.js`:
@@ -1521,6 +1557,12 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   `linux.test.js` has the Linux side (bytes after the request line; a dispatcher built before MC-1588 refusing them, the
   reply saying why), `guest_unit_check.py` `guest.py`'s, and `provision.test.js` a 2.5 MB guest setup script staged at
   build.
+- `persistent.test.js` (MC-1582): a persistent VM's plan and journal (only the VMs it builds), its approval text and
+  `vm_status`; plain acquires never get it, a named one does, with no work-session cap but `maxLeaseMinutes` per
+  renewal; its state kept through stop, a plain start, release and the next lease, each a park and never a restore;
+  an explicit clean start and `vm_reset` restoring it; a disconnect, a helper restart, a failed start's cleanup and a
+  quarantine retry each parking it; interactive starts and refresh refused; and, through `server.js`, `vm_reset`
+  sending `reset` (`vm_start` never), and an older helper without the `persistent` feature never sent a persistent plan.
 - `approvals.test.js`:
   - unapproved plans;
   - forged approvals: another digest, operation or epoch, expired, a malformed nonce, another plan's id, a writable
