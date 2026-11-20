@@ -5,7 +5,7 @@ clean checkpoint with a build copied in, runs commands, reads files back, and st
 agents can each hold VMs at once, Windows or Linux (from a qcow2 cloud image you choose). A work session can keep its
 VM running (`vm_sync`, `vm_reset`, `vm_renew`); release still restores it. VMs are disposable by default; a pool may
 also hold **persistent** VMs, built only when you ask, which keep their state and their checkpoints between leases
-for research (see
+for research; an existing VM can be switched either way by a plan (see
 [Persistent VMs](docs/tools.md#persistent-vms-a-vm-the-user-keeps-for-research-mc-1582)).
 
 It's the catalogue's alternative to [`windows-sandbox`](../windows-sandbox/): Windows Sandbox runs one guest at a time,
@@ -122,7 +122,7 @@ guests in [docs/linux.md](docs/linux.md).
 | `vm_stop` / `vm_release` | Restore and verify clean (a persistent VM: shut down, keeping its state); release also ends the lease. |
 | `vm_renew`, `vm_status`, `vm_wait` | Extend the lease; the pool and your leases; a slow tool's result. |
 | `pool_plan` | Plans a create, resize, remove, refresh or pool checkpoint; changes nothing. |
-| `pool_create` / `pool_resize` / `pool_remove` / `pool_refresh` / `pool_checkpoint` | Applies a plan, once. |
+| `pool_create` / `pool_resize` / `pool_remove` / `pool_refresh` / `pool_checkpoint` / `pool_persistence` | Applies a plan, once. |
 | `pool_status` | The pool, the image and any job in progress. |
 
 Every argument, sessions with several VMs, slow operations, checkpoints, persistent VMs and sharing the pool between

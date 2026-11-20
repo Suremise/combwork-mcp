@@ -36,6 +36,8 @@
  *             before its removal; lcp-dropped { opId } once confirmed gone (or never made); lcp-keep { opId, checkpointId }
  *             MC-1589: a persistent VM's lease checkpoint, settled at its lease's end as the VM's (kept across leases,
  *             its checkpoint type already put back), until it is removed on request (lcp-drop, lcp-dropped) or with the VM
+ *   persistence { jobId, vmId, persistent }               MC-1591: a VM switched by a persistence plan's job (a
+ *             disposable one is restored to clean right after; a failed restore quarantines it)
  *   pcp-select { opId, name, vmId, checkpointId, snapName, owner, image, os, at, sourceLease, replaces? }  MC-1532: a
  *             pool checkpoint published (its take, an lcp-take of the source lease, leaves the lease's records); the one
  *             it replaces starts retiring; pcp-retire { vmId, checkpointId } retires one by plan; pcp-retired
@@ -188,6 +190,8 @@ class Journal {
         case 'lcp-taken': { const x = s.leaseSnaps.get(r.opId); if (x) x.checkpointId = r.checkpointId; break }
         case 'lcp-drop': { const x = s.leaseSnaps.get(r.opId); if (x) x.dropping = true; break }
         case 'lcp-dropped': s.leaseSnaps.delete(r.opId); break
+        // MC-1591: an existing VM switched between persistent and disposable by an approved (or within-caps) plan's job.
+        case 'persistence': { const v = s.vms.get(r.vmId); if (v) v.persistent = r.persistent === true; break }
         // MC-1589: a persistent VM's lease checkpoint, kept with the VM once its lease ended (no lease owns it now).
         case 'lcp-keep': { const x = s.leaseSnaps.get(r.opId); if (x) Object.assign(x, { kept: true, checkpointId: r.checkpointId, origType: null, dropping: false }); break }
         // MC-1532: a pool checkpoint published (out of the lease's records, durably), the one it replaces retiring in the
