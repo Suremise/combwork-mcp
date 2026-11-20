@@ -30,9 +30,13 @@ Setup's options, its storage rules, direct mode and the installed files. Part of
    - `%ProgramData%\hyperv-mcp` (the helper's state) and the disk folder, both readable only by SYSTEM,
      Administrators and the service. `policy.json` and `approvals\` in there are writable only by Administrators and
      SYSTEM. How setup makes them trustworthy is under [Storage](#storage-where-it-may-be-and-how-setup-trusts-it) below;
-   - `policy.json`, the pool's hard limits. By default they're derived from the host: up to a quarter of its logical
-     CPUs per VM (at most 8), half its memory in all, up to 4 VMs, 128 GB disks, network mode up to none (a new
-     install; a rerun keeps the current value). Override any of them: `-MaxVms`,
+   - `policy.json`, the pool's hard limits. On a first install they're derived from the host: up to a quarter of its
+     logical CPUs per VM (at most 8), half its memory in all, up to 4 VMs, 128 GB disks, network mode up to none.
+     **A rerun keeps every value you don't pass** (MC-1592), `-DiskFolder` and `-BuildRoot` included (so a rerun
+     needs no options at all), and its output lists the values it kept, the ones your options changed (old -> new),
+     and any it set now because the policy didn't hold them yet. The checkpoint settings and `-MaxSessionMinutes` are
+     left to the helper's defaults until you set them; `-1` (`0` for `-MaxSessionMinutes`) puts one back to the
+     helper's default, and `-BuildRoot none` clears the build folders. Override any of them: `-MaxVms`,
      `-MaxCoresPerVm`, `-MaxMemoryGB`, `-MaxDiskGBPerVm`, `-MaxNetwork None|Host|Internet|InternetLan` (with
      `-HostSubnet`; see [Network modes](../README.md#network-modes)), `-MaxReservePercent`, `-MaxLeaseMinutes`, `-MaxSessionMinutes`
      (a work session's cap for `vm_renew`: at least `-MaxLeaseMinutes`, with no upper limit; left out, 480 or

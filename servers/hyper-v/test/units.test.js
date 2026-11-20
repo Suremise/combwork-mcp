@@ -683,17 +683,18 @@ test('setup copies every helper file the service runs (guest-sync.ps1, guests/ a
 for (const E of ENGINES) test(`setup: -MaxSessionMinutes is checked as the helper checks it, before anything changes (PowerShell ${E.name})`, () => {
   const src = fs.readFileSync(path.join(__dirname, '..', 'setup', 'install.ps1'), 'utf8')
   const { spawnSync } = require('child_process')
-  const line = /^if \(\$MaxSessionMinutes -and .*$/m.exec(src)
+  // MC-1592: the check reads the resolved limits ($lim: passed, kept or default); here, the values passed.
+  const line = /^if \(\$null -ne \$lim\.maxSessionMinutes -and .*$/m.exec(src)
   assert.ok(line)
   const sc = scratch('setup-session')
   const file = path.join(sc.dir, 'session.ps1')
-  fs.writeFileSync(file, `param([int]$MaxLeaseMinutes = 240, [int]$MaxSessionMinutes = 0)\n$ErrorActionPreference = 'Stop'\n${line[0]}\n'ok'\n`)
+  fs.writeFileSync(file, `param([int]$MaxLeaseMinutes = 240, [int]$MaxSessionMinutes = 0)\n$ErrorActionPreference = 'Stop'\n$lim = @{ maxLeaseMinutes = $MaxLeaseMinutes; maxSessionMinutes = $(if ($MaxSessionMinutes) { $MaxSessionMinutes } else { $null }) }\n${line[0]}\n'ok'\n`)
   const run = (lease, session) => spawnSync(E.exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, '-MaxLeaseMinutes', String(lease), '-MaxSessionMinutes', String(session)], { encoding: 'utf8', env: E.env })
   // MC-1579: no upper limit (formerly 1440), and no floor beyond one lease.
   for (const [lease, session, ok] of [[240, 0, true], [240, 480, true], [240, 240, true], [240, 239, false], [60, 4, false], [240, 1441, true], [2880, 100000, true], [1, 1, true]]) {
     const r = run(lease, session)
     assert.strictEqual(r.status === 0, ok, `${lease}/${session}: ${r.stdout}${r.stderr}`)
-    if (!ok) assert.match(r.stdout + r.stderr, /-MaxSessionMinutes must be at least -MaxLeaseMinutes/)
+    if (!ok) assert.match(r.stdout + r.stderr, /-MaxSessionMinutes \(\d+\) must be at least -MaxLeaseMinutes \(\d+\)/)
     if (session) assert.strictEqual(policy.problems({ ...policy.DEFAULTS, diskFolders: ['D:\\hv'], maxLeaseMinutes: lease, maxSessionMinutes: session }).length === 0, ok, `the helper agrees: ${lease}/${session}`)
   }
 })
@@ -719,4 +720,96 @@ for (const E of ENGINES) test(`setup: -ApprovePoolChanges, kept on a rerun that 
     assert.deepStrictEqual(policy.problems({ ...policy.DEFAULTS, diskFolders: ['D:\\hv'], approvePoolChanges: want }), [])
   }
   assert.deepStrictEqual(policy.problems({ ...policy.DEFAULTS, diskFolders: ['D:\\hv'], approvePoolChanges: 'never' }), ['approvePoolChanges must be within-caps or each'])
+})
+
+// MC-1592: install.ps1's limits on a rerun, run as setup runs them (the block cut from the script): every limit not
+// passed keeps the current policy's value; a passed one replaces it; host defaults only on a first install or for a
+// setting the policy doesn't hold yet; an optional one removed by -1 (0 for -MaxSessionMinutes). The report says which.
+for (const E of ENGINES) test(`setup: a rerun keeps every limit it isn't passed (PowerShell ${E.name})`, () => {
+  const { spawnSync } = require('child_process')
+  const src = fs.readFileSync(path.join(__dirname, '..', 'setup', 'install.ps1'), 'utf8')
+  const block = /^# MC-1592 begin[\s\S]*?^# MC-1592 end$/m.exec(src)
+  assert.ok(block, 'the limits block in install.ps1')
+  const sc = scratch(`setup-limits-${E.name}`)
+  const file = path.join(sc.dir, 'limits.ps1')
+  const params = ['MaxVms', 'MaxCoresPerVm', 'MaxMemoryGB', 'MaxDiskGBPerVm', 'MaxReservePercent', 'MaxLeaseMinutes', 'MaxSessionMinutes', 'MaxLeaseCheckpoints', 'MaxCheckpointsPerVm', 'MinFreeGBForCheckpoint', 'MaxBuildMB']
+  const defaults = { MaxVms: 0, MaxCoresPerVm: 0, MaxMemoryGB: 0, MaxDiskGBPerVm: 128, MaxReservePercent: 100, MaxLeaseMinutes: 240, MaxSessionMinutes: 0, MaxLeaseCheckpoints: -1, MaxCheckpointsPerVm: -1, MinFreeGBForCheckpoint: -1, MaxBuildMB: 2048 }
+  fs.writeFileSync(file, [
+    `param(${params.map(n => `[int]$${n} = ${defaults[n]}`).join(', ')}, [string]$Current = '')`,
+    "$ErrorActionPreference = 'Stop'",
+    "$curPolicy = if ($Current) { Get-Content -Raw -LiteralPath $Current | ConvertFrom-Json } else { $null }",
+    '$hostCpus = 16; $hostRamGB = 64',
+    '$setupBound = $PSBoundParameters',
+    block[0],
+    'ConvertTo-Json -Compress -Depth 4 @{ lim = $lim; report = $limitsReport }'
+  ].join('\n'))
+  const cur = path.join(sc.dir, 'policy.json')
+  const run = (args, current) => {
+    const r = spawnSync(E.exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, ...args, ...(current ? ['-Current', current] : [])], { encoding: 'utf8', env: E.env })
+    assert.strictEqual(r.status, 0, r.stderr + r.stdout)
+    return JSON.parse(r.stdout.trim())
+  }
+  // A first install: the host's defaults (16 CPUs, 64 GB) and the fixed ones; optional settings left to the helper.
+  const first = run([])
+  assert.deepStrictEqual(first.lim, { maxVms: 4, maxCoresPerVm: 4, maxMemoryMBTotal: 32768, maxDiskGBPerVm: 128, maxReservePercent: 100, maxLeaseMinutes: 240, maxBuildMB: 2048, maxSessionMinutes: null, maxLeaseCheckpoints: null, maxCheckpointsPerVm: null, minFreeGBForCheckpoint: null })
+  assert.ok(first.report.set.includes('maxVms 4 (default)'), JSON.stringify(first.report))
+  assert.deepStrictEqual([first.report.kept, first.report.changed], [[], []])
+  // A rerun with nothing passed (only -DiskFolder, in setup): every value kept, the optional ones too.
+  const stored = { maxVms: 2, maxCoresPerVm: 2, maxMemoryMBTotal: 8192, maxDiskGBPerVm: 200, maxReservePercent: 25, maxLeaseMinutes: 600, maxBuildMB: 512, maxSessionMinutes: 900, maxLeaseCheckpoints: 5, maxCheckpointsPerVm: 6, minFreeGBForCheckpoint: 30 }
+  fs.writeFileSync(cur, JSON.stringify({ schema: 1, ...stored }))
+  const rerun = run([], cur)
+  assert.deepStrictEqual(rerun.lim, stored)
+  assert.deepStrictEqual([rerun.report.changed, rerun.report.set], [[], []])
+  assert.strictEqual(rerun.report.kept.length, 11)
+  assert.ok(rerun.report.kept.includes('maxDiskGBPerVm 200'))
+  // A rerun that changes one cap: only that one changes, and the report says from what.
+  const one = run(['-MaxDiskGBPerVm', '300'], cur)
+  assert.deepStrictEqual(one.lim, { ...stored, maxDiskGBPerVm: 300 })
+  assert.deepStrictEqual(one.report.changed, ['maxDiskGBPerVm 200 -> 300'])
+  assert.strictEqual(one.report.kept.length, 10)
+  // -MaxMemoryGB is in GB, stored in MB; passing the same value counts as kept.
+  const mem = run(['-MaxMemoryGB', '8', '-MaxVms', '3'], cur)
+  assert.deepStrictEqual([mem.lim.maxMemoryMBTotal, mem.lim.maxVms], [8192, 3])
+  assert.deepStrictEqual(mem.report.changed, ['maxVms 2 -> 3'])
+  // An optional setting removed (back to the helper's default), and one the policy doesn't hold yet set from its default.
+  fs.writeFileSync(cur, JSON.stringify({ schema: 1, maxVms: 2, maxCoresPerVm: 2, maxMemoryMBTotal: 8192, maxDiskGBPerVm: 200, maxReservePercent: 25, maxLeaseMinutes: 600, maxSessionMinutes: 900 }))
+  const older = run(['-MaxSessionMinutes', '0'], cur)
+  assert.strictEqual(older.lim.maxSessionMinutes, null)
+  assert.deepStrictEqual(older.report.changed, ["maxSessionMinutes 900 -> the helper's default"])
+  assert.strictEqual(older.lim.maxBuildMB, 2048)
+  assert.deepStrictEqual(older.report.set, ['maxBuildMB 2048 (default)'])
+})
+
+// MC-1592: -DiskFolder and -BuildRoot on a rerun, the blocks cut from install.ps1: left out, the current policy's;
+// -DiskFolder still required on a first install; -BuildRoot none clears the list.
+for (const E of ENGINES) test(`setup: a rerun keeps -DiskFolder and -BuildRoot when they aren't passed (PowerShell ${E.name})`, () => {
+  const { spawnSync } = require('child_process')
+  const src = fs.readFileSync(path.join(__dirname, '..', 'setup', 'install.ps1'), 'utf8')
+  const disk = /^# MC-1592: left out on a rerun, the current policy's disk folders\.[\s\S]*?^\$folders = .*$/m.exec(src)
+  const roots = /^# MC-1592: left out on a rerun, the current policy's list is kept[\s\S]*?^elseif .*$/m.exec(src)
+  assert.ok(disk && roots, 'the -DiskFolder and -BuildRoot blocks in install.ps1')
+  const sc = scratch(`setup-folders-${E.name}`)
+  const file = path.join(sc.dir, 'folders.ps1')
+  fs.writeFileSync(file, [
+    "param([string[]]$DiskFolder = @(), [string[]]$BuildRoot = @(), [string]$Current = '')",
+    "$ErrorActionPreference = 'Stop'",
+    "$curPolicy = if ($Current) { Get-Content -Raw -LiteralPath $Current | ConvertFrom-Json } else { $null }",
+    disk[0], roots[0],
+    "'folders: ' + ($folders -join '|') + ' roots: ' + (@($BuildRoot) -join '|')"
+  ].join('\n'))
+  const cur = path.join(sc.dir, 'policy.json')
+  const d1 = path.join(sc.dir, 'disks'), b1 = path.join(sc.dir, 'builds')
+  fs.writeFileSync(cur, JSON.stringify({ diskFolders: [d1], buildRoots: [b1] }))
+  const run = (args, current) => spawnSync(E.exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', `& '${file}' ${args}${current ? ` -Current '${current}'` : ''}`], { encoding: 'utf8', env: E.env })
+  const kept = run('', cur)
+  assert.strictEqual(kept.status, 0, kept.stderr)
+  assert.strictEqual(kept.stdout.trim(), `folders: ${d1} roots: ${b1}`)
+  const d2 = path.join(sc.dir, 'other')
+  const passed = run(`-DiskFolder '${d2}' -BuildRoot none`, cur)
+  assert.strictEqual(passed.stdout.trim(), `folders: ${d2} roots:`)
+  const first = run('')
+  assert.notStrictEqual(first.status, 0)
+  // As projects.test.js's saidBy: PowerShell 7 colours its error and frames each wrapped line with "|".
+  const said = (first.stdout + first.stderr).replace(/\x1b\[[0-9;]*m/g, '').replace(/\s*\r?\n\s*\|\s*/g, ' ').replace(/\s+/g, ' ')
+  assert.match(said, /Name a folder for the VMs' disks: -DiskFolder D:\\hyperv-mcp \(needed on a first install; a rerun keeps the current one\)/)
 })
