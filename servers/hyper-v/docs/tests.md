@@ -258,7 +258,9 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   MC-1589: a persistent VM's checkpoint kept at release and through a helper restart (journalled `lcp-keep`, still in
   Hyper-V), listed in `vm_status`, restored by a later named lease and removed only on request; a take Hyper-V
   completes after its call failed kept once the release finds it; `maxCheckpointsPerVm` across leases and
-  `maxLeaseCheckpoints` per lease; and a disposable VM's checkpoints still removed with its lease.
+  `maxLeaseCheckpoints` per lease; a removal that fails holding its slot until a retry confirms it (a lease's own at
+  its end, a kept one at the VM's next park); an interrupted take that made nothing still getting its checkpoint type
+  put back (the intent kept while that fails); and a disposable VM's checkpoints still removed with its lease.
 - `approvals.test.js`:
   - unapproved plans;
   - forged approvals: another digest, operation or epoch, expired, a malformed nonce, another plan's id, a writable

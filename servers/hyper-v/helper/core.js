@@ -1231,8 +1231,10 @@ class Helper {
     targets.sort((a, b) => (b.snap ? depth(b.snap) : -1) - (a.snap ? depth(a.snap) : -1))
     for (const { x, snap } of targets) {
       if (!x.pool && keeps(x)) {
-        // MC-1589: a persistent VM's: kept with it, its checkpoint type put back first; forgotten if it isn't there.
-        if (snap && x.origType) {
+        // MC-1589: a persistent VM's: kept with it, its checkpoint type put back first; forgotten if it isn't there. The
+        // type is put back either way (an interrupted take may have left ProductionOnly and made nothing), and the
+        // intent stays until it reads back as it was.
+        if (x.origType) {
           let type = null
           try { type = (await this.hv('checkpoint-type', this.ident(vm))).type; if (type !== x.origType) type = (await this.hv('checkpoint-type', { ...this.ident(vm), set: x.origType })).type } catch (e) { return `lease checkpoint cleanup pending: putting back the checkpoint type failed (${e.message})` }
           if (type !== x.origType) return `lease checkpoint cleanup pending: the checkpoint type is ${type}, not ${x.origType}`
@@ -2336,8 +2338,11 @@ class Helper {
       const mine = this.leaseCheckpoints(lease)
       if (mine.some(x => x.name === name)) throw new Error(mine.find(x => x.name === name).kept ? `${vm.vmName} already keeps a checkpoint "${name}" from an earlier lease: vm_restore it, or remove it first (vm_checkpoint({ name: "${name}", remove: true })).` : `This lease already has a checkpoint "${name}".`)
       const cap = this.policy.maxLeaseCheckpoints ?? policyMod.DEFAULT_LEASE_CHECKPOINTS
-      const taken = mine.filter(x => !x.kept).length
-      if (taken >= cap) throw new Error(`This lease holds ${taken} checkpoints, the policy's maxLeaseCheckpoints (${cap}).`)
+      // MC-1589: a removal not yet confirmed (dropping) still holds its slot: the snapshot may still be there.
+      const takes = [...this.state.leaseSnaps.values()].filter(x => x.vmId === vm.vmId && x.leaseId === lease.leaseId && !x.kept && !x.snapName.startsWith('hvmcp-pool-'))
+      const taken = takes.length
+      const removing = takes.filter(x => x.dropping).length
+      if (taken >= cap) throw new Error(`This lease holds ${taken} checkpoints${removing ? ` (${removing} whose removal didn't finish: retried when this lease ends)` : ''}, the policy's maxLeaseCheckpoints (${cap}).`)
       // MC-1589: a persistent VM keeps its checkpoints across leases, so they count against maxCheckpointsPerVm with its
       // pool checkpoints (retiring and being taken included): the bound that keeps it under Hyper-V's 50.
       if (vm.persistent) {
@@ -2469,7 +2474,8 @@ class Helper {
    * keeps from an earlier lease too) now, under the VM's lock: by its exact id and owned name, journalled lcp-drop
    * before the removal and lcp-dropped once Hyper-V confirms it gone (and the checkpoint type put back if its take left
    * that pending). An unconfirmed take isn't removed here (it may still be in progress): the lease's end settles it. A
-   * removal that fails stays journalled as dropping, and the VM's next cleanup (its park, release or start) retries it.
+   * removal that fails stays journalled as dropping, still holding its slot (the snapshot may be there): this lease's
+   * own take is retried when the lease ends, one a persistent VM kept at its next cleanup (dropLeaseSnapshots).
    */
   async removeCheckpoint(lease, vm, name) {
     return this.vmLock(vm.vmId)(async () => {
@@ -2482,7 +2488,9 @@ class Helper {
       const y = list.find(x => x.id === cp.checkpointId)
       if (y && y.name !== cp.snapName) throw new Error(`The checkpoint "${name}"'s id ${cp.checkpointId} now has the name "${y.name}" in Hyper-V: it is left alone (it may not be this helper's any more).`)
       this.journal.append({ t: 'lcp-drop', opId: cp.opId })
-      const retried = "it is retried at the VM's next cleanup (its release, park or start)"
+      // This lease's own take is retried when the lease ends (holding its slot until then); one the persistent VM kept
+      // from an earlier lease, at the VM's next cleanup (a stop, start or release parks it).
+      const retried = cp.kept ? "it is retried at the VM's next cleanup (a stop, start or release)" : 'it is retried when this lease ends, and holds its checkpoint slot until then'
       if (y) {
         let gone = false
         try { gone = (await this.hv('snapshot-remove', { ...this.ident(vm), checkpointId: y.id, snapName: cp.snapName }, this.forLease(lease, this.tm(lease).ms.checkpointMinutes))).removed === true } catch (e) { throw new Error(`Removing the checkpoint "${name}" failed (${e.message}); ${retried}.`) }
