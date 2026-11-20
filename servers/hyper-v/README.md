@@ -293,8 +293,10 @@ can change it; a rerun without it keeps the current choice.
   were all built under your approval).
 - **`Each`:** every plan needs your approval, as before.
 
-Either way, the caps are checked again when a plan applies, the decision is made then (from the policy as it is, not
-from what the plan said), and a plan applies once.
+Either way, the caps are checked again when a plan applies, and a plan applies once. Whether it needs approval is
+decided then too: from the policy the helper loaded when it started (setup restarts it, so a rerun's choice applies
+to every plan from then on, including plans made before) and the plans you've approved, not from what the plan's reply
+said. While uninstall has quiesced the helper, its own removal of the pool always needs its approval.
 
 The steps, for a plan that needs your approval:
 

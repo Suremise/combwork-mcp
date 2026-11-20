@@ -2715,12 +2715,15 @@ class Helper {
   }
 
   /**
-   * MC-1576: why a plan needs the user's approval, [] when it may apply within the policy's caps. Always decided from the
-   * policy as it is now and the images the user approved (the journal), at the plan and again at apply: the reasons a
-   * plan's text showed are never the authority. Setup's approvePoolChanges: 'each' (every plan approved) or
+   * MC-1576: why a plan needs the user's approval, [] when it may apply within the policy's caps. Decided from the policy
+   * this helper loaded at start (setup restarts it after writing policy.json) and the images the user approved (the
+   * journal), at the plan and again at apply: the reasons a plan's text showed are never the authority. Setup's approvePoolChanges: 'each' (every plan approved) or
    * 'within-caps' (the default): then only new content for the clean state every lease starts from needs approval.
    */
   approvalReasons(plan) {
+    // MC-1576 round 1: while uninstall has quiesced the helper, its own removal of the pool (the only change allowed
+    // then) is the exact plan the uninstaller approved, whatever setup chose.
+    if (this.quiesced) return ['the helper is being uninstalled: only the uninstaller\'s own approved removal of the pool']
     if (this.policy.approvePoolChanges === 'each') return ['setup chose to approve each pool change (install.ps1 -ApprovePoolChanges Each)']
     const out = []
     if (plan.add?.length && plan.image) {
