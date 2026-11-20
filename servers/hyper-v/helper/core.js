@@ -409,6 +409,7 @@ class Helper {
    */
   async recover() {
     const notes = []
+    this.sweepSourceAdmins(true) // MC-1578: no job runs at start-up: an interrupted build's password goes too
     let s = this.state
     for (const i of s.intents.values()) {
       if (i.done) continue
@@ -1886,7 +1887,8 @@ class Helper {
       this.stillHeld(lease)
       lease.running = false
       const r = await this.restore(vm, null, lease)
-      throw new Error(`${e.message.replace(/\.?$/, '.')} ${r.ok ? `${vm.vmName} was restored to clean (network disconnected).` : r.text}`)
+      // MC-1582: a persistent VM was parked, not restored: its reply says so.
+      throw new Error(`${e.message.replace(/\.?$/, '.')} ${r.ok ? (r.parked ? `${r.text.replace(/\.$/, '')}.` : `${vm.vmName} was restored to clean (network disconnected).`) : r.text}`)
     }
   }
 
@@ -1896,7 +1898,7 @@ class Helper {
       this.stillHeld(lease)
       lease.running = false
       const r = await this.restore(vm, null, lease)
-      throw new Error(`${vm.vmName} started, but ${e.message}. ${r.ok ? 'It was restored to clean (network disconnected).' : r.text} vm_reset to try again, or ask for network none.`)
+      throw new Error(`${vm.vmName} started, but ${e.message}. ${r.ok ? (r.parked ? r.text : 'It was restored to clean (network disconnected).') : r.text} vm_reset to try again, or ask for network none.`)
     }
   }
 
@@ -2251,6 +2253,8 @@ class Helper {
     lease.interactive = null
     lease.dirty = !r.ok
     Object.assign(lease.sync, { gen: lease.sync.gen + 1, plan: null, trusted: false, record: new Map() })
+    // MC-1582: a persistent VM is parked instead: shut down (which ends what the run started), its disk kept.
+    if (r.ok && r.parked) return `The VM was shut down to end everything the run started: ${r.text} Its output above was read first; vm_start (its disk as it is) or vm_reset (clean) to go on.`
     return r.ok
       ? `The VM was restored to its clean checkpoint, which ends everything the run started (C:\\out with it; its output above was read first): vm_start or vm_reset to go on.`
       : `Restoring the VM to end what it started failed: ${r.text}`
@@ -2487,6 +2491,7 @@ class Helper {
   }
 
   status(connId) {
+    this.sweepSourceAdmins() // MC-1578: approvals that expired unused
     const s = this.state
     const mine = new Set(connId ? this.heldLeases(connId).map(l => l.vmId) : [])
     const vms = [...s.vms.values()].map(v => {
@@ -2512,7 +2517,7 @@ class Helper {
     })
     const img = [...s.images.values()].at(-1)
     const lines = [
-      `Pool: ${vms.length ? `${vms.length} VM(s)` : 'no VMs'}; network ${s.network} (approved in a plan: ${net.DESCRIBE[s.network]})${s.switch ? `; old pool switch ${s.switch.name} (${s.switch.phase}, unused by runs)` : ''}; image: ${img ? (img.os === 'linux' ? linuxImages.describe(img) : `${img.edition} ${img.build} (${img.sha256.slice(0, 12)}…${img.path ? `, from ${img.path}` : ''})`) : 'none'}.`,
+      `Pool: ${vms.length ? `${vms.length} VM(s)` : 'no VMs'}; network ${s.network} (approved in a plan: ${net.DESCRIBE[s.network]})${s.switch ? `; old pool switch ${s.switch.name} (${s.switch.phase}, unused by runs)` : ''}; image: ${img ? describeImage(img) : 'none'}.`,
       ...vms,
       ...this.shareLines(),
       this.job ? `Pool job in progress: ${this.job.op} (${this.job.jobId}): ${this.job.progress}` : this.lastJob ? `Last pool job: ${this.lastJob.op} ${this.lastJob.ok ? 'finished' : 'FAILED'}: ${this.lastJob.note}` : null,
@@ -2534,6 +2539,7 @@ class Helper {
 
   /** pool_plan: read-only apart from writing the plan record (and starting an image check if one is needed). */
   async plan(args = {}) {
+    this.sweepSourceAdmins() // MC-1578: approvals that expired unused
     const op = args.action ?? 'create'
     if (op === 'checkpoint' || op === 'checkpoint-remove') return this.planCheckpoint(args)
     if (op === 'refresh-clean') return this.planRefresh(args)
@@ -2595,16 +2601,28 @@ class Helper {
         if (!img.ready) return { text: img.text }
         plan.image = img.image
       }
+      // MC-1578 round 1: a ready-made disk's own size is a floor: each new VM's disk is at least that (it is copied, then
+      // only ever grown), so the plan and the policy are checked against the size the VMs will really have.
+      if (plan.add.length && plan.image?.ready) {
+        const need = Number(plan.image.virtualGB)
+        if (!(need > 0)) throw new Error('The ready-made disk\'s size isn\'t recorded: check the image again (pool_plan with its { vhdx | vm, admin }).')
+        if (args.diskGB !== undefined && args.diskGB < need) throw new Error(`The ready-made disk is ${need} GB: diskGB must be at least that (it is copied whole, never shrunk).`)
+        for (const x of plan.add) x.diskGB = Math.max(x.diskGB, need)
+        const bad = policyMod.checkPool(this.policy, [...others, ...keep, ...plan.add], { network })
+        if (bad.length) throw new Error(`That plan is outside the policy: ${bad.join('; ')} (the ready-made disk is ${need} GB, so each new VM's disk is at least that).`)
+      }
       if (plan.add.length) {
         // The build's one online step, bound here (MC-1513): an evaluation image always (it lasts about a day
         // unactivated); an own copy only when asked. Nothing else ever connects the Default Switch.
         const evaluation = plan.image.evaluation
         if (plan.image.os === 'linux' && args.activate !== undefined) throw new Error('activate is for Windows images: a Linux VM is built offline, with no licence to activate.')
+        // MC-1578: a ready-made disk is used as it is: nothing is activated, and no product key goes in.
+        if (plan.image.ready && args.activate !== undefined) throw new Error('activate is for a Windows ISO install: a ready-made disk is used as it is, and its licence is only read.')
         if (evaluation && args.activate === false) throw new Error('An evaluation image must be activated online once when each VM is built (unactivated, it stops allowing interactive logons after about a day): leave activate out.')
         const online = evaluation || args.activate === true
         if (online && !facts.defaultSwitch) throw new Error(`This host has no Default Switch, so Windows can't be activated online when a VM is built${evaluation ? ' (an evaluation image needs that)' : ''}.`)
         plan.activation = online ? 'online-once' : 'none'
-        plan.productKey = plan.image.os !== 'linux' && !evaluation && !!this.productKey()
+        plan.productKey = plan.image.os !== 'linux' && !plan.image.ready && !evaluation && !!this.productKey()
       }
       // MC-1577 (the user's choice): their own guest setup script, run in each VM this plan builds. None by default: a
       // plain build adds nothing of its own to the guest. A resize names it again for the VMs it adds.
@@ -2711,19 +2729,24 @@ class Helper {
     // MC-1572: the shapes that asked the helper to download (Windows' download, Linux's pinned distro or pin) are gone.
     if (want.download !== undefined || want.distro !== undefined || want.pin !== undefined || want.release !== undefined) throw new Error(images.NO_DOWNLOAD)
     const linux = want.file !== undefined
-    if (linux && (want.iso !== undefined || want.edition !== undefined)) throw new Error('image is { iso, edition? } for Windows or { file } for Linux, not both')
+    // MC-1578: a ready-made Windows disk, or one of the user's own VMs (its disk flattened into a copy).
+    const ready = want.vhdx !== undefined || want.vm !== undefined
+    if ([linux, want.iso !== undefined, ready].filter(Boolean).length > 1) throw new Error('image is one of { iso, edition? } (Windows, installed unattended), { vhdx, admin } or { vm, admin } (a ready-made Windows disk), or { file } (a Linux qcow2)')
     const job = { progress: 'starting' }
     this.imageJob = job
     const p = linux
       ? linuxImages.prepare({ want, dir: join(location, 'images'), hv: this.hv, known: s.images, ownDirs: [this.dir], progress: t => { job.progress = t }, maxVirtualBytes: this.policy.maxDiskGBPerVm * 1024 ** 3 })
-      : images.prepare({ want, dir: join(location, 'images'), hv: this.hv, known: s.images, ownDirs: [this.dir], progress: t => { job.progress = t } })
+      : ready
+        ? images.prepareReady({ want, dir: join(location, 'images'), hv: this.hv, known: s.images, ownDirs: [this.dir], poolVmIds: [...s.vms.keys()], progress: t => { job.progress = t } })
+        : images.prepare({ want, dir: join(location, 'images'), hv: this.hv, known: s.images, ownDirs: [this.dir], progress: t => { job.progress = t } })
     p.then(img => {
-      const what = img.os === 'linux' ? linuxImages.describe(img) : `${img.edition} ${img.build} (${img.sha256.slice(0, 12)}…${img.path ? `, from ${img.path}` : ''})`
+      const what = describeImage(img)
       if (img.existing) { this.lastImage = `ready: ${what}`; return }
-      this.journal.append({ t: 'image', ...img })
+      const { updated, ...rec } = img // MC-1578 round 1: another admin for the same bytes: the newest record wins
+      this.journal.append({ t: 'image', ...rec })
       this.lastImage = `ready: ${what}`
     }, e => { this.lastImage = `REFUSED: ${e.message}` }).finally(() => { this.imageJob = null })
-    return { ready: false, text: linux ? 'Checking the Linux image now (copied into the helper\'s folder while hashed, then converted to the base VHDX with nothing installed on the host). This takes a few minutes: call pool_status, then pool_plan again with no image to use it.' : 'Checking the image now (copied into the helper\'s folder while hashed, then its editions and build read before anything runs). This takes a few minutes for a 7 GB ISO: call pool_status, then pool_plan again with no image to use it.' }
+    return { ready: false, text: ready ? 'Copying the disk into the helper\'s folder now, while hashing it (for a VM: its disk flattened into a copy; the VM itself is only read). This takes a few minutes for a large disk: call pool_status, then pool_plan again with no image to use it.' : linux ? 'Checking the Linux image now (copied into the helper\'s folder while hashed, then converted to the base VHDX with nothing installed on the host). This takes a few minutes: call pool_status, then pool_plan again with no image to use it.' : 'Checking the image now (copied into the helper\'s folder while hashed, then its editions and build read before anything runs). This takes a few minutes for a 7 GB ISO: call pool_status, then pool_plan again with no image to use it.' }
   }
 
   // ---------- pool changes (approved) ----------
@@ -2743,6 +2766,7 @@ class Helper {
       if (this.now() > plan.expires) throw new Error(`Plan ${planId} has expired: make a new plan (pool_plan) and approve it.`)
       const nonce = await this.checkApproval(plan, digest)
       const s = this.state
+      let sourceAdmin = null
       // Recheck against the pool as it is now (under the lock) and the policy.
       for (const r of plan.remove || []) {
         const vm = s.vms.get(r.vmId)
@@ -2767,6 +2791,11 @@ class Helper {
         if (rec.os !== 'linux' && (rec.edition !== plan.image.edition || (rec.imageIndex ?? 1) !== (plan.image.imageIndex ?? 1))) throw new Error('The plan\'s image edition no longer matches its record: make a new plan.')
         if (isEval(plan.image) && plan.activation !== 'online-once') throw new Error(`Plan ${planId} doesn't activate its evaluation image (it was made before activation was planned): make a new plan.`)
         if (plan.productKey && !this.productKey()) throw new Error(`Plan ${planId} uses the pool's product key, but setup holds none now: make a new plan.`)
+        // MC-1578: a ready-made disk's admin password, typed by the user into approve.ps1 for exactly this approval.
+        if (plan.image?.ready) {
+          sourceAdmin = this.readSourceAdmin(plan, digest)
+          if (!sourceAdmin) throw new Error(`Plan ${planId} needs the password of ${plan.image.admin} in its disk, and none was given for this approval: approve it again (approve.cmd asks for it).`)
+        }
         if (plan.guestScript) {
           let gsBytes = null
           try { gsBytes = fs.readFileSync(this.guestScriptFile(plan.guestScript)) } catch { /* below */ }
@@ -2776,13 +2805,15 @@ class Helper {
       const jobId = `j-${hex(6)}`
       this.journal.append({ t: 'job', jobId, op, planId, nonce })
       for (const r of plan.remove || []) this.journal.append({ t: 'removing', jobId, vmId: r.vmId })
-      const job = { jobId, op, progress: 'started' }
+      // MC-1578: the source admin's credential stays in memory with the job, never in the journal or a note; its file
+      // is deleted when the job ends, done or failed.
+      const job = { jobId, op, progress: 'started', planId, sourceAdmin }
       this.job = job
       job.promise = this.runJob(job, plan).then(
         note => { this.journal.append({ t: 'jobEnd', jobId, ok: true, note }); this.lastJob = { op, ok: true, note } },
         e => { this.journal.append({ t: 'jobEnd', jobId, ok: false, note: e.message }); this.lastJob = { op, ok: false, note: e.message } }
-      ).finally(() => { this.job = null; this.kick() })
-      return { text: `Approved plan ${planId} accepted: pool job ${jobId} (${op}) is running. ${op === 'remove' || (op !== 'refresh' && !(plan.add || []).length) ? '' : op === 'refresh' ? "Each VM's guest steps are rerun offline: about 20-40 minutes each, one at a time. " : plan.image?.os === 'linux' ? 'Creating a Linux VM copies its verified image and first boots it offline from its cloud-init seed: a few minutes each, one at a time. ' : 'Creating a VM installs Windows unattended: about 20-40 minutes each, one at a time. '}Follow it with pool_status.`, data: { jobId } }
+      ).finally(() => { job.sourceAdmin = null; this.dropSourceAdmin(planId); this.job = null; this.kick() })
+      return { text: `Approved plan ${planId} accepted: pool job ${jobId} (${op}) is running. ${op === 'remove' || (op !== 'refresh' && !(plan.add || []).length) ? '' : op === 'refresh' ? "Each VM's guest steps are rerun offline: about 20-40 minutes each, one at a time. " : plan.image?.os === 'linux' ? 'Creating a Linux VM copies its verified image and first boots it offline from its cloud-init seed: a few minutes each, one at a time. ' : plan.image?.ready ? 'Creating a VM copies the ready-made disk and sets the helper\'s accounts up in it, offline: a few minutes each, one at a time. ' : 'Creating a VM installs Windows unattended: about 20-40 minutes each, one at a time. '}Follow it with pool_status.`, data: { jobId } }
     })
   }
 
@@ -3082,6 +3113,7 @@ class Helper {
     fs.mkdirSync(a.folder, { recursive: true })
     const linuxImg = this.state.images.get(plan.image.sha256)
     if ((linuxImg?.os || 'windows') === 'linux') return this.createLinuxVm(job, plan, a, linuxImg, step)
+    if (linuxImg?.ready) return this.createReadyVm(job, plan, a, linuxImg, step)
     const creds = this.creds()
     step('writing its answer file')
     const media = join(a.folder, 'setup-media')
@@ -3122,6 +3154,53 @@ class Helper {
     if (bad) throw new Error(`its clean baseline doesn't verify: ${bad}`)
     this.journal.append({ t: 'ready', intentId: a.intentId, vmId: vm.vmId, cleanCheckpointId: cp.checkpointId, licence, profiles, guestScript, ...(a.persistent ? { persistent: true } : {}) })
     return buildNote(profiles)
+  }
+
+  /**
+   * MC-1578: a VM from a ready-made Windows disk (the user's own, or a copy of their VM's), offline: the copy (checked
+   * against the approved SHA-256 first, grown to the plan's size), its first start, the disk's admin account (the
+   * password the user typed when approving, in memory only) used once to make the helper's accounts (accounts by those
+   * names in the copy are reset), each read back and signed in as; then the guest setup, the guest setup script, the
+   * licence read (nothing activated), the verified logon undo (autologon off, its password secret gone, UAC on,
+   * Windows' Userinit, C:\hvmcp clean: whatever the disk came with), and the clean checkpoint. No unattended install,
+   * no activation, no first-logon wait.
+   */
+  async createReadyVm(job, plan, a, img, step) {
+    const src = job.sourceAdmin
+    if (!src) throw new Error(`there's no password for ${plan.image.admin} for this approval: approve the plan again (approve.cmd asks for it)`)
+    const creds = this.creds()
+    step('checking the disk copy against the approved SHA-256, then creating the VM')
+    const c = await this.hv('create-vm', { os: 'windows', name: a.name, folder: a.folder, cores: a.cores, memoryMB: a.memoryMB, diskGB: a.diskGB, baseVhdx: img.file, baseSha256: plan.image.sha256 }, { timeoutMs: 20 * 60_000 })
+    this.journal.append({ t: 'created', intentId: a.intentId, vmId: c.vmId })
+    const vm = this.state.vms.get(c.vmId)
+    step(`starting it offline and waiting for its account ${src.user}`)
+    await this.hv('start-vm', { ...this.ident(vm), noKeys: true }) // it boots from its disk: no DVD prompt to answer
+    const readyMs = this.tm().ms.guestReadyMinutes
+    if (await this.waitGuest(vm, src, readyMs) === null) throw new Error(`its guest didn't answer as ${src.user} within ${Math.round(readyMs / 60_000)} min (the disk must be an installed Windows that isn't generalized, and ${src.user} its administrator with the password you typed)`)
+    step('making the helper\'s accounts hvadmin and hvuser')
+    const r = await this.hv('guest-accounts', { ...this.ident(vm), cred: src, admin: creds.admin, user: creds.user }, { timeoutMs: 120_000 })
+    const why = accountsProblem(r)
+    if (why) throw new Error(`the helper's accounts didn't verify: ${why}`)
+    if (await this.waitGuest(vm, creds.admin, readyMs) === null) throw new Error('hvadmin, just made, doesn\'t sign in')
+    step('setting up the guest')
+    const g = await this.guestSetup(vm, creds)
+    let guestScript = null
+    if (plan.guestScript) {
+      step(`running the guest setup script ${plan.guestScript.name} (offline)`)
+      guestScript = await this.runGuestScript(vm, plan.guestScript)
+    }
+    step('reading its Windows licence (offline)')
+    const lic = await this.hv('guest-licence', { ...this.ident(vm), cred: creds.admin }, { timeoutMs: 120_000 })
+    const licence = licenceOf(lic, images.isEvalEdition(g.editionId), this.now(), 0) // read as it is: no fresh-build minimum
+    step('setting autologon and UAC back to Windows\' own (verified)')
+    await this.undoLogon(vm, creds)
+    step('shutting down and taking the clean checkpoint')
+    const cp = await this.hv('make-clean', { ...this.ident(vm), shutdownMs: this.tm().ms.shutdownMinutes }, { timeoutMs: this.tm().d.makeCleanCallMs })
+    const facts = await this.restoreVia(vm, 'restore', { ...this.ident(vm), checkpointId: cp.checkpointId })
+    const bad = baselineProblem(facts, { ...vm, cleanCheckpointId: cp.checkpointId })
+    if (bad) throw new Error(`its clean baseline doesn't verify: ${bad}`)
+    this.journal.append({ t: 'ready', intentId: a.intentId, vmId: vm.vmId, cleanCheckpointId: cp.checkpointId, licence, profiles: null, guestScript, guest: { editionId: g.editionId, build: g.build }, ...(a.persistent ? { persistent: true } : {}) })
+    return `ready-made disk: ${g.editionId} build ${g.build}; licence status ${lic.status}; no first-logon wait (an interactive start's first logon does that work)`
   }
 
   /**
@@ -3355,6 +3434,38 @@ class Helper {
     return licenceOf(r, isEval(plan.image), this.now())
   }
 
+  // ---------- MC-1578: a ready-made disk's admin password ----------
+  // approve.ps1 writes it (typed by the user) to secrets\source-admin\<planId>.json, in the helper's own state folder
+  // (SYSTEM, Administrators and the helper only), bound to that approval: plan id, digest, image SHA-256 and user. Only
+  // that plan's job reads it, and it never enters a plan, the journal, a status, a note or a command line (hv.ps1 gets
+  // it on stdin). Deleted when the job ends; one whose approval expired unused at the next plan or status; and, at
+  // start-up, every one (no job is running then: an interrupted build's included).
+  sourceAdminFile(planId) { return join(this.dir, 'secrets', 'source-admin', `${planId}.json`) }
+
+  readSourceAdmin(plan, digest) {
+    let c
+    try { c = JSON.parse(fs.readFileSync(this.sourceAdminFile(plan.id), 'utf8').replace(/^\uFEFF/, '')) } catch { return null }
+    if (c?.planId !== plan.id || c.digest !== digest || String(c.imageSha256).toLowerCase() !== plan.image.sha256 || c.user !== plan.image.admin) return null
+    if (typeof c.password !== 'string' || !c.password) return null
+    return { user: c.user, password: c.password }
+  }
+
+  dropSourceAdmin(planId) { try { fs.rmSync(this.sourceAdminFile(planId), { force: true }) } catch { /* gone */ } }
+
+  /** Abandoned ones: every one but the running job's whose approval has expired; with all, every one but its. */
+  sweepSourceAdmins(all = false) {
+    const dir = join(this.dir, 'secrets', 'source-admin')
+    let names = []
+    try { names = fs.readdirSync(dir) } catch { return }
+    for (const n of names) {
+      const id = n.replace(/\.json$/i, '')
+      if (this.job?.planId === id) continue // a build using it: its approval may outlast nothing, the job ends it
+      let expires = 0
+      try { expires = Date.parse(JSON.parse(fs.readFileSync(join(dir, n), 'utf8').replace(/^\uFEFF/, '')).expires) } catch { /* unreadable: expired */ }
+      if (all || !(expires > this.now())) { try { fs.rmSync(join(dir, n), { force: true }) } catch { /* next time */ } }
+    }
+  }
+
   /** The pool's product key (setup's -ProductKeyFile), or null. Never in a reply, plan, journal or log. */
   productKey() {
     try {
@@ -3453,7 +3564,7 @@ const PROTOCOL = 'hyperv-mcp/3' // 2: renew, sync_plan, sync (MC-1497); 3: start
 // 'user-images' = pool_plan's image is any local file the user names ({ iso } of any x64 edition, or a Linux { file }),
 // with no pins and no downloads; acquire's distro is any /etc/os-release ID (MC-1572).
 // 'multi-vm' = a connection holds several leases; every lease op takes vm (the VM's name), and leases lists them (MC-1580).
-const FEATURES = ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean', 'linux', 'debug-keep', 'timing', 'network-modes', 'user-images', 'guest-script', 'multi-vm', 'persistent']
+const FEATURES = ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean', 'linux', 'debug-keep', 'timing', 'network-modes', 'user-images', 'guest-script', 'multi-vm', 'ready-images', 'persistent']
 const LEASE_CHECKPOINT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$/
 // MC-1532: a pool checkpoint's name.
 const POOL_CHECKPOINT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._+-]{0,39}$/
@@ -3492,6 +3603,24 @@ function diagLine(d) {
   const gone = DIAG_LOGS.filter(k => d.logs[k] === 'unavailable')
   if (gone.length) parts.push(`unavailable: ${gone.join(', ')}`)
   return parts.join(', ')
+}
+
+/**
+ * MC-1578: hv.ps1 'guest-accounts' read back: hvadmin an enabled administrator, hvuser an enabled standard user (not in
+ * Administrators or Remote Management Users), each signing in with the helper's password. What's wrong, or null.
+ */
+function accountsProblem(r) {
+  const bad = []
+  const a = r?.admin || {}
+  const u = r?.user || {}
+  if (a.exists !== true || a.enabled !== true) bad.push('hvadmin is missing or disabled')
+  if (a.isAdmin !== true) bad.push('hvadmin isn\'t in Administrators')
+  if (a.signsIn !== true) bad.push('hvadmin doesn\'t sign in with the helper\'s password')
+  if (u.exists !== true || u.enabled !== true) bad.push('hvuser is missing or disabled')
+  if (u.isAdmin !== false) bad.push('hvuser is still in Administrators')
+  if (u.remoteMgmt !== false) bad.push('hvuser is still in Remote Management Users')
+  if (u.signsIn !== true) bad.push('hvuser doesn\'t sign in with the helper\'s password')
+  return bad.length ? bad.join('; ') : null
 }
 
 /** MC-1520: the build's note on its slow or retried logons, for the job's done line (pool_status), or ''. */
@@ -3598,7 +3727,9 @@ function expiry(vm, now) {
  * Only an absent or unreadable date is ignored (hv.ps1 sends none for Windows' 1601 sentinel): a real end date that
  * has passed fails the build, never giving way to the grace figure. An own copy is recorded as it is (no expiry).
  */
-function licenceOf(r, evaluation, now) {
+// minDays: the fresh ISO build's minimum (EVAL_MIN_DAYS); MC-1578's ready-made disk passes 0: an evaluation part way
+// through its period is taken as it is, its end recorded for the usual warnings (one already over is still refused).
+function licenceOf(r, evaluation, now, minDays = EVAL_MIN_DAYS) {
   if (!r || typeof r !== 'object') throw new Error('the guest reported no licence')
   const status = Number(r.status)
   if (!evaluation) return { kind: 'own', activated: status === 1, status }
@@ -3609,7 +3740,7 @@ function licenceOf(r, evaluation, now) {
   const end = Math.min(...ends)
   if (end <= now) throw new Error(`the evaluation's end date, ${new Date(end).toISOString()}, has already passed`)
   const days = Math.floor((end - now) / DAY_MS)
-  if (days < EVAL_MIN_DAYS) throw new Error(`the evaluation activated with only ${days} day(s) left (at least ${EVAL_MIN_DAYS} needed)`)
+  if (days < minDays) throw new Error(`the evaluation activated with only ${days} day(s) left (at least ${minDays} needed)`)
   return { kind: 'evaluation', expiresAt: new Date(end).toISOString() }
 }
 
@@ -3676,7 +3807,13 @@ const isEval = img => img.evaluation ?? images.isEvalEdition(img.edition)
 // MC-1572: path (the file the user named) and signature (information only) for images checked from now on.
 const pick = img => img.os === 'linux'
   ? { sha256: img.sha256, size: img.size, imageIndex: 1, evaluation: false, source: img.source, path: img.path ?? null, os: 'linux', distro: img.distro ?? null, release: img.release ?? null, serial: img.serial ?? null, name: img.name ?? null } // MC-1501
-  : { sha256: img.sha256, size: img.size, edition: img.edition, build: img.build, imageIndex: img.imageIndex ?? 1, evaluation: isEval(img), source: img.source, path: img.path ?? null, signature: img.signature ?? null, os: img.os || 'windows' }
+  : img.ready // MC-1578: a ready-made Windows disk (its edition and build are read from the guest at build)
+    ? { sha256: img.sha256, size: img.size, imageIndex: 1, evaluation: false, source: img.source, path: img.path ?? null, vmName: img.vmName ?? null, vmId: img.vmId ?? null, os: 'windows', ready: true, admin: img.admin, virtualGB: img.virtualGB ?? null }
+    : { sha256: img.sha256, size: img.size, edition: img.edition, build: img.build, imageIndex: img.imageIndex ?? 1, evaluation: isEval(img), source: img.source, path: img.path ?? null, signature: img.signature ?? null, os: img.os || 'windows' }
+/** An image in a line: a Linux one, a ready-made Windows disk (MC-1578), or a Windows ISO's edition and build. */
+const describeImage = img => img.os === 'linux' ? linuxImages.describe(img)
+  : img.ready ? `ready-made Windows disk ${img.source === 'vm' ? `from the VM ${img.vmName} (${img.vmId})` : `from ${img.path}`}, ${img.virtualGB ? `${img.virtualGB} GB, ` : ''}admin account ${img.admin} (${img.sha256.slice(0, 12)}…)`
+    : `${img.edition} ${img.build} (${img.sha256.slice(0, 12)}…${img.path ? `, from ${img.path}` : ''})`
 /** MC-1572: where an image came from, for the plan: the user's file, or an earlier check's record. */
 const imageFrom = img => img.path ? `from ${img.path}, copied into the helper's folder; the build uses that copy, checked against this SHA-256 first` : 'checked earlier (the helper\'s copy, checked against this SHA-256 before the build uses it)'
 const OSES = ['windows', 'linux']
@@ -3688,7 +3825,7 @@ function describePlan(plan, digest, approve, T) {
   // MC-1582: what a persistent VM gives up, said in the plan the user approves.
   if (plan.persistent) lines.push('- PERSISTENT (MC-1582): each VM this plan builds is never restored to clean at release, at its deadline, when its session disconnects, at a helper restart or at a plain vm_start: it is shut down and disconnected instead, and keeps whatever its runs left (installed software, files, settings, C:\\out, anything a run did) for the next lease, of any agent that names it. Plain acquires never get it; vm_acquire({ vm }) does. Its leases have no work-session cap (each acquire and renew stays within maxLeaseMinutes). It still has a clean checkpoint: vm_start({ checkpoint: \'clean\' }) or vm_reset restores it and discards what it kept. Network stays off unless a start asks, and is disconnected at every stop')
   // MC-1531: refresh plans.
-  if (plan.op === 'refresh') for (const v of plan.refresh) lines.push(`- refresh the clean checkpoint of ${v.name}: restore it, start it offline, rerun the build's guest steps (the registry policy and the Defender exclusions; the test accounts' profiles are kept as built, not logged on again: fixes to the build's profile setup need a rebuild, not a refresh), shut it down and take a new clean checkpoint; then remove the old one (its pool checkpoints are kept). Nothing goes online and nothing is re-activated; its evaluation end stays as recorded. The VM isn't leased meanwhile.`)
+  if (plan.op === 'refresh') for (const v of plan.refresh) lines.push(`- refresh the clean checkpoint of ${v.name}: restore it, start it offline, rerun the build's guest setup (its folders; not the guest setup script, whose work is already in the clean checkpoint; the test accounts' profiles are kept as built, not logged on again: fixes to the build's profile setup need a rebuild, not a refresh), shut it down and take a new clean checkpoint; then remove the old one (its pool checkpoints are kept). Nothing goes online and nothing is re-activated; its evaluation end stays as recorded. The VM isn't leased meanwhile.`)
   // MC-1532: pool-checkpoint plans.
   if (plan.op === 'checkpoint') for (const v of plan.vms) lines.push(plan.mode === 'remove' ? `- remove the pool checkpoint "${plan.checkpoint}" of ${v.name} (owner ${v.owner}); a lease already using it keeps it until that lease ends` : `- ${plan.mode === 'replace' ? 'replace' : 'publish'} the pool checkpoint "${plan.checkpoint}" of ${v.name} (owner ${v.owner}, ${v.os}, image ${v.image === 'legacy' ? 'unknown' : v.image.slice(0, 12)}), from lease ${v.leaseId}'s state: its logon undone and verified, network disconnected, the guest shut down, then checkpointed Off; any project's lease may then start from it${plan.mode === 'replace' ? '; the old one stops being offered at once and is removed when no lease uses it' : ''}`)
   if (plan.switch) lines.push(`- create the internal switch ${plan.switch} (host and guests only; no internet, no LAN)`)
@@ -3701,7 +3838,10 @@ function describePlan(plan, digest, approve, T) {
   if (linux) lines.push(`- image: ${linuxImages.label(plan.image)}, SHA-256 ${plan.image.sha256}, ${imageFrom(plan.image)}`)
   if (linux && plan.add?.length) lines.push('- Linux build: each new VM is a copy of the image\'s verified base VHDX with a cloud-init seed (users hvadmin and hvuser with locked passwords; SSH keys made by the helper and held only by it; sshd only on the Hyper-V socket, for the helper\'s forced command), first booted offline; cloud-init is turned off and the seed removed before its clean checkpoint')
   if (plan.debugKeepFailedBuild) lines.push('- DEBUG (MC-1545): if a Linux build fails, its VM is kept, turned on, network disconnected, never leased, for an administrator to inspect in Hyper-V Manager (its console, its COM1 diagnostics, a host-side HvMcpVsock retry; no login or other access to the guest is added; its seed, with its host key, stays with it); a resize plan with no image and vms equal to the number of other VMs in the pool removes only it; any other create or resize removes it too, along with the changes it asks for; a remove plan removes the whole pool')
-  if (plan.image && !linux) lines.push(`- image: ${plan.image.edition}${plan.image.imageIndex > 1 ? ` (index ${plan.image.imageIndex})` : ''} build ${plan.image.build}, SHA-256 ${plan.image.sha256}, ${imageFrom(plan.image)}${plan.image.signature ? `; setup files: ${plan.image.signature.microsoft ? 'signed by Microsoft' : `not signed by Microsoft (${plan.image.signature.note}): information only`}` : ''}`)
+  const ready = !!plan.image?.ready // MC-1578
+  if (ready) lines.push(`- image: ready-made Windows disk ${plan.image.source === 'vm' ? `from your VM ${plan.image.vmName} (id ${plan.image.vmId}; its disk flattened into a copy; the VM itself is only read, never changed)` : `from ${plan.image.path}`}, SHA-256 ${plan.image.sha256}, copied into the helper's folder; the build uses that copy, checked against this SHA-256 first`)
+  if (ready && plan.add?.length) lines.push(`- ready-made build: each new VM is a copy of that disk (${plan.image.virtualGB} GB; grown to the plan's disk size, never shrunk), started offline. The disk's admin account ${plan.image.admin} is used once, to make the helper's own accounts hvadmin (an administrator) and hvuser (a standard user; accounts by those names in the copy are reset to that); its password is the one you type when you approve, kept only until this plan's builds end. Then the guest setup, autologon and UAC set back to Windows' own (verified), and the clean checkpoint. No unattended install, no activation, and no first-logon wait: an interactive start's first logon does Windows' first-logon work then`)
+  if (plan.image && !linux && !ready) lines.push(`- image: ${plan.image.edition}${plan.image.imageIndex > 1 ? ` (index ${plan.image.imageIndex})` : ''} build ${plan.image.build}, SHA-256 ${plan.image.sha256}, ${imageFrom(plan.image)}${plan.image.signature ? `; setup files: ${plan.image.signature.microsoft ? 'signed by Microsoft' : `not signed by Microsoft (${plan.image.signature.note}): information only`}` : ''}`)
   // MC-1577: the user's guest setup script, or none: the build adds no guest changes of its own.
   if (plan.add?.length) {
     const gs = plan.guestScript
@@ -3709,10 +3849,10 @@ function describePlan(plan, digest, approve, T) {
       ? `- guest setup script: ${gs.path} (${gs.bytes} bytes, SHA-256 ${gs.sha256}), run once in each new VM as its admin, offline, before its clean checkpoint; a non-zero exit fails that VM's build`
       : '- guest setup script: none (nothing is added to the guest beyond the build\'s own accounts and folders)')
   }
-  if (plan.add?.length && !linux) lines.push(`- provisioning: each new VM logs hvadmin and hvuser on interactively once (offline), waits for Windows' first-logon setup to finish, then turns autologon off and resets UAC and the watcher's start before its clean checkpoint; each account within ${Math.round(T.ms.provisionMinutes / 60_000)} min (a logon attempt up to ${Math.round(BUILD_LOGON_WAIT_MS / 60_000)} min once it has begun, one with no sign of a logon ${Math.round(FIRST_LOGON_SIGN_MS / 60_000)} min after its new boot is seen retried at once, then accepted once Windows' App Readiness reports the account's first-logon app setup finished and ${Math.round(PROVISION_QUIET_MS / 60_000)} min of observed quiet follow, one retry if needed; the time Windows itself suspends that setup isn't counted, up to ${Math.round(T.ms.provisionMinutes / 60_000)} min more)`)
+  if (plan.add?.length && !linux && !ready) lines.push(`- provisioning: each new VM logs hvadmin and hvuser on interactively once (offline), waits for Windows' first-logon setup to finish, then turns autologon off and resets UAC and the watcher's start before its clean checkpoint; each account within ${Math.round(T.ms.provisionMinutes / 60_000)} min (a logon attempt up to ${Math.round(BUILD_LOGON_WAIT_MS / 60_000)} min once it has begun, one with no sign of a logon ${Math.round(FIRST_LOGON_SIGN_MS / 60_000)} min after its new boot is seen retried at once, then accepted once Windows' App Readiness reports the account's first-logon app setup finished and ${Math.round(PROVISION_QUIET_MS / 60_000)} min of observed quiet follow, one retry if needed; the time Windows itself suspends that setup isn't counted, up to ${Math.round(T.ms.provisionMinutes / 60_000)} min more)`)
   if (plan.activation === 'online-once') lines.push('- activation: each new VM goes online once, through Windows\' Default Switch, to activate Windows; it is disconnected (verified) before its clean checkpoint, and no start ever uses that switch')
   else if (plan.add?.length && !linux) lines.push('- activation: none (each new VM stays offline; its licence is read and shown)')
-  if (plan.add?.length && plan.image && !plan.image.evaluation && !linux) lines.push(`- product key: ${plan.productKey ? 'the pool\'s (set by install.ps1 -ProductKeyFile), written only into the answer file' : 'none'}`)
+  if (plan.add?.length && plan.image && !plan.image.evaluation && !linux && !ready) lines.push(`- product key: ${plan.productKey ? 'the pool\'s (set by install.ps1 -ProductKeyFile), written only into the answer file' : 'none'}`)
   if (plan.host) lines.push(`Host: ${plan.host.logicalCpus} logical CPUs, ${plan.host.memoryMB} MB.`)
   lines.push('', 'Nothing is changed until the user approves this exact plan, as one line in an admin terminal (cmd or PowerShell):', approve,
     'It shows the plan from the helper\'s own record and asks for the 6 characters above. Then call ' + `pool_${plan.op}({ planId: "${plan.id}" }).`,

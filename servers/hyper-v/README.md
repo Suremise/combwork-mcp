@@ -58,7 +58,7 @@ Hyper-V Administrators, so agents running as you can't drive Hyper-V directly.
 | Keep a leased VM running for a **work session**: several runs in one guest, with `vm_sync` copying changed files into its `C:\build` (no restore between them), and the lease renewed up to the policy's `maxLeaseMinutes` at a time and `maxSessionMinutes` in all. | Carry anything past the lease: release, the deadline and the session's connection closing all restore and verify it as above. Write anywhere in the guest but `C:\build` and its own staging folder when syncing, or follow a link or junction there. |
 | Run commands in a leased Linux guest over SSH on a Hyper-V socket (no network), through Windows' own `ssh.exe` with fixed arguments, the guest's forced command and a per-VM key only the helper holds (see "Linux guests"). | Give an agent a key, an SSH endpoint or a shell in the guest other than the run it asked for. Run anything on the host but `powershell.exe` with its fixed script, `node` for itself, and, for Linux guests, `ssh.exe` from System32 and setup's own `HvMcpVsock.exe`, each with fixed arguments. |
 | Run commands in a leased guest over PowerShell Direct, as its admin or its standard user, with passwords only the helper holds. On request, log one of those accounts on in the guest (autologon, then a guest restart) and run commands in its desktop session through a watcher started at logon (`hvuser` as a standard user, or `hvadmin` elevated); a run there that doesn't finish cleanly restores the VM. | Run any program on the host except `powershell.exe` with its own fixed script (and `node` for itself). An agent's text never reaches a host command line or script: it's passed as JSON on stdin and arrives in the guest as data. Leave a logon behind: autologon and its password live only inside the guest, and the next restore of the clean checkpoint removes them. |
-| Build from the image file **you** name for these VMs (any x64 Windows ISO, or a Linux qcow2 cloud image): copy it into its own folder while hashing it, read its edition and build, and show its path and SHA-256 in the plan you approve (see "The image"). | Download an image, or choose one for you. Build from bytes other than the ones you approved: the copy is hashed again just before it is used. Install a converter or any other tool on the host. |
+| Build from the image file **you** name for these VMs (any x64 Windows ISO, a Windows disk you prepared or one of your own VMs, or a Linux qcow2 cloud image): copy it into its own folder while hashing it, read its edition and build, and show its path and SHA-256 in the plan you approve (see "The image"). | Download an image, or choose one for you. Build from bytes other than the ones you approved: the copy is hashed again just before it is used. Install a converter or any other tool on the host. |
 
 **Don't put real sign-ins, tokens or real CLIs in a VM.** It's for testing a build on a clean Windows. Use fake CLIs
 and test accounts.
@@ -435,6 +435,51 @@ you approved.
   that one, and asking for another edition of the same ISO is refused.
 - **Images checked before 4.0.0** stay usable by their hash; plans for them say "checked earlier".
 - After the install, the guest's own report of its edition and build is compared with the image, as a sanity check.
+
+#### A ready-made disk, or one of your own VMs (MC-1578)
+
+Instead of an ISO, name a Windows you have already installed and set up, as you want every pool VM to start:
+
+```
+pool_plan({ ..., image: { vhdx: "D:\\VMs\\win11-dev.vhdx", admin: "Administrator" } })
+pool_plan({ ..., image: { vm: "win11-dev", admin: "Administrator" } })
+```
+
+- **What it must be:** an installed Windows (Windows 10, Windows Server 2016 or later, for PowerShell Direct) that
+  starts to its logon screen, **not generalized** (not sysprepped), with `admin` a local administrator account in
+  it. A VM named by name or id must be one of yours outside the pool: off, Generation 2, one disk (checkpoints are
+  fine). Its disk is **only read**: flattened (Convert-VHD) into the helper's copy. The VM itself is never started,
+  changed or owned.
+- **The copy and its hash:** as for an ISO, the helper copies it into its own folder while hashing it. The plan
+  names the source and SHA-256, and each build checks the copy against that hash first.
+- **The password:** approve.cmd asks you for `admin`'s password. It's never asked of or passed by an agent, and never
+  on a command line. It's kept in the helper's secrets folder (SYSTEM, Administrators and the helper only), bound to
+  that approval, and deleted when the plan's builds end, when the approval expires unused, or when the helper next
+  starts. Another plan for the same disk (a resize) asks again. To use another administrator in the same disk (or to
+  correct a mistyped name), plan with `{ vhdx | vm, admin: "<the other>" }` again: later plans use that name, and
+  plans already made keep theirs.
+- **Its size:** the disk's own size (recorded with the image, shown in the plan) is the floor. Each VM's disk is
+  at least that, grown to the plan's `diskGB` if that's larger, and never shrunk. A smaller `diskGB` is refused, and the
+  policy's `maxDiskGBPerVm` is checked against the size the VMs will have. A disk bigger than the plan's size is
+  refused at create.
+- **Its licence:** read as it is. An evaluation part way through its period is fine, and its end is recorded for the
+  usual expiry warnings. One already over is refused. The fresh ISO build's 85-day minimum doesn't apply.
+- **Each VM's build, offline:**
+  1. A copy of the disk, grown to the plan's size, with Secure Boot and a vTPM.
+  2. `admin` is used once, to make the helper's own accounts: `hvadmin` (an administrator) and `hvuser` (a standard
+     user). Accounts by those names in your disk are reset to that, and each is read back and signed in as.
+  3. The guest setup and your guest setup script, if the plan names one.
+  4. The licence is read (nothing is activated).
+  5. Autologon, its stored password, UAC and Windows' Userinit are set back to Windows' own (verified), so nothing of
+     the disk's own logon set-up becomes the pool's clean state.
+  6. The clean checkpoint.
+
+  Nothing else of yours in the disk is changed.
+- **Skipped:** the unattended install, activation, the product key and the first-logon wait. So an interactive start's
+  first logon in these VMs does Windows' first-logon work then (it took 2-5 minutes before MC-1516). Runs in
+  session 0 aren't affected.
+- **Not included:** a generalized (sysprepped) disk, a Linux `.vhdx` (Linux's ready-made image is the qcow2 path), and
+  a VM with more than one disk.
 
 **What the build can build: limits, not gates.**
 
@@ -1393,6 +1438,22 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
     fix applied under 5.1 only;
   - setup's helper file list holding every helper file (and the zip the whole helper folder), and its `-BuildRoot`
     and `-MaxSessionMinutes` checks agreeing with the helper's, under 5.1 and 7.
+- `ready.test.js` (MC-1578): pool VMs from a ready-made disk or one of your own VMs, against the stub:
+  - the plan naming the source, its SHA-256 and its admin, with no install, activation or first-logon lines;
+  - the build's steps in order: the disk's admin for its first answer and the account step only, hvadmin for every
+    later step, none of the ISO path's steps;
+  - accounts by the helper's names already in the disk (hvuser an administrator, both disabled), autologon and an LSA
+    password inherited: made right, undone and verified; the disk's admin itself named hvuser;
+  - a wrong read-back, an undo that doesn't verify, a wrong password, a generalized disk: each failing the build,
+    rolled back;
+  - the password: refused when missing or bound to another plan, digest, disk or account; deleted on success, on
+    failure, when its approval expires unused (an unexpired one kept), and at start-up after a helper stopped
+    mid-build; never in the journal, a plan or the status;
+  - the disk copy changed after approval refused at create; `activate`, a bad path, a bad account name, both shapes at
+    once refused;
+  - a source VM: its disk read into a copy; a running, Generation 1, two-disk, missing or pool VM refused, and a failed
+    conversion; every outside VM's record and its disk unchanged;
+  - `server.test.js`: the `ready-images` feature gate.
 - `launchers.test.js` (MC-1575): `install.cmd`, `uninstall.cmd` and `approve.cmd`, each run for real by its one line
   typed in cmd, Windows PowerShell 5.1 and PowerShell 7, beside a stub script:
   - spaced paths for every path option, arriving exactly; exit codes 0 and 7 reaching each caller;

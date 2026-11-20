@@ -143,9 +143,16 @@ test('MC-1582: a disconnect, a helper restart, a failed start\'s cleanup and a q
   const d = helper.conn(11)
   await waitFor(async () => d.request('acquire', { vm: persistent.name, minutes: 30 }).then(() => true, () => false), T.waitForMs, 'the VM free again')
   sc.patchStub(s => { s.fail['configure-start'] = 1 })
-  await assert.rejects(d.request('start'), /injected failure of configure-start/)
+  await assert.rejects(d.request('start'), /injected failure of configure-start\. hvmcp-[0-9a-f]+ parked \(persistent: .*not restored, so its disk keeps what the lease left\)\.$/)
   await d.request('start')
   await d.request('run', { command: `write ${KEEP} kept` })
+  // A Windows run whose timeout kill through its job can't be confirmed: the VM is shut down to end it, not restored.
+  sc.patchStub(s => { s.runJobs = true; s.jobKillFails = true })
+  const timedOut = await d.request('run', { command: 'sleep', timeoutSec: 1 })
+  assert.match(timedOut.text, /its job's kill couldn't be confirmed .*The VM was shut down to end everything the run started: hvmcp-[0-9a-f]+ parked \(persistent: .*\)\. Its output above was read first; vm_start \(its disk as it is\) or vm_reset \(clean\) to go on\./)
+  assert.doesNotMatch(timedOut.text, /restored to its clean checkpoint/)
+  sc.patchStub(s => { s.runJobs = false; s.jobKillFails = false })
+  await d.request('start')
   // A helper restart voids the lease: parked, reported so.
   await helper.kill()
   helper = await startHelper(sc, T.profile('retryQuick'))
@@ -212,4 +219,60 @@ m.Helper.prototype.request = async function (connId, op, args) {
   await s.call('vm_start')
   await s.call('vm_reset')
   assert.deepStrictEqual(lines().filter(l => l.op === 'start').map(l => l.args.reset ?? null), [null, true])
+})
+
+// hv.ps1's own $Park, run in Windows PowerShell 5.1 with the Hyper-V cmdlets it calls shadowed by script functions (a
+// function wins over a cmdlet of the same name): a guest that never finishes shutting down (Stop-VM -Force's job never
+// ends) is turned off once shutdownMs is up, the call returns within it, and the shutdown job is stopped and removed.
+test('MC-1582: hv.ps1\'s $Park for real: the shutdown bounded by shutdownMs, the turn-off reached, the job removed; a quick shutdown, a saved and a paused VM', { skip: process.platform !== 'win32' }, () => {
+  const { spawnSync } = require('child_process')
+  const { ps51Env } = require('../helper/hv')
+  const HV = fs.readFileSync(path.join(__dirname, '..', 'helper', 'hv.ps1'), 'utf8')
+  const s = HV.indexOf('\n$Park = {')
+  const block = HV.slice(s + 1, HV.indexOf('\n}\n', s + 1) + 3)
+  assert.ok(block.startsWith('$Park = {'), 'found $Park')
+  const sc = scratch('pers-park-ps')
+  const harness = path.join(sc.dir, 'park.ps1')
+  fs.writeFileSync(harness, `$ErrorActionPreference = 'Stop'
+$script:st = 'Running'; $script:offAt = $null; $script:log = @()
+function Get-VM { param($Id) if ($script:offAt -and (Get-Date) -ge $script:offAt) { $script:st = 'Off' }; [pscustomobject]@{ State = $script:st } }
+function Stop-VM { [CmdletBinding()] param($VM, [switch]$Force, [switch]$AsJob, [switch]$TurnOff)
+  if ($TurnOff) { $script:st = 'Off'; $script:log += 'turnoff'; return }
+  $script:log += 'shutdown'
+  if ($script:mode -eq 'quick') { $script:offAt = (Get-Date).AddMilliseconds(600) }
+  Start-Job -ScriptBlock { Start-Sleep 120 } }
+function Remove-VMSavedState { param($VM) $script:st = 'Off'; $script:log += 'drop-saved' }
+function Get-VMNetworkAdapter { param($VM) 'nic' }
+function Disconnect-VMNetworkAdapter { process { $script:log += 'disconnect' } }
+function Clear-Acls { param($vm) $script:log += 'acls' }
+function Set-VMProcessor { [CmdletBinding()] param($VM, $Reserve) $script:log += "reserve $Reserve" }
+function Facts { param($vm) @{ state = $script:st } }
+${block}
+$vm = [pscustomobject]@{ Id = [guid]::NewGuid() }
+$out = @{}
+foreach ($case in @(@('hung', 'Running', 2000), @('quick', 'Running', 20000), @('saved', 'Saved', 20000), @('paused', 'Paused', 20000))) {
+  $script:mode = $case[0]; $script:st = $case[1]; $script:offAt = $null; $script:log = @()
+  $t = [Diagnostics.Stopwatch]::StartNew()
+  $f = & $Park $vm $case[2]
+  $out[$case[0]] = @{ ms = $t.ElapsedMilliseconds; forced = $f.park.forced; state = $f.state; log = @($script:log); jobs = @(Get-Job).Count }
+}
+'RESULT:' + (ConvertTo-Json -InputObject $out -Depth 5 -Compress)
+`)
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', harness], { encoding: 'utf8', env: ps51Env(), timeout: T.spawnMs, windowsHide: true })
+  const m = /RESULT:(.*)/.exec(r.stdout || '')
+  assert.ok(m, `no result: ${r.stdout}${r.stderr}`)
+  const res = JSON.parse(m[1])
+  const tail = ['disconnect', 'acls', 'reserve 0']
+  // A guest that never shuts down: turned off once its 2 s are up, not after Stop-VM's own wait (minutes).
+  assert.deepStrictEqual(res.hung.log, ['shutdown', 'turnoff', ...tail])
+  assert.deepStrictEqual([res.hung.forced, res.hung.state, res.hung.jobs], [true, 'Off', 0], 'turned off; the shutdown job stopped and removed')
+  assert.ok(res.hung.ms >= 1900 && res.hung.ms < 8000, `bounded by shutdownMs: ${res.hung.ms} ms`)
+  // A guest that shuts down in time: no turn-off, and no wait past it.
+  assert.deepStrictEqual(res.quick.log, ['shutdown', ...tail])
+  assert.deepStrictEqual([res.quick.forced, res.quick.state, res.quick.jobs], [false, 'Off', 0])
+  assert.ok(res.quick.ms < 8000, `${res.quick.ms} ms`)
+  // A saved state is discarded (no shutdown to ask for); a paused VM is turned off at once.
+  assert.deepStrictEqual([res.saved.log, res.saved.forced], [['drop-saved', ...tail], false])
+  assert.deepStrictEqual([res.paused.log, res.paused.forced], [['turnoff', ...tail], true])
+  assert.ok(res.paused.ms < 3000, `no wait for a paused VM: ${res.paused.ms} ms`)
 })

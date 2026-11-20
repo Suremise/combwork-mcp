@@ -279,3 +279,25 @@ m.Helper.prototype.request = async function (connId, op, args) {
   const r = await s.call('pool_plan', { vms: 1, cores: 2, memoryGB: 4, guestScript: 'C:\setup\guest.ps1' })
   assert.match(r.text, /has no 'guest-script' feature, which a guest setup script \(guestScript\) needs: run setup again/)
 })
+
+test('server.js (MC-1578): a helper without the ready-images feature is never sent a ready-made disk or VM: pool_plan refuses it with "run setup again"', async t => {
+  const sc = scratch('ready-feature', { policy: { maxVms: 3 } })
+  let h = await startHelper(sc)
+  await h.stop()
+  const shim = path.join(sc.dir, 'older-core.js')
+  fs.writeFileSync(shim, `const m = require(${JSON.stringify(path.join(__dirname, '..', 'helper', 'core.js'))})
+const request = m.Helper.prototype.request
+m.Helper.prototype.request = async function (connId, op, args) {
+  if (op === 'version') { const v = await request.call(this, connId, op, args); return { ...v, data: { ...v.data, features: v.data.features.filter(f => f !== 'ready-images') } } }
+  if (op === 'pool_plan' && args?.image && (args.image.vhdx !== undefined || args.image.vm !== undefined)) throw new Error('should not be sent: a ready-made image')
+  return request.call(this, connId, op, args)
+}
+`)
+  const env = { ...sc.env, HYPERV_MCP_ENABLED: '1', HYPERV_MCP_MODE: 'direct', NODE_OPTIONS: `--require ${JSON.stringify(shim)}` }
+  const s = server(env)
+  t.after(() => s.close())
+  for (const image of [{ vhdx: 'C:\\disks\\win.vhdx', admin: 'Administrator' }, { vm: 'mywin', admin: 'Administrator' }]) {
+    const r = await s.call('pool_plan', { vms: 1, cores: 2, memoryGB: 4, image })
+    assert.match(r.text, /has no 'ready-images' feature, which a ready-made Windows disk or VM as the image needs: run setup again/, JSON.stringify(image))
+  }
+})

@@ -502,6 +502,39 @@ $GuestRead = {
   @{ files = $out }
 }
 
+# MC-1582: a persistent VM's park, in place of a restore: its disk is left as it is (no checkpoint is applied or read).
+# The guest is shut down cleanly within shutdownMs; a saved state is discarded; a paused one, or one still not Off when
+# the time is up, is turned off. Then its adapter is disconnected and its port ACLs cleared (in that order), CPU reserve
+# 0, and its Facts answered for the helper's check (parkProblem). Stop-VM -Force waits for the guest itself (up to five
+# minutes, as Microsoft documents it), so the shutdown request runs as a job: the configured time bounds the wait, the
+# turn-off is always reached within it, and the job is stopped and removed by its own handle whatever happens.
+$Park = {
+  param($vm, $shutdownMs)
+  $forced = $false
+  $deadline = (Get-Date).AddMilliseconds($(if ([int]$shutdownMs -gt 0) { [int]$shutdownMs } else { 300000 }))
+  $job = $null
+  try {
+    $state = [string](Get-VM -Id $vm.Id).State
+    if ($state -eq 'Saved') { Remove-VMSavedState -VM $vm }
+    elseif ($state -eq 'Running') { $job = Stop-VM -VM $vm -Force -AsJob -ErrorAction SilentlyContinue }
+    elseif ($state -ne 'Off') { $deadline = Get-Date } # paused, or between states: no guest to ask
+    while ([string](Get-VM -Id $vm.Id).State -ne 'Off' -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
+    if ([string](Get-VM -Id $vm.Id).State -ne 'Off') {
+      $forced = $true
+      if ($job) { Stop-Job -Job $job -ErrorAction SilentlyContinue }
+      Stop-VM -VM $vm -TurnOff -Force -ErrorAction Stop
+    }
+  } finally {
+    if ($job) { Stop-Job -Job $job -ErrorAction SilentlyContinue; Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+  }
+  Get-VMNetworkAdapter -VM $vm | Disconnect-VMNetworkAdapter
+  Clear-Acls $vm
+  Set-VMProcessor -VM $vm -Reserve 0
+  $f = Facts $vm
+  $f.park = @{ forced = $forced }
+  $f
+}
+
 $GuestSetup = {
   param($userName)
   $ErrorActionPreference = 'Stop'
@@ -517,6 +550,37 @@ $GuestSetup = {
   $folders = (Test-Path -LiteralPath 'C:\out' -PathType Container) -and (Test-Path -LiteralPath 'C:\build' -PathType Container) -and (Test-Path -LiteralPath 'C:\hvmcp' -PathType Container)
   $buildProtected = [bool](Get-Acl -LiteralPath 'C:\build').AreAccessRulesProtected
   @{ editionId = $cv.EditionID; build = $cv.CurrentBuild; ubr = $cv.UBR; folders = $folders; buildProtected = $buildProtected }
+}
+
+# MC-1578: the helper's accounts in a VM built from a ready-made disk, made through the disk's own admin account.
+# hvadmin: made, or its password reset; enabled; in Administrators. hvuser: the same, in Users, and taken out of
+# Administrators and Remote Management Users. Accounts by those names in the copy are reset to that (the disk is a copy
+# the user chose); no other account is touched. Read back: each one's existence, state and memberships, and whether it
+# signs in with the helper's password. Passwords come in as arguments and are never returned or written.
+$GuestAccounts = {
+  param($admin, $user)
+  $ErrorActionPreference = 'Stop'
+  $ADM = 'S-1-5-32-544'; $USR = 'S-1-5-32-545'; $RMU = 'S-1-5-32-580'
+  foreach ($x in @($admin, $user)) {
+    $pw = ConvertTo-SecureString -String ([string]$x.password) -AsPlainText -Force
+    if (Get-LocalUser -Name ([string]$x.user) -ErrorAction SilentlyContinue) {
+      Set-LocalUser -Name ([string]$x.user) -Password $pw -PasswordNeverExpires $true
+      Enable-LocalUser -Name ([string]$x.user)
+    } else { New-LocalUser -Name ([string]$x.user) -Password $pw -PasswordNeverExpires -AccountNeverExpires | Out-Null }
+  }
+  $in = { param($sid, $name) [bool](@(Get-LocalGroupMember -SID $sid -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*\$name" }).Count) }
+  if (-not (& $in $ADM $admin.user)) { Add-LocalGroupMember -SID $ADM -Member ([string]$admin.user) }
+  if (-not (& $in $USR $user.user)) { Add-LocalGroupMember -SID $USR -Member ([string]$user.user) }
+  if (& $in $ADM $user.user) { Remove-LocalGroupMember -SID $ADM -Member ([string]$user.user) }
+  if (& $in $RMU $user.user) { Remove-LocalGroupMember -SID $RMU -Member ([string]$user.user) }
+  Add-Type -AssemblyName System.DirectoryServices.AccountManagement
+  $ctx = New-Object System.DirectoryServices.AccountManagement.PrincipalContext ([System.DirectoryServices.AccountManagement.ContextType]::Machine)
+  $read = {
+    param($x)
+    $u = Get-LocalUser -Name ([string]$x.user) -ErrorAction SilentlyContinue
+    @{ exists = [bool]$u; enabled = [bool]($u -and $u.Enabled); isAdmin = (& $in $ADM $x.user); remoteMgmt = (& $in $RMU $x.user); signsIn = [bool]$ctx.ValidateCredentials([string]$x.user, [string]$x.password) }
+  }
+  @{ admin = (& $read $admin); user = (& $read $user) }
 }
 
 # MC-1577: a finished build-time run's files (the guest setup script's), cleared before the clean checkpoint: its
@@ -944,6 +1008,30 @@ try {
         @{ vmId = $vm.Id.ToString() }
         break
       }
+      if ($a.baseVhdx) {
+        # MC-1578: a ready-made Windows disk: the helper's copy of the disk the user approved, its SHA-256 checked here
+        # against the plan's with nothing created yet, then copied for this VM (grown to the plan's size), booted from
+        # disk with Windows' Secure Boot template and a vTPM, as an ISO-built VM is. No DVD; the adapter disconnected.
+        if ([string]$a.baseSha256 -notmatch '^[0-9a-f]{64}$') { throw 'create-vm needs the approved disk''s SHA-256' }
+        $baseHash = (Get-FileHash -LiteralPath ([string]$a.baseVhdx) -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($baseHash -ne [string]$a.baseSha256) { throw "the disk's copy ($([string]$a.baseVhdx)) has changed since it was checked and approved (SHA-256 $baseHash, not $([string]$a.baseSha256)): refused, nothing created" }
+        # MC-1578 round 1: never more than the approved size (the plan's diskGB is at least the disk's own size).
+        $baseSize = (Get-VHD -Path ([string]$a.baseVhdx)).Size
+        if ($baseSize -gt ([long]$a.diskGB * 1GB)) { throw "the ready-made disk is $([math]::Ceiling($baseSize / 1GB)) GB, more than the plan's $([long]$a.diskGB) GB: refused, nothing created" }
+        Copy-Item -LiteralPath ([string]$a.baseVhdx) -Destination $vhd
+        if ((Get-VHD -Path $vhd).Size -lt ([long]$a.diskGB * 1GB)) { Resize-VHD -Path $vhd -SizeBytes ([long]$a.diskGB * 1GB) }
+        $vm = New-VM -Name ([string]$a.name) -Generation 2 -Path $folder -VHDPath $vhd -MemoryStartupBytes ([long]$a.memoryMB * 1MB)
+        Set-VMMemory -VM $vm -DynamicMemoryEnabled $false
+        Set-VMProcessor -VM $vm -Count ([int]$a.cores) -Reserve 0
+        Set-VM -VM $vm -AutomaticCheckpointsEnabled $false -CheckpointType Standard -AutomaticStartAction Nothing -AutomaticStopAction TurnOff
+        Set-VMFirmware -VM $vm -EnableSecureBoot On -SecureBootTemplate MicrosoftWindows
+        Set-VMKeyProtector -VM $vm -NewLocalKeyProtector
+        Enable-VMTPM -VM $vm
+        Get-VMNetworkAdapter -VM $vm | Disconnect-VMNetworkAdapter
+        Set-VMFirmware -VM $vm -FirstBootDevice (Get-VMHardDiskDrive -VM $vm | Select-Object -First 1)
+        @{ vmId = $vm.Id.ToString() }
+        break
+      }
       # MC-1572: the ISO is the helper's copy of the image the user approved: its SHA-256 must still be the plan's, checked
       # here, just before it is attached, with nothing created yet.
       if ([string]$a.isoSha256 -notmatch '^[0-9a-f]{64}$') { throw 'create-vm needs the approved image''s SHA-256' }
@@ -1207,6 +1295,41 @@ try {
       $vm = Get-OwnVm $a
       Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestProvisioned -ArgumentList ([string]$a.account), ([int]$a.quietMs), $ProfileCounts.ToString(), $AppReadinessState.ToString()
     }
+    'vhd-size' {
+      # MC-1578 round 1: a ready-made disk copy's virtual size (bytes), recorded with the image: the floor of its VMs' size.
+      $p = [string]$a.path
+      if ($p -notmatch '\.vhdx$' -or -not (Test-Path -LiteralPath $p -PathType Leaf)) { throw 'vhd-size needs a .vhdx file' }
+      @{ bytes = [long](Get-VHD -Path $p).Size }
+    }
+    'image-from-vm' {
+      # MC-1578: one of the user's own VMs as a ready-made disk: found by id or exact name, never one of the pool's, off,
+      # Generation 2, with one VHDX; its disk (with any checkpoints' chain) flattened by Convert-VHD into the helper's
+      # file. Only read: nothing of the VM is started, changed or removed.
+      $want = [string]$a.vm
+      $vm = $null
+      $g = [guid]::Empty
+      if ([guid]::TryParse($want, [ref]$g)) { $vm = Get-VM -Id $g -ErrorAction SilentlyContinue }
+      if (-not $vm) {
+        $hits = @(Get-VM -ErrorAction SilentlyContinue | Where-Object { $_.Name -ceq $want })
+        if ($hits.Count -gt 1) { throw "more than one VM is named $want`: name it by its id" }
+        $vm = $hits | Select-Object -First 1
+      }
+      if (-not $vm) { throw "there's no VM named $want" }
+      if (@($a.poolVmIds | ForEach-Object { [string]$_ }) -contains $vm.Id.ToString()) { throw "$($vm.Name) is one of the pool's own VMs: name a VM of your own" }
+      if ($vm.State -ne 'Off') { throw "$($vm.Name) is $($vm.State): turn it off first (its disk is only read, and a running VM's isn't consistent)" }
+      if ($vm.Generation -ne 2) { throw "$($vm.Name) is a Generation $($vm.Generation) VM: pool VMs are Generation 2 (UEFI)" }
+      $disks = @(Get-VMHardDiskDrive -VM $vm)
+      if ($disks.Count -ne 1) { throw "$($vm.Name) has $($disks.Count) disks: only a VM with one disk can be used" }
+      $path = [string]$disks[0].Path
+      if (-not $path -or $path -notmatch '\.a?vhdx$') { throw "$($vm.Name)'s disk isn't a VHDX file" }
+      Convert-VHD -Path $path -DestinationPath ([string]$a.out) -VHDType Dynamic
+      @{ vmId = $vm.Id.ToString(); name = $vm.Name }
+    }
+    'guest-accounts' {
+      # MC-1578: in a VM built from a ready-made disk, through the disk's own admin account (cred): the helper's accounts.
+      $vm = Get-OwnVm $a
+      Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestAccounts -ArgumentList $a.admin, $a.user
+    }
     'guest-run-clear' {
       $vm = Get-OwnVm $a
       Invoke-Command -VMId $vm.Id -Credential (Cred $a.cred) -ScriptBlock $GuestRunClear -ArgumentList ([int]$a.n)
@@ -1233,23 +1356,9 @@ try {
       @{ status = $r.status; graceMinutes = $r.graceMinutes; evalEnd = $r.evalEnd; channel = $r.channel; error = $r.error; disconnected = ($left.Count -eq 0) }
     }
     'park' {
-      # MC-1582: a persistent VM's cleanup, in place of a restore: its disk is left as it is (no checkpoint is applied or
-      # read). The guest shut down cleanly within shutdownMs (a saved state discarded; a paused or unanswering one turned
-      # off after the wait), then its adapter disconnected and port ACLs cleared (in that order), CPU reserve 0. The
-      # helper checks the answer (parkProblem): Off, disconnected, no ACLs, reserve 0.
+      # MC-1582: a persistent VM's cleanup, in place of a restore ($Park).
       $vm = Get-OwnVm $a
-      $forced = $false
-      if ($vm.State -eq 'Saved') { Remove-VMSavedState -VM $vm }
-      elseif ($vm.State -eq 'Running') { Stop-VM -VM $vm -Force -ErrorAction SilentlyContinue }
-      $t = (Get-Date).AddMilliseconds($(if ([int]$a.shutdownMs -gt 0) { [int]$a.shutdownMs } else { 300000 }))
-      while ((Get-VM -Id $vm.Id).State -ne 'Off' -and (Get-Date) -lt $t) { Start-Sleep 2 }
-      if ((Get-VM -Id $vm.Id).State -ne 'Off') { $forced = $true; Stop-VM -VM $vm -TurnOff -Force -ErrorAction Stop }
-      Get-VMNetworkAdapter -VM $vm | Disconnect-VMNetworkAdapter
-      Clear-Acls $vm
-      Set-VMProcessor -VM $vm -Reserve 0
-      $f = Facts $vm
-      $f.park = @{ forced = $forced }
-      $f
+      & $Park $vm ([int]$a.shutdownMs)
     }
     'net-off' {
       # After a failed or killed online step: the guest off, then every adapter disconnected, verified.
