@@ -2,7 +2,7 @@
 
 > **Superseded in part by MC-1572 (hyper-v 4.0.0):** the pinned images, the helper's downloads and the checksum and
 > OpenPGP checks (§2) are gone. The user names any local qcow2 cloud image, and the plan they approve names its path and
-> SHA-256. The README's "The image" and "Linux guests" describe what holds now.
+> SHA-256. [The image](pool.md#the-image) and [Linux guests](linux.md#linux-guests) describe what holds now.
 
 One server, one pool, one helper. Linux plugs in as a new image kind on MC-1502's pool model (images tagged by OS,
 `vm_acquire({ os })`, per-OS caps). It also adds a **guest driver** per OS for the two things that differ: install and
@@ -326,7 +326,7 @@ The same tools, with nothing new:
 - `vm_status` and `pool_status` show OS, distro, release and serial;
 - `pool_plan({ image: { distro: 'debian' } })` picks the newest pinned Debian; or give a pin's SHA-256.
 
-A session may hold a Linux and a Windows VM together (MC-1580; the README, "More than one VM per session"): pass `vm`, each VM's name, to the lease tools.
+A session may hold a Linux and a Windows VM together (MC-1580; [More than one VM per session](tools.md#more-than-one-vm-per-session)): pass `vm`, each VM's name, to the lease tools.
 
 **Protocol:** a helper feature `linux` (protocol 3, like `images`). The server sends no Linux `vm_acquire` and no
 Linux `pool_plan` to a helper without it, and says "run setup again".
