@@ -679,3 +679,39 @@ test('MC-1590: vm_reset (a clean restore) on a persistent VM counts as the logon
   assert.strictEqual(stubOf(sc, persistent).undos || 0, u0, 'no undo needed at the release')
   assert.deepStrictEqual(guestLogon(stubOf(sc, persistent)).armed, false)
 })
+
+test('MC-1590 round 1: restoring a checkpoint that holds a logon journals the undo before the restore: a lost reply, then a release or a helper restart, still undoes it', async t => {
+  const { sc, h, persistent } = await pool('pers-int-cp-lost')
+  let helper = h
+  t.after(() => helper.stop())
+  const c = helper.conn(10)
+  await c.request('acquire', { vm: persistent.name, minutes: 30 })
+  await c.request('start', { interactive: 'admin' })
+  await c.request('checkpoint', { name: 'logged-on' })
+  await c.request('release')
+  assert.deepStrictEqual(guestLogon(stubOf(sc, persistent)), UNDONE(1), 'undone at the first release')
+  const dirties = () => sc.journal().filter(r => r.t === 'logon-dirty').length
+  const undos = () => sc.journal().filter(r => r.t === 'logon-undone').length
+  // A later lease restores it; Hyper-V applies it, but the reply is lost.
+  const d = helper.conn(11)
+  await d.request('acquire', { vm: persistent.name, minutes: 30 })
+  const [d0, u0] = [dirties(), undos()]
+  sc.patchStub(st => { st.leaseRestoreLost = true })
+  await assert.rejects(d.request('restore-checkpoint', { name: 'logged-on' }), /the restore was applied, then its reply was lost/)
+  assert.deepStrictEqual(guestLogon(stubOf(sc, persistent)), { armed: true, userinit: 'watcher', enableLUA: 0 }, 'the guest holds the logon again')
+  assert.strictEqual(dirties(), d0 + 1, 'journalled before the restore was issued')
+  assert.strictEqual(sc.journal().filter(r => r.t === 'logon-dirty').at(-1).enableLUA, 1, 'with the UAC state recorded at its logon')
+  await d.request('release')
+  assert.strictEqual(undos(), u0 + 1)
+  assert.deepStrictEqual(guestLogon(stubOf(sc, persistent)), UNDONE(1), 'undone at the release')
+  // Again, and the helper dies before anything else: its start-up recovery undoes it.
+  const e = helper.conn(12)
+  await e.request('acquire', { vm: persistent.name, minutes: 30 })
+  sc.patchStub(st => { st.leaseRestoreLost = true })
+  await assert.rejects(e.request('restore-checkpoint', { name: 'logged-on' }), /reply was lost/)
+  await helper.kill()
+  helper = await startHelper(sc)
+  await helper.conn(1).request('status')
+  assert.strictEqual(undos(), u0 + 2)
+  assert.deepStrictEqual(guestLogon(stubOf(sc, persistent)), UNDONE(1), 'undone at recovery')
+})

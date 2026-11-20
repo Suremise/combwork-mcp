@@ -271,7 +271,8 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   and verified before the park at release, stop, a plain start, a disconnect and a helper restart (no autologon,
   Windows' own Userinit, the guest's own UAC state, its disk kept, never restored); an undo failure quarantining it
   until the retry starts it offline and undoes it; a kept checkpoint taken while logged on making a later restore one
-  to undo again; and `vm_reset`'s verified clean restore counting as the undo.
+  to undo again, journalled before that restore is issued (a restore applied whose reply is lost is still undone at
+  the release, and at a helper restart's recovery); and `vm_reset`'s verified clean restore counting as the undo.
 - `approvals.test.js`:
   - unapproved plans;
   - forged approvals: another digest, operation or epoch, expired, a malformed nonce, another plan's id, a writable

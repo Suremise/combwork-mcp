@@ -2631,13 +2631,16 @@ class Helper {
       Object.assign(lease.sync, { gen: lease.sync.gen + 1, plan: null, trusted: false, record: new Map() })
       this.dropStage(this.conns.get(lease.connId))
       lease.dirty = true
+      // MC-1590 round 1: a checkpoint that holds an interactive logon (taken before its undo) makes it one to undo, with
+      // the UAC state recorded at its logon, journalled before the restore is issued: an outcome that is lost (a killed
+      // call, a timeout, a helper that dies) still leaves the undo to every later park. Conservative: an existing intent
+      // is replaced by the checkpoint's, and one is never cleared here.
+      if (cp.logon && this.state.vms.get(vm.vmId)?.persistent) this.journal.append({ t: 'logon-dirty', vmId: vm.vmId, enableLUA: cp.logon.enableLUA })
       const after = await this.restoreVia(vm, 'lease-restore', { ...this.ident(vm), checkpointId: cp.checkpointId, snapName: cp.snapName }, { lease })
       this.stillHeld(lease)
       const rp = restoreProblem(after) // MC-1536/1537: a timed-out phase is refused, whatever the facts say
       if (rp) throw new Error(`Restoring "${name}" didn't verify: ${rp}. vm_reset to go on from clean.`)
       if (after.vmId !== vm.vmId || after.parentCheckpointId !== cp.checkpointId || after.state !== 'Off') throw new Error(`Restoring "${name}" didn't verify (state ${after.state}, parent ${after.parentCheckpointId}): vm_reset to go on from clean.`)
-      // MC-1590: a checkpoint that holds an interactive logon (taken before its undo) makes it one to undo again.
-      if (cp.logon && !this.state.vms.get(vm.vmId)?.logonDirty) this.journal.append({ t: 'logon-dirty', vmId: vm.vmId, enableLUA: cp.logon.enableLUA })
       // MC-1556: the lease's mode, checked again against the pool's (lowered meanwhile? then refused, nothing started).
       this.netAllowed(lease.network)
       const spec = await this.configureStartOrClean(vm, lease, lease.network, lease.reserve || 0)

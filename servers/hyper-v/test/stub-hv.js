@@ -363,7 +363,8 @@ function run(s, op, a) {
       // With typeRestoreFails (MC-1589): it died before putting the type back, leaving ProductionOnly and no snapshot.
       if (s.productionCallDies) { if (!s.typeRestoreFails) vm.checkpointType = orig; throw new Error('injected: the take call died') }
       const id = crypto.randomUUID()
-      const cp = { id, name: a.snapName, parentId: vm.parent, disk: { ...vm.disk }, switchName: vm.switchName, acls: vm.acls || [], reserve: vm.reserve, production: true }
+      // MC-1590: the guest's logon state is on the disk too (autologon, Userinit, UAC), so the checkpoint holds it.
+      const cp = { id, name: a.snapName, parentId: vm.parent, disk: { ...vm.disk }, switchName: vm.switchName, acls: vm.acls || [], reserve: vm.reserve, production: true, armed: !!vm.armed, userinit: vm.userinit ?? null, enableLUA: vm.enableLUA ?? 1 }
       if (s.productionFailDelayed) { vm.delayedTake = { cp, listings: 0 }; vm.checkpointType = orig; throw new Error('injected: the take call failed; Hyper-V finishes it later') }
       vm.checkpoints.push(cp)
       vm.parent = id
@@ -399,6 +400,9 @@ function run(s, op, a) {
       vm.acls = cp.acls || []
       vm.reserve = cp.reserve ?? 0
       vm.loggedOn = null; vm.watcher = false; vm.elevated = false
+      if (cp.production) { vm.armed = !!cp.armed; vm.userinit = cp.userinit ?? null; vm.enableLUA = cp.enableLUA ?? 1 } // MC-1590
+      // MC-1590 round 1: leaseRestoreLost: the restore is applied, then the call fails (its reply lost).
+      if (s.leaseRestoreLost) { delete s.leaseRestoreLost; save(s); throw new Error('injected: the restore was applied, then its reply was lost') }
       return { ...facts(vm), parentCheckpointId: before, restore: { ok: true, phase: 'restored', timedOut: false, last: 'Off', waitedMs: 0 } }
     }
     // factsParentWrong: the next facts-vm reports another parent (a verification mismatch), once; not a restore's own
