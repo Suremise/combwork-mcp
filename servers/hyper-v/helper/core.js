@@ -5,8 +5,10 @@
  *
  * Invariants:
  * - It acts only on VMs the journal records as its own, by VM id, and hv.ps1 re-checks each one's name and folder.
- * - Every pool change needs an approval written by the elevated approve.ps1 (not writable by the user or the service),
- *   bound to the plan's digest, operation, expiry, epoch and a single-use nonce; and stays within policy.json.
+ * - Every pool change stays within policy.json and applies once. A change that needs approval (setup's
+ *   approvePoolChanges 'each', or, within the caps, one bringing a new image, a guest setup script or a ready-made disk:
+ *   MC-1576) needs one written by the elevated approve.ps1 (not writable by the user or the service), bound to the plan's
+ *   digest, operation, expiry, epoch and a single-use nonce.
  * - Every pool change is journalled before each side effect, and recovered at start (journal.js).
  * - Every start restores the clean checkpoint by id first, unconditionally; every stop and release restores it and
  *   verifies the baseline (Off, parent = clean, adapter disconnected, reserve 0). A VM that fails that is quarantined.
@@ -410,6 +412,7 @@ class Helper {
   async recover() {
     const notes = []
     this.sweepSourceAdmins(true) // MC-1578: no job runs at start-up: an interrupted build's password goes too
+    this.migrateApprovals()
     let s = this.state
     for (const i of s.intents.values()) {
       if (i.done) continue
@@ -1262,7 +1265,7 @@ class Helper {
     const bytes = Buffer.from(canonical(plan), 'utf8')
     fs.writeFileSync(join(this.dir, 'plans', `${plan.id}.json`), bytes, { flag: 'wx' })
     const digest = sha256(bytes)
-    return { text: describePlan(plan, digest, this.approveLine(plan.id), this.tm()), data: { planId: plan.id, digest } }
+    return { text: this.planText(plan, digest), data: { planId: plan.id, digest } }
   }
 
   /**
@@ -2480,7 +2483,7 @@ class Helper {
       this.recovery?.length ? `At start-up: ${this.recovery.join(' ')}` : null,
       ...[...s.intents.values()].filter(i => !i.done && i.online && !i.offline).map(i => `WARNING: ${i.vmName} may still be online (its build's activation step didn't finish): it is being removed, retried every few minutes.`),
       `Product key for non-evaluation images (install.ps1 -ProductKeyFile): ${this.productKey() ? 'set' : 'none'}.`,
-      `Policy: up to ${this.policy.maxVms} VMs, ${this.policy.maxCoresPerVm} cores each, ${this.policy.maxMemoryMBTotal} MB in all, ${this.policy.maxDiskGBPerVm} GB disks, in ${this.policy.diskFolders.join('; ')}; network up to ${this.policy.maxNetwork}${this.policy.hostNetwork ? ` (host mode: ${this.policy.hostNetwork.switchName}, this PC ${this.policy.hostNetwork.hostAddress} on ${this.policy.hostNetwork.subnet})` : ''}; CPU reserve up to ${this.policy.maxReservePercent}%; leases up to ${this.policy.maxLeaseMinutes} min at a time, renewable to ${policyMod.sessionMinutes(this.policy)} min per work session${this.policy.maxSessionMinutes === undefined ? ' (the default)' : ''}.`,
+      `Policy: up to ${this.policy.maxVms} VMs, ${this.policy.maxCoresPerVm} cores each, ${this.policy.maxMemoryMBTotal} MB in all, ${this.policy.maxDiskGBPerVm} GB disks, in ${this.policy.diskFolders.join('; ')}; network up to ${this.policy.maxNetwork}${this.policy.hostNetwork ? ` (host mode: ${this.policy.hostNetwork.switchName}, this PC ${this.policy.hostNetwork.hostAddress} on ${this.policy.hostNetwork.subnet})` : ''}; CPU reserve up to ${this.policy.maxReservePercent}%; leases up to ${this.policy.maxLeaseMinutes} min at a time, renewable to ${policyMod.sessionMinutes(this.policy)} min per work session${this.policy.maxSessionMinutes === undefined ? ' (the default)' : ''}; pool changes ${this.policy.approvePoolChanges === 'each' ? 'each approved by the user (setup chose Each)' : 'within these caps apply without approval (a new image, a guest setup script or a ready-made disk still needs it)'}.`,
       `Build folders set by an admin (install.ps1 -BuildRoot): ${this.policy.buildRoots.length ? this.policy.buildRoots.join('; ') : 'none'}.`,
       // MC-1558: this connection's timings (its MCP server's HYPERV_MCP_* keys), and setup's caps when it set any.
       `Timings for this connection: ${timing.describe(this.tm({ timing: this.connTiming(connId) }))}${this.policy.timingCaps && Object.keys(this.policy.timingCaps).length ? `; setup's caps: ${Object.entries(this.policy.timingCaps).map(([k, v]) => `${k} ${v}`).join(', ')}` : ''}.`,
@@ -2596,7 +2599,7 @@ class Helper {
     const file = join(this.dir, 'plans', `${plan.id}.json`)
     fs.writeFileSync(file, bytes, { flag: 'wx' })
     const digest = sha256(bytes)
-    return { text: describePlan(plan, digest, this.approveLine(plan.id), this.tm()), data: { planId: plan.id, digest } }
+    return { text: this.planText(plan, digest), data: { planId: plan.id, digest } }
   }
 
   /**
@@ -2648,7 +2651,58 @@ class Helper {
     const bytes = Buffer.from(canonical(plan), 'utf8')
     fs.writeFileSync(join(this.dir, 'plans', `${plan.id}.json`), bytes, { flag: 'wx' })
     const digest = sha256(bytes)
-    return { text: describePlan(plan, digest, this.approveLine(plan.id), this.tm()), data: { planId: plan.id, digest } }
+    return { text: this.planText(plan, digest), data: { planId: plan.id, digest } }
+  }
+
+  /** A plan's text, with how it applies: approved by the user, or within the caps (MC-1576). */
+  planText(plan, digest) {
+    return describePlan(plan, digest, this.approveLine(plan.id), this.tm(), this.approvalReasons(plan))
+  }
+
+  /**
+   * MC-1576: why a plan needs the user's approval, [] when it may apply within the policy's caps. Always decided from the
+   * policy as it is now and the images the user approved (the journal), at the plan and again at apply: the reasons a
+   * plan's text showed are never the authority. Setup's approvePoolChanges: 'each' (every plan approved) or
+   * 'within-caps' (the default): then only new content for the clean state every lease starts from needs approval.
+   */
+  approvalReasons(plan) {
+    if (this.policy.approvePoolChanges === 'each') return ['setup chose to approve each pool change (install.ps1 -ApprovePoolChanges Each)']
+    const out = []
+    if (plan.add?.length && plan.image) {
+      if (plan.image.ready) out.push('a ready-made disk or VM (you type its admin password when you approve)')
+      else if (!this.state.approvedImages.has(plan.image.sha256)) out.push('a new image: no plan you approved has built from it')
+    }
+    if (plan.guestScript) out.push('a guest setup script')
+    return out
+  }
+
+  /**
+   * MC-1576: under the pool lock, before a plan's job: a plan is applied once (approved or not); then its approval when
+   * it needs one. Returns the approval's nonce, or null for a plan applied within the caps.
+   */
+  async authorize(plan, digest) {
+    if (this.state.usedPlans.has(plan.id)) throw new Error(`Plan ${plan.id} was already applied: make a new plan.`)
+    return this.approvalReasons(plan).length ? this.checkApproval(plan, digest) : null
+  }
+
+  /** MC-1576: a job's record: its nonce, or approval 'caps'; and, approved, the image it builds from. */
+  jobRecord(jobId, op, plan, nonce) {
+    this.journal.append({ t: 'job', jobId, op, planId: plan.id, ...(nonce ? { nonce } : { approval: 'caps' }) })
+    if (nonce && plan.add?.length && plan.image?.sha256 && !this.state.approvedImages.has(plan.image.sha256)) this.journal.append({ t: 'image-approved', sha256: plan.image.sha256, planId: plan.id })
+  }
+
+  /**
+   * MC-1576: once, at the first start of a helper with approvals within the caps: every VM then in the pool was built
+   * under the user's approval, so its image counts as approved. Never again after: a job within the caps, or a check
+   * alone, never makes an image approved.
+   */
+  migrateApprovals() {
+    const s = this.state
+    if (s.approvalsMigrated) return
+    for (const sha of new Set([...s.vms.values()].map(v => this.imageOf(v)))) {
+      if (/^[0-9a-f]{64}$/.test(sha) && !s.approvedImages.has(sha)) this.journal.append({ t: 'image-approved', sha256: sha, planId: null })
+    }
+    this.journal.append({ t: 'approvals-migrated' })
   }
 
   approveLine(planId) {
@@ -2709,7 +2763,7 @@ class Helper {
       if (plan.op !== op) throw new Error(`Plan ${planId} is a ${plan.op} plan, not ${op}.`)
       if (plan.epoch !== this.journal.epoch) throw new Error(`Plan ${planId} belongs to an earlier pool state: make a new plan.`)
       if (this.now() > plan.expires) throw new Error(`Plan ${planId} has expired: make a new plan (pool_plan) and approve it.`)
-      const nonce = await this.checkApproval(plan, digest)
+      const nonce = await this.authorize(plan, digest)
       const s = this.state
       let sourceAdmin = null
       // Recheck against the pool as it is now (under the lock) and the policy.
@@ -2748,7 +2802,7 @@ class Helper {
         }
       }
       const jobId = `j-${hex(6)}`
-      this.journal.append({ t: 'job', jobId, op, planId, nonce })
+      this.jobRecord(jobId, op, plan, nonce)
       for (const r of plan.remove || []) this.journal.append({ t: 'removing', jobId, vmId: r.vmId })
       // MC-1578: the source admin's credential stays in memory with the job, never in the journal or a note; its file
       // is deleted when the job ends, done or failed.
@@ -2758,7 +2812,7 @@ class Helper {
         note => { this.journal.append({ t: 'jobEnd', jobId, ok: true, note }); this.lastJob = { op, ok: true, note } },
         e => { this.journal.append({ t: 'jobEnd', jobId, ok: false, note: e.message }); this.lastJob = { op, ok: false, note: e.message } }
       ).finally(() => { job.sourceAdmin = null; this.dropSourceAdmin(planId); this.job = null; this.kick() })
-      return { text: `Approved plan ${planId} accepted: pool job ${jobId} (${op}) is running. ${op === 'remove' || (op !== 'refresh' && !(plan.add || []).length) ? '' : op === 'refresh' ? "Each VM's guest steps are rerun offline: about 20-40 minutes each, one at a time. " : plan.image?.os === 'linux' ? 'Creating a Linux VM copies its verified image and first boots it offline from its cloud-init seed: a few minutes each, one at a time. ' : plan.image?.ready ? 'Creating a VM copies the ready-made disk and sets the helper\'s accounts up in it, offline: a few minutes each, one at a time. ' : 'Creating a VM installs Windows unattended: about 20-40 minutes each, one at a time. '}Follow it with pool_status.`, data: { jobId } }
+      return { text: `${nonce ? 'Approved plan' : 'Plan'} ${planId} accepted${nonce ? '' : ' (within the policy\'s caps: no approval needed)'}: pool job ${jobId} (${op}) is running. ${op === 'remove' || (op !== 'refresh' && !(plan.add || []).length) ? '' : op === 'refresh' ? "Each VM's guest steps are rerun offline: about 20-40 minutes each, one at a time. " : plan.image?.os === 'linux' ? 'Creating a Linux VM copies its verified image and first boots it offline from its cloud-init seed: a few minutes each, one at a time. ' : plan.image?.ready ? 'Creating a VM copies the ready-made disk and sets the helper\'s accounts up in it, offline: a few minutes each, one at a time. ' : 'Creating a VM installs Windows unattended: about 20-40 minutes each, one at a time. '}Follow it with pool_status.`, data: { jobId } }
     })
   }
 
@@ -2777,9 +2831,9 @@ class Helper {
       if (p.op !== 'checkpoint') throw new Error(`Plan ${planId} is a ${p.op} plan, not a pool-checkpoint plan.`)
       if (p.epoch !== this.journal.epoch) throw new Error(`Plan ${planId} belongs to an earlier pool state: make a new plan.`)
       if (this.now() > p.expires) throw new Error(`Plan ${planId} has expired: make a new plan (pool_plan) and approve it.`)
-      const nonce = await this.checkApproval(p, sha256(bytes))
+      const nonce = await this.authorize(p, sha256(bytes))
       const jobId = `j-${hex(6)}`
-      this.journal.append({ t: 'job', jobId, op: 'checkpoint', planId, nonce })
+      this.jobRecord(jobId, 'checkpoint', p, nonce)
       this.journal.append({ t: 'jobEnd', jobId, ok: true, note: `pool checkpoint "${p.checkpoint}" (${p.mode}): carried out VM by VM` })
       return p
     })
@@ -3749,7 +3803,7 @@ const describeImage = img => img.os === 'linux' ? linuxImages.describe(img)
 const imageFrom = img => img.path ? `from ${img.path}, copied into the helper's folder; the build uses that copy, checked against this SHA-256 first` : 'checked earlier (the helper\'s copy, checked against this SHA-256 before the build uses it)'
 const OSES = ['windows', 'linux']
 
-function describePlan(plan, digest, approve, T) {
+function describePlan(plan, digest, approve, T, reasons = ['approval']) {
   const lines = [`Plan ${plan.id} (${plan.op}), valid for 30 minutes. Digest ${digest}; its first 6 characters are ${digest.slice(0, 6)}.`]
   for (const a of plan.add || []) lines.push(`- create ${a.name}: ${a.cores} cores, ${a.memoryMB} MB static memory, ${a.diskGB} GB dynamic disk, in ${a.folder}; network adapter disconnected`)
   for (const r of plan.remove || []) lines.push(`- remove ${r.name} and its folder ${r.folder}`)
@@ -3783,6 +3837,12 @@ function describePlan(plan, digest, approve, T) {
   else if (plan.add?.length && !linux) lines.push('- activation: none (each new VM stays offline; its licence is read and shown)')
   if (plan.add?.length && plan.image && !plan.image.evaluation && !linux && !ready) lines.push(`- product key: ${plan.productKey ? 'the pool\'s (set by install.ps1 -ProductKeyFile), written only into the answer file' : 'none'}`)
   if (plan.host) lines.push(`Host: ${plan.host.logicalCpus} logical CPUs, ${plan.host.memoryMB} MB.`)
+  // MC-1576: within the caps, a plan with nothing new for the clean state applies as it is.
+  if (!reasons.length) {
+    lines.push('', `This plan is within the policy's caps, and setup lets those apply without approval (install.ps1 -ApprovePoolChanges WithinCaps, the default): call pool_${plan.op}({ planId: "${plan.id}" }). The caps are checked again when it applies.`)
+    return lines.join('\n')
+  }
+  if (!reasons[0].startsWith('setup chose') && reasons[0] !== 'approval') lines.push('', `It needs the user's approval: ${reasons.join('; ')}.`)
   lines.push('', 'Nothing is changed until the user approves this exact plan, as one line in an admin terminal (cmd or PowerShell):', approve,
     'It shows the plan from the helper\'s own record and asks for the 6 characters above. Then call ' + `pool_${plan.op}({ planId: "${plan.id}" }).`,
     'Don\'t approve it for the user: only they can, and only they should.')

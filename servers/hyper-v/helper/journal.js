@@ -8,7 +8,11 @@
  *   epoch     { epoch }                                   first record; a fresh state gets a fresh random epoch
  *   image     { sha256, size, file, source, edition, build, imageIndex, pinned, evaluation }   a verified image in the
  *             helper's own folder, with its one edition (older records: evaluation when edition is EnterpriseEval)
- *   job       { jobId, op, planId, nonce }                a pool change began; its approval's nonce is now used
+ *   job       { jobId, op, planId, nonce }                a pool change began; its approval's nonce is now used, and
+ *             its plan (MC-1576: either way; a plan applied within the caps has approval: 'caps' and no nonce)
+ *   image-approved { sha256, planId }                     MC-1576: a plan the user approved builds from this image
+ *   approvals-migrated {}                                 MC-1576: the images of the VMs in the pool at the first start
+ *             with approvals within the caps (all built under approval) were recorded as approved just before it
  *   intent    { jobId, intentId, vmName, folder, cores, memoryMB, diskGB }   about to create this VM, in this folder
  *   created   { intentId, vmId }                          New-VM returned this id
  *   online    { intentId }                                about to connect this unfinished VM to the Default Switch
@@ -127,11 +131,17 @@ class Journal {
     // checkpointId (null until its take is confirmed), at, dropping }.
     // poolSnaps (MC-1532): published pool checkpoints by checkpointId: { checkpointId, opId, name, vmId, snapName, owner,
     // image, os, at, sourceLease, retiring }.
-    const s = { vms: new Map(), intents: new Map(), jobs: new Map(), usedNonces: new Set(), images: new Map(), switch: null, network: 'none', quarantined: new Map(), leaseSnaps: new Map(), poolSnaps: new Map(), refreshes: new Map() }
+    const s = { vms: new Map(), intents: new Map(), jobs: new Map(), usedNonces: new Set(), usedPlans: new Set(), approvedImages: new Set(), approvalsMigrated: false, images: new Map(), switch: null, network: 'none', quarantined: new Map(), leaseSnaps: new Map(), poolSnaps: new Map(), refreshes: new Map() }
     for (const r of this.records) {
       switch (r.t) {
         case 'image': s.images.set(r.sha256, r); break
-        case 'job': s.jobs.set(r.jobId, { ...r, ended: false }); if (r.nonce) s.usedNonces.add(r.nonce); break
+        // MC-1576: a plan is applied once, approved or within the caps: its job's record, written before it runs, uses it up.
+        case 'job': s.jobs.set(r.jobId, { ...r, ended: false }); if (r.nonce) s.usedNonces.add(r.nonce); if (r.planId) s.usedPlans.add(r.planId); break
+        // MC-1576: an image a plan the user approved builds from (never a check alone, never a job within the caps).
+        case 'image-approved': s.approvedImages.add(r.sha256); break
+        // MC-1576: written once, at the first start with approvals within the caps: the images of the VMs then in the
+        // pool (each built under the user's approval) were recorded just before it.
+        case 'approvals-migrated': s.approvalsMigrated = true; break
         case 'jobEnd': { const j = s.jobs.get(r.jobId); if (j) Object.assign(j, { ended: true, ok: r.ok, note: r.note }); break }
         case 'intent': s.intents.set(r.intentId, { ...r, vmId: null, done: false, online: false, offline: false }); break
         case 'online': { const i = s.intents.get(r.intentId); if (i) i.online = true; break }

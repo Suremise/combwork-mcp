@@ -423,7 +423,7 @@ test('renew: the policy\'s maxSessionMinutes is checked against maxLeaseMinutes,
   await helper.acquire('a', { minutes: 60 })
   clock.now += 50 * MIN
   assert.throws(() => helper.renew('a', { minutes: 60 }), /at most 40 minutes now/)
-  assert.match(helper.status('a').text, /leases up to 60 min at a time, renewable to 90 min per work session\./)
+  assert.match(helper.status('a').text, /leases up to 60 min at a time, renewable to 90 min per work session;/)
 })
 
 test('MC-1579 round 2: a session cap past JavaScript\'s last date ends the session on that date; renewing past it is refused by name, never a RangeError', async t => {

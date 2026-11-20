@@ -66,7 +66,7 @@ test('a plan changed after approval no longer matches its digest', async t => {
 })
 
 test('an approval is used once: its nonce is journalled before any side effect', async t => {
-  const { sc, h, admin } = await fresh('single-use')
+  const { sc, h, admin } = await fresh('single-use', { policy: { approvePoolChanges: 'each' } }) // MC-1576: every plan approved, so the nonce is the guard
   t.after(() => h.stop())
   const p1 = (await plan(admin)).data.planId
   const a = approve(sc, p1)
@@ -78,7 +78,7 @@ test('an approval is used once: its nonce is journalled before any side effect',
   const p2 = (await admin.request('pool_plan', { action: 'resize', vms: 2 })).data.planId
   approve(sc, p2, { nonce: a.nonce })
   await assert.rejects(admin.request('pool_resize', { planId: p2 }), /already been used/)
-  await assert.rejects(admin.request('pool_create', { planId: p1 }), /already been used|no longer empty/)
+  await assert.rejects(admin.request('pool_create', { planId: p1 }), /was already applied/) // MC-1576: before its approval is even read
 })
 
 test('plan ids are opaque: anything else is refused before a file is touched', async t => {

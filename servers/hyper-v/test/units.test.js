@@ -697,3 +697,26 @@ for (const E of ENGINES) test(`setup: -MaxSessionMinutes is checked as the helpe
     if (session) assert.strictEqual(policy.problems({ ...policy.DEFAULTS, diskFolders: ['D:\\hv'], maxLeaseMinutes: lease, maxSessionMinutes: session }).length === 0, ok, `the helper agrees: ${lease}/${session}`)
   }
 })
+
+// MC-1576: install.ps1's -ApprovePoolChanges, run as setup runs it (the block cut from the script): WithinCaps by
+// default, Each on asking; left out, a rerun keeps the current policy's choice (an older policy with none: WithinCaps).
+for (const E of ENGINES) test(`setup: -ApprovePoolChanges, kept on a rerun that leaves it out (PowerShell ${E.name})`, () => {
+  const { spawnSync } = require('child_process')
+  const src = fs.readFileSync(path.join(__dirname, '..', 'setup', 'install.ps1'), 'utf8')
+  const block = /^\$approveMode = [\s\S]*?^  else \{ 'within-caps' \}$/m.exec(src)
+  assert.ok(block, 'the -ApprovePoolChanges block in install.ps1')
+  const sc = scratch(`setup-approve-${E.name}`)
+  const file = path.join(sc.dir, 'approve-mode.ps1')
+  fs.writeFileSync(file, `param([string]$ApprovePoolChanges = '', [string]$Current = '')\n$ErrorActionPreference = 'Stop'\n$curPolicy = if ($Current) { $Current | ConvertFrom-Json } else { $null }\n${block[0]}\n'mode: ' + $approveMode\n`)
+  const run = (arg, cur) => spawnSync(E.exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', file, ...(arg ? ['-ApprovePoolChanges', arg] : []), ...(cur ? ['-Current', cur] : [])], { encoding: 'utf8', env: E.env })
+  for (const [arg, cur, want] of [
+    ['', '', 'within-caps'], ['Each', '', 'each'], ['WithinCaps', '{"approvePoolChanges":"each"}', 'within-caps'],
+    ['', '{"approvePoolChanges":"each"}', 'each'], ['', '{"maxVms":2}', 'within-caps']
+  ]) {
+    const r = run(arg, cur)
+    assert.strictEqual(r.status, 0, r.stderr)
+    assert.strictEqual(r.stdout.trim(), `mode: ${want}`, `${arg} / ${cur}`)
+    assert.deepStrictEqual(policy.problems({ ...policy.DEFAULTS, diskFolders: ['D:\\hv'], approvePoolChanges: want }), [])
+  }
+  assert.deepStrictEqual(policy.problems({ ...policy.DEFAULTS, diskFolders: ['D:\\hv'], approvePoolChanges: 'never' }), ['approvePoolChanges must be within-caps or each'])
+})

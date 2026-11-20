@@ -286,6 +286,7 @@ test('round 1: the same disk with another admin (a typo corrected, another admin
   const sha = plan1.image.sha256
   const p2 = await admin.request('pool_plan', { action: 'resize', vms: 2, image: sha })
   assert.match(p2.text, /admin account Other is used once/, p2.text)
+  assert.match(p2.text, /It needs the user's approval: a ready-made disk or VM \(you type its admin password when you approve\)/, 'MC-1576: within the caps too')
   approveReady(sc, p2.data.planId, { password: 'other-pw' })
   await admin.request('pool_resize', { planId: p2.data.planId })
   await waitFor(async () => /Last pool job: resize (finished|FAILED)/.test(await statusText(admin)), T.waitForMs, 'the grow')

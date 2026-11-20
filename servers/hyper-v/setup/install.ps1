@@ -39,6 +39,9 @@
 # checkpoints one lease may take, how many pool checkpoints one VM may hold, and the free space a take must leave
 # (MC-1579). The two counts together may be at most 48: Hyper-V keeps at most 50 checkpoints of a VM, and the clean
 # checkpoint, with a second one while it is refreshed, takes 2. Left out, the helper's defaults.
+# -ApprovePoolChanges (MC-1576): WithinCaps (the default) lets a plan within this policy apply without approval, unless it
+# brings a new image, a guest setup script or a ready-made disk or VM; Each asks for approve.cmd on every plan. Left out,
+# a rerun keeps the current choice.
 # It is idempotent: run it again to update the helper or change the policy. It keeps an existing pool and its state.
 # It never enables Windows features or restarts the PC: if Hyper-V is off, it says how to turn it on and stops.
 param(
@@ -63,7 +66,8 @@ param(
   [string[]]$BuildRoot = @(),
   [string]$ProjectsFile = '',
   [string]$ProductKeyFile = '',
-  [string]$LinuxTransport = 'HvSocket'
+  [string]$LinuxTransport = 'HvSocket',
+  [ValidateSet('', 'WithinCaps', 'Each')][string]$ApprovePoolChanges = ''
 )
 $ErrorActionPreference = 'Stop'
 # Runs under Windows PowerShell 5.1 or PowerShell 7 (MC-1575). Under 5.1 started from a PowerShell 7 window, it
@@ -190,6 +194,11 @@ if ($MaxNetwork -and $PSBoundParameters.ContainsKey('AllowNetwork')) { throw 'Gi
 $curPolicy = $null
 $curPolicyFile = Join-Path $state 'policy.json'
 if (Test-Path -LiteralPath $curPolicyFile) { try { $curPolicy = Get-Content -Raw -LiteralPath $curPolicyFile | ConvertFrom-Json } catch { $curPolicy = $null } }
+# MC-1576: how pool changes are approved: WithinCaps (the default: plans within the policy apply; a new image, a guest
+# setup script or a ready-made disk still needs approval) or Each (every plan approved). Left out, a rerun keeps it.
+$approveMode = if ($ApprovePoolChanges) { @{ WithinCaps = 'within-caps'; Each = 'each' }[$ApprovePoolChanges] }
+  elseif ($curPolicy -and @('within-caps', 'each') -contains [string]$curPolicy.approvePoolChanges) { [string]$curPolicy.approvePoolChanges }
+  else { 'within-caps' }
 $netMode = if ($MaxNetwork) { @{ None = 'none'; Host = 'host'; Internet = 'internet'; InternetLan = 'internet-lan' }[$MaxNetwork] }
   elseif ($PSBoundParameters.ContainsKey('AllowNetwork')) { if ($AllowNetwork) { 'host' } else { 'none' } }
   elseif ($curPolicy -and $curPolicy.maxNetwork) { [string]$curPolicy.maxNetwork }
@@ -375,6 +384,7 @@ $policy = [ordered]@{
   maxReservePercent = $MaxReservePercent; maxLeaseMinutes = $MaxLeaseMinutes; maxBuildMB = $MaxBuildMB
   buildRoots = @($buildRoots)
   linuxTransport = 'hvsocket'
+  approvePoolChanges = $approveMode
 }
 if ($projects.Count) { $policy.projects = @($projects) } # checked, against this maxVms, before anything changed
 if ($MaxSessionMinutes) { $policy.maxSessionMinutes = $MaxSessionMinutes }
@@ -405,7 +415,7 @@ Step "Build folders set by an admin (beside each client's MCP roots): $(if ($bui
 Step "Projects sharing the pool: $projectsLine."
 Step "Product key (-ProductKeyFile): $keyLine."
 Step $(if ($defaultSwitch) { "Default Switch: present. Each evaluation VM goes online through it once, when it is built, to activate Windows (about 90 days from then); runs use it only in the internet modes, when a plan the user approved allows them." } else { "Default Switch: absent. Evaluation VMs can't be activated here, so pools need a non-evaluation image (an own copy, built offline), and the internet modes can't be used." })
-Step ("Policy: up to {0} VMs, {1} cores each, {2} GB memory in all, {3} GB disks; network {4}; images: any ISO or qcow2 file the plan you approve names; leases up to {5} min, work sessions up to {6} min." -f $policy.maxVms, $policy.maxCoresPerVm, ($policy.maxMemoryMBTotal / 1024), $policy.maxDiskGBPerVm, "up to $netMode (each pool's mode is chosen in the plan you approve)", $MaxLeaseMinutes, $(if ($MaxSessionMinutes) { $MaxSessionMinutes } else { [Math]::Max($MaxLeaseMinutes, 480) }))
+Step ("Policy: up to {0} VMs, {1} cores each, {2} GB memory in all, {3} GB disks; network {4}; images: any ISO or qcow2 file the plan you approve names; leases up to {5} min, work sessions up to {6} min; pool changes: {7}." -f $policy.maxVms, $policy.maxCoresPerVm, ($policy.maxMemoryMBTotal / 1024), $policy.maxDiskGBPerVm, "up to $netMode (each pool's mode is chosen in the plan you approve)", $MaxLeaseMinutes, $(if ($MaxSessionMinutes) { $MaxSessionMinutes } else { [Math]::Max($MaxLeaseMinutes, 480) }), $(if ($approveMode -eq 'each') { 'each one approved (approve.cmd)' } else { 'within these caps they apply without approval; a new image, a guest setup script or a ready-made disk still asks (-ApprovePoolChanges Each for every one)' }))
 
 # 8. Start.
 if ($Mode -eq 'Service') {
