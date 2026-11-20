@@ -39,8 +39,8 @@ if ($Confirmed -and $p.op -ne 'remove') { throw "-Confirmed is only for the unin
 
 Write-Host ''
 Write-Host "Plan ${Plan}: $($p.op) the hyper-v pool" -ForegroundColor Cyan
-foreach ($a in @($p.add)) { if ($a) { Write-Host ("  create {0}: {1} cores, {2} MB memory, {3} GB disk, in {4}" -f $a.name, $a.cores, $a.memoryMB, $a.diskGB, $a.folder) } }
-foreach ($r in @($p.remove)) { if ($r) { Write-Host ("  remove {0} and its folder {1}" -f $r.name, $r.folder) } }
+foreach ($a in @($p.add)) { if ($a) { Write-Host ("  create {0}: {1} cores, {2} MB memory, {3} GB disk, in {4}{5}" -f $a.name, $a.cores, $a.memoryMB, $a.diskGB, $a.folder, $(if ($a.persistent) { '; PERSISTENT (MC-1582): never restored at release, leased only by name; whatever a run leaves stays for the next lease' } else { '' })) } }
+foreach ($r in @($p.remove)) { if ($r) { Write-Host ("  remove {0} and its folder {1}{2}" -f $r.name, $r.folder, $(if ($r.persistent) { ' (a persistent VM: its kept state is lost)' } else { '' })) } }
 # MC-1531: a refresh plan.
 foreach ($r in @($p.refresh)) { if ($r) { Write-Host ("  refresh the clean checkpoint of {0}: rerun the build's guest setup offline (its folders; not the guest setup script; the accounts' profiles kept as built, not logged on: profile-setup fixes need a rebuild), take a new clean checkpoint, remove the old one (pool checkpoints kept; nothing goes online; its evaluation end unchanged)" -f $r.name) } }
 # MC-1532: a pool-checkpoint plan.

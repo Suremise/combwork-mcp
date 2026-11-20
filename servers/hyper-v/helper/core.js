@@ -451,7 +451,7 @@ class Helper {
     for (const vm of this.state.vms.values()) {
       if (!vm.ready) continue
       const r = await this.restore(vm)
-      notes.push(r.ok ? `${vm.vmName}: restored to clean.` : `${vm.vmName}: ${r.text}`)
+      notes.push(r.ok ? (r.parked ? `${vm.vmName}: parked (persistent: not restored).` : `${vm.vmName}: restored to clean.`) : `${vm.vmName}: ${r.text}`)
     }
     return notes
   }
@@ -704,6 +704,8 @@ class Helper {
       const img = this.imageOf(v)
       if (this.osOf(v) !== want.os) return false
       if (want.vm && v.vmName !== want.vm) return false
+      // MC-1582: a persistent VM keeps what earlier leases left, so only an acquire that names it gets it.
+      if (v.persistent && !want.vm) return false
       if (want.checkpoint && !this.poolCheckpointOn(v.vmId, want.checkpoint)) return false
       if (want.image && img !== want.image) return false
       if (want.distro && this.distroOf(v) !== want.distro) return false
@@ -770,7 +772,8 @@ class Helper {
     const now = this.now()
     // An evaluation VM's lease never runs past its recorded end: the work session is capped there too.
     const licenceEnd = evalEnd(vm)
-    const sessionEnd = Math.min(now + policyMod.sessionMinutes(this.policy) * MINUTE_MS, licenceEnd ?? Infinity, DATE_MAX_MS)
+    // MC-1582: a persistent VM's lease has no work-session cap (maxLeaseMinutes still bounds each acquire and renew).
+    const sessionEnd = Math.min(vm.persistent ? Infinity : now + policyMod.sessionMinutes(this.policy) * MINUTE_MS, licenceEnd ?? Infinity, DATE_MAX_MS)
     const lease = {
       leaseId: `l-${hex(6)}`, vmId: vm.vmId, vmName: vm.vmName, connId, ownerConn: connId, pid: c.pid, ending: null, children: new Set(),
       acquiredAt: now, sessionEnd, deadline: Math.min(sessionEnd, now + Math.round(minutes * MINUTE_MS)), keepOnFailure: !!keepOnFailure,
@@ -797,9 +800,10 @@ class Helper {
     this.armDeadline(lease)
     const share = `${project === 'other' ? '' : ` for project ${project}`}${this.osOf(vm) === 'windows' && !want.image ? '' : ` (${this.osOf(vm)}, image ${this.imageOf(vm).slice(0, 12)})`}`
     const failed = this.failedNote(vm)
-    const cap = licenceEnd !== null && sessionEnd === licenceEnd ? `its Windows evaluation's end` : `the policy's work-session cap`
+    const cap = licenceEnd !== null && sessionEnd === licenceEnd ? `its Windows evaluation's end` : vm.persistent ? 'a persistent VM: no work-session cap' : `the policy's work-session cap`
     const from = lease.startFrom ? ` It starts from the pool checkpoint "${lease.startFrom.name}" (vm_start({ checkpoint: 'clean' }) for clean).` : ''
-    return { text: `Leased ${vm.vmName} (lease ${lease.leaseId})${share} until ${new Date(lease.deadline).toISOString()}; vm_renew can extend it up to ${new Date(sessionEnd).toISOString()} (${cap}). Call vm_start next; always vm_release when done.${from}${failed ? ` Note: ${failed}; every free VM that fitted had a failed start, and this one's was the longest ago.` : ''}`, data: { lease: lease.leaseId, vm: vm.vmName, deadline: lease.deadline, sessionEnd, project, os: lease.os, image: lease.image } }
+    const persistent = vm.persistent ? ' PERSISTENT: it is never restored at release or at a plain vm_start, so it holds whatever earlier leases left; vm_start({ checkpoint: \'clean\' }) or vm_reset restores it to clean and discards that.' : ''
+    return { text: `Leased ${vm.vmName} (lease ${lease.leaseId})${share} until ${new Date(lease.deadline).toISOString()}; vm_renew can extend it up to ${new Date(sessionEnd).toISOString()} (${cap}). Call vm_start next; always vm_release when done.${persistent}${from}${failed ? ` Note: ${failed}; every free VM that fitted had a failed start, and this one's was the longest ago.` : ''}`, data: { lease: lease.leaseId, vm: vm.vmName, deadline: lease.deadline, sessionEnd, project, os: lease.os, image: lease.image, ...(vm.persistent ? { persistent: true } : {}) } }
   }
 
   /** Settles an entry's waiting request once: with a result, or an error. Its token makes a late timer a no-op. */
@@ -1090,7 +1094,10 @@ class Helper {
    * Returns { ok, text }. With a lease (a start or stop on its behalf), the restore is the lease's: if the lease ends
    * meanwhile, it stops there and leaves the VM to the lease's own cleanup, without quarantining it.
    */
-  async restore(vm, target = null, lease = null) {
+  async restore(vm, target = null, lease = null, { explicit = false } = {}) {
+    // MC-1582: a persistent VM is restored only when that is asked for (a start naming a checkpoint, vm_reset); every
+    // other cleanup (release, deadline, disconnect, recovery, quarantine retry, stop, a failed start's) parks it.
+    if (vm.persistent && !explicit) return this.park(vm, lease)
     let facts = null
     let why = null
     // MC-1532: a lease's start may restore one of the VM's pool checkpoints instead of clean (by its exact id); the
@@ -1121,6 +1128,33 @@ class Helper {
     }
     if (s.quarantined.has(vm.vmId)) this.journal.append({ t: 'unquarantine', vmId: vm.vmId })
     return { ok: true, text: target ? `${vm.vmName} restored to its pool checkpoint "${target.name}".` : `${vm.vmName} restored to clean (Off, at its clean checkpoint, network disconnected, no CPU reserve).` }
+  }
+
+  /**
+   * MC-1582: a persistent VM's cleanup in place of a restore: the guest shut down (turned off if it doesn't), its adapter
+   * disconnected with no port ACLs, CPU reserve 0, verified from the op's fresh facts (parkProblem: no checkpoint is
+   * applied or checked, so its disk is as the last lease left it). The lease checkpoints no live lease owns are removed,
+   * as after a restore. A park that doesn't verify quarantines it, as a failed restore does; the retry parks again.
+   * Returns { ok, text }, as restore does.
+   */
+  async park(vm, lease = null) {
+    let why = null
+    try {
+      const T = this.tm(lease)
+      const f = await this.hv('park', { ...this.ident(vm), shutdownMs: T.ms.shutdownMinutes }, lease ? this.forLease(lease, T.d.shutdownCallMs) : { timeoutMs: T.d.shutdownCallMs })
+      why = parkProblem(f, vm)
+    } catch (e) {
+      if (lease && (lease.ending || this.leases.get(lease.vmId) !== lease)) return { ok: false, text: `This connection's lease on ${vm.vmName} ended while the request waited: call vm_acquire again.` }
+      why = e.message
+    }
+    if (!why) why = await this.dropLeaseSnapshots(vm)
+    const s = this.state
+    if (why) {
+      if (s.quarantined.get(vm.vmId) !== why) this.journal.append({ t: 'quarantine', vmId: vm.vmId, why })
+      return { ok: false, text: `CLEANUP FAILED: ${vm.vmName} (persistent) could not be confirmed parked (${why}). It is quarantined (never leased) until a park confirms it; the helper retries every few minutes. Its disk was not restored.` }
+    }
+    if (s.quarantined.has(vm.vmId)) this.journal.append({ t: 'unquarantine', vmId: vm.vmId })
+    return { ok: true, text: `${vm.vmName} parked (persistent: shut down, network disconnected, no CPU reserve; not restored, so its disk keeps what the lease left).`, parked: true }
   }
 
   /**
@@ -1255,6 +1289,7 @@ class Helper {
     for (const n of names) {
       const vm = [...s.vms.values()].find(v => v.vmName === n)
       if (!vm || !vm.ready || vm.removing) throw new Error(`No ready VM named ${n} in the pool.`)
+      if (vm.persistent) throw new Error(`${n} is persistent: a clean-checkpoint refresh restores it first, which would discard what it kept. Not offered on persistent VMs.`)
       if (this.refreshOf(vm.vmId)) throw new Error(`${n} has an unfinished refresh (its old clean checkpoint not yet removed): wait for it (vm_status), then plan again.`)
       if ((evalEnd(vm) ?? Infinity) - this.now() < EVAL_LAST_MS) throw new Error(`${n} is in its Windows evaluation's last hour.`)
       const folder = (facts.folders || []).find(x => vm.folder.toLowerCase().startsWith(x.folder.toLowerCase()))
@@ -1855,7 +1890,8 @@ class Helper {
       this.stillHeld(lease)
       lease.running = false
       const r = await this.restore(vm, null, lease)
-      throw new Error(`${e.message.replace(/\.?$/, '.')} ${r.ok ? `${vm.vmName} was restored to clean (network disconnected).` : r.text}`)
+      // MC-1582: a persistent VM was parked, not restored: its reply says so.
+      throw new Error(`${e.message.replace(/\.?$/, '.')} ${r.ok ? (r.parked ? `${r.text.replace(/\.$/, '')}.` : `${vm.vmName} was restored to clean (network disconnected).`) : r.text}`)
     }
   }
 
@@ -1865,19 +1901,21 @@ class Helper {
       this.stillHeld(lease)
       lease.running = false
       const r = await this.restore(vm, null, lease)
-      throw new Error(`${vm.vmName} started, but ${e.message}. ${r.ok ? 'It was restored to clean (network disconnected).' : r.text} vm_reset to try again, or ask for network none.`)
+      throw new Error(`${vm.vmName} started, but ${e.message}. ${r.ok ? (r.parked ? r.text : 'It was restored to clean (network disconnected).') : r.text} vm_reset to try again, or ask for network none.`)
     }
   }
 
   // ---------- runs ----------
 
-  async start(connId, { network, reserveCpu = 0, interactive = false, checkpoint, vm: named } = {}) {
+  async start(connId, { network, reserveCpu = 0, interactive = false, checkpoint, reset = false, vm: named } = {}) {
     const lease = this.leaseOf(connId, named)
     const c = this.conns.get(connId)
     if (checkpoint !== undefined && (typeof checkpoint !== 'string' || !POOL_CHECKPOINT_RE.test(checkpoint))) throw new Error("checkpoint must be 'clean' or one of this VM's pool checkpoints (vm_status lists them).")
     if (![false, 'user', 'admin'].includes(interactive)) throw new Error("interactive must be false, 'user' or 'admin'")
     if (lease.kept) throw new Error(`${lease.vmName} is kept for inspection: vm_release it, then vm_acquire again (a release restores it).`)
     if (interactive && lease.os === 'linux') throw new Error('Linux guests have no desktop session: interactive is for Windows guests.')
+    // MC-1582: an interactive logon changes the guest (autologon, the watcher) and only a restore undoes it.
+    if (interactive && this.state.vms.get(lease.vmId)?.persistent) throw new Error(`${lease.vmName} is persistent: an interactive start isn't offered on it yet (its logon changes would stay with no restore to undo them). Start it without interactive.`)
     const mode = net.modeOf(network)
     this.netAllowed(mode)
     if (!Number.isInteger(reserveCpu) || reserveCpu < 0 || reserveCpu > this.policy.maxReservePercent) throw new Error(`reserveCpu must be a whole percentage, 0-${this.policy.maxReservePercent} (the policy's cap).`)
@@ -1902,8 +1940,12 @@ class Helper {
       s.plan = null
       s.trusted = false
       s.record = new Map()
-      const r = await this.restore(vm, target, lease) // unconditionally, before every run
+      // Unconditionally, before every run. MC-1582: a persistent VM is restored only when this start asks for it (a
+      // checkpoint named, or vm_reset); otherwise it is parked and started from its disk as it is.
+      const explicit = checkpoint !== undefined || reset === true
+      const r = await this.restore(vm, target, lease, { explicit })
       if (!r.ok) { lease.dirty = true; throw new Error(`${r.text} The start was refused.`) }
+      const kept = !!r.parked
       const tRestore = this.now()
       // Every stage of a start is the lease's: its Hyper-V calls are registered with it (ending the lease kills them), and
       // each stage first checks the lease still holds, so nothing more starts once it has ended.
@@ -1952,8 +1994,10 @@ class Helper {
       }
       s.trusted = true
       return {
-        text: `Started ${vm.vmName} from ${target ? `its pool checkpoint "${target.name}"` : 'its clean checkpoint'}: restore ${((tRestore - t0) / 1000).toFixed(1)} s, guest ready after ${(waited / 1000).toFixed(1)} s${logon}; ${build}; network ${netText}; CPU reserve ${reserveCpu}%. ${this.paths(vm).out} is empty. Deadline ${new Date(lease.deadline).toISOString()}.`,
-        data: { vm: vm.vmName, network: mode, ...(lease.net?.address ? { address: lease.net.address, hostAddress: lease.net.hostAddress } : {}), reserveCpu, interactive }
+        text: kept
+          ? `Started ${vm.vmName} from its disk as it was (persistent: not restored; vm_start({ checkpoint: 'clean' }) or vm_reset for clean): shut down and parked in ${((tRestore - t0) / 1000).toFixed(1)} s, guest ready after ${(waited / 1000).toFixed(1)} s; ${build}; network ${netText}; CPU reserve ${reserveCpu}%. ${this.paths(vm).out} keeps what earlier runs left. Deadline ${new Date(lease.deadline).toISOString()}.`
+          : `Started ${vm.vmName} from ${target ? `its pool checkpoint "${target.name}"` : 'its clean checkpoint'}: restore ${((tRestore - t0) / 1000).toFixed(1)} s, guest ready after ${(waited / 1000).toFixed(1)} s${logon}; ${build}; network ${netText}; CPU reserve ${reserveCpu}%. ${this.paths(vm).out} is empty. Deadline ${new Date(lease.deadline).toISOString()}.`,
+        data: { vm: vm.vmName, network: mode, ...(lease.net?.address ? { address: lease.net.address, hostAddress: lease.net.hostAddress } : {}), reserveCpu, interactive, ...(kept ? { persistent: true, restored: false } : {}) }
       }
     })
   }
@@ -2212,6 +2256,8 @@ class Helper {
     lease.interactive = null
     lease.dirty = !r.ok
     Object.assign(lease.sync, { gen: lease.sync.gen + 1, plan: null, trusted: false, record: new Map() })
+    // MC-1582: a persistent VM is parked instead: shut down (which ends what the run started), its disk kept.
+    if (r.ok && r.parked) return `The VM was shut down to end everything the run started: ${r.text} Its output above was read first; vm_start (its disk as it is) or vm_reset (clean) to go on.`
     return r.ok
       ? `The VM was restored to its clean checkpoint, which ends everything the run started (C:\\out with it; its output above was read first): vm_start or vm_reset to go on.`
       : `Restoring the VM to end what it started failed: ${r.text}`
@@ -2230,7 +2276,7 @@ class Helper {
     lease.interactive = null
     lease.dirty = !r.ok
     Object.assign(lease.sync, { gen: lease.sync.gen + 1, plan: null, trusted: false, record: new Map() })
-    return { text: r.ok ? `Reverted: ${r.text}` : r.text, isError: !r.ok }
+    return { text: r.ok ? (r.parked ? `Stopped: ${r.text}` : `Reverted: ${r.text}`) : r.text, isError: !r.ok }
   }
 
   /** MC-1529: this lease's checkpoints, journalled and not dropped (a take not yet confirmed included). */
@@ -2470,7 +2516,7 @@ class Helper {
       const unknownNote = unknown?.length ? `; unknown checkpoints left alone: ${unknown.join(', ')}` : ''
       const li = this.isLinux(v) ? s.images.get(img) : null
       const osLabel = li?.distro ? `linux (${li.name || `${li.distro} ${li.release}`}, build ${li.serial})` : this.isLinux(v) && v.guest?.id ? `linux (${v.guest.id} ${v.guest.versionId ?? ''}`.trimEnd() + ')' : this.osOf(v)
-      return `- ${v.vmName}: ${osLabel}, image ${img === 'legacy' ? 'unknown (made before images were recorded)' : img.slice(0, 12)}; ${v.cores} cores, ${v.memoryMB} MB, ${v.diskGB} GB disk; ${state}${mine.has(v.vmId) ? ' (yours)' : ''}${expiry(v, this.now())}${failed ? `; ${failed}` : ''}${fromNote}${pcNote}${cpNote}${unknownNote}`
+      return `- ${v.vmName}: ${osLabel}, image ${img === 'legacy' ? 'unknown (made before images were recorded)' : img.slice(0, 12)}; ${v.cores} cores, ${v.memoryMB} MB, ${v.diskGB} GB disk; ${v.persistent ? 'PERSISTENT (never restored at release; leased only by name), ' : ''}${state}${mine.has(v.vmId) ? ' (yours)' : ''}${expiry(v, this.now())}${failed ? `; ${failed}` : ''}${fromNote}${pcNote}${cpNote}${unknownNote}`
     })
     const img = [...s.images.values()].at(-1)
     const lines = [
@@ -2512,7 +2558,7 @@ class Helper {
     const plan = { id: `p-${hex(8)}`, op, epoch: this.journal.epoch, created: this.now(), expires: this.now() + PLAN_TTL_MS, prefix: this.policy.prefix, host: { logicalCpus: facts.logicalCpus, memoryMB: facts.memoryMB } }
     if (op === 'remove') {
       if (!all.length && !s.switch) throw new Error('There is no pool to remove.')
-      plan.remove = all.map(v => ({ vmId: v.vmId, name: v.vmName, folder: v.folder }))
+      plan.remove = all.map(v => ({ vmId: v.vmId, name: v.vmName, folder: v.folder, ...(v.persistent ? { persistent: true } : {}) }))
       plan.removeSwitch = s.switch ? s.switch.name : null
     } else {
       if (op === 'create' && pool.length) throw new Error(`The pool already has ${pool.length} VM(s): use action "resize" (or "remove" first).`)
@@ -2520,7 +2566,8 @@ class Helper {
       // An image named by its SHA-256 (a verified one): create from it, or resize that image's group only. A resize with
       // no image is the whole pool, as before; legacy VMs (image unknown) are in no image's group.
       const groupImg = typeof args.image === 'string' ? this.verifiedImage(args.image) : null
-      const group = groupImg && op === 'resize' ? pool.filter(v => this.imageOf(v) === groupImg.sha256) : pool
+      // MC-1582: a resize that shrinks removes disposable VMs first; a persistent one goes only when no other is left.
+      const group = (groupImg && op === 'resize' ? pool.filter(v => this.imageOf(v) === groupImg.sha256) : pool).slice().sort((a, b) => (b.persistent ? 1 : 0) - (a.persistent ? 1 : 0))
       const others = pool.filter(v => !group.includes(v))
       const like = group.find(v => v.ready) || pool.find(v => v.ready)
       const n = args.vms ?? (op === 'create' ? Math.min(2, this.policy.maxVms) : group.length)
@@ -2540,7 +2587,7 @@ class Helper {
         const intentId = `i-${hex(8)}`
         return { intentId, name: `${this.policy.prefix}-${hex(4)}`, folder: `${location}\\pool\\${intentId}`, cores, memoryMB, diskGB }
       })
-      plan.remove = [...kept, ...group.slice(n)].map(v => ({ vmId: v.vmId, name: v.vmName, folder: v.folder }))
+      plan.remove = [...kept, ...group.slice(n)].map(v => ({ vmId: v.vmId, name: v.vmName, folder: v.folder, ...(v.persistent ? { persistent: true } : {}) }))
       plan.network = network
       if (op === 'resize') plan.networkWas = s.network
       plan.keep = [...others, ...keep].filter(v => v.ready).map(v => ({ name: v.vmName, cores: v.cores, memoryMB: v.memoryMB, diskGB: v.diskGB }))
@@ -2592,6 +2639,14 @@ class Helper {
         if (args.debugKeepFailedBuild !== true) throw new Error('debugKeepFailedBuild must be true, or left out.')
         if (!plan.add.length || plan.image?.os !== 'linux') throw new Error('debugKeepFailedBuild is only for a plan that builds Linux VMs.')
         plan.debugKeepFailedBuild = true
+      }
+      // MC-1582 (the user's choice): every VM this plan builds is persistent (never restored at release, leased only by
+      // name). Disposable is the default; the plan and the approval show it, and its digest binds it.
+      if (args.persistent !== undefined) {
+        if (args.persistent !== true) throw new Error('persistent must be true, or left out (VMs are disposable by default).')
+        if (!plan.add.length) throw new Error('persistent is for a plan that builds VMs: this one builds none.')
+        plan.persistent = true
+        for (const a of plan.add) a.persistent = true
       }
       if (!plan.add.length && !plan.remove.length && network === s.network) throw new Error(`The pool already has ${pool.length} VM(s) and network ${network}: nothing to change.`)
     }
@@ -3151,7 +3206,7 @@ class Helper {
     const facts = await this.restoreVia(vm, 'restore', { ...this.ident(vm), checkpointId: cp.checkpointId })
     const bad = baselineProblem(facts, { ...vm, cleanCheckpointId: cp.checkpointId })
     if (bad) throw new Error(`its clean baseline doesn't verify: ${bad}`)
-    this.journal.append({ t: 'ready', intentId: a.intentId, vmId: vm.vmId, cleanCheckpointId: cp.checkpointId, licence, profiles, guestScript })
+    this.journal.append({ t: 'ready', intentId: a.intentId, vmId: vm.vmId, cleanCheckpointId: cp.checkpointId, licence, profiles, guestScript, ...(a.persistent ? { persistent: true } : {}) })
     return buildNote(profiles)
   }
 
@@ -3198,7 +3253,7 @@ class Helper {
     const facts = await this.restoreVia(vm, 'restore', { ...this.ident(vm), checkpointId: cp.checkpointId })
     const bad = baselineProblem(facts, { ...vm, cleanCheckpointId: cp.checkpointId })
     if (bad) throw new Error(`its clean baseline doesn't verify: ${bad}`)
-    this.journal.append({ t: 'ready', intentId: a.intentId, vmId: vm.vmId, cleanCheckpointId: cp.checkpointId, licence, profiles: null, guestScript, guest: { editionId: g.editionId, build: g.build } })
+    this.journal.append({ t: 'ready', intentId: a.intentId, vmId: vm.vmId, cleanCheckpointId: cp.checkpointId, licence, profiles: null, guestScript, guest: { editionId: g.editionId, build: g.build }, ...(a.persistent ? { persistent: true } : {}) })
     return `ready-made disk: ${g.editionId} build ${g.build}; licence status ${lic.status}; no first-logon wait (an interactive start's first logon does that work)`
   }
 
@@ -3214,7 +3269,7 @@ class Helper {
     const facts = await this.restoreVia(vm, 'restore', { ...this.ident(vm), checkpointId: cp.checkpointId })
     const bad = baselineProblem(facts, { ...vm, cleanCheckpointId: cp.checkpointId })
     if (bad) throw new Error(`its clean baseline doesn't verify: ${bad}`)
-    this.journal.append({ t: 'ready', intentId: a.intentId, vmId: vm.vmId, cleanCheckpointId: cp.checkpointId, ...record })
+    this.journal.append({ t: 'ready', intentId: a.intentId, vmId: vm.vmId, cleanCheckpointId: cp.checkpointId, ...record, ...(a.persistent ? { persistent: true } : {}) })
     const d = record.diag || {}
     return `${record.guest.id} ${record.guest.versionId}${record.guest.serial ? ` build ${record.guest.serial}` : ''}, kernel ${record.guest.kernel}; SSH over the Hyper-V socket${d.hv_sock_driver ? ` (hv_sock ${d.hv_sock_driver})` : ''}`
   }
@@ -3563,7 +3618,7 @@ const PROTOCOL = 'hyperv-mcp/3' // 2: renew, sync_plan, sync (MC-1497); 3: start
 // 'user-images' = pool_plan's image is any local file the user names ({ iso } of any x64 edition, or a Linux { file }),
 // with no pins and no downloads; acquire's distro is any /etc/os-release ID (MC-1572).
 // 'multi-vm' = a connection holds several leases; every lease op takes vm (the VM's name), and leases lists them (MC-1580).
-const FEATURES = ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean', 'linux', 'debug-keep', 'timing', 'network-modes', 'user-images', 'guest-script', 'multi-vm', 'ready-images']
+const FEATURES = ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean', 'linux', 'debug-keep', 'timing', 'network-modes', 'user-images', 'guest-script', 'multi-vm', 'ready-images', 'persistent']
 const LEASE_CHECKPOINT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$/
 // MC-1532: a pool checkpoint's name.
 const POOL_CHECKPOINT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._+-]{0,39}$/
@@ -3773,6 +3828,20 @@ function restoreProblem(f) {
 }
 
 /** Why restored facts aren't the clean baseline, or null. */
+/**
+ * MC-1582: a parked persistent VM's check, from the park op's fresh facts: the same VM, Off, its adapter disconnected
+ * with no port ACLs, no CPU reserve. Its checkpoint parent isn't checked: the disk is as the last lease left it.
+ */
+function parkProblem(f, vm) {
+  if (!f || typeof f !== 'object') return 'no facts'
+  if (f.vmId !== vm.vmId) return 'a different VM answered'
+  if (f.state !== 'Off') return `state is ${f.state}, not Off`
+  if (f.switchName) return `its network adapter is connected to ${f.switchName}`
+  if (f.acls?.length) return `its network adapter still has ${f.acls.length} port ACL(s)`
+  if (f.reserve !== 0) return `CPU reserve is ${f.reserve}%`
+  return null
+}
+
 function baselineProblem(f, vm) {
   if (!f || typeof f !== 'object') return 'no facts'
   const rp = restoreProblem(f)
@@ -3805,8 +3874,10 @@ const OSES = ['windows', 'linux']
 
 function describePlan(plan, digest, approve, T, reasons = ['approval']) {
   const lines = [`Plan ${plan.id} (${plan.op}), valid for 30 minutes. Digest ${digest}; its first 6 characters are ${digest.slice(0, 6)}.`]
-  for (const a of plan.add || []) lines.push(`- create ${a.name}: ${a.cores} cores, ${a.memoryMB} MB static memory, ${a.diskGB} GB dynamic disk, in ${a.folder}; network adapter disconnected`)
-  for (const r of plan.remove || []) lines.push(`- remove ${r.name} and its folder ${r.folder}`)
+  for (const a of plan.add || []) lines.push(`- create ${a.name}: ${a.cores} cores, ${a.memoryMB} MB static memory, ${a.diskGB} GB dynamic disk, in ${a.folder}; network adapter disconnected${a.persistent ? '; PERSISTENT' : ''}`)
+  for (const r of plan.remove || []) lines.push(`- remove ${r.name} and its folder ${r.folder}${r.persistent ? ' (a persistent VM: what it kept is lost)' : ''}`)
+  // MC-1582: what a persistent VM gives up, said in the plan the user approves.
+  if (plan.persistent) lines.push('- PERSISTENT (MC-1582): each VM this plan builds is never restored to clean at release, at its deadline, when its session disconnects, at a helper restart or at a plain vm_start: it is shut down and disconnected instead, and keeps whatever its runs left (installed software, files, settings, C:\\out, anything a run did) for the next lease, of any agent that names it. Plain acquires never get it; vm_acquire({ vm }) does. Its leases have no work-session cap (each acquire and renew stays within maxLeaseMinutes). It still has a clean checkpoint: vm_start({ checkpoint: \'clean\' }) or vm_reset restores it and discards what it kept. Network stays off unless a start asks, and is disconnected at every stop')
   // MC-1531: refresh plans.
   if (plan.op === 'refresh') for (const v of plan.refresh) lines.push(`- refresh the clean checkpoint of ${v.name}: restore it, start it offline, rerun the build's guest setup (its folders; not the guest setup script, whose work is already in the clean checkpoint; the test accounts' profiles are kept as built, not logged on again: fixes to the build's profile setup need a rebuild, not a refresh), shut it down and take a new clean checkpoint; then remove the old one (its pool checkpoints are kept). Nothing goes online and nothing is re-activated; its evaluation end stays as recorded. The VM isn't leased meanwhile.`)
   // MC-1532: pool-checkpoint plans.
