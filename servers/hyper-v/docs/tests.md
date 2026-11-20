@@ -264,7 +264,9 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   MC-1591: a persistence plan making a disposable VM persistent (bound in the plan record, journalled, leased only by
   name after, its state kept, through a restart) and a persistent one disposable again (restored to clean and verified
   by the job, what it kept and its kept checkpoints gone, plain acquires getting it); a leased VM refused at the plan
-  and skipped by a job it was leased before; and a failed restore quarantining it until the retry restores it.
+  and skipped by a job it was leased before; a failed restore quarantining it until the retry restores it; and
+  `approve.ps1`'s own summary block, run in Windows PowerShell 5.1, explaining both directions (what is discarded,
+  the kept checkpoints by name).
 - `approvals.test.js`:
   - unapproved plans;
   - forged approvals: another digest, operation or epoch, expired, a malformed nonce, another plan's id, a writable

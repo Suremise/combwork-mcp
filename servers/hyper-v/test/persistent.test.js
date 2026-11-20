@@ -534,3 +534,28 @@ test('MC-1591: a switch to disposable whose restore fails quarantines the VM (no
   await waitFor(async () => !/QUARANTINED/.test((await admin.request('status')).text), T.waitForMs, 'the retry\'s restore')
   assert.ok(!stubOf(sc, persistent).disk[KEEP], 'restored by the retry (not parked)')
 })
+
+// approve.ps1's own summary (the lines the administrator reads before typing the digest), run in Windows PowerShell
+// 5.1 on synthetic persistence plans: both directions say what the switch does, by name.
+test('MC-1591 round 1: approve.ps1\'s summary explains a persistence plan in both directions (what is discarded, the kept checkpoints named)', { skip: process.platform !== 'win32' }, () => {
+  const { spawnSync } = require('child_process')
+  const { ps51Env } = require('../helper/hv')
+  const SRC = fs.readFileSync(path.join(__dirname, '..', 'helper', 'approve.ps1'), 'utf8')
+  const s = SRC.indexOf('Write-Host "Plan ${Plan}')
+  const e = SRC.indexOf('\nif (-not $Confirmed) {', s)
+  assert.ok(s > 0 && e > s, 'found the summary block')
+  const block = SRC.slice(s, e)
+  const sc = scratch('pers-approve-ps')
+  const plan = { id: 'p-0123456789abcdef', op: 'persistence', persistence: [{ vmId: 'a', name: 'hvmcp-research', persistent: false, kept: ['tools', 'before upgrade'] }, { vmId: 'b', name: 'hvmcp-other', persistent: true }, { vmId: 'c', name: 'hvmcp-plain', persistent: false }] }
+  const planFile = path.join(sc.dir, 'plan.json')
+  fs.writeFileSync(planFile, JSON.stringify(plan))
+  const harness = path.join(sc.dir, 'summary.ps1')
+  fs.writeFileSync(harness, `$ErrorActionPreference = 'Stop'\n$Plan = 'p-0123456789abcdef'\n$p = Get-Content -LiteralPath '${planFile.replace(/'/g, "''")}' -Raw | ConvertFrom-Json\n${block}\n`)
+  const r = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', harness], { encoding: 'utf8', env: ps51Env(), timeout: T.spawnMs, windowsHide: true })
+  assert.strictEqual(r.status, 0, r.stderr)
+  const out = r.stdout
+  assert.match(out, /Plan p-0123456789abcdef: persistence the hyper-v pool/)
+  assert.match(out, /make hvmcp-research disposable again: its clean checkpoint is restored first and verified, which DISCARDS what it kept \(installed software, files, settings, C:\\out, anything a run did\) and removes the checkpoints it kept \("tools", "before upgrade"\); its pool checkpoints stay; then it is restored at every start and release, and plain acquires may get it/)
+  assert.match(out, /make hvmcp-other PERSISTENT: from now on it is never restored to clean at release, .*so whatever a run leaves, and its checkpoints, stay for the next lease of any agent that names it; plain acquires stop getting it/)
+  assert.match(out, /make hvmcp-plain disposable again: .*anything a run did\); its pool checkpoints stay/, 'no kept checkpoints: none named')
+})

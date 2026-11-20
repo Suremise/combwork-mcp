@@ -43,6 +43,17 @@ foreach ($a in @($p.add)) { if ($a) { Write-Host ("  create {0}: {1} cores, {2} 
 foreach ($r in @($p.remove)) { if ($r) { Write-Host ("  remove {0} and its folder {1}{2}" -f $r.name, $r.folder, $(if ($r.persistent) { ' (a persistent VM: its kept state is lost)' } else { '' })) } }
 # MC-1531: a refresh plan.
 foreach ($r in @($p.refresh)) { if ($r) { Write-Host ("  refresh the clean checkpoint of {0}: rerun the build's guest setup offline (its folders; not the guest setup script; the accounts' profiles kept as built, not logged on: profile-setup fixes need a rebuild), take a new clean checkpoint, remove the old one (pool checkpoints kept; nothing goes online; its evaluation end unchanged)" -f $r.name) } }
+# MC-1591: a persistence plan: each VM switched, and what that does to it.
+foreach ($v in @($p.persistence)) {
+  if (-not $v) { continue }
+  if ($v.persistent -eq $true) {
+    Write-Host ("  make {0} PERSISTENT: from now on it is never restored to clean at release, its deadline, a disconnect, a helper restart or a plain start (it is shut down and disconnected instead), so whatever a run leaves, and its checkpoints, stay for the next lease of any agent that names it; plain acquires stop getting it; it starts from its clean checkpoint, as it is now" -f $v.name)
+  } else {
+    $keptNames = @($v.kept | Where-Object { $_ })
+    $keptText = if ($keptNames.Count) { ' and removes the checkpoints it kept (' + (($keptNames | ForEach-Object { '"' + $_ + '"' }) -join ', ') + ')' } else { '' }
+    Write-Host ("  make {0} disposable again: its clean checkpoint is restored first and verified, which DISCARDS what it kept (installed software, files, settings, C:\out, anything a run did){1}; its pool checkpoints stay; then it is restored at every start and release, and plain acquires may get it" -f $v.name, $keptText)
+  }
+}
 # MC-1532: a pool-checkpoint plan.
 if ($p.op -eq 'checkpoint') {
   foreach ($v in @($p.vms)) {
