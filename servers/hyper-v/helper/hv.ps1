@@ -502,6 +502,39 @@ $GuestRead = {
   @{ files = $out }
 }
 
+# MC-1582: a persistent VM's park, in place of a restore: its disk is left as it is (no checkpoint is applied or read).
+# The guest is shut down cleanly within shutdownMs; a saved state is discarded; a paused one, or one still not Off when
+# the time is up, is turned off. Then its adapter is disconnected and its port ACLs cleared (in that order), CPU reserve
+# 0, and its Facts answered for the helper's check (parkProblem). Stop-VM -Force waits for the guest itself (up to five
+# minutes, as Microsoft documents it), so the shutdown request runs as a job: the configured time bounds the wait, the
+# turn-off is always reached within it, and the job is stopped and removed by its own handle whatever happens.
+$Park = {
+  param($vm, $shutdownMs)
+  $forced = $false
+  $deadline = (Get-Date).AddMilliseconds($(if ([int]$shutdownMs -gt 0) { [int]$shutdownMs } else { 300000 }))
+  $job = $null
+  try {
+    $state = [string](Get-VM -Id $vm.Id).State
+    if ($state -eq 'Saved') { Remove-VMSavedState -VM $vm }
+    elseif ($state -eq 'Running') { $job = Stop-VM -VM $vm -Force -AsJob -ErrorAction SilentlyContinue }
+    elseif ($state -ne 'Off') { $deadline = Get-Date } # paused, or between states: no guest to ask
+    while ([string](Get-VM -Id $vm.Id).State -ne 'Off' -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 500 }
+    if ([string](Get-VM -Id $vm.Id).State -ne 'Off') {
+      $forced = $true
+      if ($job) { Stop-Job -Job $job -ErrorAction SilentlyContinue }
+      Stop-VM -VM $vm -TurnOff -Force -ErrorAction Stop
+    }
+  } finally {
+    if ($job) { Stop-Job -Job $job -ErrorAction SilentlyContinue; Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+  }
+  Get-VMNetworkAdapter -VM $vm | Disconnect-VMNetworkAdapter
+  Clear-Acls $vm
+  Set-VMProcessor -VM $vm -Reserve 0
+  $f = Facts $vm
+  $f.park = @{ forced = $forced }
+  $f
+}
+
 $GuestSetup = {
   param($userName)
   $ErrorActionPreference = 'Stop'
@@ -1321,6 +1354,11 @@ try {
       }
       $left = @(Get-VMNetworkAdapter -VM $vm | Where-Object { $_.SwitchName -or ($_.SwitchId -and $_.SwitchId -ne [guid]::Empty) })
       @{ status = $r.status; graceMinutes = $r.graceMinutes; evalEnd = $r.evalEnd; channel = $r.channel; error = $r.error; disconnected = ($left.Count -eq 0) }
+    }
+    'park' {
+      # MC-1582: a persistent VM's cleanup, in place of a restore ($Park).
+      $vm = Get-OwnVm $a
+      & $Park $vm ([int]$a.shutdownMs)
     }
     'net-off' {
       # After a failed or killed online step: the guest off, then every adapter disconnected, verified.

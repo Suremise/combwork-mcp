@@ -293,3 +293,28 @@ test('round 1: the same disk with another admin (a typo corrected, another admin
   assert.deepStrictEqual(sc.stub().calls.filter(c => c.op === 'guest-accounts').map(c => c.as), ['Administrator', 'Other'])
   assert.deepStrictEqual(secrets(sc), [])
 })
+
+// MC-1582 with MC-1578: a persistent VM built from a ready-made disk is persistent like any other: the journal's ready
+// record says so, a plain acquire skips it, and a named lease's state survives release (parked, never restored).
+test('MC-1582: a persistent VM from a ready-made disk: journalled persistent, leased only by name, its state kept across leases', async t => {
+  const { sc, h, admin } = await withReadyImage(t, 'ready-persistent')
+  const { plan, line } = await planAndBuild(sc, admin, { args: { persistent: true } })
+  assert.match(line, /create finished/, line)
+  assert.match(plan.text, /- PERSISTENT \(MC-1582\): each VM this plan builds is never restored to clean/)
+  const ready = sc.journal().find(r => r.t === 'ready')
+  assert.strictEqual(ready.persistent, true)
+  const vm = vms(sc)[0]
+  const restoresOf = () => (sc.stub().restores || []).filter(r => r.vmId === vm.id).length
+  await assert.rejects(h.conn(5).request('acquire', { minutes: 30 }), /No VM is free|none is free/)
+  const c = h.conn(6)
+  await c.request('acquire', { vm: vm.name, minutes: 30 })
+  const r0 = restoresOf()
+  assert.match((await c.request('start')).text, /from its disk as it was \(persistent: not restored/)
+  await c.request('run', { command: 'write C:\research.txt kept' })
+  assert.match((await c.request('release')).text, /parked \(persistent/)
+  const d = h.conn(7)
+  await d.request('acquire', { vm: vm.name, minutes: 30 })
+  await d.request('start')
+  assert.match((await d.request('run', { command: 'cat C:\research.txt' })).text, /kept/)
+  assert.strictEqual(restoresOf(), r0, 'never restored')
+})
