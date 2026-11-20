@@ -101,9 +101,15 @@ const NO_STDIN = { stdio: ['ignore', 'pipe', 'inherit'] }
 /** node -e: a child that takes the lock, writes held (its pid), and keeps it until gate exists (or it is killed). */
 const HOLDER = `const fs = require('fs'); const [js, file, held, gate] = process.argv.slice(1)
 require(js).withLock(file, () => { fs.writeFileSync(held, String(process.pid)); while (!fs.existsSync(gate)) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5) })`
-/** node -e: a child that takes the lock and writes the time it entered. */
-const ENTER = `const fs = require('fs'); const [js, file, entered] = process.argv.slice(1)
-require(js).withLock(file, () => fs.writeFileSync(entered, String(Date.now())))`
+/**
+ * node -e: a child that takes the lock and writes entered. Its first refusal (the lock found held, not clearable)
+ * writes tried: the owner file it was kept out by, read at that moment.
+ */
+const ENTER = `const fs = require('fs'); const [js, file, tried, entered] = process.argv.slice(1)
+const owner = () => { try { return fs.readFileSync(file + '.lock/owner', 'utf8') } catch { return '' } }
+require(js).withLock(file, () => fs.writeFileSync(entered, 'entered'), { onRefused: n => { if (n === 1) fs.writeFileSync(tried, owner()) } })`
+/** Waits until the lock folder is old enough that only a live holder keeps it from being cleared as stale. */
+const lockAged = (lock, STALE_MS) => waitFor(() => Date.now() - fs.statSync(lock).birthtimeMs >= STALE_MS, T.waitForMs, 'the lock folder old enough to look stale')
 /** node -e: a child that adds 1 to the counter n times, each a patch under the lock. */
 const COUNTER = `const [js, file, n] = process.argv.slice(1)
 for (let i = 0; i < Number(n); i++) require(js).patch(file, s => { s.count = (s.count || 0) + 1 })`
@@ -147,22 +153,27 @@ test('the stubs\' lock: a live holder\'s lock is never cleared, whatever a conte
   const gate = path.join(sc.dir, 'gate')
   const holder = run(['-e', HOLDER, STATE_JS, file, held, gate], NO_STDIN)
   await waitFor(() => fs.existsSync(held), T.waitForMs, 'the holder holding the lock')
-  // Old enough to be a stale lock's age: only its holder being alive keeps it.
-  await new Promise(r => setTimeout(r, STALE_MS + T.pollMs))
+  // Old enough to be a stale lock's age (its folder's own age, read): only its holder being alive keeps it.
+  await lockAged(lock, STALE_MS)
   // The review's interleaving: a contender that saw a dead owner acts after a live one has taken the lock. Its one act
   // is breakStale, which can't move a folder a live process holds: refused, and the holder still owns it.
   assert.strictEqual(breakStale(lock), false, 'a live holder\'s lock is not cleared')
   assert.strictEqual(fs.readFileSync(path.join(lock, 'owner'), 'utf8'), String(holder.pid))
-  // A contender in another process waits for it.
+  // A contender in another process tries, and is kept out: its refusal is seen (tried, naming the holder it found)
+  // while the holder still holds the gate shut, and it hasn't entered.
+  const tried = path.join(sc.dir, 'tried')
   const entered = path.join(sc.dir, 'entered')
-  const contender = run(['-e', ENTER, STATE_JS, file, entered], NO_STDIN)
-  await new Promise(r => setTimeout(r, STALE_MS + T.pollMs))
-  assert.ok(!fs.existsSync(entered), 'the contender is still waiting')
-  const opened = Date.now()
+  const contender = run(['-e', ENTER, STATE_JS, file, tried, entered], NO_STDIN)
+  await waitFor(() => fs.existsSync(tried), T.waitForMs, 'the contender refused the held lock')
+  assert.strictEqual(fs.readFileSync(tried, 'utf8'), String(holder.pid), 'kept out by the live holder\'s lock')
+  assert.ok(!fs.existsSync(entered), 'refused, it did not enter')
+  assert.strictEqual(fs.readFileSync(path.join(lock, 'owner'), 'utf8'), String(holder.pid), 'the holder still holds it')
+  assert.strictEqual(holder.exitCode, null, 'the holder is still running, inside the lock')
+  // Only now is the holder let go; the contender then gets in.
   fs.writeFileSync(gate, 'open')
   assert.strictEqual((await holder.done).code, 0)
   assert.strictEqual((await contender.done).code, 0)
-  assert.ok(Number(fs.readFileSync(entered, 'utf8')) >= opened, 'it entered only once the holder let go')
+  assert.ok(fs.existsSync(entered), 'it entered once the holder let go')
   // And in this process, once both are gone.
   assert.strictEqual(withLock(file, () => 'mine'), 'mine')
   assert.ok(!fs.existsSync(lock), 'released: no lock left')
@@ -188,9 +199,16 @@ test('the stubs\' lock: a killed holder\'s lock (and one made but never entered)
   assert.strictEqual(JSON.parse(fs.readFileSync(file, 'utf8')).count, 100)
   assert.ok(!fs.existsSync(lock))
   // A lock folder made but never entered (its maker killed between mkdir and chdir): left alone while new, then cleared.
+  // Each look reports the age it decided on (however late, on a loaded machine, the first look comes): nobody holds this
+  // folder, so every look while it was new left it, and the one look that cleared it saw it old enough.
   fs.mkdirSync(lock)
-  const t0 = Date.now()
-  assert.strictEqual(withLock(file, () => Date.now() - t0 >= STALE_MS - T.pollMs), true, 'taken only once it was old enough to be stale')
+  const checks = []
+  assert.strictEqual(withLock(file, () => 'taken', { onCheck: c => checks.push(c) }), 'taken')
+  const cleared = checks.filter(c => c.cleared)
+  assert.strictEqual(cleared.length, 1, 'cleared once')
+  assert.ok(cleared[0].ageMs >= STALE_MS, `cleared only once old enough (${cleared[0].ageMs} ms)`)
+  assert.ok(checks.filter(c => !c.cleared).every(c => c.ageMs < STALE_MS), 'left alone only while new')
+  assert.ok(!fs.existsSync(lock), 'then taken and released')
 })
 
 

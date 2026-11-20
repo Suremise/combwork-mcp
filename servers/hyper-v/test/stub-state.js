@@ -25,19 +25,31 @@ const STALE_MS = 1000 // a lock folder younger than this may be one its maker ha
 const LOCK_WAIT_MS = 60_000 // a lock still held after this is a bug (critical sections take milliseconds): say so
 const sleepMs = ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms)
 
-/** Moves a lock folder no live process holds out of the way (then removes it). False if it is held, too new, or gone. */
-function breakStale(dir) {
+/**
+ * One look at a lock folder that exists: { cleared, ageMs } (ageMs: its age as this look read it, null if it was
+ * gone). Cleared: moved out of the way (then removed), as no live process held it and it wasn't new; not cleared if it
+ * is held, new, or gone.
+ */
+function staleCheck(dir) {
   let st
-  try { st = fs.statSync(dir) } catch { return false }
-  if (Date.now() - st.birthtimeMs < STALE_MS) return false
+  try { st = fs.statSync(dir) } catch { return { cleared: false, ageMs: null } }
+  const ageMs = Date.now() - st.birthtimeMs
+  if (ageMs < STALE_MS) return { cleared: false, ageMs }
   const aside = `${dir}.stale-${process.pid}-${crypto.randomBytes(4).toString('hex')}`
-  try { fs.renameSync(dir, aside) } catch { return false } // held (EBUSY), or another clearer moved it first
+  try { fs.renameSync(dir, aside) } catch { return { cleared: false, ageMs } } // held (EBUSY), or another clearer moved it first
   try { fs.rmSync(aside, { recursive: true, force: true }) } catch { /* a leftover beside the state: harmless */ }
-  return true
+  return { cleared: true, ageMs }
 }
+/** Moves a lock folder no live process holds out of the way. False if it is held, too new, or gone. */
+const breakStale = dir => staleCheck(dir).cleared
 
-/** Runs fn holding the state file's lock (sync). */
-function withLock(file, fn) {
+/**
+ * Runs fn holding the state file's lock (sync). For the tests: onRefused(n, check) is called each time an attempt
+ * finds the lock there and doesn't clear it (n from 1), before it waits and tries again (a sign that this process
+ * tried and was kept out); onCheck(check) for every look at a lock found there (staleCheck's { cleared, ageMs }).
+ */
+function withLock(file, fn, { onRefused = null, onCheck = null } = {}) {
+  let refused = 0
   const dir = `${file}.lock`
   const home = process.cwd()
   const t0 = Date.now()
@@ -56,7 +68,11 @@ function withLock(file, fn) {
         }
         process.chdir(home)
       }
-    } else breakStale(dir)
+    } else {
+      const check = staleCheck(dir)
+      if (onCheck) onCheck(check)
+      if (!check.cleared && onRefused) onRefused(++refused, check)
+    }
     if (Date.now() - t0 > LOCK_WAIT_MS) throw new Error(`the stub state's lock (${dir}) stays held`)
     sleepMs(2)
   }
