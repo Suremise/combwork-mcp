@@ -79,7 +79,9 @@ The full model: [docs/security.md](docs/security.md).
    setting is in `combwork-mcp.example.json` with its default ([configuration](docs/configuration.md)).
 4. Ask an agent to plan a pool (next section).
 
-**Upgrading:** run setup again before using a new server (`install.cmd` alone is enough: it keeps your settings). An older helper refuses
+**Upgrading:** run setup again before using a new server. `install.cmd` with no options is enough: a rerun keeps your settings,
+`-Mode` and `-User` included. The one exception is an install from before this release that used `-Mode Direct` or
+another `-User`: pass those once, since its policy didn't record them. An older helper refuses
 newer features with "run setup again"; the pool's VMs and images are kept. What each release changed:
 [docs/upgrading.md](docs/upgrading.md).
 

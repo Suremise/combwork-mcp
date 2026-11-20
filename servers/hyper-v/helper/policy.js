@@ -75,6 +75,9 @@ function problems(p) {
   if (p.hostNetwork !== undefined) { const why = net.hostNetworkProblem(p.hostNetwork); if (why) out.push(why) }
   out.push(...timing.capsProblems(p.timingCaps)) // MC-1558: each a known key, a number within its floor and maximum
   if (p.approvePoolChanges !== undefined && !['within-caps', 'each'].includes(p.approvePoolChanges)) out.push('approvePoolChanges must be within-caps or each')
+  // MC-1592: setup's own -Mode and -User, recorded so a rerun keeps them; the helper doesn't use them.
+  if (p.setupMode !== undefined && !['Service', 'Direct'].includes(p.setupMode)) out.push('setupMode must be Service or Direct')
+  if (p.setupUser !== undefined && (typeof p.setupUser !== 'string' || !p.setupUser)) out.push('setupUser must be an account name')
   if (!int(p.maxReservePercent, 0, 100)) out.push('maxReservePercent must be 0-100')
   // MC-1579: leases and sessions have no ceiling (formerly 24 h): the helper waits for a deadline past Node's timer
   // limit in steps, and ends a session no later than the last date JavaScript can hold (core.js, DATE_MAX_MS).

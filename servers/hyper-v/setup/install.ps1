@@ -114,6 +114,13 @@ $HVADMINS = 'S-1-5-32-578'
 $curPolicy = $null
 $curPolicyFile = Join-Path $state 'policy.json'
 if (Test-Path -LiteralPath $curPolicyFile) { try { $curPolicy = Get-Content -Raw -LiteralPath $curPolicyFile | ConvertFrom-Json } catch { $curPolicy = $null } }
+# MC-1592 round 1: -Mode and -User, left out on a rerun, are the install's own (policy.json's setupMode and setupUser,
+# recorded from this release on). A policy from before them gives none: Service and the caller, as before, so an
+# older direct-mode install passes -Mode Direct -User <account> once.
+# MC-1592 mode begin
+if (-not $PSBoundParameters.ContainsKey('Mode') -and $curPolicy -and @('Service', 'Direct') -contains [string]$curPolicy.setupMode) { $Mode = [string]$curPolicy.setupMode }
+if (-not $PSBoundParameters.ContainsKey('User') -and $curPolicy -and [string]$curPolicy.setupUser) { $User = [string]$curPolicy.setupUser }
+# MC-1592 mode end
 
 # 1. Hyper-V
 if (-not (Get-Command Get-VM -ErrorAction SilentlyContinue) -or -not (Get-Service vmms -ErrorAction SilentlyContinue)) {
@@ -217,6 +224,17 @@ $lim = [ordered]@{
 }
 # MC-1592 end
 $poolMaxVms = $lim.maxVms
+# MC-1592 round 1: the timing caps an admin set in policy.json (MC-1558; setup has no option for them) are kept,
+# checked with the helper's own code before anything changes.
+$timingCaps = if ($curPolicy -and $null -ne $curPolicy.timingCaps) { $curPolicy.timingCaps } else { $null }
+if ($null -ne $timingCaps) {
+  $nodeCaps = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
+  if (-not $nodeCaps) { throw 'Node (18 or later) is not on PATH.' }
+  $why = (ConvertTo-Json -InputObject $timingCaps -Depth 4 -Compress) | & $nodeCaps -e "const t = require(process.argv[1]); let s = ''; process.stdin.on('data', d => s += d).on('end', () => process.stdout.write(t.capsProblems(JSON.parse(s)).join('; ')))" (Join-Path $src 'helper\timing.js')
+  if ($LASTEXITCODE) { throw 'The timing caps check (node) failed.' }
+  if ($why) { throw "policy.json's timingCaps can't be used: $why. Fix them in policy.json, or remove them. Nothing was changed." }
+  $limitsReport.kept += "timingCaps $(ConvertTo-Json -InputObject $timingCaps -Depth 4 -Compress)"
+}
 # A project's cap or reservation for the report: a number (Windows), or one per OS, never cast.
 function Format-Share($v) {
   if ($null -eq $v) { return 'none' }
@@ -418,6 +436,7 @@ if ($wantHost) {
 
 # 7. The policy: hard limits for every pool change, writable only by Administrators and SYSTEM. Written with its final
 # ACL from the moment it exists (a new file, then renamed over the old one).
+# MC-1592 policy begin
 $policy = [ordered]@{
   schema = 1; prefix = 'hvmcp'
   maxVms = $lim.maxVms; maxCoresPerVm = $lim.maxCoresPerVm; maxMemoryMBTotal = $lim.maxMemoryMBTotal
@@ -430,6 +449,9 @@ $policy = [ordered]@{
 if ($projects.Count) { $policy.projects = @($projects) } # checked, against this maxVms, before anything changed
 foreach ($k in 'maxSessionMinutes', 'maxLeaseCheckpoints', 'maxCheckpointsPerVm', 'minFreeGBForCheckpoint') { if ($null -ne $lim[$k]) { $policy[$k] = $lim[$k] } }
 if ($hostNetwork) { $policy.hostNetwork = $hostNetwork } # MC-1556
+if ($null -ne $timingCaps) { $policy.timingCaps = $timingCaps } # MC-1592 round 1: kept on a rerun
+$policy.setupMode = $Mode; $policy.setupUser = $User # MC-1592 round 1: a rerun's defaults
+# MC-1592 policy end
 $policyFile = Join-Path $state 'policy.json'
 Write-SecureFile $policyFile ($policy | ConvertTo-Json -Depth 4) @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=ReadAndExecute") $ADMINS
 $keyFile = Join-Path (Join-Path $state 'secrets') 'product-key.json'
@@ -455,7 +477,7 @@ Step "Product key (-ProductKeyFile): $keyLine."
 Step $(if ($defaultSwitch) { "Default Switch: present. Each evaluation VM goes online through it once, when it is built, to activate Windows (about 90 days from then); runs use it only in the internet modes, when a plan the user approved allows them." } else { "Default Switch: absent. Evaluation VMs can't be activated here, so pools need a non-evaluation image (an own copy, built offline), and the internet modes can't be used." })
 # MC-1592: which limits a rerun kept, which the options changed, and which were set now.
 if ($limitsReport.changed.Count) { Step "Policy changed by this run's options: $($limitsReport.changed -join '; ')." }
-if ($curPolicy -and $limitsReport.kept.Count) { Step "Policy kept from the current policy.json (not passed): $($limitsReport.kept -join '; ')." }
+if ($curPolicy -and $limitsReport.kept.Count) { Step "Policy kept as it was (not passed, or passed unchanged): $($limitsReport.kept -join '; ')." }
 if ($limitsReport.set.Count) { Step "Policy set now ($(if ($curPolicy) { 'not in the current policy.json yet' } else { 'first install' })): $($limitsReport.set -join '; ')." }
 Step ("Policy: up to {0} VMs, {1} cores each, {2} GB memory in all, {3} GB disks; network {4}; images: any ISO or qcow2 file the plan you approve names; leases up to {5} min, work sessions up to {6} min; pool changes: {7}." -f $policy.maxVms, $policy.maxCoresPerVm, ($policy.maxMemoryMBTotal / 1024), $policy.maxDiskGBPerVm, "up to $netMode (each pool's mode is chosen in the plan you approve)", $lim.maxLeaseMinutes, $(if ($null -ne $lim.maxSessionMinutes) { $lim.maxSessionMinutes } else { [Math]::Max($lim.maxLeaseMinutes, 480) }), $(if ($approveMode -eq 'each') { 'each one approved (approve.cmd)' } else { 'within these caps they apply without approval; a new image, a guest setup script or a ready-made disk still asks (-ApprovePoolChanges Each for every one)' }))
 

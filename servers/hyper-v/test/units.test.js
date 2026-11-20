@@ -813,3 +813,56 @@ for (const E of ENGINES) test(`setup: a rerun keeps -DiskFolder and -BuildRoot w
   const said = (first.stdout + first.stderr).replace(/\x1b\[[0-9;]*m/g, '').replace(/\s*\r?\n\s*\|\s*/g, ' ').replace(/\s+/g, ' ')
   assert.match(said, /Name a folder for the VMs' disks: -DiskFolder D:\\hyperv-mcp \(needed on a first install; a rerun keeps the current one\)/)
 })
+
+// MC-1592 round 1: the policy setup writes on a rerun (its own block, cut from install.ps1, given the resolved values):
+// an admin's timingCaps kept, and still a policy the helper loads with them; a one-cap change changes only that cap;
+// -Mode and -User recorded. And the -Mode/-User block: left out on a rerun, the recorded ones; an older policy without
+// them gives Service and the caller, as before.
+for (const E of ENGINES) test(`setup: a rerun's policy keeps timingCaps and records -Mode and -User; left out, they're kept (PowerShell ${E.name})`, () => {
+  const { spawnSync } = require('child_process')
+  const src = fs.readFileSync(path.join(__dirname, '..', 'setup', 'install.ps1'), 'utf8')
+  const block = /^# MC-1592 policy begin[\s\S]*?^# MC-1592 policy end$/m.exec(src)
+  const mode = /^# MC-1592 mode begin[\s\S]*?^# MC-1592 mode end$/m.exec(src)
+  assert.ok(block && mode, 'the policy and mode blocks in install.ps1')
+  const sc = scratch(`setup-policy-${E.name}`)
+  const cur = path.join(sc.dir, 'policy.json')
+  const caps = { outputBytes: 4096, commandChars: 1000 }
+  const stored = { schema: 1, maxVms: 2, maxCoresPerVm: 2, maxMemoryMBTotal: 8192, maxDiskGBPerVm: 200, diskFolders: ['D:\\hv'], maxNetwork: 'host', timingCaps: caps, setupMode: 'Direct', setupUser: 'PC\\tester' }
+  fs.writeFileSync(cur, JSON.stringify(stored))
+  const file = path.join(sc.dir, 'policy.ps1')
+  fs.writeFileSync(file, [
+    "param([int]$Disk = 200, [string]$Current = '', [string]$Mode = 'Service', [string]$User = 'PC\\caller')",
+    "$ErrorActionPreference = 'Stop'",
+    "$curPolicy = if ($Current) { Get-Content -Raw -LiteralPath $Current | ConvertFrom-Json } else { $null }",
+    mode[0],
+    "$lim = [ordered]@{ maxVms = 2; maxCoresPerVm = 2; maxMemoryMBTotal = 8192; maxDiskGBPerVm = $Disk; maxReservePercent = 100; maxLeaseMinutes = 240; maxBuildMB = 2048; maxSessionMinutes = $null; maxLeaseCheckpoints = $null; maxCheckpointsPerVm = $null; minFreeGBForCheckpoint = $null }",
+    "$folders = @('D:\\hv'); $netMode = 'host'; $buildRoots = @(); $approveMode = 'within-caps'; $projects = @(); $hostNetwork = $null",
+    "$timingCaps = if ($curPolicy -and $null -ne $curPolicy.timingCaps) { $curPolicy.timingCaps } else { $null }",
+    block[0],
+    'ConvertTo-Json -InputObject $policy -Depth 4 -Compress'
+  ].join('\n'))
+  const run = args => {
+    const r = spawnSync(E.exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', `& '${file}' ${args}`], { encoding: 'utf8', env: E.env })
+    assert.strictEqual(r.status, 0, r.stderr + r.stdout)
+    return JSON.parse(r.stdout.trim())
+  }
+  const written = run(`-Current '${cur}'`)
+  assert.deepStrictEqual(written.timingCaps, caps, 'the timing caps kept')
+  assert.deepStrictEqual([written.setupMode, written.setupUser], ['Direct', 'PC\\tester'], 'the recorded mode and user, not the defaults')
+  assert.deepStrictEqual(policy.problems({ ...written, hostNetwork: { switchId: '00000000-0000-0000-0000-000000000000', switchName: 'hvmcp-host', subnet: '10.137.42.0/24', hostAddress: '10.137.42.1' } }), [])
+  // The helper still uses them: they cap the timings it resolves.
+  const loaded = policy.load((() => { const d = path.join(sc.dir, 'state'); fs.mkdirSync(d, { recursive: true }); fs.writeFileSync(path.join(d, 'policy.json'), JSON.stringify({ ...written, maxNetwork: 'none' })); return d })())
+  assert.deepStrictEqual(loaded.timingCaps, caps)
+  // One cap changed: only that one; the caps, mode and user still kept.
+  const one = run(`-Current '${cur}' -Disk 300`)
+  assert.strictEqual(one.maxDiskGBPerVm, 300)
+  assert.deepStrictEqual([one.timingCaps, one.setupMode, one.maxVms], [caps, 'Direct', 2])
+  // Passed: they replace the recorded ones.
+  const passed = run(`-Current '${cur}' -Mode Service -User 'PC\\other'`)
+  assert.deepStrictEqual([passed.setupMode, passed.setupUser], ['Service', 'PC\\other'])
+  // An older policy without them: Service and the caller, as before; no timing caps, none written.
+  fs.writeFileSync(cur, JSON.stringify({ schema: 1, maxVms: 2 }))
+  const older = run(`-Current '${cur}'`)
+  assert.deepStrictEqual([older.setupMode, older.setupUser, older.timingCaps], ['Service', 'PC\\caller', undefined])
+  assert.deepStrictEqual(policy.problems({ ...policy.DEFAULTS, diskFolders: ['D:\\hv'], setupMode: 'Elsewhere' }), ['setupMode must be Service or Direct'])
+})
