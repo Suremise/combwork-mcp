@@ -38,7 +38,8 @@ const DEFAULTS = {
 const HV = Object.freeze({ checkpoints: 50 })
 // A VM holds its clean checkpoint, its pool checkpoints (maxCheckpointsPerVm, counting retiring ones and ones being
 // taken), the lease's own (maxLeaseCheckpoints), and for a moment during a refresh a second clean one: so the two
-// policy numbers together may be at most Hyper-V's 50 less those 2.
+// policy numbers together may be at most Hyper-V's 50 less those 2. MC-1589: a persistent VM's own checkpoints (kept
+// across leases, and its lease's) count within maxCheckpointsPerVm with its pool checkpoints, so it stays under too.
 const CHECKPOINTS_FREE = HV.checkpoints - 2
 const DEFAULT_LEASE_CHECKPOINTS = 3
 const DEFAULT_POOL_CHECKPOINTS = 4

@@ -354,7 +354,8 @@ function run(s, op, a) {
       // productionFail: Hyper-V's own terminal failure, answered as such (failed: true), as hv.ps1 does.
       if (s.productionFail) { vm.checkpointType = orig; return { failed: true, error: 'injected: a production checkpoint could not be made', checkpointType: orig } }
       // productionCallDies: the call itself fails (transport, a killed process): the outcome is unknown.
-      if (s.productionCallDies) { vm.checkpointType = orig; throw new Error('injected: the take call died') }
+      // With typeRestoreFails (MC-1589): it died before putting the type back, leaving ProductionOnly and no snapshot.
+      if (s.productionCallDies) { if (!s.typeRestoreFails) vm.checkpointType = orig; throw new Error('injected: the take call died') }
       const id = crypto.randomUUID()
       const cp = { id, name: a.snapName, parentId: vm.parent, disk: { ...vm.disk }, switchName: vm.switchName, acls: vm.acls || [], reserve: vm.reserve, production: true }
       if (s.productionFailDelayed) { vm.delayedTake = { cp, listings: 0 }; vm.checkpointType = orig; throw new Error('injected: the take call failed; Hyper-V finishes it later') }

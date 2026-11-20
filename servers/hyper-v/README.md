@@ -4,7 +4,8 @@ An MCP server that gives agents **disposable Hyper-V test VMs** from a pool. An 
 clean checkpoint with a build copied in, runs commands, reads files back, and stops it, which restores it. Several
 agents can each hold VMs at once, Windows or Linux (from a qcow2 cloud image you choose). A work session can keep its
 VM running (`vm_sync`, `vm_reset`, `vm_renew`); release still restores it. VMs are disposable by default; a pool may
-also hold **persistent** VMs, built only when you ask, which keep their state between leases for research (see
+also hold **persistent** VMs, built only when you ask, which keep their state and their checkpoints between leases
+for research (see
 [Persistent VMs](docs/tools.md#persistent-vms-a-vm-the-user-keeps-for-research-mc-1582)).
 
 It's the catalogue's alternative to [`windows-sandbox`](../windows-sandbox/): Windows Sandbox runs one guest at a time,

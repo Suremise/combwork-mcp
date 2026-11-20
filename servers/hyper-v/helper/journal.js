@@ -33,7 +33,9 @@
  *   quarantine{ vmId, why } / unquarantine { vmId }       a VM that couldn't be confirmed clean, and its release
  *   lcp-take  { opId, vmId, leaseId, name, snapName, origType }  MC-1529: before a lease checkpoint's take (its Hyper-V
  *             name is snapName, hvmcp-lease-<opId>; origType the VM's checkpoint type before it); lcp-taken { opId, checkpointId } once confirmed; lcp-drop { opId }
- *             before its removal; lcp-dropped { opId } once confirmed gone (or never made)
+ *             before its removal; lcp-dropped { opId } once confirmed gone (or never made); lcp-keep { opId, checkpointId }
+ *             MC-1589: a persistent VM's lease checkpoint, settled at its lease's end as the VM's (kept across leases,
+ *             its checkpoint type already put back), until it is removed on request (lcp-drop, lcp-dropped) or with the VM
  *   pcp-select { opId, name, vmId, checkpointId, snapName, owner, image, os, at, sourceLease, replaces? }  MC-1532: a
  *             pool checkpoint published (its take, an lcp-take of the source lease, leaves the lease's records); the one
  *             it replaces starts retiring; pcp-retire { vmId, checkpointId } retires one by plan; pcp-retired
@@ -128,7 +130,7 @@ class Journal {
    */
   state() {
     // leaseSnaps (MC-1529): lease checkpoints not yet confirmed removed, by opId: { opId, vmId, leaseId, name, snapName,
-    // checkpointId (null until its take is confirmed), at, dropping }.
+    // checkpointId (null until its take is confirmed), at, dropping, kept (MC-1589: a persistent VM's, outliving its lease) }.
     // poolSnaps (MC-1532): published pool checkpoints by checkpointId: { checkpointId, opId, name, vmId, snapName, owner,
     // image, os, at, sourceLease, retiring }.
     const s = { vms: new Map(), intents: new Map(), jobs: new Map(), usedNonces: new Set(), usedPlans: new Set(), approvedImages: new Set(), approvalsMigrated: false, images: new Map(), switch: null, network: 'none', quarantined: new Map(), leaseSnaps: new Map(), poolSnaps: new Map(), refreshes: new Map() }
@@ -182,10 +184,12 @@ class Journal {
           break
         case 'pool-network': s.network = r.mode; break
         // MC-1529: a lease checkpoint's life: intent before the take, its id once confirmed, intent before removal, gone.
-        case 'lcp-take': s.leaseSnaps.set(r.opId, { opId: r.opId, vmId: r.vmId, leaseId: r.leaseId, name: r.name, snapName: r.snapName, origType: r.origType ?? null, checkpointId: null, at: r.at, dropping: false }); break
+        case 'lcp-take': s.leaseSnaps.set(r.opId, { opId: r.opId, vmId: r.vmId, leaseId: r.leaseId, name: r.name, snapName: r.snapName, origType: r.origType ?? null, checkpointId: null, at: r.at, dropping: false, kept: false }); break
         case 'lcp-taken': { const x = s.leaseSnaps.get(r.opId); if (x) x.checkpointId = r.checkpointId; break }
         case 'lcp-drop': { const x = s.leaseSnaps.get(r.opId); if (x) x.dropping = true; break }
         case 'lcp-dropped': s.leaseSnaps.delete(r.opId); break
+        // MC-1589: a persistent VM's lease checkpoint, kept with the VM once its lease ended (no lease owns it now).
+        case 'lcp-keep': { const x = s.leaseSnaps.get(r.opId); if (x) Object.assign(x, { kept: true, checkpointId: r.checkpointId, origType: null, dropping: false }); break }
         // MC-1532: a pool checkpoint published (out of the lease's records, durably), the one it replaces retiring in the
         // same record; retired by plan; gone once its removal is confirmed.
         case 'pcp-select': {
