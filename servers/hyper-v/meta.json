@@ -1,5 +1,5 @@
 {
-  "version": "4.2.0",
+  "version": "5.0.0",
   "description": "Disposable Hyper-V test VMs from a pool, Windows or Linux (Debian, Ubuntu): several agents at once, from a clean or shared checkpoint or kept warm; lease checkpoints; session 0, desktop or SSH runs.",
   "tags": ["testing", "windows", "linux", "hyper-v", "vm"],
   "requires": {
