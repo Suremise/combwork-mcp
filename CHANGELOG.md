@@ -4,6 +4,27 @@ What each release changed, by server. A release is one tag, `v<version>` ([RELEA
 keeps its own version in `servers/<name>/meta.json`. Releases before 1.8.0 are on the
 [releases page](https://github.com/Suremise/combwork-mcp/releases).
 
+## 1.9.0
+
+### hyper-v 5.1.0 (from 5.0.0)
+
+A minor version: new features for persistent VMs, nothing you must do. Rerun setup (`setup\install.cmd`, the same
+line, in an admin terminal) to get them: without it, the 5.1.0 server still does everything 5.0.0 did, and refuses
+`pool_persistence` and `vm_checkpoint`'s `remove` with "run setup again". See
+[upgrading.md](servers/hyper-v/docs/upgrading.md) ("From 5.0.0 to 5.1.0").
+
+- A persistent VM's checkpoints are the VM's, not the lease's: kept when the lease ends, listed in `vm_status`,
+  restorable by a later lease that names it, and removed only when you ask (`vm_checkpoint` with `remove: true`), all
+  within the policy's `maxCheckpointsPerVm` (MC-1589).
+- An existing pool VM can be made persistent, or disposable again (its clean checkpoint restored and verified first),
+  by a plan: `pool_plan` with `action: "persistence"`, applied with the new `pool_persistence` (MC-1591).
+- An interactive start works on a persistent VM: the logon is undone and verified before every park, UAC put back as
+  the guest had it, or the VM is quarantined (MC-1590).
+- The tests' stub helper keeps its state behind one lock and merges its saves, so parallel test calls don't lose each
+  other's changes; tests only, no change to the server or helper (MC-1594).
+
+ollama, trilium and windows-sandbox are unchanged (1.4.0, 1.2.0, 1.3.0).
+
 ## 1.8.0
 
 ### hyper-v 5.0.0 (from 4.0.0)

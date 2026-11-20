@@ -80,3 +80,15 @@ applies, and:
 - From this release on, a rerun keeps every setting you don't pass (MC-1592). This first rerun from 4.0.0 is the
   exception for `-Mode` and `-User`, which 4.0.0 didn't record: pass them again if you used `-Mode Direct` or another
   `-User`.
+
+**From 5.0.0 to 5.1.0 (persistent VMs, MC-1589 to MC-1591): rerun setup to get the new features; nothing else to do.**
+- The rerun (the same line) keeps every setting, `-Mode` and `-User` included, and the pool's VMs, images and
+  checkpoints.
+- Without it, the 5.0.0 helper works as before: a persistent VM's lease checkpoints are still removed when its lease
+  ends, and an interactive start on it is still refused. The 5.1.0 server refuses `pool_persistence`,
+  `pool_plan({ action: 'persistence' })` and `vm_checkpoint({ remove: true })` with "run setup again".
+- With it: a persistent VM keeps its checkpoints across leases (MC-1589), an existing VM can be switched between
+  persistent and disposable by a plan (MC-1591), and an interactive start works on a persistent VM, its logon undone
+  and verified before every park (MC-1590). See [Persistent VMs](tools.md#persistent-vms-a-vm-the-user-keeps-for-research-mc-1582).
+- From 4.0.0 straight to 5.1.0: one rerun covers both; follow "From 4.0.0 to 5.0.0" above (pass `-Mode` and `-User`
+  again if you used `-Mode Direct` or another `-User`).
