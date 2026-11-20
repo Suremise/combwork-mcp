@@ -30,8 +30,9 @@ never released on their own.
 - Every setting is in `combwork-mcp.example.json`'s `env` with its default; fixed limits became settings, with caps
   only where a larger value breaks something (MC-1579).
 - More than one VM per session, e.g. a Windows and a Linux VM together; every lease tool takes `vm` (MC-1580).
-- Disk folders at any depth; a storage folder's extra read-only or write grant is shown and removed on the admin's
-  word (MC-1581).
+- Disk folders at any depth. Setup shows another account's extra grant on a disk folder, read-only or able to write,
+  and removes it only when the admin types REMOVE; the state folder still refuses any other account's write grant
+  (MC-1581).
 - A persistent VM you keep, for research (MC-1582).
 - Uninstall asks once, showing what goes, its answer bound to the exact VMs (MC-1583).
 - A short README; the detail moves to `docs/`, linked (MC-1584).

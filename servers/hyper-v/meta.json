@@ -10,6 +10,6 @@
       "features": ["Hyper-V"]
     },
     "node": ">=18",
-    "apps": ["Its helper service, set up once in an admin terminal (setup\\install.cmd), and again after upgrading", "A Windows x64 ISO of your choice for the pool's VMs (for example Microsoft's Windows 11 Enterprise evaluation, or your own copy with its product key), downloaded yourself: the helper downloads nothing", "For Linux guests only: Windows' OpenSSH Client (an optional feature), and a qcow2 cloud image of your choice (Debian 13 and Ubuntu 26.04 have been run)"]
+    "apps": ["Its helper service, set up once in an admin terminal (setup\\install.cmd), and again after upgrading", "For Windows VMs, one of: a Windows x64 ISO of your choice (for example Microsoft's Windows 11 Enterprise evaluation, or your own copy with its product key), downloaded yourself (the helper downloads nothing); or a ready-made, not sysprepped Windows .vhdx or one of your own VMs, with its admin account's password, typed when you approve", "For Linux guests only: Windows' OpenSSH Client (an optional feature), and a qcow2 cloud image of your choice (Debian 13 and Ubuntu 26.04 have been run)"]
   }
 }
