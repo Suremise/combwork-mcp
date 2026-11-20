@@ -436,3 +436,101 @@ test('MC-1589 round 1: an interrupted take on a persistent VM that made nothing 
   assert.ok(sc.journal().some(r => r.opId === opId && r.t === 'lcp-dropped'), 'then settled as never made')
   assert.ok(!sc.journal().some(r => r.t === 'lcp-keep'), 'nothing kept')
 })
+
+// MC-1591: an existing VM switched by a persistence plan (pool_plan action persistence, applied by pool_persistence),
+// journalled; made disposable, it is restored to clean and verified first (its kept checkpoints removed); leased, it is
+// refused at the plan and skipped by the job.
+async function switchVm(admin, sc, targets, persistent) {
+  const plan = await admin.request('pool_plan', { action: 'persistence', targets, persistent })
+  approve(sc, plan.data.planId)
+  const applied = await admin.request('pool_persistence', { planId: plan.data.planId })
+  let st = ''
+  await waitFor(async () => /Last pool job: persistence (finished|FAILED)/.test(st = (await admin.request('status')).text), T.poolJobMs, 'the persistence job')
+  return { plan, applied, note: /Last pool job: persistence [^\n]*/.exec(st)[0] }
+}
+
+test('MC-1591: a disposable VM made persistent by a plan: journalled, leased only by name from then on, its state kept at release', async t => {
+  const { sc, h, admin, disposable } = await pool('pers-switch-on')
+  let helper = h
+  t.after(() => helper.stop())
+  const { plan, note } = await switchVm(admin, sc, [disposable.name], true)
+  assert.match(plan.text, new RegExp(`^Plan p-[0-9a-f]+ \\(persistence\\)`))
+  assert.match(plan.text, new RegExp(`- make ${disposable.name} persistent: from now on it is never restored to clean at release, .*plain acquires stop getting it, vm_acquire\\(\\{ vm \\}\\) does; .*It starts from its clean checkpoint, as it is now\\.`))
+  const file = JSON.parse(fs.readFileSync(path.join(sc.stateDir, 'plans', `${plan.data.planId}.json`), 'utf8'))
+  assert.deepStrictEqual(file.persistence.map(e => [e.vmId, e.persistent]), [[disposable.id, true]], 'bound in the plan record')
+  assert.match(note, new RegExp(`finished: .*${disposable.name}: persistent now`))
+  assert.ok(sc.journal().some(r => r.t === 'persistence' && r.vmId === disposable.id && r.persistent === true), 'journalled')
+  assert.match((await admin.request('status')).text, new RegExp(`- ${disposable.name}: [^\\n]*PERSISTENT`))
+  // Both VMs persistent now: a plain acquire gets neither; a named one does, and the VM keeps what it left.
+  await assert.rejects(h.conn(10).request('acquire', { minutes: 30 }), /No VM is free|none is free/)
+  const r0 = restores(sc, disposable)
+  const c = h.conn(11)
+  await leaseAndWrite(c, disposable.name)
+  await c.request('release')
+  assert.ok(stubOf(sc, disposable).disk[KEEP], 'kept at release')
+  assert.strictEqual(restores(sc, disposable), r0, 'parked, not restored')
+  // A helper restart keeps it persistent (the journal).
+  await helper.stop()
+  helper = await startHelper(sc)
+  assert.match((await helper.conn(1).request('status')).text, new RegExp(`- ${disposable.name}: [^\\n]*PERSISTENT`))
+})
+
+test('MC-1591: a persistent VM made disposable again: restored to clean and verified first, its kept checkpoints removed, then plain acquires get it', async t => {
+  const { sc, h, admin, persistent } = await pool('pers-switch-off')
+  t.after(() => h.stop())
+  const c = h.conn(10)
+  await leaseAndWrite(c, persistent.name)
+  await c.request('checkpoint', { name: 'kept' })
+  await c.request('release')
+  const r0 = restores(sc, persistent)
+  const { plan, note } = await switchVm(admin, sc, [persistent.name], false)
+  assert.match(plan.text, new RegExp(`- make ${persistent.name} disposable again: its clean checkpoint is restored first and verified \\(Off, at the checkpoint, network disconnected, no CPU reserve\\), which DISCARDS what it kept \\(installed software, files, settings, C:\\\\out, anything a run did\\) and removes the checkpoints it kept \\("kept"\\); its pool checkpoints stay\\.`))
+  assert.match(note, new RegExp(`${persistent.name}: disposable again, restored to clean \\(verified\\); the checkpoints it kept are removed`))
+  const jr = sc.journal()
+  const flip = jr.findIndex(r => r.t === 'persistence' && r.vmId === persistent.id && r.persistent === false)
+  assert.ok(flip >= 0, 'journalled')
+  assert.strictEqual(restores(sc, persistent), r0 + 1, 'restored once, by the job')
+  const vm = stubOf(sc, persistent)
+  assert.ok(!vm.disk[KEEP], 'what it kept is discarded')
+  assert.deepStrictEqual(vm.checkpoints.map(x => x.name), ['clean'], 'its kept checkpoint removed')
+  assert.deepStrictEqual([vm.state, vm.switchName, vm.reserve, vm.parent], ['Off', null, 0, vm.checkpoints[0].id], 'verified clean')
+  const st = (await admin.request('status')).text
+  assert.doesNotMatch(st, new RegExp(`- ${persistent.name}: [^\\n]*PERSISTENT`))
+  assert.doesNotMatch(st, /checkpoints it keeps/)
+  // Plain acquires get it now (two disposable VMs, two plain leases).
+  const got = [(await h.conn(11).request('acquire', { minutes: 30 })).data.vm, (await h.conn(12).request('acquire', { minutes: 30 })).data.vm]
+  assert.ok(got.includes(persistent.name), `a plain acquire got it: ${got}`)
+})
+
+test('MC-1591: refusals: a leased VM (at the plan, and skipped by the job if leased since), the state it already has, bad arguments', async t => {
+  const { sc, h, admin, persistent, disposable } = await pool('pers-switch-refuse')
+  t.after(() => h.stop())
+  const c = h.conn(10)
+  await c.request('acquire', { vm: persistent.name, minutes: 30 })
+  await assert.rejects(admin.request('pool_plan', { action: 'persistence', targets: [persistent.name], persistent: false }), new RegExp(`${persistent.name} is leased: its lease must end before it can be switched\\. Nothing was planned\\.`))
+  await assert.rejects(admin.request('pool_plan', { action: 'persistence', targets: [disposable.name], persistent: false }), /is already disposable/)
+  await assert.rejects(admin.request('pool_plan', { action: 'persistence', targets: [disposable.name] }), /persistent must be true .* or false/)
+  await assert.rejects(admin.request('pool_plan', { action: 'persistence', targets: [], persistent: true }), /targets must list at least one VM name/)
+  await assert.rejects(admin.request('pool_plan', { action: 'persistence', targets: ['nope'], persistent: true }), /No ready VM named nope/)
+  // Planned while free, leased before it applies: skipped, not switched.
+  const plan = await admin.request('pool_plan', { action: 'persistence', targets: [disposable.name], persistent: true })
+  approve(sc, plan.data.planId)
+  assert.strictEqual((await h.conn(11).request('acquire', { minutes: 30 })).data.vm, disposable.name)
+  await admin.request('pool_persistence', { planId: plan.data.planId })
+  await waitFor(async () => /Last pool job: persistence finished: [^\n]*skipped \(leased/.test((await admin.request('status')).text), T.poolJobMs, 'the job, skipping it')
+  assert.ok(!sc.journal().some(r => r.t === 'persistence'), 'nothing switched')
+  await assert.rejects(admin.request('pool_persistence', { planId: plan.data.planId }), /already applied/)
+})
+
+test('MC-1591: a switch to disposable whose restore fails quarantines the VM (no lease gets it) until a retry restores it', async t => {
+  const { sc, h, admin, persistent } = await pool('pers-switch-fail', { env: T.profile('retryQuick') })
+  t.after(() => h.stop())
+  const c = h.conn(10)
+  await leaseAndWrite(c, persistent.name)
+  await c.request('release')
+  sc.patchStub(s => { s.fail.restore = 1 })
+  const { note } = await switchVm(admin, sc, [persistent.name], false)
+  assert.match(note, new RegExp(`${persistent.name}: disposable now, but its restore didn't verify .*quarantined until a restore confirms it`))
+  await waitFor(async () => !/QUARANTINED/.test((await admin.request('status')).text), T.waitForMs, 'the retry\'s restore')
+  assert.ok(!stubOf(sc, persistent).disk[KEEP], 'restored by the retry (not parked)')
+})

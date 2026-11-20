@@ -16,6 +16,7 @@ Every tool, sessions, checkpoints, persistent VMs, projects and builds. Part of 
 | `vm_stop({ keep=false })` | A disposable VM: turns it off and restores the clean checkpoint, then **verifies** it (a persistent VM is shut down and disconnected instead, keeping its state: see [Persistent VMs](#persistent-vms-a-vm-the-user-keeps-for-research-mc-1582)): Off, at the checkpoint (by id), adapter disconnected, reserve 0. It says "Reverted" only then. Otherwise **CLEANUP FAILED**, and the VM is quarantined. The lease stays. `keep` (or a failed run with `keepOnFailure`) leaves it as it is until release or the deadline. |
 | `vm_checkpoint({ name })` | Takes a named checkpoint of your leased VM as it runs now: files, installed software and the registry (a production checkpoint, disk only: not running programs or a logon session). Yours only, removed when the lease ends (a persistent VM keeps them across leases). `remove: true` removes the named one. See [Checkpoints within a lease](#checkpoints-within-a-lease). |
 | `vm_restore({ name })` | Restores one of your lease's checkpoints and starts the VM from it, with the lease's current network and CPU reserve. No one is logged on interactively afterwards, and C:\build is unconfirmed until a full `vm_sync`. |
+| `pool_persistence({ planId })` | Carries out a persistence plan (`pool_plan({ action: 'persistence', targets, persistent })`): each VM made persistent, or disposable again with its clean checkpoint restored and verified first. See [Persistent VMs](#persistent-vms-a-vm-the-user-keeps-for-research-mc-1582). |
 | `pool_refresh({ planId })` | Carries out an approved refresh-clean plan: reruns the build's guest setup on each VM (profiles kept as built) and makes that its new clean checkpoint, keeping its pool checkpoints and evaluation days. See [Refreshing a VM's clean checkpoint in place](#refreshing-a-vms-clean-checkpoint-in-place). |
 | `pool_checkpoint({ planId })` | Carries out an approved pool-checkpoint plan: publishes (or replaces, or removes) a named checkpoint of each VM a lease prepared. See [Pool checkpoints](#pool-checkpoints-a-prepared-state-any-lease-can-start-from). |
 | `vm_release()` | Restores the VM (as `vm_stop`; a persistent VM is parked, keeping its state) and ends the lease. |
@@ -165,7 +166,17 @@ projects start from (MC-1532) and refreshing the clean checkpoint in place (MC-1
 Every pool VM is disposable by default: restored to its clean checkpoint at every start and release. When the user asks
 for a VM to keep, for research, a create or resize plan can build persistent ones instead: `pool_plan({ action:
 'resize', vms: <n>, persistent: true })`. Every VM that plan builds is persistent. The plan says so, the approval shows
-it, and its digest binds it. An existing VM isn't converted: remove it and add a persistent one.
+it, and its digest binds it.
+
+**Switching an existing VM (MC-1591).** `pool_plan({ action: 'persistence', targets: [<names>], persistent: true })`
+makes free VMs persistent, and `persistent: false` makes them disposable again; `pool_persistence({ planId })`
+carries the plan out as a pool job, VM by VM, each switch journalled. It applies like any plan: within the policy's
+caps without approval (setup's default, WithinCaps), or approved by the user when setup chose Each. A VM made
+persistent starts from its clean checkpoint, as it is. A VM made disposable is **restored to its clean checkpoint
+first and verified**, which discards what it kept and the checkpoints it kept (the plan says so and names them; its
+pool checkpoints stay), so the next plain lease gets clean; a restore that fails quarantines it until a retry
+confirms it. A leased VM (or one kept for inspection), a quarantined or busy one, or one already as asked is refused
+at the plan; one leased after the plan was made is skipped by the job.
 
 **What a persistent VM gives up: the clean restore.** It is never restored at release, at its deadline, when its
 session disconnects, at a helper restart, after a cleanup failure, or at a plain `vm_start`. It is **parked** instead:

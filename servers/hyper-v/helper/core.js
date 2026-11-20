@@ -214,6 +214,7 @@ class Helper {
     this.unknownSnapshots = new Map() // MC-1529: vmId -> names of checkpoints neither clean nor a lease's: left alone
     this.pcpBusy = new Set() // MC-1532: VMs a pool-checkpoint operation has reserved: never leased or cleaned meanwhile
     this.refreshing = new Set() // MC-1531: VMs a clean refresh is working on: never leased meanwhile
+    this.switching = new Set() // MC-1591: VMs a persistence plan is switching: never leased meanwhile
     this.leases = new Map() // vmId -> lease
     this.conns = new Map() // connId -> { pid, vmId }
     this.job = null // the pool job in progress: { jobId, op, progress, promise }
@@ -598,7 +599,7 @@ class Helper {
   freeVms() {
     const s = this.state
     const now = this.now()
-    return [...s.vms.values()].filter(v => v.ready && !v.removing && !s.quarantined.has(v.vmId) && !this.leases.has(v.vmId) && !this.pcpBusy.has(v.vmId) && !this.refreshing.has(v.vmId) && !this.refreshOf(v.vmId) && (evalEnd(v) ?? Infinity) - now >= EVAL_LAST_MS)
+    return [...s.vms.values()].filter(v => v.ready && !v.removing && !s.quarantined.has(v.vmId) && !this.leases.has(v.vmId) && !this.pcpBusy.has(v.vmId) && !this.refreshing.has(v.vmId) && !this.switching.has(v.vmId) && !this.refreshOf(v.vmId) && (evalEnd(v) ?? Infinity) - now >= EVAL_LAST_MS)
   }
 
   // ---------- projects, fair share and the queue (MC-1502) ----------
@@ -1287,6 +1288,68 @@ class Helper {
   }
 
   // ---------- refreshing a VM's clean checkpoint (MC-1531) ----------
+
+  // ---------- switching a VM between persistent and disposable (MC-1591) ----------
+
+  /**
+   * MC-1591: a persistence plan: each target a ready pool VM, not leased (nor kept for inspection), not quarantined or
+   * busy, and not already as asked. Bound to its id and name and the state it switches from. persistent: true makes it
+   * persistent (it is clean now: a disposable VM is restored at every release); false makes it disposable again, its
+   * clean checkpoint restored and verified first, which discards what it kept and the checkpoints it kept.
+   */
+  async planPersistence(args) {
+    const list = Array.isArray(args.targets) ? args.targets : []
+    const names = [...new Set(list)]
+    if (!names.length || names.some(n => typeof n !== 'string')) throw new Error('targets must list at least one VM name (vm_status lists them).')
+    if (args.persistent !== true && args.persistent !== false) throw new Error('persistent must be true (make the targets persistent) or false (make them disposable again).')
+    const to = args.persistent
+    const s = this.state
+    const entries = []
+    for (const n of names) {
+      const vm = [...s.vms.values()].find(v => v.vmName === n)
+      if (!vm || !vm.ready || vm.removing || vm.debugKept) throw new Error(`No ready VM named ${n} in the pool.`)
+      if ((vm.persistent === true) === to) throw new Error(`${n} is already ${to ? 'persistent' : 'disposable'}.`)
+      if (this.leases.has(vm.vmId)) throw new Error(`${n} is leased${this.leases.get(vm.vmId).kept ? ' (kept for inspection)' : ''}: its lease must end before it can be switched. Nothing was planned.`)
+      if (s.quarantined.has(vm.vmId)) throw new Error(`${n} is quarantined (${s.quarantined.get(vm.vmId)}): plan again once the helper's retry has cleared it.`)
+      if (this.refreshOf(vm.vmId) || this.refreshing.has(vm.vmId) || this.pcpBusy.has(vm.vmId)) throw new Error(`${n} is busy (a refresh or pool-checkpoint operation): plan again when it has finished.`)
+      const kept = this.persistentCheckpoints(vm).filter(x => x.kept && !x.dropping).map(x => x.name)
+      entries.push({ vmId: vm.vmId, name: vm.vmName, persistent: to, ...(kept.length ? { kept } : {}) })
+    }
+    const plan = { id: `p-${hex(8)}`, op: 'persistence', epoch: this.journal.epoch, created: this.now(), expires: this.now() + PLAN_TTL_MS, prefix: this.policy.prefix, persistence: entries }
+    const bytes = Buffer.from(canonical(plan), 'utf8')
+    fs.writeFileSync(join(this.dir, 'plans', `${plan.id}.json`), bytes, { flag: 'wx' })
+    const digest = sha256(bytes)
+    return { text: this.planText(plan, digest), data: { planId: plan.id, digest } }
+  }
+
+  /**
+   * MC-1591: switches one VM, inside the pool job. Checked and held with no await between (never leased meanwhile),
+   * then under its VM lock. To persistent: journalled (persistence), nothing else changes. To disposable: journalled
+   * first, then restored like any disposable VM (clean by id, verified; the lease checkpoints it kept removed, since
+   * a disposable VM keeps none); a restore that fails quarantines it, so no lease gets it until a restore confirms it
+   * (a helper restart restores it too). Returns the job note's line.
+   */
+  async persistenceOne(job, e, label) {
+    const s = this.state
+    const vm0 = s.vms.get(e.vmId)
+    if (!vm0 || !vm0.ready || vm0.removing || vm0.vmName !== e.name) return `${e.name}: skipped (it changed since the plan: make a new one)`
+    if ((vm0.persistent === true) === e.persistent) return `${e.name}: skipped (already ${e.persistent ? 'persistent' : 'disposable'})`
+    if (this.leases.has(vm0.vmId) || s.quarantined.has(vm0.vmId) || this.pcpBusy.has(vm0.vmId) || this.refreshing.has(vm0.vmId) || this.switching.has(vm0.vmId) || this.refreshOf(vm0.vmId)) return `${e.name}: skipped (leased, quarantined or busy: plan again when it's free)`
+    this.switching.add(vm0.vmId)
+    job.progress = `${label}: making it ${e.persistent ? 'persistent' : 'disposable'}`
+    try {
+      return await this.vmLock(vm0.vmId)(async () => {
+        this.journal.append({ t: 'persistence', jobId: job.jobId, vmId: vm0.vmId, persistent: e.persistent })
+        if (e.persistent) return `${e.name}: persistent now (never restored at release; leased only by name)`
+        job.progress = `${label}: restoring its clean checkpoint`
+        const vm = this.state.vms.get(vm0.vmId)
+        const r = await this.restore(vm)
+        if (!r.ok) return `${e.name}: disposable now, but its restore didn't verify (${r.text}): quarantined until a restore confirms it`
+        const left = this.persistentCheckpoints({ ...vm, persistent: true }).length
+        return `${e.name}: disposable again, restored to clean (verified)${e.kept?.length ? `; the checkpoints it kept are ${left ? `being removed (${left} left: retried at its next restore)` : 'removed'}` : ''}`
+      })
+    } finally { this.switching.delete(vm0.vmId) }
+  }
 
   /** MC-1531: this VM's unresolved refresh record (one at most), or null. */
   refreshOf(vmId) {
@@ -2648,7 +2711,8 @@ class Helper {
     const op = args.action ?? 'create'
     if (op === 'checkpoint' || op === 'checkpoint-remove') return this.planCheckpoint(args)
     if (op === 'refresh-clean') return this.planRefresh(args)
-    if (!['create', 'resize', 'remove'].includes(op)) throw new Error('action must be create, resize, remove, checkpoint, checkpoint-remove or refresh-clean')
+    if (op === 'persistence') return this.planPersistence(args)
+    if (!['create', 'resize', 'remove'].includes(op)) throw new Error('action must be create, resize, remove, checkpoint, checkpoint-remove, refresh-clean or persistence')
     const s = this.state
     const all = [...s.vms.values()]
     // MC-1545: a failed Linux build kept for debugging is in no group and counts toward nothing: every create or resize
@@ -3224,6 +3288,10 @@ class Helper {
     for (const [k, e] of (plan.refresh || []).entries()) {
       done.push(await this.refreshOne(job, e, `VM ${k + 1} of ${plan.refresh.length} (${e.name})`))
     }
+    // MC-1591: persistence switches, VM by VM.
+    for (const [k, e] of (plan.persistence || []).entries()) {
+      done.push(await this.persistenceOne(job, e, `VM ${k + 1} of ${plan.persistence.length} (${e.name})`))
+    }
     if (plan.add?.length) this.ensureCreds()
     for (const [k, a] of (plan.add || []).entries()) {
       const label = `VM ${k + 1} of ${plan.add.length} (${a.name})`
@@ -3704,6 +3772,7 @@ class Helper {
       case 'pool_remove': return this.apply('remove', args)
       case 'pool_checkpoint': return this.poolCheckpoint(connId, args)
       case 'pool_refresh': return this.apply('refresh', args)
+      case 'pool_persistence': return this.apply('persistence', args)
       case 'quiesce': return this.quiesce()
       case 'version': return { text: PROTOCOL, data: { protocol: PROTOCOL, features: [...FEATURES], buildRoots: [...this.policy.buildRoots] } }
       case 'whoami': return this.whoami(args.roots)
@@ -3725,7 +3794,8 @@ const PROTOCOL = 'hyperv-mcp/3' // 2: renew, sync_plan, sync (MC-1497); 3: start
 // with no pins and no downloads; acquire's distro is any /etc/os-release ID (MC-1572).
 // 'multi-vm' = a connection holds several leases; every lease op takes vm (the VM's name), and leases lists them (MC-1580).
 // 'persistent-checkpoints' = a persistent VM keeps its lease checkpoints across leases; vm_checkpoint's remove (MC-1589).
-const FEATURES = ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean', 'linux', 'debug-keep', 'timing', 'network-modes', 'user-images', 'guest-script', 'multi-vm', 'ready-images', 'persistent', 'persistent-checkpoints']
+// 'persistence' = pool_plan's persistence action and pool_persistence: an existing VM made persistent or disposable (MC-1591).
+const FEATURES = ['projects', 'images', 'named', 'checkpoints', 'pool-checkpoints', 'refresh-clean', 'linux', 'debug-keep', 'timing', 'network-modes', 'user-images', 'guest-script', 'multi-vm', 'ready-images', 'persistent', 'persistent-checkpoints', 'persistence']
 const LEASE_CHECKPOINT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$/
 // MC-1532: a pool checkpoint's name.
 const POOL_CHECKPOINT_RE = /^[A-Za-z0-9][A-Za-z0-9 ._+-]{0,39}$/
@@ -3983,6 +4053,10 @@ function describePlan(plan, digest, approve, T, reasons = ['approval']) {
   const lines = [`Plan ${plan.id} (${plan.op}), valid for 30 minutes. Digest ${digest}; its first 6 characters are ${digest.slice(0, 6)}.`]
   for (const a of plan.add || []) lines.push(`- create ${a.name}: ${a.cores} cores, ${a.memoryMB} MB static memory, ${a.diskGB} GB dynamic disk, in ${a.folder}; network adapter disconnected${a.persistent ? '; PERSISTENT' : ''}`)
   for (const r of plan.remove || []) lines.push(`- remove ${r.name} and its folder ${r.folder}${r.persistent ? ' (a persistent VM: what it kept is lost, its kept checkpoints with it)' : ''}`)
+  // MC-1591: switching existing VMs; making one persistent says what it gives up, as a build's plan does.
+  if (plan.op === 'persistence') for (const v of plan.persistence) lines.push(v.persistent
+    ? `- make ${v.name} persistent: from now on it is never restored to clean at release, its deadline, a disconnect, a helper restart or a plain vm_start (it is shut down and disconnected instead), so it keeps whatever its runs leave, and its checkpoints, for the next lease of any agent that names it; plain acquires stop getting it, vm_acquire({ vm }) does; its leases have no work-session cap. It starts from its clean checkpoint, as it is now. vm_start({ checkpoint: 'clean' }) or vm_reset restores it to clean`
+    : `- make ${v.name} disposable again: its clean checkpoint is restored first and verified (Off, at the checkpoint, network disconnected, no CPU reserve), which DISCARDS what it kept (installed software, files, settings, C:\\out, anything a run did)${v.kept?.length ? ` and removes the checkpoints it kept (${v.kept.map(x => `"${x}"`).join(', ')})` : ''}; its pool checkpoints stay. Then it is restored at every start and release again, and plain acquires may get it`)
   // MC-1582: what a persistent VM gives up, said in the plan the user approves.
   if (plan.persistent) lines.push('- PERSISTENT (MC-1582): each VM this plan builds is never restored to clean at release, at its deadline, when its session disconnects, at a helper restart or at a plain vm_start: it is shut down and disconnected instead, and keeps whatever its runs left (installed software, files, settings, C:\\out, anything a run did) for the next lease, of any agent that names it. Plain acquires never get it; vm_acquire({ vm }) does. Its leases have no work-session cap (each acquire and renew stays within maxLeaseMinutes). It still has a clean checkpoint: vm_start({ checkpoint: \'clean\' }) or vm_reset restores it and discards what it kept. Network stays off unless a start asks, and is disconnected at every stop')
   // MC-1531: refresh plans.
