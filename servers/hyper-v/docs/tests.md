@@ -255,6 +255,10 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   an explicit clean start and `vm_reset` restoring it; a disconnect, a helper restart, a failed start's cleanup and a
   quarantine retry each parking it; interactive starts and refresh refused; and, through `server.js`, `vm_reset`
   sending `reset` (`vm_start` never), and an older helper without the `persistent` feature never sent a persistent plan.
+  MC-1589: a persistent VM's checkpoint kept at release and through a helper restart (journalled `lcp-keep`, still in
+  Hyper-V), listed in `vm_status`, restored by a later named lease and removed only on request; a take Hyper-V
+  completes after its call failed kept once the release finds it; `maxCheckpointsPerVm` across leases and
+  `maxLeaseCheckpoints` per lease; and a disposable VM's checkpoints still removed with its lease.
 - `approvals.test.js`:
   - unapproved plans;
   - forged approvals: another digest, operation or epoch, expired, a malformed nonce, another plan's id, a writable

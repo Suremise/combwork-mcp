@@ -58,7 +58,7 @@ test('MC-1582: the plan says what a persistent VM gives up; the journal binds it
   assert.match(shrink.text, new RegExp(`- remove ${disposable.name} and its folder`))
   assert.doesNotMatch(shrink.text, new RegExp(`- remove ${persistent.name}`))
   const all = await admin.request('pool_plan', { action: 'remove' })
-  assert.match(all.text, new RegExp(`- remove ${persistent.name} and its folder .* \\(a persistent VM: what it kept is lost\\)`))
+  assert.match(all.text, new RegExp(`- remove ${persistent.name} and its folder .* \\(a persistent VM: what it kept is lost, its kept checkpoints with it\\)`))
 })
 
 test('MC-1582: plain acquires never get a persistent VM; a named one does, with no work-session cap', async t => {
@@ -275,4 +275,107 @@ foreach ($case in @(@('hung', 'Running', 2000), @('quick', 'Running', 20000), @(
   assert.deepStrictEqual([res.saved.log, res.saved.forced], [['drop-saved', ...tail], false])
   assert.deepStrictEqual([res.paused.log, res.paused.forced], [['turnoff', ...tail], true])
   assert.ok(res.paused.ms < 3000, `no wait for a paused VM: ${res.paused.ms} ms`)
+})
+
+// MC-1589: a persistent VM's lease checkpoints are the VM's: kept with it at the lease's end (lcp-keep), through a
+// helper restart, listed in vm_status for everyone, restorable by a later lease that names it, removed only on request
+// (vm_checkpoint's remove) or with the VM; within maxCheckpointsPerVm. A disposable VM's go with the lease, as before.
+const snapOf = (sc, name) => sc.journal().find(r => r.t === 'lcp-take' && r.name === name).snapName
+const stubOf = (sc, vm) => vmsOf(sc).find(v => v.id === vm.id)
+
+test('MC-1589: a checkpoint taken in one lease of a persistent VM survives release and a helper restart; a later named lease restores it, and removes it on request', async t => {
+  const { sc, h, persistent } = await pool('pers-cp-keep')
+  let helper = h
+  t.after(() => helper.stop())
+  const c = helper.conn(10)
+  await leaseAndWrite(c, persistent.name)
+  const taken = await c.request('checkpoint', { name: 'tools' })
+  assert.match(taken.text, /^Checkpoint "tools" taken .*it's kept with hvmcp-[0-9a-f]+ after this lease \(persistent\): a later lease that names the VM can vm_restore it, until vm_checkpoint\(\{ name, remove: true \}\) removes it or the VM is removed\./)
+  assert.match((await c.request('status')).text, /your checkpoints \(kept with it after your lease\): "tools" \(taken /)
+  await c.request('run', { command: 'write C:\\after.txt later' })
+  assert.match((await c.request('release')).text, /^Released\. hvmcp-[0-9a-f]+ parked/)
+  const snap = snapOf(sc, 'tools')
+  assert.ok(stubOf(sc, persistent).checkpoints.some(x => x.name === snap), 'still in Hyper-V after the release')
+  assert.ok(sc.journal().some(r => r.t === 'lcp-keep' && r.checkpointId), 'journalled as kept with the VM, by its id')
+  assert.ok(!sc.journal().some(r => r.t === 'lcp-drop' || r.t === 'lcp-dropped'), 'never removed')
+  // A helper restart: replayed from the journal, still listed (for any caller, the VM free).
+  await helper.stop()
+  helper = await startHelper(sc)
+  const keptLine = new RegExp(`- ${persistent.name}: [^\\n]*; checkpoints it keeps \\(vm_restore by name in a lease of it\\): "tools" \\(taken `)
+  const st = (await helper.conn(1).request('status')).text
+  assert.match(st, keptLine)
+  assert.match(st, new RegExp(`- ${persistent.name}: [^\\n]*free`))
+  // A later lease, another session, by name: restores it (the file written before it is back, the one after is gone).
+  const d = helper.conn(11)
+  await d.request('acquire', { vm: persistent.name, minutes: 30 })
+  await d.request('start')
+  assert.match((await d.request('status')).text, keptLine, 'the holder sees it among the VM\'s')
+  await assert.rejects(d.request('checkpoint', { name: 'tools' }), /already keeps a checkpoint "tools" from an earlier lease: vm_restore it, or remove it first/)
+  assert.match((await d.request('restore-checkpoint', { name: 'tools' })).text, /^Restored hvmcp-[0-9a-f]+ to its checkpoint "tools" and started it/)
+  assert.match((await d.request('run', { command: `cat ${KEEP}` })).text, /kept/)
+  assert.match((await d.request('run', { command: 'check C:\\after.txt' })).text, /^Exit code 1\./, 'the change after the checkpoint is gone')
+  // Removed on request (the VM needn't be running), and only then.
+  await d.request('stop')
+  const removed = await d.request('checkpoint', { name: 'tools', remove: true })
+  assert.match(removed.text, /^Checkpoint "tools" removed from hvmcp-[0-9a-f]+\.$/)
+  assert.ok(!stubOf(sc, persistent).checkpoints.some(x => x.name === snap), 'gone from Hyper-V')
+  assert.deepStrictEqual(sc.journal().filter(r => r.t === 'lcp-drop' || r.t === 'lcp-dropped').map(r => r.t), ['lcp-drop', 'lcp-dropped'])
+  assert.doesNotMatch((await d.request('status')).text, /checkpoints it keeps/)
+  await assert.rejects(d.request('restore-checkpoint', { name: 'tools' }), /hvmcp-[0-9a-f]+ has no checkpoint "tools"\./)
+  await assert.rejects(d.request('checkpoint', { name: 'tools', remove: true }), /has no checkpoint "tools"/)
+  await assert.rejects(d.request('checkpoint', { name: 'tools', remove: 'yes' }), /remove must be true, or left out/)
+})
+
+test('MC-1589: a take that Hyper-V completes after its call failed is kept with the persistent VM once the release finds it', async t => {
+  const { sc, h, persistent } = await pool('pers-cp-delayed')
+  t.after(() => h.stop())
+  const c = h.conn(10)
+  await leaseAndWrite(c, persistent.name)
+  sc.patchStub(st => { st.productionFailDelayed = true })
+  await assert.rejects(c.request('checkpoint', { name: 'late' }), /couldn't be taken .*settled when this lease ends/)
+  sc.patchStub(st => { st.productionFailDelayed = false })
+  await c.request('release')
+  const snap = snapOf(sc, 'late')
+  const found = stubOf(sc, persistent).checkpoints.find(x => x.name === snap)
+  assert.ok(found, 'it appeared later, and was kept, not removed')
+  assert.ok(sc.journal().some(r => r.t === 'lcp-keep' && r.checkpointId === found.id), 'kept by the id it was found with')
+  const d = h.conn(11)
+  await d.request('acquire', { vm: persistent.name, minutes: 30 })
+  assert.match((await d.request('restore-checkpoint', { name: 'late' })).text, /^Restored hvmcp-[0-9a-f]+ to its checkpoint "late"/)
+})
+
+test('MC-1589: a persistent VM\'s checkpoints count against maxCheckpointsPerVm across leases; maxLeaseCheckpoints counts one lease\'s takes', async t => {
+  const { h, persistent } = await pool('pers-cp-caps', { policy: { maxLeaseCheckpoints: 1, maxCheckpointsPerVm: 2 } })
+  t.after(() => h.stop())
+  const lease = async n => { const c = h.conn(n); await c.request('acquire', { vm: persistent.name, minutes: 30 }); await c.request('start'); return c }
+  const c = await lease(10)
+  await c.request('checkpoint', { name: 'a' })
+  await c.request('release')
+  const d = await lease(11)
+  assert.match((await d.request('checkpoint', { name: 'b' })).text, /^Checkpoint "b" taken/, 'the kept "a" isn\'t this lease\'s take')
+  await assert.rejects(d.request('checkpoint', { name: 'c' }), /This lease holds 1 checkpoints, the policy's maxLeaseCheckpoints \(1\)/)
+  await d.request('release')
+  const e = await lease(12)
+  await assert.rejects(e.request('checkpoint', { name: 'c' }), /hvmcp-[0-9a-f]+ \(persistent\) holds 2 checkpoints of its own, the policy's maxCheckpointsPerVm \(2\) in all: remove one first/)
+  await e.request('checkpoint', { name: 'a', remove: true })
+  assert.match((await e.request('checkpoint', { name: 'c' })).text, /^Checkpoint "c" taken/)
+})
+
+test('MC-1589: a disposable VM keeps today\'s behaviour: its checkpoints go with the lease (and remove works on it too)', async t => {
+  const { sc, h, disposable } = await pool('pers-cp-disposable')
+  t.after(() => h.stop())
+  const c = h.conn(10)
+  assert.strictEqual((await c.request('acquire', { minutes: 30 })).data.vm, disposable.name)
+  await c.request('start')
+  assert.match((await c.request('checkpoint', { name: 'a' })).text, /it's removed when this lease ends\.$/)
+  await c.request('checkpoint', { name: 'b' })
+  assert.match((await c.request('checkpoint', { name: 'b', remove: true })).text, /^Checkpoint "b" removed from /)
+  assert.match((await c.request('status')).text, /your checkpoints: "a" \(taken [^)]+\)(;|\n|$)/)
+  await c.request('release')
+  assert.deepStrictEqual(stubOf(sc, disposable).checkpoints.map(x => x.name), ['clean'], 'removed with the lease')
+  assert.ok(!sc.journal().some(r => r.t === 'lcp-keep'), 'nothing kept')
+  const d = h.conn(11)
+  await d.request('acquire', { minutes: 30 })
+  await assert.rejects(d.request('restore-checkpoint', { name: 'a' }), /This lease has no checkpoint "a"\./)
+  assert.doesNotMatch((await d.request('status')).text, /checkpoints it keeps/)
 })
