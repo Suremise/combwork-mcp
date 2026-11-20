@@ -68,9 +68,8 @@ The full model: [docs/security.md](docs/security.md).
    `-MaxMemoryGB`, `-MaxDiskGBPerVm`, `-MaxNetwork None|Host|Internet|InternetLan`, `-MaxLeaseMinutes` and the rest
    ([every option](docs/setup.md)). `-ApprovePoolChanges WithinCaps|Each` chooses which pool changes need your
    approval (below). It never enables a Windows feature or restarts the PC. Run it again to update or change the
-   policy, with the same options you used before: a rerun keeps some settings you leave out (the network ceiling, the
-   approval mode, the projects and product key), but the VM, core, memory and disk limits go back to their defaults
-   unless you pass them ([which ones](docs/setup.md)).
+   policy: a rerun keeps every setting you don't pass, the disk folder included, and changes only those you do. Its
+   output lists which it kept and which it changed. Host defaults apply only on a first install.
 3. Add the server to your client, with `HYPERV_MCP_ENABLED=1`:
    ```json
    { "mcpServers": { "hyper-v": { "command": "node",
@@ -80,7 +79,9 @@ The full model: [docs/security.md](docs/security.md).
    setting is in `combwork-mcp.example.json` with its default ([configuration](docs/configuration.md)).
 4. Ask an agent to plan a pool (next section).
 
-**Upgrading:** run setup again (the same line, with all your options) before using a new server. An older helper refuses
+**Upgrading:** run setup again before using a new server. `install.cmd` with no options is enough: a rerun keeps your settings,
+`-Mode` and `-User` included. The one exception is an install from before this release that used `-Mode Direct` or
+another `-User`: pass those once, since its policy didn't record them. An older helper refuses
 newer features with "run setup again"; the pool's VMs and images are kept. What each release changed:
 [docs/upgrading.md](docs/upgrading.md).
 

@@ -6,8 +6,10 @@ What each release changed for an installed helper. Part of the [hyper-v docs](..
 
 **Upgrading from an earlier release:** run setup again (step 2, the same line) in an admin terminal before
 using the new server: the helper's protocol and features changed, and an older helper refuses each newer feature with
-"run setup again". The pool's VMs and images are kept; pass the same options you used before (`-DiskFolder`,
-`-BuildRoot` and the rest), since a rerun replaces them.
+"run setup again". The pool's VMs and images are kept, and so is every setting you don't pass (MC-1592: before it, a
+rerun put the VM, core, memory, disk, lease and build limits and the build folders back to their defaults, and
+dropped an admin's `timingCaps`, unless they were passed again). `-Mode` and `-User` are kept from this release on; an
+older install that used `-Mode Direct` or another `-User` passes them on its first rerun.
 
 **From 2.0.0 to 2.1.0 (Linux guests):**
 - Without the rerun, 2.1.0 still serves Windows guests, and refuses Linux ones with "run setup again".

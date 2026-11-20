@@ -13,7 +13,7 @@
 #   - the disk folder(s) for the pool's VMs (only SYSTEM, Administrators and the service).
 # -BuildRoot names folders builds may also come from, beside each client's MCP roots (e.g. a folder a project stages
 # builds in): recorded in policy.json, so agents can't add to them. Give each as a literal path, not %LOCALAPPDATA%,
-# which in an admin prompt can be another account's. A rerun replaces the list: leave -BuildRoot out to clear it.
+# which in an admin prompt can be another account's. Left out, a rerun keeps the list; -BuildRoot none clears it.
 # Direct mode (-Mode Direct) installs no service: it adds -User to Hyper-V Administrators instead, so any program you
 # run, agents included, can drive Hyper-V without the server's rules. Read the README before choosing it.
 #
@@ -42,10 +42,11 @@
 # -ApprovePoolChanges (MC-1576): WithinCaps (the default) lets a plan within this policy apply without approval, unless it
 # brings a new image, a guest setup script or a ready-made disk or VM; Each asks for approve.cmd on every plan. Left out,
 # a rerun keeps the current choice.
-# It is idempotent: run it again to update the helper or change the policy. It keeps an existing pool and its state.
+# It is idempotent: run it again to update the helper or change the policy. It keeps an existing pool and its state,
+# and every setting not passed (MC-1592: -DiskFolder too, so a rerun needs no options); it says which it kept and changed.
 # It never enables Windows features or restarts the PC: if Hyper-V is off, it says how to turn it on and stops.
 param(
-  [Parameter(Mandatory = $true)][string[]]$DiskFolder,
+  [string[]]$DiskFolder = @(),
   [string]$User = [Security.Principal.WindowsIdentity]::GetCurrent().Name,
   [ValidateSet('Service', 'Direct')][string]$Mode = 'Service',
   [int]$MaxVms = 0,
@@ -109,6 +110,19 @@ $svc = 'HyperVMcp'
 $svcAccount = "NT SERVICE\$svc"
 $groupName = 'Hyper-V MCP Users'
 $HVADMINS = 'S-1-5-32-578'
+# MC-1592: the current policy, if setup ran before: a rerun keeps every value the user doesn't pass.
+$curPolicy = $null
+$curPolicyFile = Join-Path $state 'policy.json'
+if (Test-Path -LiteralPath $curPolicyFile) { try { $curPolicy = Get-Content -Raw -LiteralPath $curPolicyFile | ConvertFrom-Json } catch { $curPolicy = $null } }
+# MC-1592 round 1: -Mode and -User, left out on a rerun, are the install's own (policy.json's setupMode and setupUser,
+# recorded from this release on). A policy from before them gives none: Service and the caller, as before, so an
+# older direct-mode install passes -Mode Direct -User <account> once.
+# MC-1592 mode begin
+if (-not $PSBoundParameters.ContainsKey('Mode') -and $curPolicy -and @('Service', 'Direct') -contains [string]$curPolicy.setupMode) { $Mode = [string]$curPolicy.setupMode }
+if (-not $PSBoundParameters.ContainsKey('User') -and $curPolicy -and [string]$curPolicy.setupUser) { $User = [string]$curPolicy.setupUser }
+# ValidateSet takes any case (-Mode direct): recorded, and compared, as Service or Direct.
+$Mode = if ($Mode -eq 'Direct') { 'Direct' } else { 'Service' }
+# MC-1592 mode end
 
 # 1. Hyper-V
 if (-not (Get-Command Get-VM -ErrorAction SilentlyContinue) -or -not (Get-Service vmms -ErrorAction SilentlyContinue)) {
@@ -130,6 +144,11 @@ $runnerSid = if ($Mode -eq 'Service') {
 # Disk folders: a folder at any depth on a local fixed drive (MC-1581; was top-level only), not a drive root. Every
 # parent is checked and held before anything changes (Open-TrustedAncestors): owned by Administrators, SYSTEM or
 # TrustedInstaller, and with nobody else able to rename or replace what is under it.
+# MC-1592: left out on a rerun, the current policy's disk folders.
+if (-not @($DiskFolder | Where-Object { $_ }).Count) {
+  if ($curPolicy -and @($curPolicy.diskFolders | Where-Object { $_ }).Count) { $DiskFolder = @($curPolicy.diskFolders | ForEach-Object { [string]$_ }) }
+  else { throw 'Name a folder for the VMs'' disks: -DiskFolder D:\hyperv-mcp (needed on a first install; a rerun keeps the current one). Nothing was changed.' }
+}
 $folders = @($DiskFolder | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') })
 foreach ($d in $folders) {
   if ($d -notmatch '^[A-Za-z]:\\[^\\]') { throw "Disk folder $d must be a folder on a local drive, such as D:\hyperv-mcp or D:\VMs\hyperv-mcp, not a drive root." }
@@ -137,6 +156,9 @@ foreach ($d in $folders) {
 }
 # Build roots: absolute local folders, not a drive root, with no link or junction on the way (the server refuses one
 # that has: it must resolve to the very path named). Checked before anything changes; one that doesn't exist yet is kept.
+# MC-1592: left out on a rerun, the current policy's list is kept; -BuildRoot none clears it.
+if (@($BuildRoot).Count -eq 1 -and $BuildRoot[0] -eq 'none') { $BuildRoot = @() }
+elseif (-not $PSBoundParameters.ContainsKey('BuildRoot') -and $curPolicy -and $curPolicy.buildRoots) { $BuildRoot = @($curPolicy.buildRoots | ForEach-Object { [string]$_ }) }
 $buildRoots = @($BuildRoot | Where-Object { $_ } | ForEach-Object {
   if ($_ -notmatch '^[A-Za-z]:\\' -or $_ -match '(^|\\)\.\.(\\|$)') { throw "Build root $_ must be an absolute local folder (X:\...) with no '..'." }
   $b = [IO.Path]::GetFullPath($_).TrimEnd('\')
@@ -165,9 +187,56 @@ if ($ProductKeyFile -and $ProductKeyFile -ne 'none') {
   try { $productKey = (Get-Content -Raw -LiteralPath $ProductKeyFile).Trim().ToUpperInvariant() } catch { throw "-ProductKeyFile $ProductKeyFile can't be read: $($_.Exception.Message)" }
   if ($productKey -notmatch '^[A-Z0-9]{5}(-[A-Z0-9]{5}){4}$') { throw "-ProductKeyFile $ProductKeyFile doesn't hold one product key (five groups of five letters or digits, joined by hyphens)." }
 }
-# The pool's VM limit, worked out here (read-only), before anything changes: -MaxVms, or a quarter of the host's
-# logical CPUs (1-4). Step 7 writes this same value.
-$poolMaxVms = $(if ($MaxVms) { $MaxVms } else { [Math]::Max(1, [Math]::Min(4, [Math]::Floor(([int](Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors) / 4))) })
+# The pool's limits, worked out here (read-only), before anything changes; step 7 writes these same values.
+$cs = Get-CimInstance Win32_ComputerSystem
+$hostCpus = [int]$cs.NumberOfLogicalProcessors
+$hostRamGB = [int][Math]::Floor($cs.TotalPhysicalMemory / 1GB)
+$setupBound = $PSBoundParameters
+# MC-1592 begin: each limit is the value passed; else, on a rerun, the current policy's; else (a first install, or a
+# setting the policy doesn't hold yet) its default, from the host where it has one. An optional setting (one the
+# helper defaults itself) stays out of the policy unless passed or already there; passing it as -1 (0 for
+# -MaxSessionMinutes) removes it. $limitsReport says which values were kept, changed or set.
+$limitsReport = [ordered]@{ kept = @(); changed = @(); set = @() }
+function Resolve-Limit([string]$key, [string]$param, $passed, $default, [switch]$Optional, [int]$Unset = -1) {
+  $stored = if ($curPolicy -and ($curPolicy.PSObject.Properties.Name -contains $key)) { $curPolicy.$key } else { $null }
+  if ($setupBound.ContainsKey($param)) {
+    $v = if ($Optional -and $passed -eq $Unset) { $null } else { $passed }
+    if ($null -eq $stored) { if ($null -ne $v) { $script:limitsReport.set += "$key $v" } }
+    elseif ("$stored" -ne "$v") { $script:limitsReport.changed += "$key $stored -> $(if ($null -eq $v) { "the helper's default" } else { $v })" }
+    else { $script:limitsReport.kept += "$key $v" }
+    return $v
+  }
+  if ($null -ne $stored) { $script:limitsReport.kept += "$key $stored"; return $stored }
+  if ($Optional) { return $null }
+  $script:limitsReport.set += "$key $default (default)"
+  return $default
+}
+$lim = [ordered]@{
+  maxVms = Resolve-Limit 'maxVms' 'MaxVms' $MaxVms ([Math]::Max(1, [Math]::Min(4, [Math]::Floor($hostCpus / 4))))
+  maxCoresPerVm = Resolve-Limit 'maxCoresPerVm' 'MaxCoresPerVm' $MaxCoresPerVm ([Math]::Max(1, [Math]::Min(8, [Math]::Floor($hostCpus / 4))))
+  maxMemoryMBTotal = Resolve-Limit 'maxMemoryMBTotal' 'MaxMemoryGB' ($MaxMemoryGB * 1024) ([Math]::Max(4096, [Math]::Floor($hostRamGB / 2) * 1024))
+  maxDiskGBPerVm = Resolve-Limit 'maxDiskGBPerVm' 'MaxDiskGBPerVm' $MaxDiskGBPerVm 128
+  maxReservePercent = Resolve-Limit 'maxReservePercent' 'MaxReservePercent' $MaxReservePercent 100
+  maxLeaseMinutes = Resolve-Limit 'maxLeaseMinutes' 'MaxLeaseMinutes' $MaxLeaseMinutes 240
+  maxBuildMB = Resolve-Limit 'maxBuildMB' 'MaxBuildMB' $MaxBuildMB 2048
+  maxSessionMinutes = Resolve-Limit 'maxSessionMinutes' 'MaxSessionMinutes' $MaxSessionMinutes $null -Optional -Unset 0
+  maxLeaseCheckpoints = Resolve-Limit 'maxLeaseCheckpoints' 'MaxLeaseCheckpoints' $MaxLeaseCheckpoints $null -Optional
+  maxCheckpointsPerVm = Resolve-Limit 'maxCheckpointsPerVm' 'MaxCheckpointsPerVm' $MaxCheckpointsPerVm $null -Optional
+  minFreeGBForCheckpoint = Resolve-Limit 'minFreeGBForCheckpoint' 'MinFreeGBForCheckpoint' $MinFreeGBForCheckpoint $null -Optional
+}
+# MC-1592 end
+$poolMaxVms = $lim.maxVms
+# MC-1592 round 1: the timing caps an admin set in policy.json (MC-1558; setup has no option for them) are kept,
+# checked with the helper's own code before anything changes.
+$timingCaps = if ($curPolicy -and $null -ne $curPolicy.timingCaps) { $curPolicy.timingCaps } else { $null }
+if ($null -ne $timingCaps) {
+  $nodeCaps = (Get-Command node.exe -ErrorAction SilentlyContinue).Source
+  if (-not $nodeCaps) { throw 'Node (18 or later) is not on PATH.' }
+  $why = (ConvertTo-Json -InputObject $timingCaps -Depth 4 -Compress) | & $nodeCaps -e "const t = require(process.argv[1]); let s = ''; process.stdin.on('data', d => s += d).on('end', () => process.stdout.write(t.capsProblems(JSON.parse(s)).join('; ')))" (Join-Path $src 'helper\timing.js')
+  if ($LASTEXITCODE) { throw 'The timing caps check (node) failed.' }
+  if ($why) { throw "policy.json's timingCaps can't be used: $why. Fix them in policy.json, or remove them. Nothing was changed." }
+  $limitsReport.kept += "timingCaps $(ConvertTo-Json -InputObject $timingCaps -Depth 4 -Compress)"
+}
 # A project's cap or reservation for the report: a number (Windows), or one per OS, never cast.
 function Format-Share($v) {
   if ($null -eq $v) { return 'none' }
@@ -184,16 +253,13 @@ if ($projects.Count) {
   $projectsLine = ($projects | ForEach-Object { "$($_.name) (cap $(Format-Share $_.maxVms)$(if ($_.images) { ", images $(@($_.images).Count)" }))" }) -join '; '
 }
 # The helper refuses a policy whose session cap is below one lease (helper/policy.js): refuse it here first.
-if ($MaxSessionMinutes -and ($MaxSessionMinutes -lt 1 -or $MaxSessionMinutes -lt $MaxLeaseMinutes)) { throw "-MaxSessionMinutes must be at least -MaxLeaseMinutes ($MaxLeaseMinutes)." }
+if ($null -ne $lim.maxSessionMinutes -and ($lim.maxSessionMinutes -lt 1 -or $lim.maxSessionMinutes -lt $lim.maxLeaseMinutes)) { throw "-MaxSessionMinutes ($($lim.maxSessionMinutes)) must be at least -MaxLeaseMinutes ($($lim.maxLeaseMinutes)). Nothing was changed." }
 # The checkpoint settings (MC-1579), checked as the helper checks them: left out (-1), the helper's defaults 3 and 4.
-$leaseCps = $(if ($MaxLeaseCheckpoints -ge 0) { $MaxLeaseCheckpoints } else { 3 })
-$poolCps = $(if ($MaxCheckpointsPerVm -ge 0) { $MaxCheckpointsPerVm } else { 4 })
+$leaseCps = $(if ($null -ne $lim.maxLeaseCheckpoints) { [int]$lim.maxLeaseCheckpoints } else { 3 })
+$poolCps = $(if ($null -ne $lim.maxCheckpointsPerVm) { [int]$lim.maxCheckpointsPerVm } else { 4 })
 if ($leaseCps + $poolCps -gt 48) { throw "-MaxLeaseCheckpoints ($leaseCps) and -MaxCheckpointsPerVm ($poolCps) together must be at most 48: Hyper-V keeps at most 50 checkpoints of a VM, and the clean checkpoint, with a second one while it is refreshed, takes 2." }
 # MC-1556: the network ceiling, and host mode's subnet, worked out and checked here (read-only), before anything changes.
 if ($MaxNetwork -and $PSBoundParameters.ContainsKey('AllowNetwork')) { throw 'Give -MaxNetwork, or the older -AllowNetwork, not both. Nothing was changed.' }
-$curPolicy = $null
-$curPolicyFile = Join-Path $state 'policy.json'
-if (Test-Path -LiteralPath $curPolicyFile) { try { $curPolicy = Get-Content -Raw -LiteralPath $curPolicyFile | ConvertFrom-Json } catch { $curPolicy = $null } }
 # MC-1576: how pool changes are approved: WithinCaps (the default: plans within the policy apply; a new image, a guest
 # setup script or a ready-made disk still needs approval) or Each (every plan approved). Left out, a rerun keeps it.
 $approveMode = if ($ApprovePoolChanges) { @{ WithinCaps = 'within-caps'; Each = 'each' }[$ApprovePoolChanges] }
@@ -372,26 +438,22 @@ if ($wantHost) {
 
 # 7. The policy: hard limits for every pool change, writable only by Administrators and SYSTEM. Written with its final
 # ACL from the moment it exists (a new file, then renamed over the old one).
-$cs = Get-CimInstance Win32_ComputerSystem
-$cpus = [int]$cs.NumberOfLogicalProcessors
-$ramGB = [int][Math]::Floor($cs.TotalPhysicalMemory / 1GB)
+# MC-1592 policy begin
 $policy = [ordered]@{
   schema = 1; prefix = 'hvmcp'
-  maxVms = $poolMaxVms
-  maxCoresPerVm = $(if ($MaxCoresPerVm) { $MaxCoresPerVm } else { [Math]::Max(1, [Math]::Min(8, [Math]::Floor($cpus / 4))) })
-  maxMemoryMBTotal = $(if ($MaxMemoryGB) { $MaxMemoryGB * 1024 } else { [Math]::Max(4096, [Math]::Floor($ramGB / 2) * 1024) })
-  maxDiskGBPerVm = $MaxDiskGBPerVm; diskFolders = $folders; maxNetwork = $netMode
-  maxReservePercent = $MaxReservePercent; maxLeaseMinutes = $MaxLeaseMinutes; maxBuildMB = $MaxBuildMB
+  maxVms = $lim.maxVms; maxCoresPerVm = $lim.maxCoresPerVm; maxMemoryMBTotal = $lim.maxMemoryMBTotal
+  maxDiskGBPerVm = $lim.maxDiskGBPerVm; diskFolders = $folders; maxNetwork = $netMode
+  maxReservePercent = $lim.maxReservePercent; maxLeaseMinutes = $lim.maxLeaseMinutes; maxBuildMB = $lim.maxBuildMB
   buildRoots = @($buildRoots)
   linuxTransport = 'hvsocket'
   approvePoolChanges = $approveMode
 }
 if ($projects.Count) { $policy.projects = @($projects) } # checked, against this maxVms, before anything changed
-if ($MaxSessionMinutes) { $policy.maxSessionMinutes = $MaxSessionMinutes }
-if ($MaxLeaseCheckpoints -ge 0) { $policy.maxLeaseCheckpoints = $MaxLeaseCheckpoints }
-if ($MaxCheckpointsPerVm -ge 0) { $policy.maxCheckpointsPerVm = $MaxCheckpointsPerVm }
-if ($MinFreeGBForCheckpoint -ge 0) { $policy.minFreeGBForCheckpoint = $MinFreeGBForCheckpoint }
+foreach ($k in 'maxSessionMinutes', 'maxLeaseCheckpoints', 'maxCheckpointsPerVm', 'minFreeGBForCheckpoint') { if ($null -ne $lim[$k]) { $policy[$k] = $lim[$k] } }
 if ($hostNetwork) { $policy.hostNetwork = $hostNetwork } # MC-1556
+if ($null -ne $timingCaps) { $policy.timingCaps = $timingCaps } # MC-1592 round 1: kept on a rerun
+$policy.setupMode = $Mode; $policy.setupUser = $User # MC-1592 round 1: a rerun's defaults
+# MC-1592 policy end
 $policyFile = Join-Path $state 'policy.json'
 Write-SecureFile $policyFile ($policy | ConvertTo-Json -Depth 4) @("$SYSTEM=FullControl", "$ADMINS=FullControl", "$runnerSid=ReadAndExecute") $ADMINS
 $keyFile = Join-Path (Join-Path $state 'secrets') 'product-key.json'
@@ -415,7 +477,11 @@ Step "Build folders set by an admin (beside each client's MCP roots): $(if ($bui
 Step "Projects sharing the pool: $projectsLine."
 Step "Product key (-ProductKeyFile): $keyLine."
 Step $(if ($defaultSwitch) { "Default Switch: present. Each evaluation VM goes online through it once, when it is built, to activate Windows (about 90 days from then); runs use it only in the internet modes, when a plan the user approved allows them." } else { "Default Switch: absent. Evaluation VMs can't be activated here, so pools need a non-evaluation image (an own copy, built offline), and the internet modes can't be used." })
-Step ("Policy: up to {0} VMs, {1} cores each, {2} GB memory in all, {3} GB disks; network {4}; images: any ISO or qcow2 file the plan you approve names; leases up to {5} min, work sessions up to {6} min; pool changes: {7}." -f $policy.maxVms, $policy.maxCoresPerVm, ($policy.maxMemoryMBTotal / 1024), $policy.maxDiskGBPerVm, "up to $netMode (each pool's mode is chosen in the plan you approve)", $MaxLeaseMinutes, $(if ($MaxSessionMinutes) { $MaxSessionMinutes } else { [Math]::Max($MaxLeaseMinutes, 480) }), $(if ($approveMode -eq 'each') { 'each one approved (approve.cmd)' } else { 'within these caps they apply without approval; a new image, a guest setup script or a ready-made disk still asks (-ApprovePoolChanges Each for every one)' }))
+# MC-1592: which limits a rerun kept, which the options changed, and which were set now.
+if ($limitsReport.changed.Count) { Step "Policy changed by this run's options: $($limitsReport.changed -join '; ')." }
+if ($curPolicy -and $limitsReport.kept.Count) { Step "Policy kept as it was (not passed, or passed unchanged): $($limitsReport.kept -join '; ')." }
+if ($limitsReport.set.Count) { Step "Policy set now ($(if ($curPolicy) { 'not in the current policy.json yet' } else { 'first install' })): $($limitsReport.set -join '; ')." }
+Step ("Policy: up to {0} VMs, {1} cores each, {2} GB memory in all, {3} GB disks; network {4}; images: any ISO or qcow2 file the plan you approve names; leases up to {5} min, work sessions up to {6} min; pool changes: {7}." -f $policy.maxVms, $policy.maxCoresPerVm, ($policy.maxMemoryMBTotal / 1024), $policy.maxDiskGBPerVm, "up to $netMode (each pool's mode is chosen in the plan you approve)", $lim.maxLeaseMinutes, $(if ($null -ne $lim.maxSessionMinutes) { $lim.maxSessionMinutes } else { [Math]::Max($lim.maxLeaseMinutes, 480) }), $(if ($approveMode -eq 'each') { 'each one approved (approve.cmd)' } else { 'within these caps they apply without approval; a new image, a guest setup script or a ready-made disk still asks (-ApprovePoolChanges Each for every one)' }))
 
 # 8. Start.
 if ($Mode -eq 'Service') {
