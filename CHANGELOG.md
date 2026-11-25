@@ -4,9 +4,14 @@ What each release changed, by server. A release is one tag, `v<version>` ([RELEA
 keeps its own version in `servers/<name>/meta.json`. Releases before 1.8.0 are on the
 [releases page](https://github.com/Suremise/combwork-mcp/releases).
 
-## Unreleased
+## 1.10.0
 
-### hyper-v
+### hyper-v 5.2.0 (from 5.1.0)
+
+A minor version: reading a big file in parts and a PowerShell line, nothing you must do. Rerun setup
+(`setup\install.cmd`, the same line, in an admin terminal) to get them: without it, the 5.2.0 server still does
+everything 5.1.0 did, keeps each `vm_read_out` reply within one MCP message, and refuses `offset` with "run setup
+again". See [upgrading.md](servers/hyper-v/docs/upgrading.md) ("From 5.1.0 to 5.2.0").
 
 - `vm_read_out` no longer sends a reply bigger than an MCP client takes: Claude Code dropped the server when one passed
   16 MB, and the session lost its VM tools and its lease. Each reply is filled up to about 12 MB measured as sent
@@ -20,6 +25,8 @@ keeps its own version in `servers/<name>/meta.json`. Releases before 1.8.0 are o
   realistic build time, about 50 minutes per Windows VM, mostly Windows' own first sign-ins (MC-1596).
 - `vm_start`, `vm_wait` and the server's instructions say a session runs one slow operation at a time, even across
   VMs: start the second VM after `vm_wait` gives the first one's result. No change to behaviour (MC-1596).
+
+ollama, trilium and windows-sandbox are unchanged (1.4.0, 1.2.0, 1.3.0).
 
 ## 1.9.0
 
