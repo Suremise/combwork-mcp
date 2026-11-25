@@ -7,7 +7,7 @@
 const test = require('node:test')
 const assert = require('assert')
 const { scratch, withPool } = require('./helpers')
-const { READ_TOTAL_MAX, RUN_INLINE_CHARS, READ_PART_BYTES } = require('../helper/core')
+const { READ_TOTAL_MAX, REPLY_BUDGET, RUN_INLINE_CHARS, READ_PART_BYTES } = require('../helper/core')
 
 async function running(t, name, stub = {}) {
   const sc = scratch(name, { stub })
@@ -84,9 +84,10 @@ test('MC-1588: vm_read_out reads a Windows guest\'s files in calls of at most 2 
   assert.deepStrictEqual(per.files.map(f => [f.path, f.cut]), [['big.bin', true]], 'the default total, 1 MB')
   const per2 = await a.request('read_out', { paths: ['big.bin', 'z.txt'], maxBytes: 3 * 1024 * 1024, maxTotalBytes: 4 * 1024 * 1024 })
   assert.deepStrictEqual(per2.files.map(f => [f.path, f.cut]), [['big.bin', true], ['z.txt', false]])
-  // The ceilings: maxTotalBytes at what one reply can hold, with its reason; maxBytes none of its own.
-  assert.strictEqual(READ_TOTAL_MAX, Math.floor((require('buffer').constants.MAX_STRING_LENGTH - 1024 * 1024) / 6))
-  await assert.rejects(a.request('read_out', { paths: ['a.bin'], maxTotalBytes: READ_TOTAL_MAX + 1 }), new RegExp(`maxTotalBytes must be 1-${READ_TOTAL_MAX}: the files come back in one reply, which Node holds as one string`))
+  // The ceilings: maxTotalBytes at one reply's budget (MC-1597), with how to read in parts; maxBytes none of its own.
+  assert.strictEqual(READ_TOTAL_MAX, REPLY_BUDGET)
+  assert.ok(REPLY_BUDGET <= 12 * 1024 * 1024, 'well under the 16 MB Claude Code takes in a message')
+  await assert.rejects(a.request('read_out', { paths: ['a.bin'], maxTotalBytes: READ_TOTAL_MAX + 1 }), new RegExp(`maxTotalBytes must be 1-${READ_TOTAL_MAX}: the files come back in one MCP reply.*Read a big file in parts: paths with just that file, and offset where the last reply stopped`))
   assert.strictEqual((await a.request('read_out', { paths: ['a.bin'], maxBytes: 2 ** 40, maxTotalBytes: READ_TOTAL_MAX })).files[0].size, small.length)
   // Round 2: a maxBytes past Int64 (which hv.ps1 casts to [long]; the stub refuses it as that cast does) reaches the
   // guest clamped to the call's total, so it reads as any other.
@@ -164,4 +165,35 @@ $res.clamped = & $GuestRead @{ paths = @('f.bin'); offset = 0; maxBytes = ${Math
   // fails; the clamped value (what the helper sends) reads as any other.
   assert.match(res.huge, /Int64/, 'a maxBytes past Int64, unclamped, fails in the guest')
   assert.deepStrictEqual([].concat(res.clamped.files).map(f => [f.path, f.cut, Buffer.from(f.data, 'base64').toString()]), [['f.bin', false, '0123456789abcdef']])
+})
+
+test('MC-1597: vm_read_out reads one file on from an offset, in the same 2 MB calls; maxBytes counts from the offset; an offset past the end reads nothing', async t => {
+  const { sc, a } = await running(t, 'caps-offset')
+  await start(a)
+  const big = Buffer.alloc(5 * 1024 * 1024 + 11)
+  for (let i = 0; i < big.length; i++) big[i] = (i * 17 + 3) % 253
+  sc.patchStub(s => {
+    const vm = Object.values(s.vms)[0]
+    vm.disk['C:\\out\\big.bin'] = big.toString('base64')
+    vm.disk['C:\\out\\z.txt'] = Buffer.from('zz').toString('base64')
+  })
+  const before = (sc.stub().readCalls || []).length
+  const at = 1024 * 1024 + 5
+  const r = await a.request('read_out', { paths: ['big.bin'], offset: at, maxBytes: 3 * 1024 * 1024, maxTotalBytes: 4 * 1024 * 1024 })
+  assert.deepStrictEqual(r.files.map(f => [f.path, f.size, f.offset, f.cut]), [['big.bin', big.length, at, true]])
+  assert.ok(Buffer.from(r.files[0].data, 'base64').equals(big.subarray(at, at + 3 * 1024 * 1024)), 'maxBytes counted from the offset')
+  const calls = sc.stub().readCalls.slice(before)
+  assert.deepStrictEqual(calls.map(c => c.offset), [at, at + READ_PART_BYTES], 'went on from the offset')
+  assert.ok(calls.every(c => c.bytes <= READ_PART_BYTES))
+  // To the end: not cut.
+  const end = await a.request('read_out', { paths: ['big.bin'], offset: big.length - 10, maxBytes: 100 })
+  assert.deepStrictEqual(end.files.map(f => [f.offset, f.cut, Buffer.from(f.data, 'base64').length]), [[big.length - 10, false, 10]])
+  // At or past the end: nothing read, the guest not asked.
+  const n = sc.stub().readCalls.length
+  const past = await a.request('read_out', { paths: ['big.bin'], offset: big.length })
+  assert.deepStrictEqual(past.files.map(f => [f.offset, f.cut, f.data.length]), [[big.length, false, 0]])
+  assert.strictEqual(sc.stub().readCalls.length, n)
+  // offset is for one file: with two, a glob, or none, refused; and a whole number.
+  for (const bad of [{ paths: ['big.bin', 'z.txt'], offset: 5 }, { glob: '*.bin', offset: 5 }, { offset: 5 }]) await assert.rejects(a.request('read_out', bad), /offset reads on in one file: give paths with just that file, and no glob/)
+  for (const offset of [-1, 1.5, '5']) await assert.rejects(a.request('read_out', { paths: ['big.bin'], offset }), /offset must be a whole number of bytes, at least 0/)
 })

@@ -157,18 +157,23 @@ function run(s, vm, req, data) {
       const files = under(vm, '/out').filter(k => vm.disk[k] !== '').map(k => ({ path: k.slice(5), size: Buffer.from(vm.disk[k], 'base64').length }))
       return { files, skipped: s.outLinks || [] }
     }
+    // MC-1597: the first path from req.offset, maxBytes counted from each file's start, each file's offset named, as
+    // guest.py does; s.oldDispatcher reads from the start and names no offset, as one built before MC-1597. Each call is
+    // recorded in state.linuxReadCalls.
     case 'read': {
       let total = 0
       const files = []
-      for (const p of req.paths) {
+      for (const [i, p] of req.paths.entries()) {
         const v = vm.disk[`/out/${p}`]
         if (v === undefined) continue
         const b = Buffer.from(v, 'base64')
-        const take = Math.min(b.length, req.maxBytes, req.maxTotalBytes - total)
-        if (take <= 0) break
+        if (req.maxTotalBytes - total <= 0 && b.length > 0) break
+        const off = i === 0 && !s.oldDispatcher ? (req.offset || 0) : 0
+        const take = Math.max(0, Math.min(Math.min(b.length, req.maxBytes) - off, req.maxTotalBytes - total))
         total += take
-        files.push({ path: p, size: b.length, cut: take < b.length, data: b.subarray(0, take).toString('base64') })
+        files.push({ path: p, size: b.length, ...(s.oldDispatcher ? {} : { offset: off }), cut: off + take < b.length, data: b.subarray(off, off + take).toString('base64') })
       }
+      s.linuxReadCalls = [...(s.linuxReadCalls || []), { paths: req.paths.length, offset: req.offset, maxBytes: req.maxBytes, maxTotalBytes: req.maxTotalBytes, bytes: total }]
       return { files }
     }
     default: throw new Error('an unknown operation')

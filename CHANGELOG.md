@@ -4,6 +4,17 @@ What each release changed, by server. A release is one tag, `v<version>` ([RELEA
 keeps its own version in `servers/<name>/meta.json`. Releases before 1.8.0 are on the
 [releases page](https://github.com/Suremise/combwork-mcp/releases).
 
+## Unreleased
+
+### hyper-v
+
+- `vm_read_out` no longer sends a reply bigger than an MCP client takes: Claude Code dropped the server when one passed
+  16 MB, and the session lost its VM tools and its lease. Each reply is filled up to about 12 MB measured as sent
+  (JSON escaping included); a file that doesn't fit stops there and says the offset to read on from, and the new
+  `offset` reads on in that one file. `maxTotalBytes` is now at most 12 MB (formerly about 85 MB). Any other reply past
+  15 MB is sent as an error instead. A Linux VM built before this reads from an offset up to 96 MB into a file; past
+  that, rebuild it (MC-1597).
+
 ## 1.9.0
 
 ### hyper-v 5.1.0 (from 5.0.0)

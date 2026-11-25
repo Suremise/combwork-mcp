@@ -18,8 +18,10 @@ const { spawn } = require('child_process')
 const { join } = require('path')
 
 const MARK = 'HVJSON:'
-// The dispatcher's answer, read up to this many characters. MC-1588: room for the largest, vm_read_out's most in one
-// call (core.js READ_TOTAL_MAX, about 85 MB) as base64 (4/3 of it), with room for the rest of the line.
+// The dispatcher's answer, read up to this many characters. MC-1588: room for vm_read_out's most in one call as base64
+// (4/3 of it), with room for the rest of the line. MC-1597: that most is now 12 MB (core.js READ_TOTAL_MAX); the room
+// is kept for a dispatcher built before MC-1597, read from a file's start to reach an offset (guests/linux.js
+// READ_OLD_MAX, 96 MB).
 const OUT_CAP = 192 * 1024 * 1024
 // Node's timers fire at once past this (about 24.8 days): a longer call bound waits this long instead (MC-1579).
 const TIMER_MAX_MS = 2 ** 31 - 1

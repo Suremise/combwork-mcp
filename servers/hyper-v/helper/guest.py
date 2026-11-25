@@ -447,12 +447,18 @@ def op_read(req, _):
     paths = req.get('paths') or []
     max_bytes = req.get('maxBytes')
     max_total = req.get('maxTotalBytes')
+    # MC-1597: the first path is read from offset (vm_read_out reads a big file in parts); maxBytes counts from each
+    # file's start, as hv.ps1's GuestRead. The answer names each file's offset, so the helper knows it was honoured.
+    offset = req.get('offset', 0)
     if not isinstance(paths, list) or len(paths) > 200 or not isinstance(max_bytes, int) or not isinstance(max_total, int):
+        raise Refused('bad read arguments')
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
         raise Refused('bad read arguments')
     root = open_root(OUT)
     out, total = [], 0
     try:
-        for p in paths:
+        for i, p in enumerate(paths):
+            off = offset if i == 0 else 0
             parts = segments(p)
             try:
                 fd = walk_dirs(root, parts[:-1])
@@ -466,15 +472,17 @@ def op_read(req, _):
                 f = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
                 with os.fdopen(f, 'rb') as fh:
                     size = os.fstat(fh.fileno()).st_size
-                    take = max(0, min(size, max_bytes, max_total - total))
-                    if take <= 0 and size > 0:
+                    if max_total - total <= 0 and size > 0:
                         break
+                    take = max(0, min(min(size, max_bytes) - off, max_total - total))
+                    if off > 0:
+                        fh.seek(off)
                     data = fh.read(take)
             finally:
                 if fd != root:
                     os.close(fd)
             total += len(data)
-            out.append({'path': '/'.join(parts), 'size': size, 'cut': len(data) < size, 'data': base64.b64encode(data).decode('ascii')})
+            out.append({'path': '/'.join(parts), 'size': size, 'offset': off, 'cut': off + len(data) < size, 'data': base64.b64encode(data).decode('ascii')})
             if total >= max_total:
                 break
     finally:

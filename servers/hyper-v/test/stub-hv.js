@@ -699,6 +699,8 @@ function run(s, op, a) {
       if (cmd === 'slow' && run.polls < Number(rest[0])) return { ...blank, done: false, pending: false }
       const put = (p, t) => { vm.disk[p.includes(':') ? p : `C:\\out\\${p}`] = Buffer.from(t).toString('base64') }
       const ok = (o = {}) => { run.result = { ...blank, done: true, exitCode: 0, ...o }; return run.result }
+      // MC-1597: the most output a stream may be, all control characters (six bytes each as sent), after N polls.
+      if (cmd === 'bigctl') return run.polls < Number(rest[0] || 0) ? { ...blank, done: false, pending: false } : ok({ stdout: '\u0001'.repeat(a.cap), stdoutCut: true })
       if (cmd === 'hang') { // a long run: records its PID (rest[2]), and if it is ever let finish, leaves a marker (rest[0])
         if (rest[2]) fs.writeFileSync(rest[2], String(process.pid))
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(rest[1] || 4000))

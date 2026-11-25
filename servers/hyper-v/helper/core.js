@@ -76,11 +76,16 @@ const GUEST_SCRIPT_MAX = MAX_STRING - 1 // less one: a .ps1 gets a byte order ma
 const RUN_INLINE_CHARS = 256 * 1024 // a character may serialise as up to 7 (_x000D_ in PowerShell's CLIXML): under 2 MB
 const RUN_PART_BYTES = 1024 * 1024 // about 1.4 M characters of base64
 const READ_PART_BYTES = 2 * 1024 * 1024 // about 2.8 M characters of base64 in the reply
-// MC-1588: vm_read_out's maxTotalBytes, at most (formerly 64 MB; maxBytes, per file, formerly 16 MB, now has no cap of
-// its own). The files come back in one reply, held as one string on the way (the helper's reply line, the server's MCP
-// reply), and Node holds a string of at most MAX_STRING_LENGTH characters. A text file's control characters are
-// written as \u00XX in JSON, six characters a byte: so a sixth of it, less 1 MB for the rest of the reply (about 85 MB).
-const READ_TOTAL_MAX = Math.floor((MAX_STRING - 1024 * 1024) / 6)
+// MC-1597: what one MCP reply may carry, measured on its encoded size (the JSON text written to stdout, in bytes).
+// Claude Code drops a stdio server whose one message passes 16 MB (it found no message boundary and closes the
+// transport); this stays well under that, with room for the reply's wrapper and notes. server.js fills vm_read_out's
+// reply up to it and refuses any reply over REPLY_HARD_MAX.
+const REPLY_BUDGET = 12 * 1024 * 1024
+const REPLY_HARD_MAX = 15 * 1024 * 1024
+// vm_read_out's maxTotalBytes, at most (MC-1588 held it to Node's string limit, about 85 MB; MC-1597 to one reply's
+// budget, since a file's bytes never encode smaller than themselves). A bigger file is read in parts: each reply says
+// the offset to go on from.
+const READ_TOTAL_MAX = REPLY_BUDGET
 // (ssh.js's OUT_CAP holds a Linux guest's answer of that much, as base64.)
 const GUEST_SCRIPT_RUN_BASE = 800_000_000 // its run numbers: above any lease's, below the Linux network scripts' 900000000
 const RETRY_MS = Number(process.env.HYPERV_MCP_RETRY_MS || 5 * 60_000)
@@ -371,7 +376,7 @@ class Helper {
   async readParts(args, opts) {
     const got = []
     let paths = Array.isArray(args.paths) ? args.paths.slice() : []
-    let offset = 0
+    let offset = args.offset || 0 // MC-1597: the first path from where an earlier reply stopped
     let total = 0
     while (paths.length && total < args.maxTotalBytes) {
       const r = await this.hv('guest-read', { ...args, paths, offset, maxTotalBytes: Math.min(READ_PART_BYTES, args.maxTotalBytes - total) }, opts)
@@ -2317,13 +2322,16 @@ class Helper {
     }
   }
 
-  async readOut(connId, { paths, glob, maxBytes = 256 * 1024, maxTotalBytes = 1024 * 1024, vm: named } = {}) {
+  async readOut(connId, { paths, glob, maxBytes = 256 * 1024, maxTotalBytes = 1024 * 1024, offset = 0, vm: named } = {}) {
     const lease = this.leaseOf(connId, named)
     if (!lease.running) throw new Error('The VM is not running: files in C:\\out are read while it runs (vm_stop restores it and discards them).')
     // MC-1588: maxBytes has no cap of its own (a file takes at most the call's total); maxTotalBytes is held to what one
-    // reply can carry (READ_TOTAL_MAX, with its reason).
+    // reply can carry (READ_TOTAL_MAX, MC-1597). offset (MC-1597): one file, read on from where an earlier reply stopped;
+    // maxBytes then counts from the offset.
     if (!Number.isInteger(maxBytes) || maxBytes < 1) throw new Error('maxBytes must be a whole number of bytes, at least 1')
-    if (!Number.isInteger(maxTotalBytes) || maxTotalBytes < 1 || maxTotalBytes > READ_TOTAL_MAX) throw new Error(`maxTotalBytes must be 1-${READ_TOTAL_MAX}: the files come back in one reply, which Node holds as one string (at most ${MAX_STRING} characters, with a text file's byte taking up to six); read a big file in parts`)
+    if (!Number.isInteger(maxTotalBytes) || maxTotalBytes < 1 || maxTotalBytes > READ_TOTAL_MAX) throw new Error(`maxTotalBytes must be 1-${READ_TOTAL_MAX}: the files come back in one MCP reply, which a client takes only up to a size (Claude Code drops a server whose reply passes 16 MB). Read a big file in parts: paths with just that file, and offset where the last reply stopped (each reply that stops short says its next offset)`)
+    if (!Number.isInteger(offset) || offset < 0) throw new Error('offset must be a whole number of bytes, at least 0')
+    if (offset > 0 && (glob !== undefined || !Array.isArray(paths) || paths.length !== 1)) throw new Error('offset reads on in one file: give paths with just that file, and no glob')
     const vm = this.vmOf(lease)
     const want = []
     if (paths !== undefined) {
@@ -2349,16 +2357,20 @@ class Helper {
       if (match) for (const f of files) if (match(f.path) && !chosen.includes(f)) chosen.push(f)
       // MC-1588 round 2: the per-file allowance sent is at most the call's total (a file can't give more), so a huge
       // maxBytes never reaches the guest side, which reads it as an Int64 (hv.ps1) or a JSON integer (guest.py).
-      const r = chosen.length
-        ? await this.guestCall(vm, 'guest-read', { ...this.ident(vm), cred: creds.admin, paths: chosen.map(f => f.path), maxBytes: Math.min(maxBytes, maxTotalBytes), maxTotalBytes }, this.forLease(lease))
-        : { files: [] }
+      // MC-1597: an offset past the file's end reads nothing (the guest isn't asked).
+      const past = offset > 0 && chosen.length && offset >= chosen[0].size
+      // The guest counts maxBytes from each file's start, so an offset is added to the first file's (as hv.ps1 does).
+      const r = chosen.length && !past
+        ? await this.guestCall(vm, 'guest-read', { ...this.ident(vm), cred: creds.admin, paths: chosen.map(f => f.path), offset, maxBytes: offset + Math.min(maxBytes, maxTotalBytes), maxTotalBytes }, this.forLease(lease))
+        : { files: past ? [{ path: chosen[0].path, size: chosen[0].size, data: '' }] : [] }
       let total = 0
       const got = []
-      for (const f of Array.isArray(r.files) ? r.files : []) {
+      for (const [i, f] of (Array.isArray(r.files) ? r.files : []).entries()) {
         if (!f || typeof f.path !== 'string' || typeof f.data !== 'string') continue
+        const from = i === 0 ? offset : 0
         const buf = Buffer.from(f.data, 'base64').subarray(0, Math.max(0, Math.min(maxBytes, maxTotalBytes - total)))
         total += buf.length
-        got.push({ path: f.path, size: f.size, cut: !!f.cut || buf.length < f.size, data: buf })
+        got.push({ path: f.path, size: f.size, offset: from, cut: from + buf.length < f.size, data: buf })
         if (total >= maxTotalBytes) break
       }
       return { files: got, missing, skipped }
@@ -4152,4 +4164,4 @@ function describePlan(plan, digest, approve, T, reasons = ['approval']) {
   return lines.join('\n')
 }
 
-module.exports = { Helper, canonical, baselineProblem, expiry, licenceOf, diagSummary, diagLine, keyOf, ancestorClash, decodeScript, PLAN_ID_RE, PROTOCOL, GUEST_SCRIPT_MAX, READ_TOTAL_MAX, RUN_INLINE_CHARS, RUN_PART_BYTES, READ_PART_BYTES }
+module.exports = { Helper, canonical, baselineProblem, expiry, licenceOf, diagSummary, diagLine, keyOf, ancestorClash, decodeScript, PLAN_ID_RE, PROTOCOL, GUEST_SCRIPT_MAX, READ_TOTAL_MAX, REPLY_BUDGET, REPLY_HARD_MAX, RUN_INLINE_CHARS, RUN_PART_BYTES, READ_PART_BYTES }
