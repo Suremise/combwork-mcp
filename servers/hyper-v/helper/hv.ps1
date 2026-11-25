@@ -971,6 +971,10 @@ try {
   $in = [Console]::In.ReadToEnd() | ConvertFrom-Json
   $a = $in.args
   $r = switch ([string]$in.op) {
+    # MC-1596: the PowerShell this script runs under, for vm_status.
+    'ps-version' {
+      @{ path = [string](Get-Process -Id $PID).Path; version = [string]$PSVersionTable.PSVersion; edition = [string]$PSVersionTable.PSEdition }
+    }
     'facts' {
       $cs = Get-CimInstance Win32_ComputerSystem
       $folders = @(foreach ($f in $a.folders) {

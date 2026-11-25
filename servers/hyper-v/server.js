@@ -566,6 +566,11 @@ async function status() {
   try {
     const v = await helper.request('version')
     const n = Number(/^hyperv-mcp\/(\d+)$/.exec(v?.data?.protocol || '')?.[1] || 0)
+    // MC-1596: beside the server's version and mode, the PowerShell the helper runs its Hyper-V script (hv.ps1) under.
+    const ps = v?.data?.powershell
+    lines.splice(1, 0, !ps ? 'PowerShell for hv.ps1: not reported by this helper (it is older than this server: run setup again to update it).'
+      : ps.error ? `PowerShell for hv.ps1: couldn't be read (${ps.error}).`
+        : `PowerShell for hv.ps1: ${ps.edition === 'Desktop' ? 'Windows PowerShell' : 'PowerShell'} ${ps.version || '(version unknown)'}, ${ps.path || '(path unknown)'}.`)
     if (n < Number(PROTOCOL.split('/')[1])) lines.push(`The helper speaks ${v?.data?.protocol}, this server ${PROTOCOL}: run setup again to update the helper.`)
     else if (n > Number(PROTOCOL.split('/')[1])) lines.push(`The helper speaks ${v?.data?.protocol}, newer than this server's ${PROTOCOL}: everything here works; update this server for the helper's newer tools.`)
     if ((v?.data?.features || []).includes('projects')) lines.push(`Your project: ${text(await helper.request('whoami', { roots: await rootList() }))}.`)

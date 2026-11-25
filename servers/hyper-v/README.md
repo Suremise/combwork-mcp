@@ -65,6 +65,14 @@ The full model: [docs/security.md](docs/security.md).
    ```
    cmd /c call "C:\path\to\combwork-mcp\servers\hyper-v\setup\install.cmd" -DiskFolder D:\hyperv-mcp
    ```
+   **Which PowerShell:** `install.cmd` runs setup under Windows PowerShell 5.1 whenever it is installed (it is on every
+   Windows), and the service then runs its Hyper-V script under that same PowerShell. **To use PowerShell 7**, run this
+   line instead (the same options; any admin terminal):
+   ```
+   cmd /c call "C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile -ExecutionPolicy Bypass -File "C:\path\to\combwork-mcp\servers\hyper-v\setup\install.ps1" -DiskFolder D:\hyperv-mcp
+   ```
+   A rerun with the other line switches it back. `vm_status` names the PowerShell the service runs
+   ([more in setup](docs/setup.md)).
    It installs the helper service, the group **Hyper-V MCP Users** (with you in it), the state folder and
    `policy.json`, the pool's limits. They default from the host; set any with `-MaxVms`, `-MaxCoresPerVm`,
    `-MaxMemoryGB`, `-MaxDiskGBPerVm`, `-MaxNetwork None|Host|Internet|InternetLan`, `-MaxLeaseMinutes` and the rest
@@ -104,8 +112,11 @@ To approve, run the plan's one line in an **admin terminal**:
 cmd /c call "C:\Program Files\hyperv-mcp\approve.cmd" -Plan p-0123456789abcdef
 ```
 It shows the plan from the helper's own record and asks for the first 6 characters of its digest. Never let an agent
-run it. Then the agent calls `pool_create` (or `pool_resize`, `pool_remove`); `pool_status` follows the build, about
-20-40 minutes per Windows VM, offline.
+run it. Then the agent calls `pool_create` (or `pool_resize`, `pool_remove`); `pool_status` follows the build, offline.
+**Plan on about 50 minutes per Windows VM**: CL-362's 2 VMs (2 cores and 6 GB each, Windows 11 25H2) took about 101
+minutes together. Most of it is Windows' own first sign-ins, which the build waits out for each of its two accounts:
+about 20 minutes each, mostly Windows' App Readiness pause (about 16 minutes) at a first sign-in. Setup from the ISO
+and the checkpoint take the rest. Slower disks or fewer cores take longer.
 
 More: the build, guest setup scripts, licences, images and ready-made disks in [docs/pool.md](docs/pool.md); Linux
 guests in [docs/linux.md](docs/linux.md).

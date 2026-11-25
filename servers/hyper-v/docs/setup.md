@@ -18,7 +18,8 @@ Setup's options, its storage rules, direct mode and the installed files. Part of
    ```
    Setup records the PowerShell it runs in only when that is one Windows has registered (a normal PowerShell 7 install
    is). Otherwise it records the one `install.cmd` would choose. Its "Service host compiled" step names the one it
-   recorded. To switch back, run setup again with the `install.cmd` line.
+   recorded, and `vm_status` names the one the service runs, with its version, on its second line. To switch back, run
+   setup again with the `install.cmd` line.
    It reports each step and can be run again (to update the helper or change the policy). It installs:
    - the helper's code, `approve.cmd` and `approve.ps1`, and the service host (compiled there by the in-box .NET
      Framework compiler) in `%ProgramFiles%\hyperv-mcp`;

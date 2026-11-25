@@ -14,6 +14,10 @@ keeps its own version in `servers/<name>/meta.json`. Releases before 1.8.0 are o
   `offset` reads on in that one file. `maxTotalBytes` is now at most 12 MB (formerly about 85 MB). Any other reply past
   15 MB is sent as an error instead. A Linux VM built before this reads from an offset up to 96 MB into a file; past
   that, rebuild it (MC-1597).
+- `vm_status` names the PowerShell the helper runs `hv.ps1` under (edition, version and path), beside the server's
+  version and mode. A helper from before this says it doesn't report it: run setup again (MC-1596).
+- README: setup's PowerShell 7 line is in step 2 beside `install.cmd`, which prefers Windows PowerShell 5.1; and a
+  realistic build time, about 50 minutes per Windows VM, mostly Windows' own first sign-ins (MC-1596).
 
 ## 1.9.0
 
