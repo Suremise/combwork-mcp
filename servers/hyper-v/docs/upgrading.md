@@ -92,3 +92,13 @@ applies, and:
   and verified before every park (MC-1590). See [Persistent VMs](tools.md#persistent-vms-a-vm-the-user-keeps-for-research-mc-1582).
 - From 4.0.0 straight to 5.1.0: one rerun covers both; follow "From 4.0.0 to 5.0.0" above (pass `-Mode` and `-User`
   again if you used `-Mode Direct` or another `-User`).
+
+**From 5.1.0 to 5.2.0 (reply size, MC-1597; PowerShell line, MC-1596): rerun setup to get the new features; nothing
+else to do.**
+- The rerun (the same line) keeps every setting and the pool's VMs, images and checkpoints.
+- Without it, the 5.1.0 helper works as before, and the 5.2.0 server still keeps each `vm_read_out` reply within about
+  12 MB, `maxTotalBytes` at most 12 MB; it refuses `offset` with "run setup again", and `vm_status` says the helper
+  doesn't report its PowerShell.
+- With it: `vm_read_out`'s `offset` reads a big file in parts, and `vm_status` names the PowerShell the helper runs
+  `hv.ps1` under. A Linux VM built before this reads from an offset up to 96 MB into a file; past that, rebuild it.
+- From 5.0.0 straight to 5.2.0: one rerun covers both; follow "From 5.0.0 to 5.1.0" above too.
