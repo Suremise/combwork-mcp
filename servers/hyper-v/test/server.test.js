@@ -45,6 +45,18 @@ test('MC-1596: vm_status names the PowerShell the helper runs hv.ps1 under, besi
   assert.match((await c.call('vm_status')).text.split('\n')[1], /^PowerShell for hv\.ps1: Windows PowerShell 5\.1\.26100\.9818, /)
 })
 
+test('MC-1596 item 4 (the user\'s choice: documented): vm_start, vm_wait and the instructions say a session runs one slow operation at a time, even across VMs', async t => {
+  const { env } = await pooled('one-at-a-time')
+  const a = server(env)
+  t.after(() => a.close())
+  const init = await a.request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '1' } })
+  assert.match(init.result.instructions, /A session runs one slow operation at a time, even across VMs: start the second VM after vm_wait gives the result of the first\./)
+  const tools = (await a.request('tools/list')).result.tools
+  const desc = name => tools.find(x => x.name === name).description
+  assert.match(desc('vm_start'), /A session runs one slow operation at a time \(MC-1596\): holding two VMs, start the second after vm_wait has given the result of the first; they cannot start together\./)
+  assert.match(desc('vm_wait'), /A session has one such operation at a time, even with several VMs: start or run in the next VM after this gives the result/)
+})
+
 test('tools, instructions and the kill switch', async t => {
   const { sc, env } = await pooled('tools')
   const off = server({ ...env, HYPERV_MCP_ENABLED: '' })

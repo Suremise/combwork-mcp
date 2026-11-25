@@ -630,7 +630,7 @@ const tools = [
   },
   {
     name: 'vm_start',
-    description: 'Start the leased VM: always restores its clean checkpoint first (a persistent VM, MC-1582: only when checkpoint is given; otherwise it starts from its disk as the last lease left it), then optionally copies a build folder in to C:\\build (/build on Linux; a copy: the guest can never change your files), with an empty C:\\out (/out). Network is none unless asked, and never above the mode the user approved for the pool (vm_status shows it).',
+    description: 'Start the leased VM: always restores its clean checkpoint first (a persistent VM, MC-1582: only when checkpoint is given; otherwise it starts from its disk as the last lease left it), then optionally copies a build folder in to C:\\build (/build on Linux; a copy: the guest can never change your files), with an empty C:\\out (/out). Network is none unless asked, and never above the mode the user approved for the pool (vm_status shows it). A session runs one slow operation at a time (MC-1596): holding two VMs, start the second after vm_wait has given the result of the first; they cannot start together.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -752,7 +752,7 @@ const tools = [
   },
   {
     name: 'vm_wait',
-    description: 'Wait for this session\'s vm_start, vm_reset, vm_restore, vm_checkpoint, vm_run or vm_sync that replied "still in progress", and get its result (MC-1553). Each call waits up to 45 s (HYPERV_MCP_REPLY_MS); call it again while it says still in progress. Ending your turn instead means nothing wakes you when the operation finishes.',
+    description: 'Wait for this session\'s vm_start, vm_reset, vm_restore, vm_checkpoint, vm_run or vm_sync that replied "still in progress", and get its result (MC-1553). Each call waits up to 45 s (HYPERV_MCP_REPLY_MS); call it again while it says still in progress. Ending your turn instead means nothing wakes you when the operation finishes. A session has one such operation at a time, even with several VMs: start or run in the next VM after this gives the result (MC-1596).',
     inputSchema: { type: 'object', properties: {} },
     run: vmWait
   },
@@ -833,7 +833,7 @@ const tools = [
 ]
 
 const INSTRUCTIONS = [
-  'Hyper-V tools give you a disposable Windows VM from a shared pool, or a Linux one (vm_acquire with os: "linux", or distro: "debian" | "ubuntu"): vm_acquire, vm_start (with your build folder), vm_run, vm_read_out, vm_stop, then always vm_release. On Linux the folders are /build and /out and commands are bash; everything else is the same. You may hold more than one VM at once (for example a Windows and a Linux one: vm_acquire for each); then pass vm (the name vm_acquire gave), to every other tool.',
+  'Hyper-V tools give you a disposable Windows VM from a shared pool, or a Linux one (vm_acquire with os: "linux", or distro: "debian" | "ubuntu"): vm_acquire, vm_start (with your build folder), vm_run, vm_read_out, vm_stop, then always vm_release. On Linux the folders are /build and /out and commands are bash; everything else is the same. You may hold more than one VM at once (for example a Windows and a Linux one: vm_acquire for each); then pass vm (the name vm_acquire gave), to every other tool. A session runs one slow operation at a time, even across VMs: start the second VM after vm_wait gives the result of the first.',
   'Every start restores the VM\'s clean checkpoint (except a persistent VM, which the user chose to keep: leased only by name, it starts as the last lease left it unless the start names a checkpoint or is a vm_reset). For a work session, keep the VM running instead: vm_sync copies only changed files into C:\\build, vm_reset gives a clean VM again, vm_renew extends the lease (within the policy). Runs are in session 0 (no desktop) unless the VM was started with interactive (a guest account logged on): then vm_run with session: "interactive" runs in that desktop session, for programs that make their own desktops or windows. Several agents can each hold a VM at once; if none is free, wait and retry.',
   'Network is none unless you ask, and never above the mode the user approved for the pool (vm_status): host (this PC only, on the ports its firewall allows), internet, or internet and LAN. Don\'t put real sign-ins, tokens or real CLIs in a VM.',
   'A slow vm_start, vm_reset, vm_restore, vm_checkpoint, vm_run or vm_sync replies within about 45 s: if it says "still in progress", call vm_wait (again and again) until it gives the result. Never end your turn while one is in progress: nothing wakes you when it finishes.',

@@ -18,6 +18,8 @@ keeps its own version in `servers/<name>/meta.json`. Releases before 1.8.0 are o
   version and mode. A helper from before this says it doesn't report it: run setup again (MC-1596).
 - README: setup's PowerShell 7 line is in step 2 beside `install.cmd`, which prefers Windows PowerShell 5.1; and a
   realistic build time, about 50 minutes per Windows VM, mostly Windows' own first sign-ins (MC-1596).
+- `vm_start`, `vm_wait` and the server's instructions say a session runs one slow operation at a time, even across
+  VMs: start the second VM after `vm_wait` gives the first one's result. No change to behaviour (MC-1596).
 
 ## 1.9.0
 

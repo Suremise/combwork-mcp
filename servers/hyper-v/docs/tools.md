@@ -44,7 +44,9 @@ checkpoints.
   are kept per VM, and dropped when that VM is released, no longer held, or acquired anew: one VM's build is never
   copied into another.
 - A disconnect ends every lease the session holds; one lease's release or deadline leaves the others.
-- One slow operation at a time per session, as before (`vm_wait`): commands in two VMs run one after the other.
+- One slow operation at a time per session, as before (`vm_wait`), even across VMs (MC-1596, the user's choice):
+  start, reset or run in the second VM after `vm_wait` has given the first one's result. Two VMs start one after the
+  other, never together; a second `vm_start` while the first is going is refused with "call vm_wait".
 
 ### Slow operations
 
