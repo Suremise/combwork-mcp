@@ -470,14 +470,16 @@ const itemCost = item => Buffer.byteLength(JSON.stringify(item)) + 1 // with its
 
 /**
  * Where a file's bytes end as text (valid UTF-8, no NUL), or -1 if they aren't. A part that stops short (more) may end
- * inside a character: that tail is left for the next part.
+ * inside a character: only that incomplete tail is left for the next part (round 2: a complete last character stays).
  */
 function textEnd(buf, more) {
   let end = buf.length
   if (more) {
     let i = end
     while (i > 0 && end - i < 3 && (buf[i - 1] & 0xc0) === 0x80) i--
-    if (i > 0 && buf[i - 1] >= 0xc0) end = i - 1
+    const lead = i > 0 ? buf[i - 1] : 0
+    const need = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : lead >= 0xc0 ? 2 : 0
+    if (need && end - (i - 1) < need) end = i - 1
   }
   const b = buf.subarray(0, end)
   return !b.includes(0) && Buffer.from(b.toString('utf8'), 'utf8').equals(b) ? end : -1
@@ -529,7 +531,12 @@ async function vmReadOut({ paths, glob, maxBytes = 256 * 1024, maxTotalBytes = 1
       }
     }
     const tEnd = img ? -1 : textEnd(f.buf, f.cut)
-    if (tEnd >= 0) {
+    // Round 2: a read too small to hold its first whole character would give an offset that never moves on.
+    if (tEnd === 0 && f.buf.length > 0 && !base64) {
+      notes.push(`${f.path}: the ${f.buf.length} bytes read from ${f.from} end inside a character: read it with a larger maxBytes (at least 4), or pass base64: true`)
+      continue
+    }
+    if (tEnd > 0 || (tEnd === 0 && f.buf.length === 0)) {
       const t = f.buf.subarray(0, tEnd)
       const more = f.cut || tEnd < f.buf.length
       const whole = { type: 'text', text: `${head(tEnd, more)}\n${t.toString('utf8')}` }
@@ -879,10 +886,14 @@ async function handle(msg) {
         const result = BOUNDED.has(tool.name) ? await begin(tool.name, () => tool.run(params?.arguments ?? {})) : await tool.run(params?.arguments ?? {})
         const r = typeof result === 'string' ? { text: result } : result
         const own = r.content ?? [{ type: 'text', text: r.text }]
-        // MC-1597: this call's reply and an earlier result together past one reply's most: the earlier result still
-        // goes (it is given once), and this call is to be made again.
-        if (earlier && Buffer.byteLength(JSON.stringify(own)) + Buffer.byteLength(JSON.stringify(earlier.result.text || '')) > REPLY_HARD_MAX - 64 * 1024) {
-          return reply(id, { content: deliver([{ type: 'text', text: `${tool.name}'s reply didn't fit in one message beside your earlier ${earlier.tool}'s result (above): call ${tool.name} again.` }]), isError: true })
+        // MC-1597: this call's reply and an earlier result together past one reply's most: this call's result goes
+        // now (it ran; it is never to be run again to get it), and the earlier one is kept for vm_wait, still given
+        // exactly once. Nothing is pending here: a call that is itself still going replies in a line.
+        if (earlier && !pending && Buffer.byteLength(JSON.stringify(own)) + Buffer.byteLength(JSON.stringify(earlier.result.text || '')) > REPLY_HARD_MAX - 64 * 1024) {
+          pending = earlier
+          const kept = earlier
+          earlier = null
+          own.push({ type: 'text', text: `Your earlier ${kept.tool} finished too${kept.result.isError ? ', and FAILED' : ''}, but its result didn't fit in one message beside this one: call vm_wait for it.` })
         }
         return reply(id, { content: deliver(own), ...(r.isError ? { isError: true } : {}) })
       } catch (e) {

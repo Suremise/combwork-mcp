@@ -6,22 +6,24 @@
 const test = require('node:test')
 const assert = require('assert')
 const path = require('path')
-const { scratch, withPool } = require('./helpers')
+const { T, scratch, withPool } = require('./helpers')
 const { server } = require('../client')
 const { REPLY_BUDGET, REPLY_HARD_MAX, READ_TOTAL_MAX } = require('../helper/core')
 
 const MB = 1024 * 1024
 const TITLE = /^--- (\S+) \((?:bytes (\d+)-(\d+) of (\d+))?(?:; read on with offset: (\d+))?(?:; )?(base64)?\) ---\n/
 
-async function running(t, name) {
+async function running(t, name, extraEnv = {}) {
   const sc = scratch(name)
   const { h } = await withPool(sc, 1)
   await h.stop()
-  const env = { ...sc.env, HYPERV_MCP_ENABLED: '1', HYPERV_MCP_MODE: 'direct', USERPROFILE: path.join(sc.dir, 'home') }
+  const env = { ...sc.env, HYPERV_MCP_ENABLED: '1', HYPERV_MCP_MODE: 'direct', USERPROFILE: path.join(sc.dir, 'home'), ...extraEnv }
   const s = server(env, { roots: [sc.builds] })
   t.after(() => s.close())
   assert.match((await s.call('vm_acquire', { minutes: 30 })).text, /Leased hvmcp-/)
-  assert.match((await s.call('vm_start', { build: path.join(sc.builds, 'app') })).text, /build copied in/)
+  let started = await s.call('vm_start', { build: path.join(sc.builds, 'app') })
+  for (let i = 0; i < 60 && /still in progress/.test(started.text); i++) started = await s.call('vm_wait')
+  assert.match(started.text, /build copied in/)
   const put = files => sc.patchStub(st => { const vm = Object.values(st.vms).find(v => v.state === 'Running'); for (const [p, b] of Object.entries(files)) vm.disk[`C:\\out\\${p}`] = b.toString('base64') })
   return { sc, s, put }
 }
@@ -132,4 +134,61 @@ test('MC-1597: maxTotalBytes past one reply\'s budget is refused with how to rea
   assert.match(list.text, new RegExp(`^The reply was \\d+ bytes, over the ${REPLY_HARD_MAX} one MCP reply may carry, so it wasn't sent: ask for less`))
   assert.ok(list.bytes < 1024)
   assert.match((await s.call('vm_status')).text, /Mode: direct/, 'the server is still there')
+})
+
+test('MC-1597 round 2: a read that stops short keeps its last character when it is whole (2, 3 and 4 bytes), leaves only an incomplete one, and one too small for a character says so instead of an offset that never moves', async t => {
+  const { s, put } = await running(t, 'ro-utf8')
+  put({ 'e2.txt': Buffer.from('éé'), 'e3.txt': Buffer.from('€€'), 'e4.txt': Buffer.from('😀😀') })
+  const page = async (file, maxBytes, extra = {}) => {
+    const r = await s.call('vm_read_out', { paths: [file], maxBytes, ...extra })
+    const m = TITLE.exec(r.content[0].text)
+    return { r, m, body: m ? r.content[0].text.slice(m[0].length) : null, next: m?.[5] ? Number(m[5]) : null }
+  }
+  // At a read boundary, whole characters of each size are kept, and the offset moves past them.
+  for (const [file, ch, n] of [['e2.txt', 'é', 2], ['e3.txt', '€', 3], ['e4.txt', '😀', 4]]) {
+    const p = await page(file, n)
+    assert.deepStrictEqual([p.body, p.next], [ch, n], `${file} read ${n} bytes: ${p.r.text}`)
+    const rest = await page(file, n, { offset: p.next })
+    assert.deepStrictEqual([rest.body, rest.next, Number(rest.m[2])], [ch, null, n], 'the rest, to the end')
+    // One byte more than a character: the incomplete one is left for the next part.
+    if (n < 4) continue
+    const over = await page(file, n + 1)
+    assert.deepStrictEqual([over.body, over.next], [ch, n])
+  }
+  const mid = await page('e3.txt', 4)
+  assert.deepStrictEqual([mid.body, mid.next], ['€', 3], 'a three-byte character and one byte of the next: the whole one, on from 3')
+  // Too small for the first character: no non-moving offset; base64 reads the bytes and moves on.
+  const small = await s.call('vm_read_out', { paths: ['e3.txt'], maxBytes: 2 })
+  assert.match(small.text, /^e3\.txt: the 2 bytes read from 0 end inside a character: read it with a larger maxBytes \(at least 4\), or pass base64: true$/)
+  assert.ok(!/offset: 0/.test(small.text))
+  const b = await page('e3.txt', 2, { base64: true })
+  assert.deepStrictEqual([b.m[6], b.next, Buffer.from(b.body, 'base64').equals(Buffer.from('€€').subarray(0, 2))], ['base64', 2, true])
+})
+
+test('MC-1597 round 2: an earlier result and this call\'s together past one reply: this call\'s result is given (never run again), the earlier one kept for vm_wait, each once', async t => {
+  const { sc, s, put } = await running(t, 'ro-earlier', { ...T.profile('replyShort'), HYPERV_MCP_OUTPUT_BYTES: String(MB) })
+  // A run whose 1 MB of control characters (about 6 MB as sent) settles while nobody waits.
+  const run = await s.call('vm_run', { command: 'bigctl 20' })
+  assert.match(run.text, /vm_run is still in progress/)
+  const text = Buffer.from('t'.repeat(READ_TOTAL_MAX))
+  put({ 'full.txt': text })
+  const runs = () => Object.values(Object.values(sc.stub().vms).find(v => v.state === 'Running').runs || {}).filter(r => /^bigctl/.test(r.command)).length
+  let r
+  for (let i = 0; i < 120; i++) {
+    r = await s.call('vm_read_out', { paths: ['full.txt'], maxBytes: READ_TOTAL_MAX, maxTotalBytes: READ_TOTAL_MAX })
+    if (!/vm_run is still in progress in this session/.test(r.text)) break
+    await new Promise(res => setTimeout(res, 250))
+  }
+  assert.ok(r.bytes <= REPLY_HARD_MAX && r.bytes < 16_000_000, `${r.bytes}`)
+  assert.strictEqual(r.isError, false, r.text.slice(0, 400))
+  assert.match(r.content[0].text, /^--- full\.txt \(bytes 0-\d+ of 12582912; read on with offset: \d+\) ---\nttt/, 'this call\'s own result')
+  assert.match(r.content.at(-1).text, /^Your earlier vm_run finished too, but its result didn't fit in one message beside this one: call vm_wait for it\.$/)
+  assert.ok(!r.content.some(c => /^Your earlier vm_run finished:/.test(c.text)))
+  const w = await s.call('vm_wait')
+  assert.ok(w.bytes <= REPLY_HARD_MAX)
+  assert.match(w.text, /^vm_run finished \(\d+ s after it was called\):\nExit code 0\./)
+  assert.ok(w.text.includes('\u0001'.repeat(1000)), 'with its output')
+  assert.match((await s.call('vm_wait')).text, /Nothing is in progress/, 'given once')
+  assert.ok(!/Your earlier/.test((await s.call('vm_status')).text), 'and not again')
+  assert.strictEqual(runs(), 1, 'the run ran once')
 })

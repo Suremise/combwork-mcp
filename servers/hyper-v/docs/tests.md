@@ -256,6 +256,9 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
   bytes a byte cut at the boundary on a whole character, the files after it named; binary as base64 cut on whole
   groups of three and read on; an image too big for one reply; `maxTotalBytes` past the budget refused with how to read
   in parts; and a reply past 15 MB (a listing of very long names) sent as an error, the server staying up.
+  Round 2: a part that stops short keeps a whole last character (2, 3 and 4 bytes) and leaves only an incomplete one;
+  a read too small for one character says so (or gives base64) instead of an offset that never moves; and an earlier
+  result that doesn't fit beside this call's reply is kept for `vm_wait`, this call's result given and its run run once.
   `linux.test.js` reads a Linux guest from an offset, and from a dispatcher built before MC-1597 (from the start, the
   front dropped; past 96 MB refused); `guest_py_check.py` the dispatcher's read from an offset on a real tree.
 - `persistent.test.js` (MC-1582): a persistent VM's plan and journal (only the VMs it builds), its approval text and
