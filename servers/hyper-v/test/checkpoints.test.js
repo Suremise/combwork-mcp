@@ -146,12 +146,17 @@ test('recovery: a take journalled without its id is found by its unique name and
   assert.match(st, new RegExp(`${vm}: .*unknown checkpoints left alone: someone else's`))
 })
 
-/** Starts a call, waits for the stub's "entered" file, then releases; returns both replies. */
-async function releaseDuring(s, sc, call, knobs) {
+/**
+ * Starts a call, waits for the stub's "entered" file (and then for ready, if given), then releases; returns both
+ * replies. The stub writes "entered" as the call begins, before it acts: a test whose point is a state the call reaches
+ * later (a snapshot made) waits for that state too, or under load its release kills the call before it gets there.
+ */
+async function releaseDuring(s, sc, call, knobs, ready) {
   const entered = path.join(sc.dir, `entered-${Date.now()}`)
   sc.patchStub(st => Object.assign(st, knobs(entered)))
   const p = call()
   await waitFor(async () => fs.existsSync(entered), T.waitForMs, 'the call has entered Hyper-V')
+  if (ready) await waitFor(ready.fn, T.waitForMs, ready.what)
   const rel = await s.call('vm_release')
   return { r: await p, rel }
 }
@@ -171,7 +176,10 @@ test('a lease released just after Hyper-V made the snapshot but before the call 
   const { s, sc, stubVm } = await lease(t, 'cp-cancel-after')
   await s.call('vm_start', {})
   const gate = path.join(sc.dir, 'gate-after-never')
-  const { r, rel } = await releaseDuring(s, sc, () => s.call('vm_checkpoint', { name: 'a' }), entered => ({ takeEntered: entered, takeGateAfter: gate }))
+  // Released only once the snapshot exists (the stub saves it before holding at takeGateAfter): "entered" alone comes
+  // before the take, and a release then would test the take cancelled before Hyper-V made anything (MC-1599).
+  const made = { fn: async () => stubVm().checkpoints.some(c => c.name.startsWith('hvmcp-lease-')), what: 'Hyper-V has made the snapshot' }
+  const { r, rel } = await releaseDuring(s, sc, () => s.call('vm_checkpoint', { name: 'a' }), entered => ({ takeEntered: entered, takeGateAfter: gate }), made)
   assert.ok(!/^Checkpoint "a" taken/.test(r.text), `no success: ${r.text}`)
   assert.match(rel.text, /^Released/)
   const v = stubVm()
