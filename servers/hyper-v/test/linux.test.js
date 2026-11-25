@@ -650,3 +650,31 @@ test('MC-1556: a Linux run in host mode gets its address from the helper\'s own 
   await c.request('release')
   await h.stop()
 })
+
+test('MC-1597: a Linux guest reads one file on from an offset; a dispatcher built before MC-1597 (no offset) is read from the start and the front dropped, and past READ_OLD_MAX the reply says to rebuild', async () => {
+  const { sc, h } = await mixedPool('lx-offset')
+  const c = h.conn(7)
+  await c.request('acquire', { minutes: 30, os: 'linux' })
+  await c.request('start', {})
+  const big = Buffer.alloc(3 * 1024 * 1024 + 5)
+  for (let i = 0; i < big.length; i++) big[i] = (i * 13 + 1) % 255
+  sc.patchStub(s => { Object.values(s.vms).find(v => v.os === 'linux').disk['/out/big.bin'] = big.toString('base64') })
+  const at = 2 * 1024 * 1024 + 3
+  const r = await c.request('read_out', { paths: ['big.bin'], offset: at, maxBytes: 2 * 1024 * 1024, maxTotalBytes: 2 * 1024 * 1024 })
+  assert.deepStrictEqual(r.files.map(f => [f.offset, f.cut]), [[at, false]])
+  assert.ok(Buffer.from(r.files[0].data, 'base64').equals(big.subarray(at)))
+  assert.deepStrictEqual(sc.stub().linuxReadCalls.at(-1), { paths: 1, offset: at, maxBytes: at + 2 * 1024 * 1024, maxTotalBytes: 2 * 1024 * 1024, bytes: big.length - at })
+  // A dispatcher from before MC-1597 reads from the start: asked again from there, its front dropped.
+  sc.patchStub(s => { s.oldDispatcher = true })
+  const old = await c.request('read_out', { paths: ['big.bin'], offset: 5, maxBytes: 100 })
+  assert.deepStrictEqual(old.files.map(f => [f.offset, f.cut]), [[5, true]])
+  assert.ok(Buffer.from(old.files[0].data, 'base64').equals(big.subarray(5, 105)))
+  assert.deepStrictEqual(sc.stub().linuxReadCalls.slice(-2).map(x => [x.offset, x.maxTotalBytes, x.bytes]), [[5, 1024 * 1024, 105], [undefined, 5 + 1024 * 1024, 105]])
+  await h.stop()
+  // Past READ_OLD_MAX from the start: refused, saying why.
+  const { LinuxDriver } = require('../helper/guests/linux')
+  const d = new LinuxDriver({})
+  d.dispatch = async () => ({ files: [{ path: 'f', size: 200 * 1024 * 1024, cut: true, data: '' }] })
+  await assert.rejects(d.call({ vmName: 'hvmcp-x' }, 'guest-read', { paths: ['f'], offset: 90 * 1024 * 1024, maxBytes: 100 * 1024 * 1024, maxTotalBytes: 8 * 1024 * 1024 }),
+    /hvmcp-x's guest dispatcher can't read from an offset \(it was built before MC-1597\), and reading from the start that far is over 100663296 bytes: rebuild the VM to read on past there/)
+})

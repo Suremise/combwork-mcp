@@ -140,6 +140,18 @@ r = call(root, {'op': 'read', 'paths': ['logs/a.log', 'leak.txt', 'leakdir/keep.
 ok(len(r['files']) == 1 and r['files'][0]['cut'] and r['files'][0]['size'] == 10, 'read capped, links never read: %r' % r)
 import base64
 ok(base64.b64decode(r['files'][0]['data']) == b'0123', 'the first 4 bytes')
+# MC-1597: the first path from an offset, maxBytes counted from the file's start; each file names its offset.
+with open(os.path.join(root, 'out/logs/b.log'), 'w') as f:
+    f.write('abc')
+r = call(root, {'op': 'read', 'paths': ['logs/a.log', 'logs/b.log'], 'offset': 3, 'maxBytes': 8, 'maxTotalBytes': 100})['result']
+ok([(x['path'], x['offset'], x['cut'], base64.b64decode(x['data'])) for x in r['files']] == [('logs/a.log', 3, True, b'34567'), ('logs/b.log', 0, False, b'abc')], 'read from an offset: %r' % r)
+r = call(root, {'op': 'read', 'paths': ['logs/a.log'], 'offset': 7, 'maxBytes': 100, 'maxTotalBytes': 2})['result']
+ok([(x['offset'], x['cut'], base64.b64decode(x['data'])) for x in r['files']] == [(7, True, b'78')], 'an offset, cut by the total: %r' % r)
+r = call(root, {'op': 'read', 'paths': ['logs/a.log'], 'offset': 10, 'maxBytes': 100, 'maxTotalBytes': 100})['result']
+ok([(x['offset'], x['cut'], x['data']) for x in r['files']] == [(10, False, '')], 'at the end: nothing: %r' % r)
+for bad in (-1, True, '3', 1.5):
+    ok('bad read arguments' in call(root, {'op': 'read', 'paths': ['logs/a.log'], 'offset': bad, 'maxBytes': 4, 'maxTotalBytes': 100}).get('error', ''), 'offset %r refused' % (bad,))
+os.remove(os.path.join(root, 'out/logs/b.log'))
 
 # Unknown operations and arguments.
 ok('unknown operation' in call(root, {'op': 'shell'}).get('error', ''), 'an unknown op refused')

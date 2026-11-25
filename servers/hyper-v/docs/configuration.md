@@ -152,20 +152,26 @@ only where a larger value breaks something, named with its reason.
   - The guest setup script: at most 536870887 bytes (about 512 MB; formerly 1 MB). The helper reads it as text, and
     Node holds a string of at most 536870888 characters (`buffer.constants.MAX_STRING_LENGTH`), one of which a `.ps1`'s
     byte order mark takes. It goes to the guest as a long command does.
-  - `vm_read_out`: `maxBytes` has no cap of its own (formerly 16 MB); `maxTotalBytes` at most 89303718 (about 85 MB;
-    formerly 64 MB, which a Windows guest couldn't return: `hv.js` read a reply up to 16 M characters, and 64 MB is 85
-    M characters of base64). The files come back in one reply, held as one string on the way (the helper's reply line,
-    the server's MCP reply), and a text file's control characters are written as `\u00XX`, six characters a byte: so a
-    sixth of Node's string limit, less 1 MB for the rest. A Windows guest's files are read in calls of at most 2 MB,
-    each going on where the last stopped; a Linux guest's in one call (`ssh.js` reads its answer up to 192 M
-    characters).
+  - `vm_read_out`: `maxBytes` has no cap of its own (formerly 16 MB); `maxTotalBytes` at most 12582912 (12 MB;
+    MC-1597, formerly about 85 MB). The files come back in one MCP reply, and a client takes only so much in one
+    message: Claude Code drops a stdio server whose reply passes 16 MB, and the session loses its VM tools and its lease
+    until `/mcp` reconnects it. So each reply is filled up to about 12 MB measured as sent: a text file's quotes and
+    newlines are written as two bytes, its other control characters as six (`\u00XX`), binary as base64 (4/3). A file
+    that doesn't fit stops there, on a whole character, and its title says `read on with offset: N`; call again with
+    `paths` naming just that file and `offset: N` (`maxBytes` then counts from the offset). Files after it are named,
+    not sent. An image too big for one reply as an image says to pass `base64: true`, which reads it in parts. A
+    Windows guest's files are read in calls of at most 2 MB, each going on where the last stopped; a Linux guest's in
+    one call. A Linux VM built before MC-1597 has a dispatcher with no offset: the helper reads it from the file's start
+    and drops the front, up to 96 MB in; past that, rebuild the VM. Any other reply past 15 MB (none is known to reach
+    it) is sent as an error saying so, never whole.
 
 ### Other limits
 
 - A cold start of a VM boots Windows: tens of seconds. A start from a checkpoint taken while running would be faster,
   but the clean baseline is taken powered off, so that "clean" is exact.
-- `vm_run` returns 16 KB per stream by default (`HYPERV_MCP_OUTPUT_BYTES`, up to 1 MB; see [Configuration](#configuration-env)), and `vm_read_out` at 256 KB per file and 1 MB per call by default (up to about 85 MB a call).
-  Write big results to a file in `C:\out` and read it in parts.
+- `vm_run` returns 16 KB per stream by default (`HYPERV_MCP_OUTPUT_BYTES`, up to 1 MB; see [Configuration](#configuration-env)), and `vm_read_out` at 256 KB per file and 1 MB per call by default (up to 12 MB a call, about 12 MB a reply as sent).
+  Write big results to a file in `C:\out` and read it in parts (`offset`). `vm_run`'s two streams stay within one
+  reply: 1 MB each at most, about 6 MB each as sent even if all control characters.
 - Commands run over PowerShell Direct in session 0, as the admin, or as the standard user in its own PowerShell Direct
   session. For that, the guest's admin adds the user to the guest's Remote Management Users group first, inside that
   throwaway guest only. A desktop session needs `vm_start`'s `interactive`: one guest restart, and only the account it

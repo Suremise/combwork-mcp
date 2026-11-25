@@ -13,7 +13,7 @@ const SERVER = join(__dirname, 'server.js')
 /**
  * Starts server.js and initializes it. With `roots` (host folders), it declares the MCP roots capability and answers
  * the server's roots/list with them; `setRoots(folders)` changes them and tells the server (roots/list_changed).
- * Returns { call(name, args) → { text, isError, content }, request, setRoots, rootsAsked, child, exit (promise), close() }.
+ * Returns { call(name, args) → { text, isError, content, bytes (the reply as sent) }, request, setRoots, rootsAsked, child, exit (promise), close() }.
  */
 function server(env, { roots, cwd } = {}) {
   const child = spawn(process.execPath, [SERVER], { env, cwd, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
@@ -29,6 +29,7 @@ function server(env, { roots, cwd } = {}) {
       rootsAsked++
       return write(current ? { id: m.id, result: { roots: current.map(p => ({ uri: pathToFileURL(p).href })) } } : { id: m.id, error: { code: -32601, message: 'Method not found' } })
     }
+    Object.defineProperty(m, 'bytes', { value: Buffer.byteLength(l) }) // the reply's size as sent (MC-1597)
     pending.get(m.id)?.(m)
     pending.delete(m.id)
   })
@@ -50,7 +51,7 @@ function server(env, { roots, cwd } = {}) {
   const call = async (name, args = {}) => {
     const m = await request('tools/call', { name, arguments: args })
     if (m.error) throw new Error(m.error.message)
-    return { text: m.result.content.filter(c => c.type === 'text').map(c => c.text).join('\n'), isError: !!m.result.isError, content: m.result.content }
+    return { text: m.result.content.filter(c => c.type === 'text').map(c => c.text).join('\n'), isError: !!m.result.isError, content: m.result.content, bytes: m.bytes }
   }
   void request('initialize', { protocolVersion: '2025-06-18', capabilities: roots ? { roots: { listChanged: true } } : {}, clientInfo: { name: 'hyper-v-client', version: '1.0.0' } })
     .then(() => { if (!exited) write({ method: 'notifications/initialized' }) })

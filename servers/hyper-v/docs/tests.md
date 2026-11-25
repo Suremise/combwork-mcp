@@ -9,7 +9,7 @@ From the repo root, `npm test` runs everything below. Hyper-V is never touched: 
 `helper.js` as a child process, the way the service host does. From this folder:
 
 ```powershell
-node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\restorewait.test.js test\runs.test.js test\caps.test.js test\persistent.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js test\linux-image.test.js test\linux-guest-files.test.js test\linux.test.js test\linux-ps.test.js test\bridge.test.js test\network.test.js test\guestnet.test.js test\uninstall.test.js test\timing.test.js test\nested-proof.test.js
+node --test test\units.test.js test\leases.test.js test\sessions.test.js test\guest-sync.test.js test\guest-agent.test.js test\interactive.test.js test\licence.test.js test\provision.test.js test\provision-clock.test.js test\provision-readiness.test.js test\provision-budget.test.js test\projects.test.js test\images.test.js test\named.test.js test\checkpoints.test.js test\poolcheckpoints.test.js test\refresh.test.js test\restorewait.test.js test\runs.test.js test\caps.test.js test\readout.test.js test\persistent.test.js test\approvals.test.js test\recovery.test.js test\server.test.js test\host.test.js test\linux-image.test.js test\linux-guest-files.test.js test\linux.test.js test\linux-ps.test.js test\bridge.test.js test\network.test.js test\guestnet.test.js test\uninstall.test.js test\timing.test.js test\nested-proof.test.js
 ```
 
 - `units.test.js`:
@@ -243,12 +243,21 @@ node --test test\units.test.js test\leases.test.js test\sessions.test.js test\gu
 - `caps.test.js` (MC-1588): a `vm_run` command held to `HYPERV_MCP_COMMAND_CHARS` (default 8000), the lease keeping
   its value; a long one sent to a Windows guest in 1 MB pieces as the account that runs it, run byte for byte, and a
   staging the guest doesn't confirm whole never started; `vm_read_out` reading a Windows guest's files in calls of at
-  most 2 MB, going on from an offset, cut by the call's total; its ceilings (`maxTotalBytes` at what one reply can hold,
-  `maxBytes` none); and `hv.ps1`'s `$GuestRunStage`, `$RunFiles` and `$GuestRead`, run with Windows PowerShell 5.1:
+  most 2 MB, going on from an offset, cut by the call's total, and (MC-1597) one file read on from an offset the caller
+  gives, an offset for more than one file refused; its ceilings (`maxTotalBytes` at one reply's budget, `maxBytes`
+  none); and `hv.ps1`'s `$GuestRunStage`, `$RunFiles` and `$GuestRead`, run with Windows PowerShell 5.1:
   a 2.5 MB `.ps1` staged, moved into place and run as UTF-8, a short staging refused, a read from an offset.
   `linux.test.js` has the Linux side (bytes after the request line; a dispatcher built before MC-1588 refusing them, the
   reply saying why), `guest_unit_check.py` `guest.py`'s, and `provision.test.js` a 2.5 MB guest setup script staged at
   build.
+- `readout.test.js` (MC-1597): no reply past what an MCP client takes in one message, through `server.js` over stdio
+  against the stub: each `vm_read_out` reply's size as sent within its budget (about 12 MB) and filled to it when a
+  file stops there; a 25 MB text file read whole in three pages, each saying where to read on; text that escapes to six
+  bytes a byte cut at the boundary on a whole character, the files after it named; binary as base64 cut on whole
+  groups of three and read on; an image too big for one reply; `maxTotalBytes` past the budget refused with how to read
+  in parts; and a reply past 15 MB (a listing of very long names) sent as an error, the server staying up.
+  `linux.test.js` reads a Linux guest from an offset, and from a dispatcher built before MC-1597 (from the start, the
+  front dropped; past 96 MB refused); `guest_py_check.py` the dispatcher's read from an offset on a real tree.
 - `persistent.test.js` (MC-1582): a persistent VM's plan and journal (only the VMs it builds), its approval text and
   `vm_status`; plain acquires never get it, a named one does, with no work-session cap but `maxLeaseMinutes` per
   renewal; its state kept through stop, a plain start, release and the next lease, each a park and never a restore;

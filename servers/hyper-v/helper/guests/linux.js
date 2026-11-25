@@ -26,6 +26,9 @@ const ATTEMPT_MS = Number(process.env.HYPERV_MCP_LINUX_ATTEMPT_MS || 60_000) // 
 // MC-1588: the longest command sent in the request line, as every dispatcher takes it (one built before MC-1588 took
 // at most this many characters); a longer one follows the line as bytes.
 const LINE_COMMAND_CHARS = 8000
+// MC-1597: the furthest a dispatcher built before MC-1597 (no offset) is read from a file's start to reach an offset:
+// as base64, well within what ssh.js reads of an answer (OUT_CAP, 192 M characters).
+const READ_OLD_MAX = 96 * 1024 * 1024
 const DIAG_KEYS = ['stage', 'vmbus', 'hv_sock_driver', 'hv_sock_modinfo', 'vsock_listen', 'sshd_config_ok', 'sshd_error', 'kernel', 'n', 'result', 'code', 'status']
 const PATHS = { build: '/build', out: '/out' }
 const sleep = ms => new Promise(r => setTimeout(r, ms))
@@ -78,7 +81,7 @@ class LinuxDriver {
       case 'guest-run-clear': return { cleared: 'at finish' }
       case 'guest-run-kill': return this.dispatch(vm, { op: 'run-kill', n: a.n, boot: a.started }, opts)
       case 'guest-list': return this.dispatch(vm, { op: 'list' }, opts)
-      case 'guest-read': return this.dispatch(vm, { op: 'read', paths: a.paths, maxBytes: a.maxBytes, maxTotalBytes: a.maxTotalBytes }, opts)
+      case 'guest-read': return this.read(vm, a, opts)
       case 'copy-in': {
         // A start's build: everything staged, after clearing /build.
         const entries = [...a.entries.values()]
@@ -113,6 +116,25 @@ class LinuxDriver {
       }
       default: throw new Error(`${op} isn't available in a Linux guest`)
     }
+  }
+
+  /**
+   * vm_read_out's read: the first path from a.offset (MC-1597), maxBytes counted from each file's start, as hv.ps1's.
+   * A dispatcher built before MC-1597 ignores offset and reads from the start (its answer names no offset): then the
+   * bytes up to the offset are read too and dropped here, within what ssh.js reads of an answer (READ_OLD_MAX).
+   */
+  async read(vm, a, opts) {
+    const offset = a.offset || 0
+    const req = { op: 'read', paths: a.paths, maxBytes: a.maxBytes, maxTotalBytes: a.maxTotalBytes }
+    const r = await this.dispatch(vm, offset > 0 ? { ...req, offset } : req, opts)
+    const first = r?.files?.[0]
+    if (!offset || !first || first.offset === offset) return r
+    if (offset + a.maxTotalBytes > READ_OLD_MAX) throw new Error(`${vm.vmName}'s guest dispatcher can't read from an offset (it was built before MC-1597), and reading from the start that far is over ${READ_OLD_MAX} bytes: rebuild the VM to read on past there`)
+    const whole = await this.dispatch(vm, { ...req, paths: a.paths.slice(0, 1), maxTotalBytes: offset + a.maxTotalBytes }, opts)
+    return { files: (whole.files || []).slice(0, 1).map(f => {
+      const data = Buffer.from(f.data, 'base64').subarray(offset)
+      return { ...f, offset, cut: offset + data.length < f.size, data: data.toString('base64') }
+    }) }
   }
 
   /**
