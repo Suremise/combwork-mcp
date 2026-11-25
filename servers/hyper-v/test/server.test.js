@@ -20,6 +20,43 @@ async function pooled(name, n = 1) {
   return { sc, env }
 }
 
+test('MC-1596: vm_status names the PowerShell the helper runs hv.ps1 under, beside the server\'s version and mode; asked once, again after a failure', async t => {
+  const { sc, env } = await pooled('ps-status')
+  const asked = () => sc.stub().calls.filter(c => c.op === 'ps-version').length
+  const before = asked()
+  const a = server(env)
+  t.after(() => a.close())
+  const lines = (await a.call('vm_status')).text.split('\n')
+  assert.match(lines[0], /^Mode: direct.*Server \d+\.\d+\.\d+/)
+  assert.strictEqual(lines[1], 'PowerShell for hv.ps1: PowerShell 7.5.4, C:\\Program Files\\PowerShell\\7\\pwsh.exe.')
+  await a.call('vm_status')
+  assert.strictEqual(asked() - before, 1, 'asked once per helper')
+  // Windows PowerShell, from a fresh helper.
+  sc.patchStub(s => { s.psVersion = { path: 'C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', version: '5.1.26100.9818', edition: 'Desktop' } })
+  const b = server(env)
+  t.after(() => b.close())
+  assert.strictEqual((await b.call('vm_status')).text.split('\n')[1], 'PowerShell for hv.ps1: Windows PowerShell 5.1.26100.9818, C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe.')
+  // A failure says so, and is asked again next time.
+  sc.patchStub(s => { s.fail['ps-version'] = 100 })
+  const c = server(env)
+  t.after(() => c.close())
+  assert.strictEqual((await c.call('vm_status')).text.split('\n')[1], 'PowerShell for hv.ps1: couldn\'t be read (ps-version: injected failure of ps-version).')
+  sc.patchStub(s => { s.fail['ps-version'] = 0 })
+  assert.match((await c.call('vm_status')).text.split('\n')[1], /^PowerShell for hv\.ps1: Windows PowerShell 5\.1\.26100\.9818, /)
+})
+
+test('MC-1596 item 4 (the user\'s choice: documented): vm_start, vm_wait and the instructions say a session runs one slow operation at a time, even across VMs', async t => {
+  const { env } = await pooled('one-at-a-time')
+  const a = server(env)
+  t.after(() => a.close())
+  const init = await a.request('initialize', { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 't', version: '1' } })
+  assert.match(init.result.instructions, /A session runs one slow operation at a time, even across VMs: start the second VM after vm_wait gives the result of the first\./)
+  const tools = (await a.request('tools/list')).result.tools
+  const desc = name => tools.find(x => x.name === name).description
+  assert.match(desc('vm_start'), /A session runs one slow operation at a time \(MC-1596\): holding two VMs, start the second after vm_wait has given the result of the first; they cannot start together\./)
+  assert.match(desc('vm_wait'), /A session has one such operation at a time, even with several VMs: start or run in the next VM after this gives the result/)
+})
+
 test('tools, instructions and the kill switch', async t => {
   const { sc, env } = await pooled('tools')
   const off = server({ ...env, HYPERV_MCP_ENABLED: '' })

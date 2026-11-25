@@ -401,6 +401,19 @@ class Helper {
     }
     return { files: got.map(f => ({ path: f.path, size: f.size, cut: f.cut, data: Buffer.concat(f.parts).toString('base64') })) }
   }
+  /**
+   * MC-1596: the PowerShell this helper runs hv.ps1 under (host.config's powershell= in the service, the launchers'
+   * choice otherwise), as that PowerShell reports itself: { path, version, edition }, or { error }. Asked once per
+   * helper process (a setup rerun restarts the service); a failure is asked again next time.
+   */
+  async powershell() {
+    if (!this.psInfo) {
+      this.psInfo = this.hv('ps-version', {}, { timeoutMs: 60_000 })
+        .then(r => ({ path: String(r?.path || ''), version: String(r?.version || ''), edition: String(r?.edition || '') }))
+        .catch(e => { this.psInfo = null; return { error: String(e.message || e).slice(0, 300) } })
+    }
+    return this.psInfo
+  }
   isLinux(vm) { return this.osOf(vm) === 'linux' }
   /** The guest's build and output folders, as the agent sees them. */
   paths(vm) { return this.isLinux(vm) ? LINUX_PATHS : { build: 'C:\\build', out: 'C:\\out' } }
@@ -3837,7 +3850,7 @@ class Helper {
       case 'pool_refresh': return this.apply('refresh', args)
       case 'pool_persistence': return this.apply('persistence', args)
       case 'quiesce': return this.quiesce()
-      case 'version': return { text: PROTOCOL, data: { protocol: PROTOCOL, features: [...FEATURES], buildRoots: [...this.policy.buildRoots] } }
+      case 'version': return { text: PROTOCOL, data: { protocol: PROTOCOL, features: [...FEATURES], buildRoots: [...this.policy.buildRoots], powershell: await this.powershell() } }
       case 'whoami': return this.whoami(args.roots)
       default: throw new Error(`unknown operation ${op}`)
     }

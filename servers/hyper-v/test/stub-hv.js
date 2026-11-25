@@ -98,6 +98,8 @@ const facts = vm => ({ vmId: vm.id, state: vm.state, parentCheckpointId: vm.pare
 function run(s, op, a) {
   S = s
   switch (op) {
+    // MC-1596: the PowerShell hv.ps1 runs under; state.psVersion overrides its fields (fail['ps-version'] fails it).
+    case 'ps-version': return { path: 'C:\\Program Files\\PowerShell\\7\\pwsh.exe', version: '7.5.4', edition: 'Core', ...(s.psVersion || {}) }
     case 'facts': return { hyperv: true, logicalCpus: 16, memoryMB: 65536, folders: (a.folders || []).map(folder => ({ folder, freeGB: s.freeGB ?? 500 })), defaultSwitch: !s.noDefaultSwitch }
     case 'guest-activate': {
       const vm = own(s, a)

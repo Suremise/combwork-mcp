@@ -54,7 +54,9 @@ The steps, for a plan that needs your approval:
 3. **Change.** The agent calls `pool_create` (or `pool_resize`, `pool_remove`) with the plan id. The helper checks the
    approval and the policy again, then runs the change in the background (`pool_status` shows it). Creating a VM
    installs Windows unattended, with no network:
-   - about 20–40 minutes each, one VM at a time, so the host's CPU isn't flooded;
+   - about 50 minutes each (CL-362: 2 VMs of 2 cores and 6 GB, Windows 11 25H2, about 101 minutes), one VM at a time,
+     so the host's CPU isn't flooded. Most of it is the wait for each account's first sign-in to settle (below), about
+     20 minutes each, mostly Windows' own App Readiness pause of about 16 minutes;
    - then the guest set-up, a sanity check of the installed edition and build, Windows' activation when the plan says
      so (see [Windows licences](#windows-licences));
    - then **the test accounts' profiles**, still offline: `hvadmin`, then `hvuser`, each logged on interactively once,
